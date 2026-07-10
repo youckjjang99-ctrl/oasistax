@@ -271,7 +271,7 @@ def check_login():
 
 def login_form(logo_html_func):
     st.markdown("<div class='login-wrap'>", unsafe_allow_html=True)
-    st.markdown(f"<div class='login-logo'>{logo_html_func(260)}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='login-logo'>{logo_html_func(320)}</div>", unsafe_allow_html=True)
 
     st.markdown("""
     <div class="login-panel">

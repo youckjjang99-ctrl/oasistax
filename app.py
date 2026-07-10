@@ -7,6 +7,8 @@ import shutil
 import pandas as pd
 from pathlib import Path
 
+from ui import apply_oasis_ui
+
 from auth import (
     apply_env_secrets, check_login, login_form, logout_button,
     is_admin, list_pending_users, list_all_users_for_admin,
@@ -93,10 +95,10 @@ def validate_customer_workbook(file_path):
     return len(errors) == 0, errors, warnings
 
 st.set_page_config(
-    page_title="OASIS 내부 지원사업 매칭",
+    page_title="OASIS 내부 CRM",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="expanded"
 )
 
 st.markdown("""
@@ -276,9 +278,223 @@ div[data-testid="stStatusWidget"] {
     font-size: 13px;
     margin-top: 34px;
 }
+
+/* ================= v3.1.0 UI/UX 리뉴얼 ================= */
+:root {
+    --oasis-navy: #062b63;
+    --oasis-blue: #0b5bd3;
+    --oasis-sky: #eaf4ff;
+    --oasis-line: #dce8f8;
+    --oasis-text: #102a43;
+    --oasis-muted: #64748b;
+}
+.stApp {
+    background:
+        radial-gradient(circle at top left, rgba(41, 126, 255, 0.12), transparent 36%),
+        linear-gradient(135deg, #f7fbff 0%, #ffffff 45%, #eef6ff 100%);
+}
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #062b63 0%, #073b91 52%, #0b5bd3 100%);
+    border-right: 1px solid rgba(255,255,255,0.12);
+}
+[data-testid="stSidebar"] > div:first-child {
+    padding-top: 1.15rem;
+}
+[data-testid="stSidebar"] img {
+    display: block;
+    margin: 0 auto 0.7rem auto;
+    filter: drop-shadow(0 10px 22px rgba(0,0,0,0.16));
+}
+.sidebar-brand {
+    text-align: center;
+    color: white;
+    margin: -4px 0 18px 0;
+}
+.sidebar-brand-title {
+    font-size: 21px;
+    font-weight: 900;
+    letter-spacing: 0.5px;
+    line-height: 1.15;
+}
+.sidebar-brand-sub {
+    font-size: 12px;
+    color: rgba(255,255,255,0.72);
+    margin-top: 5px;
+    letter-spacing: 1.2px;
+}
+.sidebar-user-card {
+    background: rgba(255,255,255,0.12);
+    border: 1px solid rgba(255,255,255,0.18);
+    border-radius: 18px;
+    padding: 13px 14px;
+    margin: 6px 0 18px 0;
+    color: white;
+    box-shadow: 0 10px 28px rgba(0,0,0,0.10);
+}
+.sidebar-user-card .name {
+    font-size: 17px;
+    font-weight: 850;
+    line-height: 1.25;
+}
+.sidebar-user-card .role {
+    font-size: 12px;
+    opacity: 0.75;
+    margin-top: 4px;
+}
+[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] .stRadio > label,
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
+[data-testid="stSidebar"] .stCaptionContainer {
+    color: rgba(255,255,255,0.82) !important;
+}
+[data-testid="stSidebar"] div[role="radiogroup"] {
+    gap: 8px;
+}
+[data-testid="stSidebar"] div[role="radiogroup"] label {
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 16px;
+    padding: 12px 14px !important;
+    margin: 0 0 8px 0;
+    min-height: 48px;
+    transition: all 0.15s ease;
+}
+[data-testid="stSidebar"] div[role="radiogroup"] label:hover {
+    background: rgba(255,255,255,0.16);
+    transform: translateX(3px);
+}
+[data-testid="stSidebar"] div[role="radiogroup"] label:has(input:checked) {
+    background: #ffffff;
+    border-color: #ffffff;
+    box-shadow: 0 14px 30px rgba(0,0,0,0.18);
+}
+[data-testid="stSidebar"] div[role="radiogroup"] label:has(input:checked) p {
+    color: #062b63 !important;
+    font-weight: 900 !important;
+}
+[data-testid="stSidebar"] div[role="radiogroup"] label p {
+    font-size: 18px !important;
+    font-weight: 780 !important;
+    letter-spacing: -0.2px;
+}
+[data-testid="stSidebar"] hr {
+    border-color: rgba(255,255,255,0.16) !important;
+    margin: 1rem 0;
+}
+.sidebar-section-label {
+    color: rgba(255,255,255,0.56);
+    font-size: 12px;
+    font-weight: 800;
+    letter-spacing: 1.1px;
+    margin: 18px 0 8px 4px;
+    text-transform: uppercase;
+}
+.block-container {
+    padding-top: 1.35rem;
+    max-width: 1240px;
+}
+.oasis-topbar {
+    justify-content: flex-start;
+    background: rgba(255,255,255,0.74);
+    border: 1px solid rgba(220,232,248,0.85);
+    border-radius: 24px;
+    padding: 16px 22px;
+    box-shadow: 0 16px 38px rgba(15,55,125,0.07);
+    backdrop-filter: blur(8px);
+    margin-bottom: 24px;
+}
+.oasis-card, .preview-box, .point-card {
+    border-radius: 26px;
+    border: 1px solid rgba(220,232,248,0.98);
+    box-shadow: 0 18px 42px rgba(15,55,125,0.08);
+}
+.oasis-card:hover, .point-card:hover {
+    box-shadow: 0 22px 48px rgba(15,55,125,0.11);
+}
+.section-title, h1, h2, h3 {
+    letter-spacing: -0.6px;
+}
+.hero {
+    position: relative;
+    overflow: hidden;
+}
+.hero:after {
+    content: "";
+    position: absolute;
+    width: 290px;
+    height: 290px;
+    right: -80px;
+    top: -70px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.12);
+}
+.metric-card {
+    background: white;
+    border: 1px solid #e6edf8;
+    border-radius: 22px;
+    padding: 22px 24px;
+    box-shadow: 0 14px 34px rgba(15, 55, 125, 0.07);
+}
+.metric-title {
+    color: #64748b;
+    font-size: 13px;
+    font-weight: 750;
+    margin-bottom: 8px;
+}
+.metric-value {
+    color: #062b63;
+    font-size: 28px;
+    font-weight: 900;
+    line-height: 1.1;
+}
+.stButton > button, .stDownloadButton > button {
+    min-height: 46px;
+    font-size: 15px;
+    border-radius: 16px;
+}
+[data-testid="stDataFrame"] {
+    border-radius: 18px;
+    overflow: hidden;
+    border: 1px solid #e6edf8;
+}
+
+
+/* v3.1.5: 상단 헤더와 로그인 로고 크기 실제 반영 */
+.login-logo img {
+    width: 320px !important;
+    max-width: 82% !important;
+    height: auto !important;
+}
+.oasis-topbar {
+    gap: 26px !important;
+    padding: 22px 34px !important;
+}
+.oasis-topbar-logo img {
+    width: 365px !important;
+    max-width: 38vw !important;
+    min-width: 300px !important;
+    height: auto !important;
+}
+.oasis-topbar-title {
+    font-size: 26px !important;
+    font-weight: 950 !important;
+    color: #062b63 !important;
+    line-height: 1.2 !important;
+    letter-spacing: -0.7px !important;
+}
+.oasis-topbar-sub {
+    font-size: 14px !important;
+    color: #64748b !important;
+    margin-top: 7px !important;
+    font-weight: 600 !important;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
+
+# v3.1.1: 사이드바 로고/메뉴 디자인 최종 보정
+apply_oasis_ui()
 
 def show_company_preview(result_file):
     previews = extract_company_previews(result_file)
@@ -300,6 +516,174 @@ def show_company_preview(result_file):
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+# =====================================================
+# v3.0.0 고객관리 기본 화면 유틸
+# =====================================================
+def read_current_user_customer_df(user_id):
+    """로그인한 회원의 누적 고객DB를 읽어 고객관리 화면에 표시할 DataFrame을 반환한다."""
+    path = get_user_cumulative_db_path(user_id)
+    if not path.exists():
+        return pd.DataFrame(), path
+
+    try:
+        # 기존 고객DB 양식/시트 구조를 유지한 파일을 우선 정리한 뒤 고객DB 시트만 읽는다.
+        path, _, _ = ensure_user_cumulative_db_format(user_id)
+        df = pd.read_excel(path, sheet_name="고객DB")
+        df = df.dropna(how="all")
+        return df, path
+    except Exception:
+        return pd.DataFrame(), path
+
+
+def render_home_page():
+    st.markdown("""
+    <div class="hero">
+        <div class="badge">OASIS TAX & ACCOUNTING · v3.1.1</div>
+        <div class="hero-title">오아시스 내부 CRM +<br>지원사업 컨설팅 플랫폼</div>
+        <div class="hero-sub">
+            고객DB, 크레탑 자동등록, 정책자금 매칭, 실행이력 관리를 하나의 내부 업무 시스템으로 통합합니다.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown("""
+        <div class="point-card">
+            <div class="point-icon">👥</div>
+            <div class="point-title">고객관리</div>
+            <div class="point-desc">회원별 누적 고객DB를 검색하고 업체별 상세정보를 빠르게 확인합니다.</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with c2:
+        st.markdown("""
+        <div class="point-card">
+            <div class="point-icon">📄</div>
+            <div class="point-title">크레탑 자동등록</div>
+            <div class="point-desc">크레탑 PDF에서 추출 가능한 정보를 고객DB에 자동으로 누적합니다.</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with c3:
+        st.markdown("""
+        <div class="point-card">
+            <div class="point-icon">📌</div>
+            <div class="point-title">정책자금 매칭</div>
+            <div class="point-desc">업체별 추천사업과 상담 포인트를 결과 엑셀로 생성합니다.</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+
+def render_customer_management_page(user_id):
+    st.markdown("### 👥 고객관리")
+    st.caption("내 누적 고객DB를 기준으로 고객을 검색하고 업체별 기본정보를 확인합니다. v3.0.0에서는 조회 중심으로 먼저 안정화했습니다.")
+
+    df, path = read_current_user_customer_df(user_id)
+    if df.empty:
+        st.info("아직 등록된 고객DB가 없습니다. 고객DB 업로드 또는 크레탑 자동등록으로 먼저 고객을 추가해주세요.")
+        return
+
+    total_count = len(df)
+    company_col = "업체명" if "업체명" in df.columns else df.columns[0]
+    biz_col = "사업자등록번호" if "사업자등록번호" in df.columns else None
+    industry_col = "업종명" if "업종명" in df.columns else None
+
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.metric("누적 고객 수", f"{total_count}건")
+    with m2:
+        if industry_col:
+            st.metric("업종 수", f"{df[industry_col].dropna().astype(str).nunique()}개")
+        else:
+            st.metric("업종 수", "-")
+    with m3:
+        st.metric("DB 파일", "정상" if path.exists() else "없음")
+
+    search_keyword = st.text_input("고객 검색", placeholder="업체명, 대표자명, 사업자번호, 업종명으로 검색")
+    filtered = df.copy()
+    if search_keyword.strip():
+        keyword = search_keyword.strip().lower()
+        mask = filtered.astype(str).apply(
+            lambda col: col.str.lower().str.contains(keyword, na=False)
+        ).any(axis=1)
+        filtered = filtered[mask]
+
+    display_cols = [c for c in ["업체명", "대표자명", "사업자등록번호", "업종명", "사업장 소재지", "종업원수", "매출액", "영업이익", "당기순이익"] if c in filtered.columns]
+    if not display_cols:
+        display_cols = list(filtered.columns[:8])
+
+    st.markdown("#### 고객 목록")
+    st.dataframe(filtered[display_cols], width='stretch', hide_index=True)
+
+    if filtered.empty:
+        st.warning("검색 결과가 없습니다.")
+        return
+
+    option_labels = []
+    row_map = {}
+    for idx, row in filtered.iterrows():
+        company = str(row.get(company_col, "")).strip() or f"고객 {idx + 1}"
+        biz_no = str(row.get(biz_col, "")).strip() if biz_col else ""
+        label = f"{company}"
+        if biz_no and biz_no.lower() != "nan":
+            label += f" · {biz_no}"
+        label = f"{label} · #{idx}"
+        option_labels.append(label)
+        row_map[label] = idx
+
+    selected_label = st.selectbox("상세보기 업체 선택", option_labels)
+    selected_row = df.loc[row_map[selected_label]]
+
+    st.markdown("#### 업체 상세")
+    d1, d2 = st.columns([1, 1])
+    with d1:
+        st.write(f"**업체명**: {selected_row.get('업체명', '')}")
+        st.write(f"**대표자명**: {selected_row.get('대표자명', '')}")
+        st.write(f"**사업자등록번호**: {selected_row.get('사업자등록번호', '')}")
+        st.write(f"**업종명**: {selected_row.get('업종명', '')}")
+        st.write(f"**사업장 소재지**: {selected_row.get('사업장 소재지', '')}")
+    with d2:
+        st.write(f"**종업원수**: {selected_row.get('종업원수', '')}")
+        st.write(f"**매출액**: {selected_row.get('매출액', selected_row.get('연매출', ''))}")
+        st.write(f"**영업이익**: {selected_row.get('영업이익', '')}")
+        st.write(f"**당기순이익**: {selected_row.get('당기순이익', '')}")
+        st.write(f"**설립일**: {selected_row.get('설립일', selected_row.get('설립년도', ''))}")
+
+    y_cols = [c for c in ["벤처", "이노비즈", "메인비즈", "기업부설연구소", "연구개발전담부서", "특허보유", "상표", "R&D수행", "스마트공장도입"] if c in df.columns]
+    if y_cols:
+        st.markdown("#### 인증·기술 현황")
+        st.dataframe(pd.DataFrame([{"항목": c, "값": selected_row.get(c, "")} for c in y_cols]), width='stretch', hide_index=True)
+
+    memo_cols = [c for c in ["키워드메모", "주요 사업내용", "비고", "기술성메모"] if c in df.columns]
+    if memo_cols:
+        with st.expander("메모/사업내용"):
+            for col in memo_cols:
+                val = selected_row.get(col, "")
+                if pd.notna(val) and str(val).strip():
+                    st.write(f"**{col}**")
+                    st.write(str(val))
+
+
+def render_cumulative_db_page(user_id):
+    st.markdown("### 📥 내 누적 고객DB")
+    st.caption("회원별로 누적된 고객DB를 기존 고객DB 양식 그대로 다운로드합니다.")
+
+    cumulative_db_path = get_user_cumulative_db_path(user_id)
+    if not cumulative_db_path.exists():
+        st.info("아직 누적 저장된 고객DB가 없습니다.")
+        return
+
+    cumulative_db_path, total_count, _ = ensure_user_cumulative_db_format(user_id)
+    st.success(f"현재 누적 고객 수: {total_count}건")
+    with open(cumulative_db_path, "rb") as f:
+        st.download_button(
+            label="내 누적 고객DB 다운로드",
+            data=f,
+            file_name="고객DB누적.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width='stretch'
+        )
+
+
 if not check_login():
     login_form(logo_html)
 
@@ -310,79 +694,68 @@ USER_DIRS = get_user_dirs(CURRENT_USER_ID)
 USER_UPLOAD_DIR = USER_DIRS["uploads"]
 USER_RESULT_DIR = USER_DIRS["results"]
 
-logo_col, logout_col = st.columns([5, 1])
-with logo_col:
-    st.markdown(f"""
-    <div class="oasis-topbar">
-        {logo_html(245)}
+# v3.0.0: 상단 탭/가로 메뉴 대신 사이드바 기반 메뉴로 전환
+with st.sidebar:
+    st.markdown(logo_html(360), unsafe_allow_html=True)
+    st.markdown("""
+    <div class="sidebar-brand">
+        <div class="sidebar-brand-title">오아시스 세무회계</div>
+        <div class="sidebar-brand-sub">OASIS TAX & ACCOUNTING</div>
     </div>
     """, unsafe_allow_html=True)
-with logout_col:
+
     if CURRENT_USER_NAME:
         role_badge = "관리자" if CURRENT_USER_IS_ADMIN else "회원"
-        st.caption(f"{CURRENT_USER_NAME}님 · {role_badge}")
+        st.markdown(f"""
+        <div class="sidebar-user-card">
+            <div class="name">{CURRENT_USER_NAME}님</div>
+            <div class="role">{role_badge} 계정으로 로그인 중</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown('<div class="sidebar-section-label">MAIN</div>', unsafe_allow_html=True)
+    menu_label_map = {
+        "홈": "홈",
+        "고객관리": "고객관리",
+        "고객DB 매칭": "고객DB 업로드/매칭",
+        "크레탑 자동등록": "크레탑 자동등록",
+        "내 누적 고객DB": "내 누적 고객DB",
+        "실행이력": "실행이력",
+        "담당자 통계": "담당자 통계",
+    }
+    if CURRENT_USER_IS_ADMIN:
+        menu_label_map["회원 승인 관리"] = "회원 승인 관리"
+
+    selected_menu_label = st.radio(
+        "메뉴",
+        list(menu_label_map.keys()),
+        key="active_main_menu_v311",
+        label_visibility="collapsed"
+    )
+    active_tab = menu_label_map[selected_menu_label]
+    st.divider()
     logout_button()
 
-st.markdown("""
-<div class="hero">
-    <div class="badge">OASIS TAX & ACCOUNTING</div>
-    <div class="hero-title">오아시스 내부 전용<br>지원사업 매칭 시스템</div>
-    <div class="hero-sub">
-        오아시스 내부 담당자가 고객DB를 업로드하면 업체별 정책자금, 공고형 지원사업,<br>
-        고용지원금 후보를 자동 정리하고 상담용 결과파일을 생성합니다.
+st.markdown(f"""
+<div class="oasis-topbar">
+    <div class="oasis-topbar-logo">{logo_html(365)}</div>
+    <div style="margin-left:22px;">
+        <div class="oasis-topbar-title">오아시스 내부 업무 시스템</div>
+        <div class="oasis-topbar-sub">CRM · 크레탑 자동등록 · 정책자금 매칭 · 실행이력 관리</div>
     </div>
 </div>
 """, unsafe_allow_html=True)
 
-c1, c2, c3 = st.columns(3)
+if active_tab == "홈":
+    render_home_page()
 
-with c1:
-    st.markdown("""
-    <div class="point-card">
-        <div class="point-icon">📌</div>
-        <div class="point-title">업체별 리포트</div>
-        <div class="point-desc">업체별 TOP 추천사업과 상담 포인트를 한 시트에 정리합니다.</div>
-    </div>
-    """, unsafe_allow_html=True)
+if active_tab == "고객관리":
+    render_customer_management_page(CURRENT_USER_ID)
 
-with c2:
-    st.markdown("""
-    <div class="point-card">
-        <div class="point-icon">📚</div>
-        <div class="point-title">실행이력 관리</div>
-        <div class="point-desc">담당자명, 업로드 파일, 결과파일 이력을 자동 저장합니다.</div>
-    </div>
-    """, unsafe_allow_html=True)
+if active_tab == "내 누적 고객DB":
+    render_cumulative_db_page(CURRENT_USER_ID)
 
-with c3:
-    st.markdown("""
-    <div class="point-card">
-        <div class="point-icon">👀</div>
-        <div class="point-title">업체 선택 미리보기</div>
-        <div class="point-desc">웹에서 업체별 TOP3를 바로 확인할 수 있습니다.</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-st.write("")
-st.write("")
-
-tab_labels = ["매칭 실행", "크레탑 자동등록", "실행이력", "담당자 통계"]
-if CURRENT_USER_IS_ADMIN:
-    tab_labels.append("회원 승인 관리")
-
-# v2.3.5: st.tabs는 모든 탭 내용을 매번 실행하므로 화면 전환이 느려질 수 있다.
-# 메뉴 선택 방식으로 바꿔 선택한 화면만 렌더링한다.
-# v2.3.6: Streamlit은 메뉴 클릭 시 앱을 재실행한다.
-# 재실행 자체는 정상 동작이지만 화면 반투명 현상을 줄이기 위해 CSS로 페이드 효과를 완화했다.
-active_tab = st.radio(
-    "메뉴",
-    tab_labels,
-    horizontal=True,
-    label_visibility="collapsed",
-    key="active_main_menu"
-)
-
-if active_tab == "매칭 실행":
+if active_tab == "고객DB 업로드/매칭":
     left, right = st.columns([1.2, 1])
 
     with left:
