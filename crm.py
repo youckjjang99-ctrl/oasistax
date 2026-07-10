@@ -170,3 +170,17 @@ def get_crm_summary(user_id: str) -> Dict[str, int]:
             status = record.get("status", "신규") or "신규"
             summary[status] = summary.get(status, 0) + 1
     return summary
+
+
+def delete_customer_record(user_id: str, customer_key: str) -> Tuple[bool, str]:
+    """CRM 보조 데이터에서 특정 고객 기록을 삭제한다.
+
+    고객DB 엑셀 행 삭제 시 상담메모/타임라인이 고아 데이터로 남지 않도록 함께 정리한다.
+    """
+    data = load_crm_data(user_id)
+    customers = data.setdefault("customers", {})
+    if customer_key in customers:
+        del customers[customer_key]
+        save_crm_data(user_id, data)
+        return True, "CRM 보조 기록도 함께 삭제되었습니다."
+    return True, "삭제할 CRM 보조 기록이 없습니다."

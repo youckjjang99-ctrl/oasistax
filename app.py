@@ -4,13 +4,16 @@ import sys
 import os
 import glob
 import shutil
+import re
 import pandas as pd
+from openpyxl import load_workbook
 from pathlib import Path
+from datetime import datetime
 
 from ui import apply_oasis_ui
 from crm import (
     STATUS_OPTIONS, ACTION_OPTIONS, make_customer_key, get_customer_record,
-    upsert_customer_record, append_timeline_event, get_crm_summary
+    upsert_customer_record, append_timeline_event, get_crm_summary, delete_customer_record
 )
 
 from auth import (
@@ -585,11 +588,59 @@ def _clean_customer_df(df: pd.DataFrame) -> pd.DataFrame:
 def _read_customer_sheet_cached(path_str: str, mtime: float):
     """누적 고객DB 고객DB 시트를 캐시로 읽고 실제 고객 행만 반환한다.
 
-    v3.2.2: 서식만 있는 빈 행을 고객으로 세지 않도록 정리한다.
+    v3.3.0: pandas가 엑셀 서식 행까지 읽어 999건으로 잡히는 문제를 피하기 위해
+    openpyxl로 실제 입력값이 있는 행만 읽고, 삭제/중복관리용 실제 엑셀 행번호(__excel_row)를 보존한다.
     """
-    df = pd.read_excel(path_str, sheet_name="고객DB", dtype=object)
-    return _clean_customer_df(df)
+    wb = load_workbook(path_str, data_only=True, read_only=True)
+    if "고객DB" not in wb.sheetnames:
+        return pd.DataFrame()
+    ws = wb["고객DB"]
 
+    header_row = 1
+    headers = []
+    for cell in ws[header_row]:
+        value = cell.value
+        headers.append(str(value).strip() if value is not None else "")
+
+    # 빈 헤더는 임시 컬럼명으로 보정
+    clean_headers = []
+    used = set()
+    for i, h in enumerate(headers, start=1):
+        name = h or f"미지정컬럼{i}"
+        base = name
+        n = 2
+        while name in used:
+            name = f"{base}_{n}"
+            n += 1
+        used.add(name)
+        clean_headers.append(name)
+
+    key_candidates = ["업체명", "사업자등록번호", "법인등록번호"]
+    key_indexes = [clean_headers.index(c) for c in key_candidates if c in clean_headers]
+    if not key_indexes and clean_headers:
+        key_indexes = [0]
+
+    rows = []
+    empty_streak = 0
+    for excel_row in range(header_row + 1, ws.max_row + 1):
+        values = [ws.cell(excel_row, col).value for col in range(1, len(clean_headers) + 1)]
+        has_key_value = any(
+            not _is_blank_customer_value(values[idx])
+            for idx in key_indexes
+            if idx < len(values)
+        )
+        if not has_key_value:
+            # 양식 하단의 빈 서식행을 빠르게 끊는다. 중간에 빈 줄이 있을 수 있어 30행 연속 공란 기준으로 중단.
+            empty_streak += 1
+            if empty_streak >= 30:
+                break
+            continue
+        empty_streak = 0
+        row_dict = {clean_headers[i]: values[i] if i < len(values) else None for i in range(len(clean_headers))}
+        row_dict["__excel_row"] = excel_row
+        rows.append(row_dict)
+
+    return pd.DataFrame(rows)
 
 def read_current_user_customer_df(user_id):
     """로그인한 회원의 누적 고객DB를 읽어 고객관리 화면에 표시할 DataFrame을 반환한다."""
@@ -606,6 +657,109 @@ def read_current_user_customer_df(user_id):
     except Exception:
         return pd.DataFrame(), path
 
+
+
+def _normalize_business_no(value):
+    return re.sub(r"\D", "", str(value or ""))
+
+
+def _normalize_company_name(value):
+    text = str(value or "").strip().lower()
+    if text in {"", "nan", "none", "null", "<na>"}:
+        return ""
+    text = re.sub(r"\(주\)|㈜|주식회사|유한회사|\(유\)", "", text)
+    text = re.sub(r"[\s\-_.(),/\\]", "", text)
+    return text
+
+
+def _get_row_display(row, company_col="업체명", biz_col="사업자등록번호"):
+    company = str(row.get(company_col, "") or "").strip()
+    rep = str(row.get("대표자명", "") or "").strip()
+    biz = str(row.get(biz_col, "") or "").strip() if biz_col in row.index else ""
+    excel_row = row.get("__excel_row", "")
+    label = company or "업체명 없음"
+    if rep and rep.lower() not in {"nan", "none"}:
+        label += f" / 대표 {rep}"
+    if biz and biz.lower() not in {"nan", "none"}:
+        label += f" / {biz}"
+    label += f" / 엑셀 {excel_row}행"
+    return label
+
+
+def find_duplicate_customer_groups(df: pd.DataFrame):
+    """사업자번호 우선, 법인번호 보조, 업체명 정규화 기준으로 중복 그룹을 찾는다."""
+    groups = []
+    if df is None or df.empty:
+        return groups
+
+    used_rows = set()
+
+    def add_groups_by_key(col_name, label_name, normalizer):
+        if col_name not in df.columns:
+            return
+        buckets = {}
+        for idx, value in df[col_name].items():
+            key = normalizer(value)
+            if not key:
+                continue
+            buckets.setdefault(key, []).append(idx)
+        for key, indexes in buckets.items():
+            real_indexes = [i for i in indexes if i not in used_rows]
+            if len(real_indexes) >= 2:
+                for i in real_indexes:
+                    used_rows.add(i)
+                groups.append({
+                    "기준": label_name,
+                    "키": key,
+                    "행인덱스": real_indexes,
+                    "건수": len(real_indexes),
+                })
+
+    add_groups_by_key("사업자등록번호", "사업자등록번호", _normalize_business_no)
+    add_groups_by_key("법인등록번호", "법인등록번호", _normalize_business_no)
+    add_groups_by_key("업체명", "업체명", _normalize_company_name)
+    return groups
+
+
+def _backup_customer_db_file(path: Path) -> Path:
+    backup_dir = path.parent / "backup"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_path = backup_dir / f"고객DB누적_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    shutil.copy2(path, backup_path)
+    return backup_path
+
+
+def delete_customer_rows_from_db(user_id: str, excel_rows, crm_keys=None):
+    """누적 고객DB에서 지정 엑셀 행을 삭제하고, CRM 보조 기록도 함께 정리한다."""
+    path = get_user_cumulative_db_path(user_id)
+    if not path.exists():
+        return False, "누적 고객DB 파일이 없습니다."
+
+    excel_rows = sorted({int(r) for r in excel_rows if r and int(r) >= 2}, reverse=True)
+    if not excel_rows:
+        return False, "삭제할 고객 행이 선택되지 않았습니다."
+
+    backup_path = _backup_customer_db_file(path)
+    wb = load_workbook(path)
+    if "고객DB" not in wb.sheetnames:
+        return False, "고객DB 시트를 찾을 수 없습니다."
+    ws = wb["고객DB"]
+
+    for row_num in excel_rows:
+        if row_num <= ws.max_row:
+            ws.delete_rows(row_num, 1)
+    wb.save(path)
+
+    if crm_keys:
+        for key in crm_keys:
+            delete_customer_record(user_id, key)
+
+    try:
+        _read_customer_sheet_cached.clear()
+    except Exception:
+        pass
+
+    return True, f"고객 {len(excel_rows)}건을 삭제했습니다. 삭제 전 백업: {backup_path.name}"
 
 def render_home_page():
     st.markdown("""
@@ -683,6 +837,90 @@ def render_customer_management_page(user_id):
         st.metric("상담중", f"{crm_summary.get('상담중', 0)}건")
     with m4:
         st.metric("신청/계약", f"{crm_summary.get('신청완료', 0) + crm_summary.get('계약완료', 0)}건")
+
+    # v3.3.0: 기존 중복 고객 정리 및 고객 삭제 기능
+    duplicate_groups = find_duplicate_customer_groups(df)
+    with st.expander(f"🧹 중복 고객/삭제 관리 ({len(duplicate_groups)}개 그룹)", expanded=False):
+        st.caption("사업자등록번호 → 법인등록번호 → 업체명 순서로 중복을 찾습니다. 삭제 전 자동 백업을 생성합니다.")
+
+        if duplicate_groups:
+            group_labels = []
+            group_map = {}
+            for group in duplicate_groups:
+                rows_for_group = df.loc[group["행인덱스"]]
+                first_company = str(rows_for_group.iloc[0].get("업체명", "") or "업체명 없음")
+                label = f"{first_company} · {group['기준']} 중복 · {group['건수']}건"
+                group_labels.append(label)
+                group_map[label] = group
+
+            selected_group_label = st.selectbox("중복 그룹 선택", group_labels, key="dup_group_select")
+            selected_group = group_map[selected_group_label]
+            dup_df = df.loc[selected_group["행인덱스"]].copy()
+            show_cols = [c for c in ["__excel_row", "업체명", "대표자명", "사업자등록번호", "법인등록번호", "업종명", "매출액", "영업이익"] if c in dup_df.columns]
+            st.dataframe(dup_df[show_cols], width='stretch', hide_index=True)
+
+            # 기본 추천: 가장 아래 엑셀 행을 최신으로 보고 1개만 유지
+            keep_default = int(dup_df["__excel_row"].max()) if "__excel_row" in dup_df.columns else None
+            row_options = []
+            row_label_to_excel = {}
+            row_label_to_key = {}
+            for _, r in dup_df.iterrows():
+                row_label = _get_row_display(r)
+                row_options.append(row_label)
+                row_label_to_excel[row_label] = int(r.get("__excel_row"))
+                row_label_to_key[row_label] = make_customer_key(r.get("업체명", ""), r.get("사업자등록번호", ""))
+
+            keep_label_default = None
+            for label, excel_row in row_label_to_excel.items():
+                if keep_default and excel_row == keep_default:
+                    keep_label_default = label
+                    break
+            keep_index = row_options.index(keep_label_default) if keep_label_default in row_options else len(row_options) - 1
+            keep_label = st.radio("남길 고객 1건 선택", row_options, index=keep_index, key="dup_keep_radio")
+            delete_labels = [label for label in row_options if label != keep_label]
+            st.info(f"선택한 1건을 남기고 나머지 {len(delete_labels)}건을 삭제합니다.")
+            confirm_merge_delete = st.checkbox("선택한 중복 고객을 삭제합니다", key="dup_confirm_delete")
+            if st.button("중복 고객 정리 실행", key="dup_delete_button", width='stretch'):
+                if not confirm_merge_delete:
+                    st.warning("삭제 확인 체크 후 실행해주세요.")
+                else:
+                    rows_to_delete = [row_label_to_excel[label] for label in delete_labels]
+                    keys_to_delete = [row_label_to_key[label] for label in delete_labels]
+                    ok, msg = delete_customer_rows_from_db(user_id, rows_to_delete, keys_to_delete)
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+        else:
+            st.success("현재 사업자번호/법인번호/업체명 기준 중복 고객이 없습니다.")
+
+        st.markdown("---")
+        st.markdown("##### 개별 고객 삭제")
+        all_labels = []
+        all_label_to_excel = {}
+        all_label_to_key = {}
+        for _, r in df.iterrows():
+            row_label = _get_row_display(r)
+            all_labels.append(row_label)
+            all_label_to_excel[row_label] = int(r.get("__excel_row"))
+            all_label_to_key[row_label] = make_customer_key(r.get("업체명", ""), r.get("사업자등록번호", ""))
+        delete_one_label = st.selectbox("삭제할 고객 선택", all_labels, key="delete_one_customer_select")
+        confirm_one_delete = st.checkbox("선택한 고객 1건을 삭제합니다", key="delete_one_confirm")
+        if st.button("선택 고객 삭제", key="delete_one_button", width='stretch'):
+            if not confirm_one_delete:
+                st.warning("삭제 확인 체크 후 실행해주세요.")
+            else:
+                ok, msg = delete_customer_rows_from_db(
+                    user_id,
+                    [all_label_to_excel[delete_one_label]],
+                    [all_label_to_key[delete_one_label]],
+                )
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
 
     st.markdown("#### 고객 검색/필터")
     f1, f2 = st.columns([2, 1])
