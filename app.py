@@ -18,7 +18,10 @@ from utils import (
     logo_html, make_upload_filename, find_customer_template,
     make_basic_customer_template_bytes, run_cleanup,
     move_result_files_to_results, extract_company_previews,
-    get_user_dirs, get_user_cumulative_db_path, append_user_customer_db
+    get_user_dirs, get_user_cumulative_db_path, append_user_customer_db,
+    extract_cretop_pdf_data, append_cretop_to_user_customer_db,
+    check_user_customer_duplicate, ensure_user_cumulative_db_format,
+    count_user_cumulative_rows
 )
 
 apply_env_secrets()
@@ -108,6 +111,17 @@ st.markdown("""
 }
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
+/* v2.3.6: 메뉴 전환 시 Streamlit 기본 재실행 페이드 효과가 화면을 반투명하게 보이게 하는 현상 완화 */
+.stApp,
+div[data-testid="stAppViewContainer"],
+section[data-testid="stSidebar"] {
+    opacity: 1 !important;
+    transition: none !important;
+}
+div[data-testid="stStatusWidget"] {
+    visibility: hidden;
+    height: 0px;
+}
 .oasis-topbar {
     display:flex;
     justify-content:center;
@@ -352,15 +366,23 @@ with c3:
 st.write("")
 st.write("")
 
-tab_labels = ["매칭 실행", "실행이력", "담당자 통계"]
+tab_labels = ["매칭 실행", "크레탑 자동등록", "실행이력", "담당자 통계"]
 if CURRENT_USER_IS_ADMIN:
     tab_labels.append("회원 승인 관리")
 
-tabs = st.tabs(tab_labels)
-tab1, tab2, tab3 = tabs[0], tabs[1], tabs[2]
-tab4 = tabs[3] if CURRENT_USER_IS_ADMIN else None
+# v2.3.5: st.tabs는 모든 탭 내용을 매번 실행하므로 화면 전환이 느려질 수 있다.
+# 메뉴 선택 방식으로 바꿔 선택한 화면만 렌더링한다.
+# v2.3.6: Streamlit은 메뉴 클릭 시 앱을 재실행한다.
+# 재실행 자체는 정상 동작이지만 화면 반투명 현상을 줄이기 위해 CSS로 페이드 효과를 완화했다.
+active_tab = st.radio(
+    "메뉴",
+    tab_labels,
+    horizontal=True,
+    label_visibility="collapsed",
+    key="active_main_menu"
+)
 
-with tab1:
+if active_tab == "매칭 실행":
     left, right = st.columns([1.2, 1])
 
     with left:
@@ -394,6 +416,7 @@ with tab1:
 
         cumulative_db_path = get_user_cumulative_db_path(CURRENT_USER_ID)
         if cumulative_db_path.exists():
+            cumulative_db_path, _, _ = ensure_user_cumulative_db_format(CURRENT_USER_ID)
             with open(cumulative_db_path, "rb") as f:
                 st.download_button(
                     label="내 누적 고객DB 다운로드",
@@ -461,6 +484,7 @@ with tab1:
                 CURRENT_USER_ID,
                 manager_name=manager_name.strip() or CURRENT_USER_NAME
             )
+            cumulative_path, _, _ = ensure_user_cumulative_db_format(CURRENT_USER_ID)
 
             st.session_state.latest_upload_file = str(uploaded_save_path)
             if saved_rows:
@@ -540,7 +564,145 @@ with tab1:
                 width='stretch'
             )
 
-with tab2:
+
+if active_tab == "크레탑 자동등록":
+    st.markdown("### 📄 크레탑 PDF로 고객 자동등록")
+    st.caption("크레탑 기업종합보고서 PDF를 업로드하면 추출 가능한 항목을 읽어 내 누적 고객DB에 1행으로 추가합니다.")
+
+    # v2.3.4: 저장 직후에는 앱을 한 번 재실행하여 상단 다운로드 버튼까지 최신 파일을 읽도록 한다.
+    # 재실행 후에도 사용자가 저장 결과를 확인할 수 있게 session_state 메시지를 표시한다.
+    if st.session_state.get("cretop_last_message"):
+        last_saved_count = int(st.session_state.get("cretop_last_saved_count", 0) or 0)
+        last_total_count = int(st.session_state.get("cretop_last_total_count", 0) or 0)
+        last_message = st.session_state.get("cretop_last_message", "")
+        if last_saved_count > 0:
+            st.success(f"{last_message} 현재 누적 고객 수: {last_total_count}건")
+        else:
+            st.info(last_message or "저장된 신규 데이터가 없습니다.")
+
+        # v2.3.6: 화면 진입만으로 엑셀 파일을 읽지 않고, 사용자가 다운로드를 요청할 때만 읽는다.
+        last_cumulative_path = get_user_cumulative_db_path(CURRENT_USER_ID)
+        if last_cumulative_path.exists():
+            if st.button("최신 누적 고객DB 다운로드 준비", key="cretop_prepare_latest_download", width='stretch'):
+                with open(last_cumulative_path, "rb") as f:
+                    st.download_button(
+                        label="최신 내 누적 고객DB 다운로드",
+                        data=f,
+                        file_name="고객DB누적.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        width='stretch',
+                        key="cretop_latest_download_after_save"
+                    )
+
+    cretop_col1, cretop_col2 = st.columns([1.1, 1])
+
+    with cretop_col1:
+        st.markdown("#### 1. PDF 업로드")
+        cretop_manager_name = st.text_input(
+            "담당자명",
+            value=CURRENT_USER_NAME or "",
+            key="cretop_manager_name",
+            placeholder="예: 임주형"
+        )
+        cretop_pdf = st.file_uploader(
+            "크레탑 기업종합보고서 PDF 업로드",
+            type=["pdf"],
+            key="cretop_pdf_uploader"
+        )
+
+    with cretop_col2:
+        st.markdown("#### 자동 입력되는 주요 항목")
+        st.write("업체명, 대표자명, 사업자등록번호, 법인번호, 주소, 업종, 종업원수, 설립일, 매출액, 영업이익, 당기순이익, 자산/부채/자본, 벤처·이노비즈·메인비즈·연구소·특허·상표 여부")
+        st.info("자동 추출이 어려운 상담메모, 희망자금, 고용계획 등은 공란으로 유지합니다.")
+
+    if cretop_pdf is not None:
+        if not cretop_manager_name.strip():
+            st.warning("담당자명을 입력해주세요.")
+            st.stop()
+
+        st.caption("PDF 업로드가 완료되었습니다. 아래 버튼을 눌러 분석을 시작하세요.")
+        analyze_requested = st.button("크레탑 PDF 분석하기", key="cretop_analyze_button", width='stretch')
+
+        # v2.3.6: PDF 업로드만으로 바로 분석하지 않고, 사용자가 분석 버튼을 누른 경우 또는 같은 PDF 분석 캐시가 있는 경우만 처리한다.
+        import hashlib
+        pdf_bytes = cretop_pdf.getvalue()
+        pdf_hash = hashlib.md5(pdf_bytes).hexdigest()
+
+        has_cached_pdf = st.session_state.get("cretop_pdf_hash") == pdf_hash
+        if not analyze_requested and not has_cached_pdf:
+            st.info("분석 버튼을 누르면 추출값 미리보기가 표시됩니다.")
+            st.stop()
+
+        if st.session_state.get("cretop_pdf_hash") != pdf_hash:
+            pdf_save_name = make_upload_filename(cretop_pdf.name).replace("업로드고객DB_", "크레탑PDF_")
+            pdf_save_path = USER_UPLOAD_DIR / pdf_save_name
+            with open(pdf_save_path, "wb") as f:
+                f.write(pdf_bytes)
+
+            with st.spinner("크레탑 PDF를 분석 중입니다..."):
+                extracted_data, extract_error = extract_cretop_pdf_data(pdf_save_path)
+
+            st.session_state["cretop_pdf_hash"] = pdf_hash
+            st.session_state["cretop_pdf_save_path"] = str(pdf_save_path)
+            st.session_state["cretop_extracted_data"] = extracted_data
+            st.session_state["cretop_extract_error"] = extract_error
+        else:
+            pdf_save_path = Path(st.session_state.get("cretop_pdf_save_path", ""))
+            extracted_data = st.session_state.get("cretop_extracted_data", {})
+            extract_error = st.session_state.get("cretop_extract_error", "")
+        if extract_error:
+            st.error(extract_error)
+        else:
+            st.markdown("#### 2. 추출값 미리보기")
+            preview_keys = [
+                "업체명", "대표자명", "사업자등록번호", "법인등록번호", "업종명", "사업장 소재지",
+                "종업원수", "설립일", "기업유형", "기업규모", "매출액", "영업이익", "당기순이익",
+                "자산총계", "부채총계", "자본총계", "벤처", "이노비즈", "메인비즈",
+                "연구개발전담부서", "기업부설연구소", "특허보유", "상표"
+            ]
+            preview_df = pd.DataFrame(
+                [{"항목": key, "추출값": extracted_data.get(key, "")} for key in preview_keys]
+            )
+            st.dataframe(preview_df, width='stretch', hide_index=True)
+
+            business_no = extracted_data.get("사업자등록번호", "")
+            is_dup = check_user_customer_duplicate(CURRENT_USER_ID, business_no)
+
+            duplicate_action = "add"
+            if is_dup:
+                st.warning("이미 내 누적 고객DB에 같은 사업자등록번호가 있습니다.")
+                duplicate_choice = st.radio(
+                    "저장 방식 선택",
+                    ["기존 데이터 업데이트", "저장하지 않기", "중복이어도 새 행으로 추가"],
+                    horizontal=True,
+                    key="cretop_duplicate_choice"
+                )
+                duplicate_action = {
+                    "기존 데이터 업데이트": "update",
+                    "저장하지 않기": "skip",
+                    "중복이어도 새 행으로 추가": "add",
+                }[duplicate_choice]
+
+            if st.button("내 누적 고객DB에 추가", width='stretch'):
+                before_count = count_user_cumulative_rows(CURRENT_USER_ID)
+                with st.spinner("크레탑 PDF 추출값을 누적 고객DB에 저장 중입니다..."):
+                    cumulative_path, saved_count, message, _, saved_preview = append_cretop_to_user_customer_db(
+                        pdf_save_path,
+                        CURRENT_USER_ID,
+                        manager_name=cretop_manager_name.strip() or CURRENT_USER_NAME,
+                        duplicate_action=duplicate_action
+                    )
+                    cumulative_path, total_count, _ = ensure_user_cumulative_db_format(CURRENT_USER_ID)
+
+                st.session_state["cretop_last_message"] = message
+                st.session_state["cretop_last_saved_count"] = saved_count
+                st.session_state["cretop_last_total_count"] = total_count
+
+                # v2.3.4: 이 시점의 상단 다운로드 버튼은 이미 과거 파일을 읽은 상태일 수 있다.
+                # 저장 완료 후 즉시 rerun하여 모든 다운로드 버튼이 최신 누적DB를 다시 읽게 한다.
+                st.rerun()
+
+if active_tab == "실행이력":
     st.markdown("### 📚 실행이력")
 
     history_df = read_run_history(CURRENT_USER_ID)
@@ -563,7 +725,7 @@ with tab2:
                     width='stretch'
                 )
 
-with tab3:
+if active_tab == "담당자 통계":
     st.markdown("### 👤 담당자별 실행횟수")
 
     stats_df = get_manager_stats(CURRENT_USER_ID)
@@ -574,47 +736,45 @@ with tab3:
         st.dataframe(stats_df, width='stretch', hide_index=True)
 
 
-if CURRENT_USER_IS_ADMIN and tab4 is not None:
-    with tab4:
-        st.markdown("### 🔐 회원 승인 관리")
-        st.caption("회원가입 신청자는 관리자 승인 전까지 매칭 시스템에 로그인할 수 없습니다.")
+if CURRENT_USER_IS_ADMIN and active_tab == "회원 승인 관리":
+    st.markdown("### 🔐 회원 승인 관리")
+    st.caption("회원가입 신청자는 관리자 승인 전까지 매칭 시스템에 로그인할 수 없습니다.")
 
-        pending_users = list_pending_users()
+    pending_users = list_pending_users()
 
-        st.markdown("#### 승인 대기 회원")
-        if not pending_users:
-            st.info("승인 대기 중인 회원이 없습니다.")
-        else:
-            for row in pending_users:
-                with st.container(border=True):
-                    c1, c2, c3 = st.columns([2.2, 1, 1])
-                    with c1:
-                        st.write(f"**{row.get('이름', '')}**")
-                        st.caption(f"아이디: {row.get('아이디', '')} / 가입일시: {row.get('가입일시', '')}")
-                    with c2:
-                        if st.button("승인", key=f"approve_{row.get('아이디', '')}", use_container_width=True):
-                            ok, msg = approve_user(row.get('아이디', ''), CURRENT_USER_ID)
-                            if ok:
-                                st.success(msg)
-                                st.rerun()
-                            else:
-                                st.error(msg)
-                    with c3:
-                        if st.button("거절", key=f"reject_{row.get('아이디', '')}", use_container_width=True):
-                            ok, msg = reject_user(row.get('아이디', ''), CURRENT_USER_ID)
-                            if ok:
-                                st.warning(msg)
-                                st.rerun()
-                            else:
-                                st.error(msg)
+    st.markdown("#### 승인 대기 회원")
+    if not pending_users:
+        st.info("승인 대기 중인 회원이 없습니다.")
+    else:
+        for row in pending_users:
+            with st.container(border=True):
+                c1, c2, c3 = st.columns([2.2, 1, 1])
+                with c1:
+                    st.write(f"**{row.get('이름', '')}**")
+                    st.caption(f"아이디: {row.get('아이디', '')} / 가입일시: {row.get('가입일시', '')}")
+                with c2:
+                    if st.button("승인", key=f"approve_{row.get('아이디', '')}", use_container_width=True):
+                        ok, msg = approve_user(row.get('아이디', ''), CURRENT_USER_ID)
+                        if ok:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+                with c3:
+                    if st.button("거절", key=f"reject_{row.get('아이디', '')}", use_container_width=True):
+                        ok, msg = reject_user(row.get('아이디', ''), CURRENT_USER_ID)
+                        if ok:
+                            st.warning(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
 
-        st.markdown("#### 전체 회원 현황")
-        all_users = list_all_users_for_admin()
-        if all_users:
-            st.dataframe(pd.DataFrame(all_users), width='stretch', hide_index=True)
-        else:
-            st.info("등록된 회원이 없습니다.")
-
+    st.markdown("#### 전체 회원 현황")
+    all_users = list_all_users_for_admin()
+    if all_users:
+        st.dataframe(pd.DataFrame(all_users), width='stretch', hide_index=True)
+    else:
+        st.info("등록된 회원이 없습니다.")
 st.markdown("""
 <div class="oasis-footer">
     © OASIS TAX & ACCOUNTING. All rights reserved.
