@@ -1,0 +1,12 @@
+v1 기반 재정리본 적용 방법
+
+1. 현재 정책자금자동화 폴더는 백업합니다.
+2. 이 압축파일을 새로 풉니다.
+3. 폴더명을 정책자금자동화로 변경합니다.
+4. 기존 .streamlit/secrets.toml만 새 폴더의 .streamlit 안으로 복사합니다.
+5. VSCode에서 새 폴더를 열고 streamlit run app.py로 테스트합니다.
+6. 정상 확인 후 GitHub 연결/Commit/Push를 진행합니다.
+
+주의:
+- Git 충돌 상태를 제거하기 위해 .git 폴더는 포함하지 않았습니다.
+- 고객DB 양식은 templates/고객DB_양식.xlsx 위치에 넣으면 됩니다.

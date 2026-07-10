@@ -1,0 +1,24 @@
+{
+  "oasistax": {
+    "user_id": "oasistax",
+    "name": "OASIS 관리자",
+    "salt": "6a05308d6ca713951b1de1154e0c8c71",
+    "password_hash": "bf97186440d2318d25e17deaf28c1bba8f4857c8c539a300e98a588053dd849a",
+    "role": "admin",
+    "status": "approved",
+    "created_at": "2026-07-10 12:51:10",
+    "approved_at": "2026-07-10 12:51:10",
+    "approved_by": "system"
+  },
+  "nam1212": {
+    "user_id": "nam1212",
+    "name": "남구엉",
+    "salt": "1395e7501cf90738efef42957d34a76a",
+    "password_hash": "fee799d77d4bb1a9e31745529dcdbb176ad8912b7f85853d8e7c1e1678dd6772",
+    "role": "member",
+    "status": "pending",
+    "created_at": "2026-07-10 12:53:11",
+    "approved_at": "",
+    "approved_by": ""
+  }
+}
