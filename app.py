@@ -8,6 +8,10 @@ import pandas as pd
 from pathlib import Path
 
 from ui import apply_oasis_ui
+from crm import (
+    STATUS_OPTIONS, ACTION_OPTIONS, make_customer_key, get_customer_record,
+    upsert_customer_record, append_timeline_event, get_crm_summary
+)
 
 from auth import (
     apply_env_secrets, check_login, login_form, logout_button,
@@ -123,6 +127,23 @@ section[data-testid="stSidebar"] {
 div[data-testid="stStatusWidget"] {
     visibility: hidden;
     height: 0px;
+}
+
+/* v3.2.1: Streamlit rerun 중 화면이 오래 반투명해 보이는 체감 완화 */
+[data-testid="stAppViewContainer"],
+[data-testid="stAppViewBlockContainer"],
+[data-testid="stSidebar"],
+[data-testid="stHeader"],
+.main,
+.block-container {
+    opacity: 1 !important;
+    transition: none !important;
+}
+[data-testid="stDecoration"],
+[data-testid="stStatusWidget"],
+.stDeployButton {
+    display: none !important;
+    visibility: hidden !important;
 }
 .oasis-topbar {
     display:flex;
@@ -519,6 +540,57 @@ def show_company_preview(result_file):
 # =====================================================
 # v3.0.0 고객관리 기본 화면 유틸
 # =====================================================
+def _is_blank_customer_value(value):
+    """CRM 고객 수 계산용 공란 판정.
+
+    엑셀 양식에 서식/검증이 999행까지 들어가 있으면 pandas가 빈 행을 함께 읽을 수 있다.
+    이 함수는 실제 값이 없는 행(None, NaN, 공백, 문자열 None/nan)을 고객으로 세지 않기 위해 사용한다.
+    """
+    if pd.isna(value):
+        return True
+    text = str(value).strip()
+    return text == "" or text.lower() in {"none", "nan", "null", "<na>", "-"}
+
+
+def _clean_customer_df(df: pd.DataFrame) -> pd.DataFrame:
+    """실제 입력된 고객 행만 남긴다.
+
+    기준: 업체명 또는 사업자등록번호 중 하나라도 실제 값이 있는 행만 고객으로 인정한다.
+    기존 고객DB 서식 행이 고객 수에 포함되어 999건으로 표시되는 문제를 방지한다.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
+    # 완전 공란 행 1차 제거
+    df = df.dropna(how="all")
+
+    key_cols = [c for c in ["업체명", "사업자등록번호"] if c in df.columns]
+    if not key_cols:
+        # 양식이 다른 경우 첫 번째 컬럼을 업체명 대용으로 사용
+        key_cols = [df.columns[0]] if len(df.columns) else []
+
+    if key_cols:
+        valid_mask = df[key_cols].apply(
+            lambda row: any(not _is_blank_customer_value(v) for v in row),
+            axis=1
+        )
+        df = df[valid_mask]
+
+    # 인덱스를 새로 맞춰 화면 표시와 상세 선택 오류를 방지
+    return df.reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False, ttl=60)
+def _read_customer_sheet_cached(path_str: str, mtime: float):
+    """누적 고객DB 고객DB 시트를 캐시로 읽고 실제 고객 행만 반환한다.
+
+    v3.2.2: 서식만 있는 빈 행을 고객으로 세지 않도록 정리한다.
+    """
+    df = pd.read_excel(path_str, sheet_name="고객DB", dtype=object)
+    return _clean_customer_df(df)
+
+
 def read_current_user_customer_df(user_id):
     """로그인한 회원의 누적 고객DB를 읽어 고객관리 화면에 표시할 DataFrame을 반환한다."""
     path = get_user_cumulative_db_path(user_id)
@@ -526,11 +598,11 @@ def read_current_user_customer_df(user_id):
         return pd.DataFrame(), path
 
     try:
-        # 기존 고객DB 양식/시트 구조를 유지한 파일을 우선 정리한 뒤 고객DB 시트만 읽는다.
+        # v3.2.1: 파일 구조 보정은 최초 진입 시에만 최소화하고, 실제 엑셀 로딩은 캐시 처리한다.
         path, _, _ = ensure_user_cumulative_db_format(user_id)
-        df = pd.read_excel(path, sheet_name="고객DB")
-        df = df.dropna(how="all")
-        return df, path
+        mtime = path.stat().st_mtime
+        df = _read_customer_sheet_cached(str(path), mtime)
+        return df.copy(), path
     except Exception:
         return pd.DataFrame(), path
 
@@ -538,7 +610,7 @@ def read_current_user_customer_df(user_id):
 def render_home_page():
     st.markdown("""
     <div class="hero">
-        <div class="badge">OASIS TAX & ACCOUNTING · v3.1.1</div>
+        <div class="badge">OASIS TAX & ACCOUNTING · v3.2.2</div>
         <div class="hero-title">오아시스 내부 CRM +<br>지원사업 컨설팅 플랫폼</div>
         <div class="hero-sub">
             고객DB, 크레탑 자동등록, 정책자금 매칭, 실행이력 관리를 하나의 내부 업무 시스템으로 통합합니다.
@@ -574,20 +646,32 @@ def render_home_page():
 
 
 def render_customer_management_page(user_id):
-    st.markdown("### 👥 고객관리")
-    st.caption("내 누적 고객DB를 기준으로 고객을 검색하고 업체별 기본정보를 확인합니다. v3.0.0에서는 조회 중심으로 먼저 안정화했습니다.")
+    st.markdown("### 👥 고객관리 CRM")
+    st.caption("내 누적 고객DB를 기준으로 고객을 검색하고, 고객 상태·상담메모·다음 액션·타임라인을 관리합니다.")
 
     df, path = read_current_user_customer_df(user_id)
     if df.empty:
         st.info("아직 등록된 고객DB가 없습니다. 고객DB 업로드 또는 크레탑 자동등록으로 먼저 고객을 추가해주세요.")
         return
 
+    df = df.copy()
     total_count = len(df)
     company_col = "업체명" if "업체명" in df.columns else df.columns[0]
     biz_col = "사업자등록번호" if "사업자등록번호" in df.columns else None
     industry_col = "업종명" if "업종명" in df.columns else None
 
-    m1, m2, m3 = st.columns(3)
+    # v3.2.0: 엑셀 원본을 건드리지 않고 CRM 보조 데이터에서 고객 상태를 불러온다.
+    crm_keys = []
+    crm_statuses = []
+    for _, row in df.iterrows():
+        key = make_customer_key(row.get(company_col, ""), row.get(biz_col, "") if biz_col else "")
+        crm_keys.append(key)
+        crm_statuses.append(get_customer_record(user_id, key).get("status", "신규"))
+    df["CRM상태"] = crm_statuses
+
+    crm_summary = get_crm_summary(user_id)
+
+    m1, m2, m3, m4 = st.columns(4)
     with m1:
         st.metric("누적 고객 수", f"{total_count}건")
     with m2:
@@ -596,9 +680,17 @@ def render_customer_management_page(user_id):
         else:
             st.metric("업종 수", "-")
     with m3:
-        st.metric("DB 파일", "정상" if path.exists() else "없음")
+        st.metric("상담중", f"{crm_summary.get('상담중', 0)}건")
+    with m4:
+        st.metric("신청/계약", f"{crm_summary.get('신청완료', 0) + crm_summary.get('계약완료', 0)}건")
 
-    search_keyword = st.text_input("고객 검색", placeholder="업체명, 대표자명, 사업자번호, 업종명으로 검색")
+    st.markdown("#### 고객 검색/필터")
+    f1, f2 = st.columns([2, 1])
+    with f1:
+        search_keyword = st.text_input("고객 검색", placeholder="업체명, 대표자명, 사업자번호, 업종명으로 검색")
+    with f2:
+        status_filter = st.selectbox("상태 필터", ["전체"] + STATUS_OPTIONS)
+
     filtered = df.copy()
     if search_keyword.strip():
         keyword = search_keyword.strip().lower()
@@ -607,41 +699,68 @@ def render_customer_management_page(user_id):
         ).any(axis=1)
         filtered = filtered[mask]
 
-    display_cols = [c for c in ["업체명", "대표자명", "사업자등록번호", "업종명", "사업장 소재지", "종업원수", "매출액", "영업이익", "당기순이익"] if c in filtered.columns]
+    if status_filter != "전체":
+        filtered = filtered[filtered["CRM상태"] == status_filter]
+
+    display_cols = [c for c in ["CRM상태", "업체명", "대표자명", "사업자등록번호", "업종명", "사업장 소재지", "종업원수", "매출액", "영업이익", "당기순이익"] if c in filtered.columns]
     if not display_cols:
         display_cols = list(filtered.columns[:8])
 
     st.markdown("#### 고객 목록")
-    st.dataframe(filtered[display_cols], width='stretch', hide_index=True)
 
     if filtered.empty:
         st.warning("검색 결과가 없습니다.")
         return
 
+    # v3.2.2: 고객이 많아져도 화면이 느려지지 않도록 20개씩 표시한다.
+    page_size = 20
+    total_filtered = len(filtered)
+    total_pages = max((total_filtered - 1) // page_size + 1, 1)
+
+    p_left, p_right = st.columns([1, 2])
+    with p_left:
+        page = st.number_input("페이지", min_value=1, max_value=total_pages, value=1, step=1)
+    with p_right:
+        st.caption(f"검색/필터 결과 {total_filtered}건 · {page_size}개씩 표시")
+
+    start = (int(page) - 1) * page_size
+    end = start + page_size
+    page_df = filtered.iloc[start:end]
+
+    st.dataframe(page_df[display_cols], width='stretch', hide_index=True)
+
     option_labels = []
     row_map = {}
-    for idx, row in filtered.iterrows():
+    for idx, row in page_df.iterrows():
         company = str(row.get(company_col, "")).strip() or f"고객 {idx + 1}"
         biz_no = str(row.get(biz_col, "")).strip() if biz_col else ""
         label = f"{company}"
-        if biz_no and biz_no.lower() != "nan":
+        if biz_no and biz_no.lower() not in {"nan", "none"}:
             label += f" · {biz_no}"
         label = f"{label} · #{idx}"
         option_labels.append(label)
         row_map[label] = idx
 
+    st.markdown("#### 고객 상세/상담관리")
     selected_label = st.selectbox("상세보기 업체 선택", option_labels)
-    selected_row = df.loc[row_map[selected_label]]
+    selected_idx = row_map[selected_label]
+    selected_row = df.loc[selected_idx]
 
-    st.markdown("#### 업체 상세")
-    d1, d2 = st.columns([1, 1])
-    with d1:
+    selected_company = str(selected_row.get(company_col, "") or "")
+    selected_biz = str(selected_row.get(biz_col, "") or "") if biz_col else ""
+    selected_key = make_customer_key(selected_company, selected_biz)
+    crm_record = get_customer_record(user_id, selected_key)
+
+    detail_left, detail_right = st.columns([1, 1])
+    with detail_left:
+        st.markdown("##### 기업 기본정보")
         st.write(f"**업체명**: {selected_row.get('업체명', '')}")
         st.write(f"**대표자명**: {selected_row.get('대표자명', '')}")
         st.write(f"**사업자등록번호**: {selected_row.get('사업자등록번호', '')}")
         st.write(f"**업종명**: {selected_row.get('업종명', '')}")
         st.write(f"**사업장 소재지**: {selected_row.get('사업장 소재지', '')}")
-    with d2:
+    with detail_right:
+        st.markdown("##### 재무/규모")
         st.write(f"**종업원수**: {selected_row.get('종업원수', '')}")
         st.write(f"**매출액**: {selected_row.get('매출액', selected_row.get('연매출', ''))}")
         st.write(f"**영업이익**: {selected_row.get('영업이익', '')}")
@@ -650,18 +769,81 @@ def render_customer_management_page(user_id):
 
     y_cols = [c for c in ["벤처", "이노비즈", "메인비즈", "기업부설연구소", "연구개발전담부서", "특허보유", "상표", "R&D수행", "스마트공장도입"] if c in df.columns]
     if y_cols:
-        st.markdown("#### 인증·기술 현황")
-        st.dataframe(pd.DataFrame([{"항목": c, "값": selected_row.get(c, "")} for c in y_cols]), width='stretch', hide_index=True)
+        with st.expander("인증·기술 현황"):
+            st.dataframe(pd.DataFrame([{"항목": c, "값": selected_row.get(c, "")} for c in y_cols]), width='stretch', hide_index=True)
 
     memo_cols = [c for c in ["키워드메모", "주요 사업내용", "비고", "기술성메모"] if c in df.columns]
     if memo_cols:
-        with st.expander("메모/사업내용"):
+        with st.expander("고객DB 메모/사업내용"):
             for col in memo_cols:
                 val = selected_row.get(col, "")
                 if pd.notna(val) and str(val).strip():
                     st.write(f"**{col}**")
                     st.write(str(val))
 
+    st.markdown("##### CRM 관리")
+    with st.form(key=f"crm_form_{selected_key}"):
+        c1, c2, c3 = st.columns([1, 1, 1])
+        with c1:
+            current_status = crm_record.get("status", "신규")
+            status_idx = STATUS_OPTIONS.index(current_status) if current_status in STATUS_OPTIONS else 0
+            new_status = st.selectbox("고객 상태", STATUS_OPTIONS, index=status_idx)
+        with c2:
+            current_action = crm_record.get("next_action", "없음")
+            action_idx = ACTION_OPTIONS.index(current_action) if current_action in ACTION_OPTIONS else len(ACTION_OPTIONS) - 1
+            new_action = st.selectbox("다음 액션", ACTION_OPTIONS, index=action_idx)
+        with c3:
+            new_next_date = st.text_input("다음 예정일", value=str(crm_record.get("next_date", "") or ""), placeholder="예: 2026-07-15")
+
+        new_memo = st.text_area("상담 메모", value=str(crm_record.get("memo", "") or ""), height=140, placeholder="대표 상담내용, 니즈, 후속조치 등을 기록하세요.")
+        submitted = st.form_submit_button("CRM 정보 저장", width='stretch')
+
+    if submitted:
+        detail = f"상태: {new_status} / 다음 액션: {new_action} / 예정일: {new_next_date}"
+        ok, msg = upsert_customer_record(
+            user_id=user_id,
+            customer_key=selected_key,
+            company_name=selected_company,
+            business_no=selected_biz,
+            status=new_status,
+            next_action=new_action,
+            next_date=new_next_date,
+            memo=new_memo,
+            event_title="CRM 정보 저장",
+            event_detail=detail,
+        )
+        if ok:
+            st.success(msg)
+            st.rerun()
+        else:
+            st.error(msg)
+
+    with st.expander("타임라인 추가", expanded=False):
+        tl_title = st.text_input("이력 제목", placeholder="예: 대표 통화, 자료요청, 제안서 발송")
+        tl_detail = st.text_area("이력 내용", height=100, placeholder="상담 내용이나 후속조치 내용을 입력하세요.")
+        if st.button("타임라인 저장", width='stretch'):
+            if not tl_title.strip() and not tl_detail.strip():
+                st.warning("저장할 내용을 입력해주세요.")
+            else:
+                ok, msg = append_timeline_event(user_id, selected_key, tl_title.strip() or "상담이력", tl_detail.strip())
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    st.markdown("##### 상담 타임라인")
+    latest_record = get_customer_record(user_id, selected_key)
+    timeline = latest_record.get("timeline", [])
+    if not timeline:
+        st.info("아직 등록된 상담이력이 없습니다.")
+    else:
+        for item in timeline[:10]:
+            with st.container(border=True):
+                st.write(f"**{item.get('title', '상담이력')}**")
+                st.caption(item.get("at", ""))
+                if item.get("detail"):
+                    st.write(item.get("detail"))
 
 def render_cumulative_db_page(user_id):
     st.markdown("### 📥 내 누적 고객DB")
@@ -749,13 +931,13 @@ st.markdown(f"""
 if active_tab == "홈":
     render_home_page()
 
-if active_tab == "고객관리":
+elif active_tab == "고객관리":
     render_customer_management_page(CURRENT_USER_ID)
 
-if active_tab == "내 누적 고객DB":
+elif active_tab == "내 누적 고객DB":
     render_cumulative_db_page(CURRENT_USER_ID)
 
-if active_tab == "고객DB 업로드/매칭":
+elif active_tab == "고객DB 업로드/매칭":
     left, right = st.columns([1.2, 1])
 
     with left:
@@ -938,7 +1120,7 @@ if active_tab == "고객DB 업로드/매칭":
             )
 
 
-if active_tab == "크레탑 자동등록":
+elif active_tab == "크레탑 자동등록":
     st.markdown("### 📄 크레탑 PDF로 고객 자동등록")
     st.caption("크레탑 기업종합보고서 PDF를 업로드하면 추출 가능한 항목을 읽어 내 누적 고객DB에 1행으로 추가합니다.")
 
@@ -1075,7 +1257,7 @@ if active_tab == "크레탑 자동등록":
                 # 저장 완료 후 즉시 rerun하여 모든 다운로드 버튼이 최신 누적DB를 다시 읽게 한다.
                 st.rerun()
 
-if active_tab == "실행이력":
+elif active_tab == "실행이력":
     st.markdown("### 📚 실행이력")
 
     history_df = read_run_history(CURRENT_USER_ID)
@@ -1098,7 +1280,7 @@ if active_tab == "실행이력":
                     width='stretch'
                 )
 
-if active_tab == "담당자 통계":
+elif active_tab == "담당자 통계":
     st.markdown("### 👤 담당자별 실행횟수")
 
     stats_df = get_manager_stats(CURRENT_USER_ID)
@@ -1109,7 +1291,7 @@ if active_tab == "담당자 통계":
         st.dataframe(stats_df, width='stretch', hide_index=True)
 
 
-if CURRENT_USER_IS_ADMIN and active_tab == "회원 승인 관리":
+elif CURRENT_USER_IS_ADMIN and active_tab == "회원 승인 관리":
     st.markdown("### 🔐 회원 승인 관리")
     st.caption("회원가입 신청자는 관리자 승인 전까지 매칭 시스템에 로그인할 수 없습니다.")
 

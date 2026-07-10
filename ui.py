@@ -157,6 +157,24 @@ def apply_oasis_ui():
 .oasis-footer {
     color: #93a4ba !important;
 }
+
+/* v3.2.1: 메뉴 전환 시 Streamlit 기본 재실행 페이드 체감 완화 */
+[data-testid="stAppViewContainer"],
+[data-testid="stAppViewBlockContainer"],
+[data-testid="stSidebar"],
+[data-testid="stHeader"],
+.main,
+.block-container {
+    opacity: 1 !important;
+    transition: none !important;
+}
+[data-testid="stDecoration"],
+[data-testid="stStatusWidget"],
+.stDeployButton {
+    display: none !important;
+    visibility: hidden !important;
+}
+
 </style>
         """,
         unsafe_allow_html=True,
