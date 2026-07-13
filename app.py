@@ -11,6 +11,12 @@ from ui import apply_oasis_ui
 from maintenance import render_system_management_page
 from cretop_runner import run_cretop_worker
 from cloud_admin import render_cloud_database_page
+from registered_policy_match import (
+    load_registered_customers,
+    build_customer_labels,
+    customer_preview,
+    create_single_customer_workbook,
+)
 from stock_valuation import (
     render_stock_valuation_page,
     save_cretop_financial_snapshot,
@@ -1299,6 +1305,200 @@ elif active_tab == "내 누적 고객DB":
     render_cumulative_db_page(CURRENT_USER_ID)
 
 elif active_tab == "고객DB 업로드/매칭":
+    st.markdown("### 등록 고객 정책자금 자동매칭")
+    st.caption(
+        "크레탑 자동등록으로 생성된 누적 고객DB에서 업체를 선택하면 "
+        "별도 엑셀 업로드 없이 바로 정책자금 매칭을 실행합니다."
+    )
+
+    cumulative_db_path = get_user_cumulative_db_path(CURRENT_USER_ID)
+    registered_customers = load_registered_customers(cumulative_db_path)
+
+    if registered_customers.empty:
+        st.info(
+            "등록된 고객이 없습니다. 먼저 크레탑 자동등록 또는 고객DB 업로드로 "
+            "고객을 등록해주세요."
+        )
+    else:
+        customer_labels, customer_row_map = build_customer_labels(
+            registered_customers
+        )
+
+        selected_customer_label = st.selectbox(
+            "매칭할 등록 고객",
+            customer_labels,
+            key="policy_registered_customer_selector",
+        )
+        selected_customer_index = customer_row_map[selected_customer_label]
+        selected_customer_row = registered_customers.loc[
+            selected_customer_index
+        ]
+
+        preview_df = customer_preview(selected_customer_row)
+        if not preview_df.empty:
+            with st.expander("선택 고객정보 확인", expanded=True):
+                st.dataframe(
+                    preview_df,
+                    hide_index=True,
+                    width='stretch',
+                )
+
+        missing_fields = []
+        required_checks = {
+            "업종명": ["업종명"],
+            "사업장 소재지": ["사업장 소재지"],
+            "설립일": ["설립일", "설립년도"],
+            "종업원수": ["종업원수", "상시근로자수"],
+            "매출액": ["매출액", "연매출", "전년도매출"],
+        }
+
+        for display_name, candidates in required_checks.items():
+            has_value = False
+            for candidate in candidates:
+                if candidate not in selected_customer_row.index:
+                    continue
+                value = selected_customer_row.get(candidate)
+                if (
+                    value is not None
+                    and str(value).strip().lower()
+                    not in {"", "nan", "none", "nat"}
+                ):
+                    has_value = True
+                    break
+            if not has_value:
+                missing_fields.append(display_name)
+
+        if missing_fields:
+            st.warning(
+                "다음 정보가 비어 있어 일부 사업의 매칭 정확도가 낮아질 수 있습니다: "
+                + ", ".join(missing_fields)
+            )
+
+        registered_manager_name = st.text_input(
+            "담당자명",
+            value=CURRENT_USER_NAME or "",
+            key="policy_registered_manager_name",
+        )
+
+        if st.button(
+            "선택 고객 정책자금 매칭 실행",
+            type="primary",
+            width='stretch',
+            key="policy_registered_match_button",
+        ):
+            if not registered_manager_name.strip():
+                st.warning("담당자명을 입력해주세요.")
+            else:
+                try:
+                    cumulative_db_path, _, _ = (
+                        ensure_user_cumulative_db_format(CURRENT_USER_ID)
+                    )
+
+                    with st.spinner(
+                        "선택 고객용 매칭파일을 만들고 정책자금을 분석 중입니다..."
+                    ):
+                        single_customer_path = create_single_customer_workbook(
+                            cumulative_db_path=cumulative_db_path,
+                            destination_dir=USER_UPLOAD_DIR,
+                            selected_row=selected_customer_row,
+                            manager_name=registered_manager_name,
+                        )
+
+                        # 기존 main.py 매칭 엔진 호환용 임시파일.
+                        # 원본 누적 고객DB는 수정하지 않는다.
+                        shutil.copy2(
+                            single_customer_path,
+                            ROOT_DIR / "고객DB.xlsx",
+                        )
+
+                        before_files = set(glob.glob("매칭결과_*.xlsx"))
+                        result = subprocess.run(
+                            [sys.executable, str(ROOT_DIR / "main.py")],
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                            errors="ignore",
+                        )
+
+                        moved_files = move_result_files_to_results(
+                            before_files
+                        )
+
+                    if moved_files:
+                        latest_file = max(
+                            moved_files,
+                            key=os.path.getmtime,
+                        )
+                        user_result_path = (
+                            USER_RESULT_DIR
+                            / os.path.basename(latest_file)
+                        )
+                        try:
+                            shutil.copy2(
+                                latest_file,
+                                user_result_path,
+                            )
+                            latest_file = str(user_result_path)
+                        except Exception:
+                            pass
+
+                        st.session_state.latest_result_file = latest_file
+                        company_name = str(
+                            selected_customer_row.get("업체명", "")
+                            or ""
+                        )
+
+                        append_run_history(
+                            upload_file_name=single_customer_path.name,
+                            result_file=latest_file,
+                            status="성공",
+                            memo=f"등록 고객 자동매칭: {company_name}",
+                            manager_name=registered_manager_name,
+                            user_id=CURRENT_USER_ID,
+                        )
+
+                        run_cleanup()
+                        st.success(
+                            f"{company_name} 정책자금 매칭이 완료되었습니다."
+                        )
+                    else:
+                        append_run_history(
+                            single_customer_path.name,
+                            "",
+                            "실패",
+                            "등록 고객 자동매칭 결과파일 없음",
+                            manager_name=registered_manager_name,
+                            user_id=CURRENT_USER_ID,
+                        )
+                        run_cleanup()
+                        st.error(
+                            "결과 파일을 찾지 못했습니다. 실행 로그를 확인해주세요."
+                        )
+
+                    with st.expander("실행 로그 보기"):
+                        if result.stdout:
+                            st.code(result.stdout)
+                        if result.stderr:
+                            st.code(result.stderr)
+
+                except PermissionError:
+                    st.error(
+                        "고객DB 파일이 열려 있습니다. 엑셀 파일을 닫고 다시 실행해주세요."
+                    )
+                except Exception as exc:
+                    st.error(
+                        f"등록 고객 정책자금 매칭 중 오류가 발생했습니다: {exc}"
+                    )
+
+    st.divider()
+    with st.expander(
+        "기존 방식: 고객DB 엑셀 파일 직접 업로드",
+        expanded=False,
+    ):
+        st.caption(
+            "외부 고객DB 파일을 직접 매칭해야 하는 경우에만 사용하세요."
+        )
+
     left, right = st.columns([1.2, 1])
 
     with left:
