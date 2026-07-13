@@ -10,6 +10,7 @@ from pathlib import Path
 from ui import apply_oasis_ui
 from maintenance import render_system_management_page
 from cretop_runner import run_cretop_worker
+from cloud_admin import render_cloud_database_page
 from stock_valuation import (
     render_stock_valuation_page,
     save_cretop_financial_snapshot,
