@@ -1,0 +1,748 @@
+from __future__ import annotations
+
+import json
+import math
+import re
+from datetime import datetime
+from io import BytesIO
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+import streamlit as st
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+
+from matching_preferences import get_matching_preferences
+from registered_policy_match import (
+    build_customer_labels,
+    load_registered_customers,
+)
+from utils import get_user_cumulative_db_path, get_user_dirs
+
+
+def _clean(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if text.lower() in {"", "nan", "none", "nat"}:
+        return ""
+    return text
+
+
+def _number(value: Any) -> float | None:
+    text = _clean(value).replace(",", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _format_money(value: Any) -> str:
+    number = _number(value)
+    if number is None:
+        return "-"
+    return f"{int(round(number)):,}원"
+
+
+def _normalize_business_no(value: Any) -> str:
+    digits = re.sub(r"[^0-9]", "", str(value or ""))
+    if len(digits) == 10:
+        return f"{digits[:3]}-{digits[3:5]}-{digits[5:]}"
+    return _clean(value)
+
+
+def _load_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def _latest_stock_record(
+    user_id: str,
+    business_no: str,
+) -> dict[str, Any]:
+    dirs = get_user_dirs(user_id)
+    records = _load_json(
+        dirs["base"] / "stock_valuations.json",
+        [],
+    )
+    if not isinstance(records, list):
+        return {}
+
+    normalized = _normalize_business_no(business_no)
+    matches = [
+        record
+        for record in records
+        if isinstance(record, dict)
+        and _normalize_business_no(record.get("business_no", ""))
+        == normalized
+    ]
+    if not matches:
+        return {}
+
+    return sorted(
+        matches,
+        key=lambda record: str(record.get("saved_at", "")),
+        reverse=True,
+    )[0]
+
+
+def _financial_snapshot(
+    user_id: str,
+    business_no: str,
+) -> dict[str, Any]:
+    dirs = get_user_dirs(user_id)
+    cache = _load_json(
+        dirs["base"] / "stock_financial_cache.json",
+        {},
+    )
+    if not isinstance(cache, dict):
+        return {}
+    return cache.get(_normalize_business_no(business_no), {}) or {}
+
+
+def _registry_snapshot(
+    user_id: str,
+    business_no: str,
+) -> dict[str, Any]:
+    dirs = get_user_dirs(user_id)
+    cache = _load_json(
+        dirs["base"] / "registry_cache.json",
+        {},
+    )
+    if not isinstance(cache, dict):
+        return {}
+    normalized = _normalize_business_no(business_no)
+    return cache.get(normalized, {}) or {}
+
+
+def _value_from_sources(
+    customer: pd.Series,
+    financial: dict[str, Any],
+    *keys: str,
+) -> Any:
+    for key in keys:
+        value = customer.get(key, "")
+        if _clean(value):
+            return value
+    for key in keys:
+        value = financial.get(key, "")
+        if _clean(value):
+            return value
+    return ""
+
+
+def _ratio(numerator: Any, denominator: Any) -> float | None:
+    num = _number(numerator)
+    den = _number(denominator)
+    if num is None or den in (None, 0):
+        return None
+    return num / den * 100
+
+
+def _build_analysis(
+    customer: pd.Series,
+    financial: dict[str, Any],
+    registry: dict[str, Any],
+    stock_record: dict[str, Any],
+    preferences: dict[str, Any],
+) -> dict[str, Any]:
+    company_name = _clean(customer.get("업체명", "")) or _clean(
+        financial.get("업체명", "")
+    )
+    business_no = _normalize_business_no(
+        customer.get("사업자등록번호", "")
+    )
+    industry = _clean(customer.get("업종명", ""))
+    address = _clean(
+        _value_from_sources(
+            customer,
+            financial,
+            "사업장 소재지",
+        )
+    )
+    establishment = _clean(
+        _value_from_sources(
+            customer,
+            financial,
+            "설립일",
+            "설립년도",
+        )
+    )
+    employees = _value_from_sources(
+        customer,
+        financial,
+        "종업원수",
+        "상시근로자수",
+    )
+
+    sales = _value_from_sources(
+        customer,
+        financial,
+        "매출액",
+        "연매출",
+        "전년도매출",
+    )
+    operating_profit = _value_from_sources(
+        customer,
+        financial,
+        "영업이익",
+    )
+    net_income = _value_from_sources(
+        customer,
+        financial,
+        "당기순이익",
+    )
+    assets = _value_from_sources(
+        customer,
+        financial,
+        "자산총계",
+    )
+    liabilities = _value_from_sources(
+        customer,
+        financial,
+        "부채총계",
+    )
+    equity = _value_from_sources(
+        customer,
+        financial,
+        "자본총계",
+    )
+
+    operating_margin = _ratio(operating_profit, sales)
+    net_margin = _ratio(net_income, sales)
+    debt_ratio = _ratio(liabilities, equity)
+
+    strengths: list[str] = []
+    cautions: list[str] = []
+    strategy: list[str] = []
+    questions: list[str] = []
+
+    sales_number = _number(sales)
+    operating_number = _number(operating_profit)
+    net_number = _number(net_income)
+    employees_number = _number(employees)
+
+    if sales_number:
+        strengths.append(
+            f"최근 확인 매출액은 {_format_money(sales)}입니다."
+        )
+    if operating_number is not None and operating_number > 0:
+        strengths.append(
+            f"영업이익 {_format_money(operating_profit)}으로 "
+            "영업단계 흑자가 확인됩니다."
+        )
+    if net_number is not None and net_number > 0:
+        strengths.append(
+            f"당기순이익 {_format_money(net_income)}으로 "
+            "최종 손익도 흑자입니다."
+        )
+    if operating_margin is not None:
+        strengths.append(
+            f"영업이익률은 약 {operating_margin:.1f}%입니다."
+        )
+    if employees_number:
+        strengths.append(
+            f"확인된 종업원수는 {int(employees_number):,}명입니다."
+        )
+
+    if not address:
+        cautions.append(
+            "사업장 소재지가 비어 있어 지역제한 사업 검토 전 보완이 필요합니다."
+        )
+    if not establishment:
+        cautions.append(
+            "설립일이 비어 있어 업력 요건 확인이 필요합니다."
+        )
+    if net_number is None:
+        cautions.append(
+            "당기순이익 자료가 없어 수익성 검토가 제한됩니다."
+        )
+    elif net_number < 0:
+        cautions.append(
+            "당기순손실 상태이므로 정책자금 심사 전 원인 확인이 필요합니다."
+        )
+    if debt_ratio is not None:
+        if debt_ratio >= 300:
+            cautions.append(
+                f"부채비율이 약 {debt_ratio:.1f}%로 높아 "
+                "보증·대출 심사 전 재무구조 확인이 필요합니다."
+            )
+        else:
+            strengths.append(
+                f"부채비율은 약 {debt_ratio:.1f}%입니다."
+            )
+
+    interests = preferences.get("관심지원분야", []) or []
+    matching_keywords = preferences.get("매칭키워드", []) or []
+    exclusions = preferences.get("제외키워드", []) or []
+    fund_purpose = _clean(preferences.get("자금사용목적", ""))
+
+    if "운전자금" in interests or "운전자금" in matching_keywords:
+        strategy.append(
+            "운전자금 수요를 중심으로 정책자금·보증기관 연계 가능성을 우선 검토합니다."
+        )
+    if any(
+        item in interests
+        for item in ["시설자금", "기계·설비 구입", "차량 구입"]
+    ):
+        strategy.append(
+            "시설·설비·차량 투자계획과 견적서를 먼저 확보해 시설자금 가능성을 검토합니다."
+        )
+    if "신규채용" in interests or "고용유지" in interests:
+        strategy.append(
+            "채용계획과 고용보험 인원을 확인해 고용지원금 및 세액공제를 함께 검토합니다."
+        )
+    if "연구개발" in interests or "특허·인증" in interests:
+        strategy.append(
+            "연구개발 조직과 지식재산 보유현황을 확인해 R&D·인증 지원사업을 검토합니다."
+        )
+    if fund_purpose:
+        strategy.append(
+            f"대표가 입력한 자금사용목적은 '{fund_purpose}'입니다."
+        )
+
+    if not strategy:
+        strategy.append(
+            "운전자금·시설투자·채용계획을 확인한 뒤 지원사업 우선순위를 정하는 것이 좋습니다."
+        )
+
+    questions.extend([
+        "최근 1년 이내 기계·시설·차량 투자계획이 있습니까?",
+        "향후 6개월 이내 신규채용 또는 고용유지 계획이 있습니까?",
+        "현재 정책자금·보증기관 대출 잔액과 만기는 어떻게 됩니까?",
+        "국세·지방세 체납이나 최근 연체 이력이 있습니까?",
+        "올해 예상 매출과 주요 거래처 변화는 어떻게 됩니까?",
+    ])
+
+    if exclusions:
+        questions.append(
+            "제외한 지원분야가 현재 사업계획과 완전히 무관한지 다시 확인할 필요가 있습니다."
+        )
+
+    stock_result = stock_record.get("result", {}) if stock_record else {}
+    stock_summary = {
+        "평가기준일": stock_record.get("valuation_date", ""),
+        "발행주식총수": stock_record.get("current_shares", ""),
+        "1주당평가액": stock_result.get("final_value_per_share"),
+        "기업전체주식가치": stock_result.get("total_equity_value"),
+    }
+
+    completeness_values = [
+        company_name,
+        business_no,
+        industry,
+        address,
+        establishment,
+        employees,
+        sales,
+        operating_profit,
+        net_income,
+        assets,
+        liabilities,
+        equity,
+    ]
+    completeness = round(
+        sum(1 for value in completeness_values if _clean(value))
+        / len(completeness_values)
+        * 100
+    )
+
+    return {
+        "company_name": company_name,
+        "business_no": business_no,
+        "industry": industry,
+        "address": address,
+        "establishment": establishment,
+        "employees": employees,
+        "sales": sales,
+        "operating_profit": operating_profit,
+        "net_income": net_income,
+        "assets": assets,
+        "liabilities": liabilities,
+        "equity": equity,
+        "operating_margin": operating_margin,
+        "net_margin": net_margin,
+        "debt_ratio": debt_ratio,
+        "strengths": strengths,
+        "cautions": cautions,
+        "strategy": strategy,
+        "questions": questions,
+        "preferences": preferences,
+        "registry": registry,
+        "stock_summary": stock_summary,
+        "completeness": completeness,
+    }
+
+
+def _style_sheet(worksheet) -> None:
+    header_fill = PatternFill(
+        fill_type="solid",
+        fgColor="1F4E78",
+    )
+    header_font = Font(
+        color="FFFFFF",
+        bold=True,
+    )
+
+    for cell in worksheet[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(
+            horizontal="center",
+            vertical="center",
+        )
+
+    for column_cells in worksheet.columns:
+        max_length = 0
+        column_letter = get_column_letter(column_cells[0].column)
+        for cell in column_cells:
+            value = "" if cell.value is None else str(cell.value)
+            max_length = max(max_length, len(value))
+            cell.alignment = Alignment(
+                vertical="top",
+                wrap_text=True,
+            )
+        worksheet.column_dimensions[column_letter].width = min(
+            max(max_length + 3, 12),
+            55,
+        )
+
+
+def _build_excel_report(analysis: dict[str, Any]) -> bytes:
+    workbook = Workbook()
+    default_sheet = workbook.active
+    workbook.remove(default_sheet)
+
+    summary = workbook.create_sheet("기업요약")
+    summary.append(["항목", "내용"])
+    summary_rows = [
+        ["업체명", analysis["company_name"]],
+        ["사업자등록번호", analysis["business_no"]],
+        ["업종", analysis["industry"]],
+        ["사업장 소재지", analysis["address"]],
+        ["설립일", analysis["establishment"]],
+        ["종업원수", analysis["employees"]],
+        ["정보완성도", f"{analysis['completeness']}%"],
+    ]
+    for row in summary_rows:
+        summary.append(row)
+    _style_sheet(summary)
+
+    financial = workbook.create_sheet("재무분석")
+    financial.append(["항목", "금액 또는 비율"])
+    financial_rows = [
+        ["매출액", _format_money(analysis["sales"])],
+        ["영업이익", _format_money(analysis["operating_profit"])],
+        ["당기순이익", _format_money(analysis["net_income"])],
+        ["자산총계", _format_money(analysis["assets"])],
+        ["부채총계", _format_money(analysis["liabilities"])],
+        ["자본총계", _format_money(analysis["equity"])],
+        [
+            "영업이익률",
+            (
+                f"{analysis['operating_margin']:.1f}%"
+                if analysis["operating_margin"] is not None
+                else "-"
+            ),
+        ],
+        [
+            "순이익률",
+            (
+                f"{analysis['net_margin']:.1f}%"
+                if analysis["net_margin"] is not None
+                else "-"
+            ),
+        ],
+        [
+            "부채비율",
+            (
+                f"{analysis['debt_ratio']:.1f}%"
+                if analysis["debt_ratio"] is not None
+                else "-"
+            ),
+        ],
+    ]
+    for row in financial_rows:
+        financial.append(row)
+    _style_sheet(financial)
+
+    diagnosis = workbook.create_sheet("컨설팅진단")
+    diagnosis.append(["구분", "내용"])
+    for item in analysis["strengths"]:
+        diagnosis.append(["강점", item])
+    for item in analysis["cautions"]:
+        diagnosis.append(["확인 필요", item])
+    for item in analysis["strategy"]:
+        diagnosis.append(["추천 전략", item])
+    _style_sheet(diagnosis)
+
+    questions = workbook.create_sheet("상담질문")
+    questions.append(["번호", "대표 상담 질문"])
+    for index, item in enumerate(
+        analysis["questions"],
+        start=1,
+    ):
+        questions.append([index, item])
+    _style_sheet(questions)
+
+    preferences = workbook.create_sheet("매칭설정")
+    preferences.append(["항목", "내용"])
+    preference_data = analysis["preferences"]
+    preference_rows = [
+        [
+            "매칭키워드",
+            ", ".join(preference_data.get("매칭키워드", []) or []),
+        ],
+        [
+            "관심지원분야",
+            ", ".join(preference_data.get("관심지원분야", []) or []),
+        ],
+        [
+            "제외키워드",
+            ", ".join(preference_data.get("제외키워드", []) or []),
+        ],
+        ["자금사용목적", preference_data.get("자금사용목적", "")],
+        ["투자예정금액", preference_data.get("투자예정금액", "")],
+        ["투자예정시기", preference_data.get("투자예정시기", "")],
+    ]
+    for row in preference_rows:
+        preferences.append(row)
+    _style_sheet(preferences)
+
+    stock = workbook.create_sheet("주가평가요약")
+    stock.append(["항목", "내용"])
+    stock_summary = analysis["stock_summary"]
+    stock_rows = [
+        ["평가기준일", stock_summary.get("평가기준일", "")],
+        ["발행주식총수", stock_summary.get("발행주식총수", "")],
+        [
+            "1주당평가액",
+            _format_money(stock_summary.get("1주당평가액")),
+        ],
+        [
+            "기업전체주식가치",
+            _format_money(stock_summary.get("기업전체주식가치")),
+        ],
+    ]
+    for row in stock_rows:
+        stock.append(row)
+    _style_sheet(stock)
+
+    output = BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    return output.getvalue()
+
+
+def render_ai_consulting_report_page(
+    user_id: str,
+    user_name: str = "",
+) -> None:
+    st.markdown("## AI 컨설팅 리포트")
+    st.caption(
+        "기존 고객DB·크레탑 재무정보·등기정보·주가평가·매칭설정을 "
+        "읽기 전용으로 결합해 상담용 리포트를 만듭니다."
+    )
+
+    customers = load_registered_customers(
+        get_user_cumulative_db_path(user_id)
+    )
+    if customers.empty:
+        st.info(
+            "등록된 고객이 없습니다. 먼저 크레탑 자동등록으로 고객을 등록해주세요."
+        )
+        return
+
+    labels, row_map = build_customer_labels(customers)
+    selected_label = st.selectbox(
+        "컨설팅 리포트 대상 고객",
+        labels,
+        key="ai_report_customer_selector",
+    )
+    customer = customers.loc[row_map[selected_label]]
+    business_no = _normalize_business_no(
+        customer.get("사업자등록번호", "")
+    )
+
+    financial = _financial_snapshot(user_id, business_no)
+    registry = _registry_snapshot(user_id, business_no)
+    stock_record = _latest_stock_record(user_id, business_no)
+    preferences = get_matching_preferences(
+        user_id,
+        business_no,
+    )
+
+    analysis = _build_analysis(
+        customer,
+        financial,
+        registry,
+        stock_record,
+        preferences,
+    )
+
+    st.markdown(
+        f"""
+        <div style="
+            padding:22px 24px;
+            border-radius:20px;
+            background:linear-gradient(135deg,#123d7a,#2563eb);
+            color:white;
+            margin:8px 0 18px 0;
+            box-shadow:0 12px 28px rgba(37,99,235,.18);
+        ">
+            <div style="font-size:1.45rem;font-weight:800;">
+                {analysis['company_name']} 컨설팅 리포트
+            </div>
+            <div style="margin-top:7px;opacity:.9;">
+                사업자번호 {analysis['business_no']} ·
+                작성자 {user_name or '-'} ·
+                {datetime.now().strftime('%Y-%m-%d')}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("정보 완성도", f"{analysis['completeness']}%")
+    m2.metric("매출액", _format_money(analysis["sales"]))
+    m3.metric("영업이익", _format_money(analysis["operating_profit"]))
+    m4.metric("당기순이익", _format_money(analysis["net_income"]))
+
+    st.markdown("### 기업 기본정보")
+    base_df = pd.DataFrame(
+        [
+            ["업종", analysis["industry"] or "-"],
+            ["사업장 소재지", analysis["address"] or "-"],
+            ["설립일", analysis["establishment"] or "-"],
+            ["종업원수", _clean(analysis["employees"]) or "-"],
+        ],
+        columns=["항목", "내용"],
+    )
+    st.dataframe(
+        base_df,
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    st.markdown("### 재무 진단")
+    f1, f2, f3 = st.columns(3)
+    f1.metric(
+        "영업이익률",
+        (
+            f"{analysis['operating_margin']:.1f}%"
+            if analysis["operating_margin"] is not None
+            else "-"
+        ),
+    )
+    f2.metric(
+        "순이익률",
+        (
+            f"{analysis['net_margin']:.1f}%"
+            if analysis["net_margin"] is not None
+            else "-"
+        ),
+    )
+    f3.metric(
+        "부채비율",
+        (
+            f"{analysis['debt_ratio']:.1f}%"
+            if analysis["debt_ratio"] is not None
+            else "-"
+        ),
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        with st.container(border=True):
+            st.markdown("#### 강점")
+            for item in analysis["strengths"] or [
+                "추가 재무정보 확인이 필요합니다."
+            ]:
+                st.markdown(f"- {item}")
+    with c2:
+        with st.container(border=True):
+            st.markdown("#### 확인 필요")
+            for item in analysis["cautions"] or [
+                "현재 주요 경고사항은 확인되지 않았습니다."
+            ]:
+                st.markdown(f"- {item}")
+    with c3:
+        with st.container(border=True):
+            st.markdown("#### 추천 전략")
+            for item in analysis["strategy"]:
+                st.markdown(f"- {item}")
+
+    st.markdown("### 대표 상담 질문")
+    for index, question in enumerate(
+        analysis["questions"],
+        start=1,
+    ):
+        st.markdown(f"**{index}.** {question}")
+
+    with st.expander("주가평가 요약", expanded=False):
+        stock_summary = analysis["stock_summary"]
+        if stock_record:
+            st.write(
+                f"평가기준일: {stock_summary.get('평가기준일') or '-'}"
+            )
+            st.write(
+                "발행주식총수: "
+                f"{stock_summary.get('발행주식총수') or '-'}"
+            )
+            st.write(
+                "1주당 평가액: "
+                f"{_format_money(stock_summary.get('1주당평가액'))}"
+            )
+            st.write(
+                "기업 전체 주식가치: "
+                f"{_format_money(stock_summary.get('기업전체주식가치'))}"
+            )
+        else:
+            st.info(
+                "저장된 주가평가 결과가 없습니다. 주가평가 메뉴에서 평가 후 저장해주세요."
+            )
+
+    with st.expander("정책자금 매칭설정", expanded=False):
+        if preferences:
+            st.json(preferences)
+        else:
+            st.info(
+                "저장된 고객별 매칭키워드가 없습니다."
+            )
+
+    excel_bytes = _build_excel_report(analysis)
+    safe_company = re.sub(
+        r'[\\/:*?"<>|]',
+        "_",
+        analysis["company_name"] or "고객",
+    )
+    filename = (
+        f"AI컨설팅리포트_{safe_company}_"
+        f"{datetime.now().strftime('%Y%m%d')}.xlsx"
+    )
+
+    st.download_button(
+        "AI 컨설팅 리포트 엑셀 다운로드",
+        data=excel_bytes,
+        file_name=filename,
+        mime=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+        type="primary",
+        use_container_width=True,
+    )
+
+    st.caption(
+        "본 리포트는 현재 저장된 기업정보를 바탕으로 만든 상담용 사전진단입니다. "
+        "정책자금 신청요건과 세무·주가평가는 기준일 자료를 추가 확인해야 합니다."
+    )
