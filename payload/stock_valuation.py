@@ -11,6 +11,7 @@ import pandas as pd
 import streamlit as st
 
 from cretop_runner import run_cretop_worker
+from registry_runner import run_registry_worker
 from utils import get_user_cumulative_db_path, get_user_dirs
 
 
@@ -419,6 +420,90 @@ def calculate_stock_valuation(inputs: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _registry_cache_path(user_id: str) -> Path:
+    dirs = get_user_dirs(user_id)
+    return dirs["base"] / "registry_cache.json"
+
+
+def _load_registry_cache(user_id: str) -> dict[str, Any]:
+    path = _registry_cache_path(user_id)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_registry_cache(
+    user_id: str,
+    business_no: str,
+    data: dict[str, Any],
+) -> None:
+    cache = _load_registry_cache(user_id)
+    key = _normalize_business_no(business_no)
+    if not key:
+        key = str(data.get("법인등록번호", "") or "")
+    if not key:
+        return
+
+    cache[key] = {
+        **dict(data or {}),
+        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    path = _registry_cache_path(user_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(cache, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+
+
+def _apply_registry_data(data: dict[str, Any]) -> None:
+    st.session_state["stock_company_name"] = str(
+        data.get("법인명")
+        or st.session_state.get("stock_company_name", "")
+    )
+    st.session_state["stock_corporate_no"] = str(
+        data.get("법인등록번호")
+        or st.session_state.get("stock_corporate_no", "")
+    )
+    st.session_state["stock_address"] = str(
+        data.get("본점소재지")
+        or st.session_state.get("stock_address", "")
+    )
+    st.session_state["stock_establishment"] = str(
+        data.get("법인설립일")
+        or st.session_state.get("stock_establishment", "")
+    )
+    st.session_state["stock_current_shares"] = _format_number(
+        data.get("발행주식총수")
+    ) or st.session_state.get("stock_current_shares", "")
+    st.session_state["stock_par_value"] = _format_number(
+        data.get("1주당액면가액")
+    ) or st.session_state.get("stock_par_value", "")
+    st.session_state["stock_capital"] = _format_number(
+        data.get("자본금")
+    )
+    st.session_state["stock_authorized_shares"] = _format_number(
+        data.get("발행할주식총수")
+    )
+    st.session_state["stock_share_classes"] = data.get("주식종류", [])
+
+
+def _compare_values(label: str, left: Any, right: Any) -> dict[str, Any]:
+    left_text = str(left or "").strip()
+    right_text = str(right or "").strip()
+    same = bool(left_text and right_text and left_text == right_text)
+    return {
+        "항목": label,
+        "기존값": left_text,
+        "등기값": right_text,
+        "일치": "일치" if same else ("차이" if left_text and right_text else "확인"),
+    }
+
+
 def _apply_loaded_record(record: dict[str, Any]) -> None:
     st.session_state["stock_loaded_record_id"] = record.get("record_id", "")
     st.session_state["stock_company_name"] = record.get("company_name", "")
@@ -432,6 +517,11 @@ def _apply_loaded_record(record: dict[str, Any]) -> None:
     )
     st.session_state["stock_current_shares"] = record.get("current_shares", "")
     st.session_state["stock_par_value"] = record.get("par_value", "")
+    st.session_state["stock_capital"] = _format_number(record.get("capital"))
+    st.session_state["stock_authorized_shares"] = _format_number(
+        record.get("authorized_shares")
+    )
+    st.session_state["stock_share_classes"] = record.get("share_classes", [])
     st.session_state["stock_valuation_type"] = record.get(
         "valuation_type",
         "일반법인(3:2)",
@@ -596,6 +686,98 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
                 )
                 st.rerun()
 
+    with st.expander("법인 등기자료에서 주식정보 불러오기", expanded=False):
+        registry_pdf = st.file_uploader(
+            "법인 등기사항증명서 PDF",
+            type=["pdf"],
+            key="stock_registry_pdf",
+        )
+        st.caption(
+            "법인명, 법인등록번호, 본점소재지, 설립일, 자본금, "
+            "발행주식총수, 1주의 금액 등을 자동 추출합니다."
+        )
+
+        if registry_pdf is not None and st.button(
+            "등기자료 분석",
+            key="stock_analyze_registry",
+            use_container_width=True,
+        ):
+            dirs = get_user_dirs(user_id)
+            registry_path = (
+                dirs["uploads"]
+                / f"등기자료_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+            )
+            registry_pdf.seek(0)
+            with open(registry_path, "wb") as output:
+                output.write(registry_pdf.read())
+
+            with st.spinner("등기자료에서 자본금과 주식정보를 찾고 있습니다..."):
+                registry_data, registry_error = run_registry_worker(
+                    registry_path,
+                    timeout=90,
+                )
+
+            if registry_error:
+                st.error(registry_error)
+            else:
+                _apply_registry_data(registry_data)
+                _save_registry_cache(
+                    user_id,
+                    st.session_state.get("stock_business_no", ""),
+                    registry_data,
+                )
+                st.session_state["stock_last_registry_data"] = registry_data
+                st.success("등기자료를 불러왔습니다. 자동 추출값을 확인·수정해주세요.")
+                st.rerun()
+
+        registry_data = st.session_state.get("stock_last_registry_data", {})
+        if registry_data:
+            st.markdown("#### 등기자료 추출값")
+            registry_preview = pd.DataFrame([
+                ["법인명", registry_data.get("법인명", "")],
+                ["법인등록번호", registry_data.get("법인등록번호", "")],
+                ["본점소재지", registry_data.get("본점소재지", "")],
+                ["법인설립일", registry_data.get("법인설립일", "")],
+                ["자본금", _format_number(registry_data.get("자본금"))],
+                ["발행할 주식 총수", _format_number(registry_data.get("발행할주식총수"))],
+                ["발행주식 총수", _format_number(registry_data.get("발행주식총수"))],
+                ["1주의 금액", _format_number(registry_data.get("1주당액면가액"))],
+            ], columns=["항목", "추출값"])
+            st.dataframe(
+                registry_preview,
+                hide_index=True,
+                use_container_width=True,
+            )
+
+            compare_rows = [
+                _compare_values(
+                    "법인명",
+                    st.session_state.get("stock_company_name", ""),
+                    registry_data.get("법인명", ""),
+                ),
+                _compare_values(
+                    "법인등록번호",
+                    st.session_state.get("stock_corporate_no", ""),
+                    registry_data.get("법인등록번호", ""),
+                ),
+                _compare_values(
+                    "본점소재지",
+                    st.session_state.get("stock_address", ""),
+                    registry_data.get("본점소재지", ""),
+                ),
+                _compare_values(
+                    "설립일",
+                    st.session_state.get("stock_establishment", ""),
+                    registry_data.get("법인설립일", ""),
+                ),
+            ]
+            st.markdown("#### 기존 정보와 비교")
+            st.dataframe(
+                pd.DataFrame(compare_rows),
+                hide_index=True,
+                use_container_width=True,
+            )
+
     records = _load_records(user_id)
     if records:
         with st.expander("저장된 주가평가 불러오기·수정", expanded=False):
@@ -660,6 +842,16 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
         par_value_text = st.text_input(
             "1주당 액면가액(원)",
             key="stock_par_value",
+        )
+        capital_text = st.text_input(
+            "등기상 자본금(원)",
+            key="stock_capital",
+            placeholder="등기자료 업로드 시 자동 입력",
+        )
+        authorized_shares_text = st.text_input(
+            "발행할 주식의 총수(주)",
+            key="stock_authorized_shares",
+            placeholder="등기자료 업로드 시 자동 입력",
         )
         valuation_type = st.selectbox(
             "평가유형",
@@ -827,6 +1019,9 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
         "valuation_date": valuation_date,
         "current_shares": _safe_number(current_shares_text),
         "par_value": _safe_number(par_value_text),
+        "capital": _safe_number(capital_text),
+        "authorized_shares": _safe_number(authorized_shares_text),
+        "share_classes": st.session_state.get("stock_share_classes", []),
         "valuation_type": valuation_type,
         "annual_rows": annual_rows,
         "total_assets": _safe_number(total_assets_text),
@@ -842,6 +1037,24 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
         "premium_exempt": premium_exempt,
         "premium_rate": premium_pct / 100,
     }
+
+    capital_number = _safe_number(capital_text)
+    issued_shares_number = _safe_number(current_shares_text)
+    par_value_number = _safe_number(par_value_text)
+
+    if capital_number and issued_shares_number and par_value_number:
+        calculated_capital = issued_shares_number * par_value_number
+        difference = abs(calculated_capital - capital_number)
+        tolerance = max(1, capital_number * 0.01)
+        if difference > tolerance:
+            st.warning(
+                "등기상 자본금과 `발행주식총수 × 1주당 액면가액`이 일치하지 않습니다. "
+                "변경등기 이력이나 종류주식 여부를 확인해주세요."
+            )
+        else:
+            st.success(
+                "등기상 자본금과 발행주식수·액면가액 계산값이 일치합니다."
+            )
 
     calculate_clicked = st.button(
         "주가평가 계산",
@@ -943,6 +1156,9 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
                 "valuation_date": valuation_date,
                 "current_shares": inputs["current_shares"],
                 "par_value": inputs["par_value"],
+                "capital": inputs.get("capital"),
+                "authorized_shares": inputs.get("authorized_shares"),
+                "share_classes": inputs.get("share_classes", []),
                 "valuation_type": valuation_type,
                 "annual_rows": annual_rows,
                 "total_assets": inputs["total_assets"],
