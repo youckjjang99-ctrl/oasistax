@@ -914,8 +914,21 @@ def get_customer_db_columns():
             df = pd.read_excel(template, sheet_name="고객DB", nrows=0)
             cols = [str(c).strip() for c in df.columns if str(c).strip()]
             if cols:
-                if "사업자등록번호" not in cols:
-                    cols.append("사업자등록번호")
+                required_cretop_columns = [
+                    "사업자등록번호",
+                    "사업장 소재지",
+                    "설립일",
+                    "종업원수",
+                    "매출액",
+                    "영업이익",
+                    "당기순이익",
+                    "자산총계",
+                    "부채총계",
+                    "자본총계",
+                ]
+                for required_column in required_cretop_columns:
+                    if required_column not in cols:
+                        cols.append(required_column)
                 return cols
         except Exception:
             pass
@@ -1202,3 +1215,114 @@ def update_user_customer_record(user_id, row_index, updates):
 
     _write_cumulative_customer_db(cumulative_path, df, columns)
     return True, f"고객정보 {len(changed)}개 항목을 수정했습니다."
+
+
+def refresh_existing_customer_from_cretop(user_id, extracted_data):
+    """
+    동일 사업자번호의 기존 고객을 찾아 크레탑 추출값으로 갱신한다.
+
+    - 새 행을 추가하지 않는다.
+    - 크레탑에서 값이 추출된 항목만 반영한다.
+    - 소재지, 설립일, 재무정보처럼 최신 보고서 값이 중요한 항목은 갱신한다.
+    """
+    cumulative_path = get_user_cumulative_db_path(user_id)
+    if not cumulative_path.exists():
+        return False, "갱신할 누적 고객DB가 없습니다.", 0
+
+    data = dict(extracted_data or {})
+    business_no = normalize_business_no(
+        data.get("사업자등록번호", data.get("사업자번호", ""))
+    )
+    company_name = data.get("업체명", data.get("기업명", ""))
+    representative_name = data.get("대표자명", data.get("대표자", ""))
+
+    columns = get_customer_db_columns()
+    df = _read_cumulative_customer_db(cumulative_path, columns)
+    if df.empty:
+        return False, "갱신할 기존 고객을 찾지 못했습니다.", 0
+
+    mask = pd.Series(False, index=df.index)
+
+    if (
+        len(business_no.replace("-", "")) == 10
+        and "사업자등록번호" in df.columns
+    ):
+        mask = (
+            df["사업자등록번호"]
+            .apply(normalize_business_no)
+            .eq(business_no)
+        )
+
+    if not mask.any() and company_name and "업체명" in df.columns:
+        company_mask = (
+            df["업체명"]
+            .apply(normalize_company_name)
+            .eq(normalize_company_name(company_name))
+        )
+        if representative_name and "대표자명" in df.columns:
+            company_mask = company_mask & (
+                df["대표자명"]
+                .apply(normalize_person_name)
+                .eq(normalize_person_name(representative_name))
+            )
+        mask = company_mask
+
+    matching_indexes = list(df.index[mask])
+    if not matching_indexes:
+        return False, "동일 고객을 찾지 못해 기존 정보를 갱신하지 못했습니다.", 0
+
+    row_data = build_customer_row_from_cretop(data, columns)
+    index = matching_indexes[0]
+
+    priority_fields = {
+        "사업자등록번호",
+        "사업장 소재지",
+        "설립일",
+        "설립년도",
+        "종업원수",
+        "상시근로자수",
+        "매출액",
+        "연매출",
+        "전년도매출",
+        "영업이익",
+        "당기순이익",
+        "자산총계",
+        "부채총계",
+        "자본총계",
+        "벤처",
+        "이노비즈",
+        "메인비즈",
+        "기업부설연구소",
+        "연구개발전담부서",
+        "특허보유",
+        "상표",
+    }
+
+    updated_fields = []
+    for column in columns:
+        new_value = row_data.get(column, "")
+        if new_value is None:
+            continue
+        if isinstance(new_value, str) and not new_value.strip():
+            continue
+
+        current_value = df.at[index, column] if column in df.columns else ""
+        current_blank = (
+            current_value is None
+            or str(current_value).strip().lower() in {"", "nan", "none", "nat"}
+        )
+
+        if current_blank or column in priority_fields:
+            if str(current_value) != str(new_value):
+                df.at[index, column] = new_value
+                updated_fields.append(column)
+
+    if not updated_fields:
+        return True, "기존 고객정보가 이미 최신 상태입니다.", 0
+
+    _write_cumulative_customer_db(cumulative_path, df, columns)
+    return (
+        True,
+        f"기존 고객의 누락·재무정보 {len(updated_fields)}개 항목을 갱신했습니다.",
+        len(updated_fields),
+    )

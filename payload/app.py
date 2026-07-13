@@ -12,8 +12,7 @@ from maintenance import render_system_management_page
 from cretop_runner import run_cretop_worker
 from crm import (
     STATUS_OPTIONS, ACTION_OPTIONS, make_customer_key, get_customer_record,
-    upsert_customer_record, append_timeline_event, get_crm_summary,
-    get_due_action_summary
+    upsert_customer_record, append_timeline_event, get_crm_summary
 )
 
 from auth import (
@@ -30,6 +29,7 @@ from utils import (
     get_user_dirs, get_user_cumulative_db_path, append_user_customer_db,
     append_cretop_to_user_customer_db,
     check_user_customer_duplicate, link_business_no_to_legacy_customer,
+    refresh_existing_customer_from_cretop,
     ensure_user_cumulative_db_format, update_user_customer_record,
     count_user_cumulative_rows
 )
@@ -938,40 +938,127 @@ def render_customer_management_page(user_id):
             else:
                 st.error(msg)
 
-    st.markdown("##### AI 기업분석 카드")
+    st.markdown("""
+    <style>
+    .oasis-analysis-title {
+        padding: 18px 22px;
+        border-radius: 18px;
+        background: linear-gradient(135deg, #0f3f91 0%, #2563eb 100%);
+        color: white;
+        margin: 18px 0 14px 0;
+        box-shadow: 0 10px 28px rgba(37, 99, 235, 0.18);
+    }
+    .oasis-analysis-title h3 {
+        margin: 0;
+        font-size: 1.35rem;
+        font-weight: 800;
+    }
+    .oasis-analysis-title p {
+        margin: 7px 0 0 0;
+        opacity: 0.88;
+        font-size: 0.92rem;
+    }
+    .oasis-score-card {
+        padding: 15px 18px;
+        border-radius: 16px;
+        background: #ffffff;
+        border: 1px solid #dbe7fb;
+        box-shadow: 0 7px 20px rgba(15, 63, 145, 0.08);
+        margin-bottom: 12px;
+    }
+    .oasis-score-label {
+        color: #64748b;
+        font-size: 0.82rem;
+        font-weight: 700;
+    }
+    .oasis-score-value {
+        color: #0f3f91;
+        font-size: 1.55rem;
+        font-weight: 850;
+        margin-top: 4px;
+    }
+    </style>
+    <div class="oasis-analysis-title">
+        <h3>AI 기업분석 카드</h3>
+        <p>현재 고객DB와 크레탑 재무정보를 기준으로 상담 포인트를 빠르게 정리합니다.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
     analysis_points = []
     risk_points = []
     question_points = []
 
-    employee_number = selected_row.get("종업원수", selected_row.get("상시근로자수", ""))
+    employee_number = selected_row.get(
+        "종업원수",
+        selected_row.get("상시근로자수", ""),
+    )
     try:
         employee_number = int(float(str(employee_number).replace(",", "")))
     except Exception:
         employee_number = 0
 
-    sales_number = selected_row.get("매출액", selected_row.get("연매출", ""))
+    sales_number = selected_row.get(
+        "매출액",
+        selected_row.get("연매출", ""),
+    )
     try:
         sales_number = int(float(str(sales_number).replace(",", "")))
     except Exception:
         sales_number = 0
 
+    operating_number = selected_row.get("영업이익", "")
+    net_number = selected_row.get("당기순이익", "")
+    try:
+        operating_number = int(float(str(operating_number).replace(",", "")))
+    except Exception:
+        operating_number = 0
+    try:
+        net_number = int(float(str(net_number).replace(",", "")))
+    except Exception:
+        net_number = 0
+
+    completeness_fields = [
+        selected_row.get("사업자등록번호", ""),
+        selected_row.get("사업장 소재지", ""),
+        selected_row.get("설립일", selected_row.get("설립년도", "")),
+        sales_number,
+        operating_number,
+        net_number,
+        employee_number,
+    ]
+    completed_fields = sum(
+        1 for value in completeness_fields
+        if format_customer_display_value(value)
+    )
+    completeness_score = round(completed_fields / len(completeness_fields) * 100)
+
     industry_text = str(selected_row.get("업종명", "") or "")
     if sales_number:
         analysis_points.append(f"최근 확인 매출액은 {sales_number:,}원입니다.")
+    if operating_number:
+        analysis_points.append(f"영업이익은 {operating_number:,}원으로 확인됩니다.")
+    if net_number:
+        analysis_points.append(f"당기순이익은 {net_number:,}원으로 확인됩니다.")
     if employee_number:
         analysis_points.append(f"종업원수는 {employee_number:,}명입니다.")
     if any(word in industry_text for word in ["제조", "건설", "운송", "물류"]):
         analysis_points.append("시설·운전자금 및 보증기관 연계 검토 가치가 있습니다.")
     if str(selected_row.get("벤처", "")).upper() == "Y":
-        analysis_points.append("벤처기업 우대가 가능한 사업을 우선 검토할 수 있습니다.")
-    if str(selected_row.get("기업부설연구소", "")).upper() == "Y" or str(selected_row.get("연구개발전담부서", "")).upper() == "Y":
-        analysis_points.append("R&D 및 기술개발 지원사업 검토에 유리한 요소가 있습니다.")
-    if not format_customer_display_value(selected_row.get("당기순이익", "")):
-        risk_points.append("당기순이익이 비어 있어 재무건전성 판단 전 확인이 필요합니다.")
+        analysis_points.append("벤처기업 우대사업을 우선 검토할 수 있습니다.")
+    if (
+        str(selected_row.get("기업부설연구소", "")).upper() == "Y"
+        or str(selected_row.get("연구개발전담부서", "")).upper() == "Y"
+    ):
+        analysis_points.append("R&D·기술개발 지원사업 검토에 유리한 요소가 있습니다.")
+
+    if not net_number:
+        risk_points.append("당기순이익 확인이 필요합니다.")
     if not format_customer_display_value(selected_row.get("사업장 소재지", "")):
-        risk_points.append("사업장 소재지가 비어 있어 지역 제한 사업 매칭 전 보완이 필요합니다.")
-    if not format_customer_display_value(selected_row.get("설립일", selected_row.get("설립년도", ""))):
-        risk_points.append("설립일이 비어 있어 업력 요건 확인이 필요합니다.")
+        risk_points.append("사업장 소재지 보완이 필요합니다.")
+    if not format_customer_display_value(
+        selected_row.get("설립일", selected_row.get("설립년도", ""))
+    ):
+        risk_points.append("설립일 보완이 필요합니다.")
 
     question_points.extend([
         "최근 1년 이내 시설·기계·차량 투자계획이 있나요?",
@@ -979,21 +1066,61 @@ def render_customer_management_page(user_id):
         "기존 정책자금·보증기관 대출 잔액과 만기는 어떻게 되나요?",
     ])
 
+    s1, s2, s3 = st.columns(3)
+    with s1:
+        st.markdown(
+            f"""
+            <div class="oasis-score-card">
+                <div class="oasis-score-label">정보 완성도</div>
+                <div class="oasis-score-value">{completeness_score}%</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with s2:
+        profitability = "흑자" if net_number > 0 else "확인 필요"
+        st.markdown(
+            f"""
+            <div class="oasis-score-card">
+                <div class="oasis-score-label">수익성 상태</div>
+                <div class="oasis-score-value">{profitability}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with s3:
+        followup_count = len(risk_points)
+        st.markdown(
+            f"""
+            <div class="oasis-score-card">
+                <div class="oasis-score-label">보완 필요</div>
+                <div class="oasis-score-value">{followup_count}건</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
     a1, a2, a3 = st.columns(3)
     with a1:
-        st.markdown("**검토 포인트**")
-        for item in analysis_points or ["현재 입력정보를 기준으로 추가 검토가 필요합니다."]:
-            st.write(f"• {item}")
+        with st.container(border=True):
+            st.markdown("#### 검토 포인트")
+            for item in analysis_points or ["추가 기업정보 확인이 필요합니다."]:
+                st.markdown(f"- {item}")
     with a2:
-        st.markdown("**확인 필요사항**")
-        for item in risk_points or ["현재 주요 누락정보는 확인되지 않았습니다."]:
-            st.write(f"• {item}")
+        with st.container(border=True):
+            st.markdown("#### 확인 필요사항")
+            for item in risk_points or ["주요 누락정보가 확인되지 않았습니다."]:
+                st.markdown(f"- {item}")
     with a3:
-        st.markdown("**대표 질문**")
-        for item in question_points:
-            st.write(f"• {item}")
+        with st.container(border=True):
+            st.markdown("#### 대표 미팅 질문")
+            for item in question_points:
+                st.markdown(f"- {item}")
 
-    st.caption("기업분석 카드는 현재 고객DB 값에 따른 규칙 기반 사전 검토입니다. 최종 추천은 정책자금 매칭 결과와 함께 판단합니다.")
+    st.caption(
+        "현재 고객DB 값에 따른 사전 분석입니다. "
+        "최종 정책자금 추천은 정책자금 매칭 결과와 함께 판단합니다."
+    )
 
     st.markdown("##### CRM 관리")
     with st.form(key=f"crm_form_{selected_key}"):
@@ -1466,38 +1593,53 @@ elif active_tab == "크레탑 자동등록":
                     representative_name=representative_name,
                 )
 
-            if is_dup:
-                extracted_data = identity_data
-                extract_error = ""
-                analysis_logs = identity_logs
-                status_box.update(
-                    label="이미 등록된 고객을 확인했습니다.",
-                    state="complete",
-                    expanded=False,
-                )
-            else:
-                # 2단계: 모든 페이지를 순차 탐색하되 분석은 별도 프로세스에서 수행
-                status_box.write(
-                    "2단계: 페이지 번호에 의존하지 않고 문서 전체의 섹션을 순차 탐색합니다."
-                )
-                extracted_data, extract_error, analysis_logs = run_cretop_worker(
-                    pdf_save_path,
-                    mode="full",
-                    timeout=180,
-                )
+            # 신규·중복 여부와 관계없이 전체 보고서를 분석한다.
+            # 중복 고객이면 새 행을 만들지 않고 기존 행의 누락정보를 갱신한다.
+            status_box.write(
+                "2단계: 문서 전체에서 소재지·설립일·재무정보를 탐색합니다."
+            )
+            extracted_data, extract_error, analysis_logs = run_cretop_worker(
+                pdf_save_path,
+                mode="full",
+                timeout=180,
+            )
 
-                if extract_error:
+            duplicate_refresh_message = ""
+            duplicate_refresh_count = 0
+
+            if extract_error:
+                status_box.update(
+                    label="PDF 분석 작업이 안전하게 중단되었습니다.",
+                    state="error",
+                    expanded=True,
+                )
+            elif is_dup:
+                (
+                    refresh_ok,
+                    duplicate_refresh_message,
+                    duplicate_refresh_count,
+                ) = refresh_existing_customer_from_cretop(
+                    CURRENT_USER_ID,
+                    extracted_data,
+                )
+                if refresh_ok:
                     status_box.update(
-                        label="PDF 분석 작업이 안전하게 중단되었습니다.",
-                        state="error",
-                        expanded=True,
-                    )
-                else:
-                    status_box.update(
-                        label="크레탑 PDF 분석이 완료되었습니다.",
+                        label="기존 고객의 누락정보를 갱신했습니다.",
                         state="complete",
                         expanded=False,
                     )
+                else:
+                    status_box.update(
+                        label="기존 고객은 확인했지만 정보 갱신에 실패했습니다.",
+                        state="error",
+                        expanded=True,
+                    )
+            else:
+                status_box.update(
+                    label="크레탑 PDF 분석이 완료되었습니다.",
+                    state="complete",
+                    expanded=False,
+                )
 
             # 작은 JSON 결과만 세션에 보관
             st.session_state["cretop_pdf_hash"] = pdf_hash
@@ -1506,12 +1648,26 @@ elif active_tab == "크레탑 자동등록":
             st.session_state["cretop_extract_error"] = extract_error or identity_error
             st.session_state["cretop_is_duplicate"] = bool(is_dup)
             st.session_state["cretop_analysis_logs"] = analysis_logs[-20:]
+            st.session_state["cretop_duplicate_refresh_message"] = (
+                duplicate_refresh_message if is_dup else ""
+            )
+            st.session_state["cretop_duplicate_refresh_count"] = (
+                duplicate_refresh_count if is_dup else 0
+            )
 
         pdf_save_path = Path(st.session_state.get("cretop_pdf_save_path", ""))
         extracted_data = dict(st.session_state.get("cretop_extracted_data", {}) or {})
         extract_error = st.session_state.get("cretop_extract_error", "")
         is_dup = bool(st.session_state.get("cretop_is_duplicate", False))
         analysis_logs = st.session_state.get("cretop_analysis_logs", [])
+        duplicate_refresh_message = st.session_state.get(
+            "cretop_duplicate_refresh_message",
+            "",
+        )
+        duplicate_refresh_count = st.session_state.get(
+            "cretop_duplicate_refresh_count",
+            0,
+        )
 
         if extract_error:
             st.error(extract_error)
@@ -1522,20 +1678,43 @@ elif active_tab == "크레탑 자동등록":
                     st.caption("수집된 분석 로그가 없습니다.")
 
         elif is_dup:
-            st.markdown("#### 중복 고객 확인")
+            st.markdown("#### 기존 고객정보 갱신 완료")
             st.warning(
                 f"{extracted_data.get('업체명', '해당 업체')} "
-                f"({extracted_data.get('사업자등록번호', '')})는 이미 "
-                "내 누적 고객DB에 등록되어 있습니다."
+                f"({extracted_data.get('사업자등록번호', '')})는 이미 등록된 고객입니다."
             )
+            if duplicate_refresh_message:
+                st.success(duplicate_refresh_message)
             st.info(
-                "중복 고객은 전체 재무분석과 엑셀 저장을 진행하지 않았습니다. "
-                "기존 정보는 고객관리 메뉴에서 확인해주세요."
+                "새 고객 행은 추가하지 않고 기존 고객의 사업장 소재지, 설립일, "
+                "당기순이익 등 누락·재무정보만 최신 크레탑 값으로 갱신했습니다."
             )
-            st.button(
-                "이미 등록된 고객입니다",
-                disabled=True,
-                key="cretop_duplicate_disabled_button",
+
+            preview_keys = [
+                "업체명", "대표자명", "사업자등록번호",
+                "사업장 소재지", "설립일", "종업원수",
+                "매출액", "영업이익", "당기순이익",
+                "자산총계", "부채총계", "자본총계",
+            ]
+            numeric_keys = {
+                "매출액", "영업이익", "당기순이익",
+                "자산총계", "부채총계", "자본총계",
+            }
+            duplicate_preview = pd.DataFrame([
+                {
+                    "항목": key,
+                    "갱신값": (
+                        f"{int(extracted_data.get(key)):,}"
+                        if key in numeric_keys
+                        and isinstance(extracted_data.get(key), (int, float))
+                        else extracted_data.get(key, "")
+                    ),
+                }
+                for key in preview_keys
+            ])
+            st.dataframe(
+                duplicate_preview,
+                hide_index=True,
                 width='stretch',
             )
 
