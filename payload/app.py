@@ -1225,29 +1225,28 @@ elif active_tab == "크레탑 자동등록":
             business_no = extracted_data.get("사업자등록번호", "")
             is_dup = check_user_customer_duplicate(CURRENT_USER_ID, business_no)
 
-            duplicate_action = "add"
+            duplicate_action = "skip"
             if is_dup:
-                st.warning("이미 내 누적 고객DB에 같은 사업자등록번호가 있습니다.")
-                duplicate_choice = st.radio(
-                    "저장 방식 선택",
-                    ["기존 데이터 업데이트", "저장하지 않기", "중복이어도 새 행으로 추가"],
-                    horizontal=True,
-                    key="cretop_duplicate_choice"
+                st.warning(
+                    "이미 내 누적 고객DB에 같은 사업자등록번호가 있습니다. "
+                    "중복 고객은 자동으로 추가하지 않습니다."
                 )
-                duplicate_action = {
-                    "기존 데이터 업데이트": "update",
-                    "저장하지 않기": "skip",
-                    "중복이어도 새 행으로 추가": "add",
-                }[duplicate_choice]
 
-            if st.button("내 누적 고객DB에 추가", width='stretch'):
+            add_customer_clicked = st.button(
+                "이미 등록된 고객입니다" if is_dup else "내 누적 고객DB에 추가",
+                width='stretch',
+                disabled=is_dup,
+                key="cretop_add_to_cumulative_db",
+            )
+
+            if add_customer_clicked:
                 before_count = count_user_cumulative_rows(CURRENT_USER_ID)
                 with st.spinner("크레탑 PDF 추출값을 누적 고객DB에 저장 중입니다..."):
                     cumulative_path, saved_count, message, _, saved_preview = append_cretop_to_user_customer_db(
                         pdf_save_path,
                         CURRENT_USER_ID,
                         manager_name=cretop_manager_name.strip() or CURRENT_USER_NAME,
-                        duplicate_action=duplicate_action
+                        duplicate_action="skip"
                     )
                     cumulative_path, total_count, _ = ensure_user_cumulative_db_format(CURRENT_USER_ID)
 
