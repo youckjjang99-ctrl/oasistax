@@ -11,6 +11,7 @@ from ui import apply_oasis_ui
 from maintenance import render_system_management_page
 from cretop_runner import run_cretop_worker
 from cloud_admin import render_cloud_database_page
+from cloud_restore import restore_customer_db_if_needed
 from consulting_report import render_ai_consulting_report_page
 from cloud_sync import (
     get_cloud_sync_status,
@@ -1276,6 +1277,14 @@ USER_DIRS = get_user_dirs(CURRENT_USER_ID)
 USER_UPLOAD_DIR = USER_DIRS["uploads"]
 USER_RESULT_DIR = USER_DIRS["results"]
 
+# Streamlit Cloud는 재배포 시 로컬 파일이 초기화될 수 있다.
+# 기존 로컬 고객이 없을 때만 Supabase 고객자료를 자동 복원한다.
+restore_session_key = f"cloud_customer_restore_{CURRENT_USER_ID}"
+if not st.session_state.get(restore_session_key):
+    restore_result = restore_customer_db_if_needed(CURRENT_USER_ID)
+    st.session_state[restore_session_key] = True
+    st.session_state["cloud_customer_restore_result"] = restore_result
+
 # v3.0.0: 상단 탭/가로 메뉴 대신 사이드바 기반 메뉴로 전환
 with st.sidebar:
     st.markdown(logo_html(360), unsafe_allow_html=True)
@@ -1333,6 +1342,13 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 if active_tab == "홈":
+    restore_notice = st.session_state.get(
+        "cloud_customer_restore_result",
+        {},
+    )
+    if restore_notice.get("restored"):
+        st.success(restore_notice.get("message", ""))
+
     render_home_page()
 
 elif active_tab == "고객관리":

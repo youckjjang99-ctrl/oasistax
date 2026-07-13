@@ -139,6 +139,40 @@ class CloudDatabase:
             )
         return response.json() if response.text else []
 
+    def select(
+        self,
+        table: str,
+        filters: dict[str, Any] | None = None,
+        columns: str = "*",
+        order: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"select": columns}
+
+        for key, value in (filters or {}).items():
+            params[key] = f"eq.{value}"
+
+        if order:
+            params["order"] = order
+        if limit is not None:
+            params["limit"] = str(int(limit))
+
+        response = requests.get(
+            self._url(table),
+            headers=self.headers,
+            params=params,
+            timeout=self.config.timeout,
+        )
+        if not response.ok:
+            raise RuntimeError(
+                f"{table} 조회 실패 HTTP {response.status_code}: "
+                f"{response.text[:800]}"
+            )
+
+        data = response.json() if response.text else []
+        return data if isinstance(data, list) else []
+
+
     def count(self, table: str, owner_user_id: str | None = None) -> int:
         headers = dict(self.headers)
         headers["Prefer"] = "count=exact"
