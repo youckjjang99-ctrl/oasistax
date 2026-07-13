@@ -5,6 +5,8 @@ import os
 import re
 import glob
 
+from bizinfo_cache import load_bizinfo_programs_cached
+
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
@@ -1264,44 +1266,17 @@ def check_input_errors(customer_df):
 
 
 def load_bizinfo_programs():
-    print("기업마당 지원사업 수집 중...")
-
-    all_rows = []
-
-    for page in range(1, API_PAGE_COUNT + 1):
-        params = {
-            "crtfcKey": API_KEY,
-            "serviceKey": API_KEY,
-            "dataType": "json",
-            "searchCnt": "100",
-            "pageUnit": "100",
-            "pageIndex": str(page)
-        }
-
-        response = requests.get(BIZINFO_URL, params=params, timeout=20)
-
-        if response.status_code != 200:
-            print("API 호출 실패:", response.status_code)
-            continue
-
-        data = response.json()
-
-        if "jsonArray" not in data:
-            print("API 응답 확인 필요:")
-            print(data)
-            continue
-
-        rows = data.get("jsonArray", [])
-        all_rows.extend(rows)
-
-    df = pd.DataFrame(all_rows)
-
-    if not df.empty:
-        df = df.drop_duplicates()
-        df.to_excel(f"지원사업DB_{TODAY}.xlsx", index=False)
-
-    return df
-
+    """
+    v3.5.0: 매칭 시 기업마당을 매번 실시간 호출하지 않고
+    data/bizinfo_programs.json 내부 DB를 우선 사용합니다.
+    내부 DB가 최초 한 번도 없는 경우에만 실시간 동기화를 한 번 시도합니다.
+    """
+    return load_bizinfo_programs_cached(
+        api_key=API_KEY,
+        page_count=API_PAGE_COUNT,
+        allow_live_fallback=True,
+        data_dir="data",
+    )
 
 def style_ws(ws, color="1F4E78"):
     header_fill = PatternFill("solid", fgColor=color)
