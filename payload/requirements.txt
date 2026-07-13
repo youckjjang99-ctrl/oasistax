@@ -1,0 +1,9 @@
+streamlit
+pandas
+openpyxl
+requests
+pillow
+python-dateutil
+numpy
+
+pypdf

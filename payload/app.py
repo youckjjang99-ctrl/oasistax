@@ -9,6 +9,7 @@ from pathlib import Path
 
 from ui import apply_oasis_ui
 from maintenance import render_system_management_page
+from cretop_runner import run_cretop_worker
 from crm import (
     STATUS_OPTIONS, ACTION_OPTIONS, make_customer_key, get_customer_record,
     upsert_customer_record, append_timeline_event, get_crm_summary
@@ -26,7 +27,7 @@ from utils import (
     make_basic_customer_template_bytes, run_cleanup,
     move_result_files_to_results, extract_company_previews,
     get_user_dirs, get_user_cumulative_db_path, append_user_customer_db,
-    extract_cretop_pdf_data, extract_cretop_identity, append_cretop_to_user_customer_db,
+    append_cretop_to_user_customer_db,
     check_user_customer_duplicate, ensure_user_cumulative_db_format,
     count_user_cumulative_rows
 )
@@ -1219,28 +1220,41 @@ elif active_tab == "크레탑 자동등록":
             width='stretch',
         )
 
-        import hashlib
-        pdf_bytes = cretop_pdf.getvalue()
-        pdf_hash = hashlib.md5(pdf_bytes).hexdigest()
+        if analyze_requested:
+            import hashlib
 
-        has_cached_pdf = st.session_state.get("cretop_pdf_hash") == pdf_hash
-        if not analyze_requested and not has_cached_pdf:
-            st.info("분석 버튼을 누르면 사업자번호 중복 확인 후 추출값 미리보기가 표시됩니다.")
-            st.stop()
-
-        if not has_cached_pdf:
             pdf_save_name = make_upload_filename(cretop_pdf.name).replace(
                 "업로드고객DB_",
                 "크레탑PDF_",
             )
             pdf_save_path = USER_UPLOAD_DIR / pdf_save_name
-            with open(pdf_save_path, "wb") as file:
-                file.write(pdf_bytes)
 
-            with st.spinner("사업자등록번호 중복 여부를 먼저 확인하고 있습니다..."):
-                identity_data, identity_error = extract_cretop_identity(
-                    pdf_save_path,
-                    max_pages=2,
+            # UploadedFile을 메모리에 복제하지 않고 디스크로 바로 저장한다.
+            cretop_pdf.seek(0)
+            with open(pdf_save_path, "wb") as destination:
+                shutil.copyfileobj(cretop_pdf, destination, length=1024 * 1024)
+
+            hash_object = hashlib.md5()
+            with open(pdf_save_path, "rb") as source_file:
+                for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
+                    hash_object.update(chunk)
+            pdf_hash = hash_object.hexdigest()
+
+            status_box = st.status("크레탑 PDF 분석을 준비하고 있습니다.", expanded=True)
+
+            # 1단계: 별도 프로세스에서 사업자번호를 동적으로 탐색
+            status_box.write("1단계: 문서 전체에서 사업자등록번호를 탐색합니다.")
+            identity_data, identity_error, identity_logs = run_cretop_worker(
+                pdf_save_path,
+                mode="identity",
+                timeout=60,
+            )
+
+            if identity_logs:
+                last_log = identity_logs[-1]
+                status_box.write(
+                    f"사업자정보 탐색: {last_log.get('page', '')}/"
+                    f"{last_log.get('total', '')} 페이지"
                 )
 
             business_no = identity_data.get("사업자등록번호", "")
@@ -1252,31 +1266,58 @@ elif active_tab == "크레탑 자동등록":
             if is_dup:
                 extracted_data = identity_data
                 extract_error = ""
+                analysis_logs = identity_logs
+                status_box.update(
+                    label="이미 등록된 고객을 확인했습니다.",
+                    state="complete",
+                    expanded=False,
+                )
             else:
-                with st.spinner("신규 고객의 크레탑 PDF를 분석 중입니다..."):
-                    extracted_data, extract_error = extract_cretop_pdf_data(
-                        pdf_save_path
+                # 2단계: 모든 페이지를 순차 탐색하되 분석은 별도 프로세스에서 수행
+                status_box.write(
+                    "2단계: 페이지 번호에 의존하지 않고 문서 전체의 섹션을 순차 탐색합니다."
+                )
+                extracted_data, extract_error, analysis_logs = run_cretop_worker(
+                    pdf_save_path,
+                    mode="full",
+                    timeout=180,
+                )
+
+                if extract_error:
+                    status_box.update(
+                        label="PDF 분석 작업이 안전하게 중단되었습니다.",
+                        state="error",
+                        expanded=True,
+                    )
+                else:
+                    status_box.update(
+                        label="크레탑 PDF 분석이 완료되었습니다.",
+                        state="complete",
+                        expanded=False,
                     )
 
+            # 작은 JSON 결과만 세션에 보관
             st.session_state["cretop_pdf_hash"] = pdf_hash
             st.session_state["cretop_pdf_save_path"] = str(pdf_save_path)
             st.session_state["cretop_extracted_data"] = dict(extracted_data or {})
-            st.session_state["cretop_extract_error"] = extract_error
+            st.session_state["cretop_extract_error"] = extract_error or identity_error
             st.session_state["cretop_is_duplicate"] = bool(is_dup)
-            st.session_state["cretop_identity_error"] = identity_error
-            del pdf_bytes
-        else:
-            pdf_save_path = Path(st.session_state.get("cretop_pdf_save_path", ""))
-            extracted_data = dict(st.session_state.get("cretop_extracted_data", {}) or {})
-            extract_error = st.session_state.get("cretop_extract_error", "")
-            is_dup = bool(st.session_state.get("cretop_is_duplicate", False))
-            identity_error = st.session_state.get("cretop_identity_error", "")
+            st.session_state["cretop_analysis_logs"] = analysis_logs[-20:]
 
-        if identity_error:
-            st.warning("사업자번호 사전 확인이 어려워 전체 분석 결과에서 다시 확인했습니다.")
+        pdf_save_path = Path(st.session_state.get("cretop_pdf_save_path", ""))
+        extracted_data = dict(st.session_state.get("cretop_extracted_data", {}) or {})
+        extract_error = st.session_state.get("cretop_extract_error", "")
+        is_dup = bool(st.session_state.get("cretop_is_duplicate", False))
+        analysis_logs = st.session_state.get("cretop_analysis_logs", [])
 
         if extract_error:
             st.error(extract_error)
+            with st.expander("PDF 분석 로그"):
+                if analysis_logs:
+                    st.json(analysis_logs)
+                else:
+                    st.caption("수집된 분석 로그가 없습니다.")
+
         elif is_dup:
             st.markdown("#### 중복 고객 확인")
             st.warning(
@@ -1294,7 +1335,8 @@ elif active_tab == "크레탑 자동등록":
                 key="cretop_duplicate_disabled_button",
                 width='stretch',
             )
-        else:
+
+        elif extracted_data:
             st.markdown("#### 2. 추출값 미리보기")
             preview_keys = [
                 "업체명", "대표자명", "사업자등록번호", "법인등록번호",
@@ -1321,6 +1363,12 @@ elif active_tab == "크레탑 자동등록":
                 for key in preview_keys
             ])
             st.dataframe(preview_df, width='stretch', hide_index=True)
+
+            with st.expander("분석 진행 로그"):
+                if analysis_logs:
+                    st.dataframe(pd.DataFrame(analysis_logs), hide_index=True, width='stretch')
+                else:
+                    st.caption("분석 로그가 없습니다.")
 
             add_customer_clicked = st.button(
                 "내 누적 고객DB에 추가",
@@ -1351,8 +1399,6 @@ elif active_tab == "크레탑 자동등록":
                     st.session_state["cretop_last_total_count"] = total_count
                 else:
                     st.info(message)
-
-                # 저장 후 st.rerun()을 호출하지 않아 PDF 재분석과 앱 전체 재실행을 방지한다.
 
 elif active_tab == "실행이력":
     st.markdown("### 📚 실행이력")
