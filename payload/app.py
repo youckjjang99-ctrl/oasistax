@@ -12,6 +12,8 @@ from maintenance import render_system_management_page
 from cretop_runner import run_cretop_worker
 from cloud_admin import render_cloud_database_page
 from cloud_restore import restore_customer_db_if_needed
+from cloud_crm_restore import restore_crm_from_cloud
+from enterprise_center import render_enterprise_management_center
 from address_tools import (
     enrich_address_fields,
     repair_user_customer_addresses,
@@ -1396,6 +1398,12 @@ if not st.session_state.get(restore_session_key):
     st.session_state[restore_session_key] = True
     st.session_state["cloud_customer_restore_result"] = restore_result
 
+crm_restore_session_key = f"cloud_crm_restore_{CURRENT_USER_ID}"
+if not st.session_state.get(crm_restore_session_key):
+    crm_restore_result = restore_crm_from_cloud(CURRENT_USER_ID)
+    st.session_state[crm_restore_session_key] = True
+    st.session_state["cloud_crm_restore_result"] = crm_restore_result
+
 # v3.0.0: 상단 탭/가로 메뉴 대신 사이드바 기반 메뉴로 전환
 with st.sidebar:
     st.markdown(logo_html(360), unsafe_allow_html=True)
@@ -1420,6 +1428,7 @@ with st.sidebar:
         "홈": "홈",
         "크레탑 자동등록": "크레탑 자동등록",
         "고객관리": "고객관리",
+        "기업관리센터": "기업관리센터",
         "정책자금 매칭": "고객DB 업로드/매칭",
         "주가평가": "주가평가",
         "AI 컨설팅 리포트": "AI 컨설팅 리포트",
@@ -1460,10 +1469,23 @@ if active_tab == "홈":
     if restore_notice.get("restored"):
         st.success(restore_notice.get("message", ""))
 
+    crm_restore_notice = st.session_state.get(
+        "cloud_crm_restore_result",
+        {},
+    )
+    if crm_restore_notice.get("restored", 0) > 0:
+        st.success(crm_restore_notice.get("message", ""))
+
     render_home_page()
 
 elif active_tab == "고객관리":
     render_customer_management_page(CURRENT_USER_ID)
+
+elif active_tab == "기업관리센터":
+    render_enterprise_management_center(
+        CURRENT_USER_ID,
+        CURRENT_USER_NAME,
+    )
 
 elif active_tab == "내 누적 고객DB":
     render_cumulative_db_page(CURRENT_USER_ID)
