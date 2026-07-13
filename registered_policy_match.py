@@ -136,11 +136,35 @@ def _find_header_row_and_columns(worksheet):
     raise ValueError("고객DB 시트에서 '업체명' 헤더를 찾지 못했습니다.")
 
 
+def _append_text(current: Any, addition: str) -> str:
+    current_text = str(current or "").strip()
+    addition = str(addition or "").strip()
+
+    if not addition:
+        return current_text
+    if not current_text:
+        return addition
+    if addition in current_text:
+        return current_text
+    return f"{current_text} / {addition}"
+
+
+def _ensure_column(worksheet, header_row: int, columns: dict[str, int], name: str) -> int:
+    if name in columns:
+        return columns[name]
+
+    column_number = worksheet.max_column + 1
+    worksheet.cell(header_row, column_number).value = name
+    columns[name] = column_number
+    return column_number
+
+
 def create_single_customer_workbook(
     cumulative_path: Path,
     destination_dir: Path,
     selected_row: pd.Series,
     manager_name: str = "",
+    matching_preferences: dict[str, Any] | None = None,
 ) -> Path:
     """
     기존 누적 고객DB를 복사한 뒤 고객DB 시트만 선택 고객 1행으로 필터링한다.
@@ -233,6 +257,118 @@ def create_single_customer_workbook(
         worksheet.cell(header_row + 1, manager_column).value = (
             manager_name.strip()
         )
+
+    preferences = dict(matching_preferences or {})
+    if preferences:
+        keyword_column = _ensure_column(
+            worksheet,
+            header_row,
+            columns,
+            "키워드메모",
+        )
+        memo_column = _ensure_column(
+            worksheet,
+            header_row,
+            columns,
+            "비고",
+        )
+        topic_columns = [
+            _ensure_column(
+                worksheet,
+                header_row,
+                columns,
+                f"희망상담주제{index}",
+            )
+            for index in range(1, 4)
+        ]
+        purpose_columns = [
+            _ensure_column(
+                worksheet,
+                header_row,
+                columns,
+                f"희망자금용도{index}",
+            )
+            for index in range(1, 4)
+        ]
+
+        matching_keywords = preferences.get("매칭키워드", []) or []
+        interest_fields = preferences.get("관심지원분야", []) or []
+        exclusion_keywords = preferences.get("제외키워드", []) or []
+        fund_purpose = str(
+            preferences.get("자금사용목적", "") or ""
+        ).strip()
+
+        keyword_text = ", ".join(
+            [str(item).strip() for item in matching_keywords + interest_fields if str(item).strip()]
+        )
+        if keyword_text:
+            current = worksheet.cell(
+                header_row + 1,
+                keyword_column,
+            ).value
+            worksheet.cell(
+                header_row + 1,
+                keyword_column,
+            ).value = _append_text(current, keyword_text)
+
+        for column_number, value in zip(
+            topic_columns,
+            list(interest_fields)[:3],
+        ):
+            worksheet.cell(header_row + 1, column_number).value = value
+
+        purpose_values = []
+        if fund_purpose:
+            purpose_values.append(fund_purpose)
+        purpose_values.extend(
+            [
+                str(item).strip()
+                for item in interest_fields
+                if str(item).strip()
+            ]
+        )
+
+        for column_number, value in zip(
+            purpose_columns,
+            purpose_values[:3],
+        ):
+            worksheet.cell(header_row + 1, column_number).value = value
+
+        memo_parts = []
+        if exclusion_keywords:
+            memo_parts.append(
+                "제외키워드: "
+                + ", ".join(
+                    str(item).strip()
+                    for item in exclusion_keywords
+                    if str(item).strip()
+                )
+            )
+
+        planned_amount = str(
+            preferences.get("투자예정금액", "") or ""
+        ).strip()
+        planned_timing = str(
+            preferences.get("투자예정시기", "") or ""
+        ).strip()
+
+        if planned_amount:
+            memo_parts.append(f"투자예정금액: {planned_amount}")
+        if planned_timing:
+            memo_parts.append(f"투자예정시기: {planned_timing}")
+
+        if memo_parts:
+            current = worksheet.cell(
+                header_row + 1,
+                memo_column,
+            ).value
+            worksheet.cell(
+                header_row + 1,
+                memo_column,
+            ).value = _append_text(
+                current,
+                " / ".join(memo_parts),
+            )
 
     workbook.save(destination)
     return destination

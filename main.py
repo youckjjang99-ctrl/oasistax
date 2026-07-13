@@ -864,6 +864,35 @@ def make_consulting_comment(row):
     return " ".join(parts)
 
 
+def get_customer_exclusion_keywords(customer):
+    values = []
+
+    direct = safe_str(customer.get("제외키워드", ""))
+    if direct:
+        values += split_keywords(direct)
+
+    memo = safe_str(customer.get("비고", ""))
+    match = re.search(
+        r"제외키워드\s*[:：]\s*(.+?)(?:/|투자예정금액|투자예정시기|$)",
+        memo,
+    )
+    if match:
+        values += split_keywords(match.group(1))
+
+    return list(dict.fromkeys(
+        keyword.strip()
+        for keyword in values
+        if keyword and keyword.strip()
+    ))
+
+
+def should_exclude_by_user_keywords(customer, program_text):
+    for keyword in get_customer_exclusion_keywords(customer):
+        if keyword and keyword in safe_str(program_text):
+            return True
+    return False
+
+
 # =========================================================
 # 5. 점수 산정
 # =========================================================
@@ -884,6 +913,10 @@ def score_api_program(customer, program):
     )
 
     if not ok:
+        return None
+
+    # 사용자가 지정한 제외키워드가 공고문에 포함되면 추천에서 제외
+    if should_exclude_by_user_keywords(customer, text):
         return None
 
     # 업종-공고 성격이 명확히 어긋나는 경우 추천 제외
@@ -979,6 +1012,9 @@ def score_policy_program(customer, program):
     if check_excluded(customer, program.get("제외업종", "")):
         return None
 
+    if should_exclude_by_user_keywords(customer, text):
+        return None
+
     score = max(region_score, 0)
     reasons = [f"지역: {region_type}"]
     checks = []
@@ -1070,6 +1106,9 @@ def score_employment_program(customer, emp):
         return None
 
     if check_excluded(customer, emp.get("제외업종", "")):
+        return None
+
+    if should_exclude_by_user_keywords(customer, text):
         return None
 
     score = max(region_score, 0)

@@ -17,6 +17,12 @@ from registered_policy_match import (
     customer_preview,
     create_single_customer_workbook,
 )
+from matching_preferences import (
+    INTEREST_OPTIONS,
+    get_matching_preferences,
+    save_matching_preferences,
+    preference_summary,
+)
 from stock_valuation import (
     render_stock_valuation_page,
     save_cretop_financial_snapshot,
@@ -1374,6 +1380,106 @@ elif active_tab == "고객DB 업로드/매칭":
                 + ", ".join(missing_fields)
             )
 
+        selected_business_no = selected_customer_row.get(
+            "사업자등록번호",
+            "",
+        )
+        saved_preferences = get_matching_preferences(
+            CURRENT_USER_ID,
+            selected_business_no,
+        )
+
+        st.markdown("#### 고객별 매칭설정")
+        st.caption(
+            "입력한 키워드는 선택 고객용 임시 매칭파일에만 반영되며 "
+            "기존 고객DB 원본은 수정하지 않습니다."
+        )
+
+        matching_keywords_text = st.text_area(
+            "매칭키워드",
+            value=", ".join(
+                saved_preferences.get("매칭키워드", []) or []
+            ),
+            placeholder="예: 골재운송, 중장비, 차량구매, 운전자금",
+            key=f"policy_match_keywords_{selected_customer_index}",
+            height=80,
+        )
+
+        selected_interests = st.multiselect(
+            "관심지원분야",
+            INTEREST_OPTIONS,
+            default=[
+                item
+                for item in (
+                    saved_preferences.get("관심지원분야", []) or []
+                )
+                if item in INTEREST_OPTIONS
+            ],
+            key=f"policy_interest_fields_{selected_customer_index}",
+        )
+
+        exclusion_keywords_text = st.text_area(
+            "제외키워드",
+            value=", ".join(
+                saved_preferences.get("제외키워드", []) or []
+            ),
+            placeholder="예: 온라인마케팅, 수출, 스마트공장",
+            key=f"policy_exclusion_keywords_{selected_customer_index}",
+            height=70,
+        )
+
+        p1, p2, p3 = st.columns(3)
+        with p1:
+            fund_purpose = st.text_input(
+                "자금사용목적",
+                value=str(
+                    saved_preferences.get("자금사용목적", "") or ""
+                ),
+                placeholder="예: 차량 교체",
+                key=f"policy_fund_purpose_{selected_customer_index}",
+            )
+        with p2:
+            planned_amount = st.text_input(
+                "투자예정금액",
+                value=str(
+                    saved_preferences.get("투자예정금액", "") or ""
+                ),
+                placeholder="예: 2억원",
+                key=f"policy_planned_amount_{selected_customer_index}",
+            )
+        with p3:
+            planned_timing = st.text_input(
+                "투자예정시기",
+                value=str(
+                    saved_preferences.get("투자예정시기", "") or ""
+                ),
+                placeholder="예: 2026년 하반기",
+                key=f"policy_planned_timing_{selected_customer_index}",
+            )
+
+        if st.button(
+            "고객별 매칭설정 저장",
+            key=f"policy_save_preferences_{selected_customer_index}",
+            width='stretch',
+        ):
+            try:
+                saved_preferences = save_matching_preferences(
+                    CURRENT_USER_ID,
+                    selected_business_no,
+                    company_name=str(
+                        selected_customer_row.get("업체명", "") or ""
+                    ),
+                    matching_keywords=matching_keywords_text,
+                    interest_fields=selected_interests,
+                    exclusion_keywords=exclusion_keywords_text,
+                    fund_purpose=fund_purpose,
+                    planned_amount=planned_amount,
+                    planned_timing=planned_timing,
+                )
+                st.success("고객별 정책자금 매칭설정을 저장했습니다.")
+            except Exception as exc:
+                st.error(f"매칭설정 저장 중 오류가 발생했습니다: {exc}")
+
         registered_manager_name = st.text_input(
             "담당자명",
             value=CURRENT_USER_NAME or "",
@@ -1397,11 +1503,26 @@ elif active_tab == "고객DB 업로드/매칭":
                     with st.spinner(
                         "선택 고객용 매칭파일을 만들고 정책자금을 분석 중입니다..."
                     ):
+                        current_preferences = save_matching_preferences(
+                            CURRENT_USER_ID,
+                            selected_business_no,
+                            company_name=str(
+                                selected_customer_row.get("업체명", "") or ""
+                            ),
+                            matching_keywords=matching_keywords_text,
+                            interest_fields=selected_interests,
+                            exclusion_keywords=exclusion_keywords_text,
+                            fund_purpose=fund_purpose,
+                            planned_amount=planned_amount,
+                            planned_timing=planned_timing,
+                        )
+
                         single_customer_path = create_single_customer_workbook(
-                            cumulative_db_path=cumulative_db_path,
+                            cumulative_path=cumulative_db_path,
                             destination_dir=USER_UPLOAD_DIR,
                             selected_row=selected_customer_row,
                             manager_name=registered_manager_name,
+                            matching_preferences=current_preferences,
                         )
 
                         # 기존 main.py 매칭 엔진 호환용 임시파일.
@@ -1973,6 +2094,98 @@ elif active_tab == "크레탑 자동등록":
                 else:
                     st.caption("분석 로그가 없습니다.")
 
+            st.markdown("#### 3. 정책자금 매칭설정")
+            st.caption(
+                "이 설정은 별도 파일에 저장되며 기존 고객DB 양식은 변경하지 않습니다."
+            )
+
+            cretop_business_no = extracted_data.get(
+                "사업자등록번호",
+                "",
+            )
+            cretop_saved_preferences = get_matching_preferences(
+                CURRENT_USER_ID,
+                cretop_business_no,
+            )
+
+            cretop_matching_keywords = st.text_area(
+                "매칭키워드",
+                value=", ".join(
+                    cretop_saved_preferences.get("매칭키워드", []) or []
+                ),
+                placeholder="예: 시설투자, 차량구매, 운전자금, 신규채용",
+                key="cretop_matching_keywords",
+                height=80,
+            )
+
+            cretop_interest_fields = st.multiselect(
+                "관심지원분야",
+                INTEREST_OPTIONS,
+                default=[
+                    item
+                    for item in (
+                        cretop_saved_preferences.get(
+                            "관심지원분야",
+                            [],
+                        )
+                        or []
+                    )
+                    if item in INTEREST_OPTIONS
+                ],
+                key="cretop_interest_fields",
+            )
+
+            cretop_exclusion_keywords = st.text_area(
+                "제외키워드",
+                value=", ".join(
+                    cretop_saved_preferences.get("제외키워드", []) or []
+                ),
+                placeholder="예: 온라인마케팅, 수출, 스마트공장",
+                key="cretop_exclusion_keywords",
+                height=70,
+            )
+
+            cp1, cp2, cp3 = st.columns(3)
+            with cp1:
+                cretop_fund_purpose = st.text_input(
+                    "자금사용목적",
+                    value=str(
+                        cretop_saved_preferences.get(
+                            "자금사용목적",
+                            "",
+                        )
+                        or ""
+                    ),
+                    placeholder="예: 운전자금",
+                    key="cretop_fund_purpose",
+                )
+            with cp2:
+                cretop_planned_amount = st.text_input(
+                    "투자예정금액",
+                    value=str(
+                        cretop_saved_preferences.get(
+                            "투자예정금액",
+                            "",
+                        )
+                        or ""
+                    ),
+                    placeholder="예: 3억원",
+                    key="cretop_planned_amount",
+                )
+            with cp3:
+                cretop_planned_timing = st.text_input(
+                    "투자예정시기",
+                    value=str(
+                        cretop_saved_preferences.get(
+                            "투자예정시기",
+                            "",
+                        )
+                        or ""
+                    ),
+                    placeholder="예: 6개월 이내",
+                    key="cretop_planned_timing",
+                )
+
             add_customer_clicked = st.button(
                 "내 누적 고객DB에 추가",
                 width='stretch',
@@ -1995,6 +2208,26 @@ elif active_tab == "크레탑 자동등록":
                     )
 
                 if saved_count > 0:
+                    try:
+                        save_matching_preferences(
+                            CURRENT_USER_ID,
+                            cretop_business_no,
+                            company_name=str(
+                                extracted_data.get("업체명", "") or ""
+                            ),
+                            matching_keywords=cretop_matching_keywords,
+                            interest_fields=cretop_interest_fields,
+                            exclusion_keywords=cretop_exclusion_keywords,
+                            fund_purpose=cretop_fund_purpose,
+                            planned_amount=cretop_planned_amount,
+                            planned_timing=cretop_planned_timing,
+                        )
+                    except Exception as preference_error:
+                        st.warning(
+                            "고객은 등록됐지만 매칭설정 저장에 실패했습니다: "
+                            f"{preference_error}"
+                        )
+
                     total_count = count_user_cumulative_rows(CURRENT_USER_ID)
                     st.success(f"{message} 현재 누적 고객 수: {total_count}건")
                     st.session_state["cretop_last_message"] = message
