@@ -15,6 +15,7 @@ TABLE_FINANCIALS = "oasis_financials"
 TABLE_REGISTRY = "oasis_registry"
 TABLE_STOCK = "oasis_stock_valuations"
 TABLE_MIGRATIONS = "oasis_migration_runs"
+TABLE_MATCHING_PREFERENCES = "oasis_matching_preferences"
 
 
 def normalize_business_no(value: Any) -> str:

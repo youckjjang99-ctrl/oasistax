@@ -11,6 +11,12 @@ from ui import apply_oasis_ui
 from maintenance import render_system_management_page
 from cretop_runner import run_cretop_worker
 from cloud_admin import render_cloud_database_page
+from cloud_sync import (
+    get_cloud_sync_status,
+    retry_cloud_sync_queue,
+    sync_customer_snapshot,
+    sync_crm_record,
+)
 from registered_policy_match import (
     load_registered_customers,
     build_customer_labels,
@@ -1183,6 +1189,15 @@ def render_customer_management_page(user_id):
             event_detail=detail,
         )
         if ok:
+            updated_crm = get_customer_record(
+                user_id,
+                selected_key,
+            )
+            sync_crm_record(
+                user_id,
+                selected_biz,
+                updated_crm,
+            )
             st.success(msg)
             st.rerun()
         else:
@@ -1195,8 +1210,22 @@ def render_customer_management_page(user_id):
             if not tl_title.strip() and not tl_detail.strip():
                 st.warning("저장할 내용을 입력해주세요.")
             else:
-                ok, msg = append_timeline_event(user_id, selected_key, tl_title.strip() or "상담이력", tl_detail.strip())
+                ok, msg = append_timeline_event(
+                    user_id,
+                    selected_key,
+                    tl_title.strip() or "상담이력",
+                    tl_detail.strip(),
+                )
                 if ok:
+                    updated_crm = get_customer_record(
+                        user_id,
+                        selected_key,
+                    )
+                    sync_crm_record(
+                        user_id,
+                        selected_biz,
+                        updated_crm,
+                    )
                     st.success(msg)
                     st.rerun()
                 else:
@@ -2228,6 +2257,13 @@ elif active_tab == "크레탑 자동등록":
                             f"{preference_error}"
                         )
 
+                    sync_customer_snapshot(
+                        CURRENT_USER_ID,
+                        extracted_data,
+                        source="cretop_registration",
+                        manager_name=CURRENT_USER_NAME,
+                    )
+
                     total_count = count_user_cumulative_rows(CURRENT_USER_ID)
                     st.success(f"{message} 현재 누적 고객 수: {total_count}건")
                     st.session_state["cretop_last_message"] = message
@@ -2321,6 +2357,31 @@ elif CURRENT_USER_IS_ADMIN and active_tab == "클라우드 DB 관리":
         CURRENT_USER_ID,
         CURRENT_USER_NAME,
     )
+
+    sync_status = get_cloud_sync_status(CURRENT_USER_ID)
+    st.markdown("### 실시간 이중저장 상태")
+    s1, s2 = st.columns(2)
+    s1.metric(
+        "Supabase 설정",
+        "연결됨" if sync_status["configured"] else "미설정",
+    )
+    s2.metric("동기화 대기", f"{sync_status['queued']}건")
+
+    if st.button(
+        "동기화 대기자료 다시 전송",
+        width='stretch',
+        key="retry_cloud_sync_queue_button",
+    ):
+        result = retry_cloud_sync_queue(CURRENT_USER_ID)
+        if result["failed"] == 0:
+            st.success(
+                f"대기자료 {result['success']}건을 모두 전송했습니다."
+            )
+        else:
+            st.warning(
+                f"{result['success']}건 성공, "
+                f"{result['failed']}건은 대기 중입니다."
+            )
 
 st.markdown("""
 <div class="oasis-footer">

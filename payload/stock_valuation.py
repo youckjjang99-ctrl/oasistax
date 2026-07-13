@@ -12,6 +12,11 @@ import streamlit as st
 
 from cretop_runner import run_cretop_worker
 from registry_runner import run_registry_worker
+from cloud_sync import (
+    sync_financial_snapshot,
+    sync_registry_snapshot,
+    sync_stock_valuation,
+)
 from utils import get_user_cumulative_db_path, get_user_dirs
 
 
@@ -121,6 +126,7 @@ def save_cretop_financial_snapshot(
         "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     _save_financial_cache(user_id, cache)
+    sync_financial_snapshot(user_id, business_no, cache[business_no])
     return True
 
 
@@ -458,6 +464,7 @@ def _save_registry_cache(
         json.dumps(cache, ensure_ascii=False, indent=2, default=str),
         encoding="utf-8",
     )
+    sync_registry_snapshot(user_id, business_no, cache[key])
 
 
 def _apply_registry_data(data: dict[str, Any]) -> None:
@@ -1189,8 +1196,11 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
                 records.insert(0, record)
 
             _save_records(user_id, records)
+            sync_stock_valuation(user_id, record)
             st.session_state["stock_loaded_record_id"] = record["record_id"]
-            st.success("주가평가 자료를 별도 파일에 저장했습니다.")
+            st.success(
+                "주가평가 자료를 로컬 파일과 Supabase에 동시 저장했습니다."
+            )
 
     with st.expander("평가 로직과 법령 적용 안내", expanded=False):
         st.markdown(

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from utils import get_user_dirs
+from cloud_sync import sync_matching_preferences
 
 
 INTEREST_OPTIONS = [
@@ -111,6 +112,7 @@ def save_matching_preferences(
     }
     data[key] = record
     _save_all(user_id, data)
+    sync_matching_preferences(user_id, key, record)
     return record
 
 
