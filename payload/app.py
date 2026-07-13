@@ -10,7 +10,10 @@ from pathlib import Path
 from ui import apply_oasis_ui
 from maintenance import render_system_management_page
 from cretop_runner import run_cretop_worker
-from stock_valuation import render_stock_valuation_page
+from stock_valuation import (
+    render_stock_valuation_page,
+    save_cretop_financial_snapshot,
+)
 from crm import (
     STATUS_OPTIONS, ACTION_OPTIONS, make_customer_key, get_customer_record,
     upsert_customer_record, append_timeline_event, get_crm_summary,
@@ -1652,6 +1655,12 @@ elif active_tab == "크레탑 자동등록":
                 )
 
             # 작은 JSON 결과만 세션에 보관
+            if not extract_error and extracted_data:
+                save_cretop_financial_snapshot(
+                    CURRENT_USER_ID,
+                    extracted_data,
+                )
+
             st.session_state["cretop_pdf_hash"] = pdf_hash
             st.session_state["cretop_pdf_save_path"] = str(pdf_save_path)
             st.session_state["cretop_extracted_data"] = dict(extracted_data or {})

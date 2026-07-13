@@ -32,6 +32,19 @@ def _safe_number(value: Any) -> float | None:
         return None
 
 
+def _ensure_text_state(key: str, default: Any = "") -> None:
+    """Streamlit text_input state must always be str or None."""
+    if key not in st.session_state:
+        st.session_state[key] = "" if default is None else str(default)
+        return
+
+    value = st.session_state.get(key)
+    if value is None:
+        st.session_state[key] = ""
+    elif not isinstance(value, str):
+        st.session_state[key] = str(value)
+
+
 def _format_number(value: Any, decimals: int = 0) -> str:
     number = _safe_number(value)
     if number is None:
@@ -46,6 +59,160 @@ def _normalize_business_no(value: Any) -> str:
     if len(digits) == 10:
         return f"{digits[:3]}-{digits[3:5]}-{digits[5:]}"
     return str(value or "").strip()
+
+
+def _financial_cache_path(user_id: str) -> Path:
+    dirs = get_user_dirs(user_id)
+    return dirs["base"] / "stock_financial_cache.json"
+
+
+def _load_financial_cache(user_id: str) -> dict[str, Any]:
+    path = _financial_cache_path(user_id)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_financial_cache(user_id: str, data: dict[str, Any]) -> None:
+    path = _financial_cache_path(user_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+
+
+def save_cretop_financial_snapshot(
+    user_id: str,
+    extracted_data: dict[str, Any],
+) -> bool:
+    """
+    Cretop analysis result is saved separately for stock valuation.
+    Existing customer DB is never modified.
+    """
+    data = dict(extracted_data or {})
+    business_no = _normalize_business_no(
+        data.get("사업자등록번호", data.get("사업자번호", ""))
+    )
+    if len(re.sub(r"[^0-9]", "", business_no)) != 10:
+        return False
+
+    cache = _load_financial_cache(user_id)
+    cache[business_no] = {
+        "업체명": data.get("업체명", ""),
+        "대표자명": data.get("대표자명", ""),
+        "사업자등록번호": business_no,
+        "법인등록번호": data.get("법인등록번호", ""),
+        "사업장 소재지": data.get("사업장 소재지", ""),
+        "설립일": data.get("설립일", ""),
+        "자산총계": data.get("자산총계"),
+        "부채총계": data.get("부채총계"),
+        "자본총계": data.get("자본총계"),
+        "매출액": data.get("매출액"),
+        "영업이익": data.get("영업이익"),
+        "당기순이익": data.get("당기순이익"),
+        "재무연도별": data.get("재무연도별", []),
+        "PDF추출일시": data.get("PDF추출일시", ""),
+        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    _save_financial_cache(user_id, cache)
+    return True
+
+
+def _apply_customer_financial_data(
+    user_id: str,
+    row: pd.Series,
+) -> tuple[bool, str]:
+    """
+    Load stock valuation inputs from existing customer DB and the separate
+    Cretop financial cache.
+    """
+    defaults = _customer_defaults(row)
+
+    st.session_state["stock_company_name"] = str(defaults.get("법인명", "") or "")
+    st.session_state["stock_business_no"] = str(
+        defaults.get("사업자등록번호", "") or ""
+    )
+    st.session_state["stock_corporate_no"] = str(
+        defaults.get("법인등록번호", "") or ""
+    )
+    st.session_state["stock_address"] = str(defaults.get("본점소재지", "") or "")
+    st.session_state["stock_establishment"] = str(
+        defaults.get("설립일", "") or ""
+    )
+    st.session_state["stock_total_assets"] = _format_number(
+        defaults.get("총자산")
+    )
+    st.session_state["stock_total_liabilities"] = _format_number(
+        defaults.get("총부채")
+    )
+
+    business_no = _normalize_business_no(defaults.get("사업자등록번호", ""))
+    cache = _load_financial_cache(user_id)
+    snapshot = cache.get(business_no, {}) if business_no else {}
+
+    if snapshot:
+        st.session_state["stock_company_name"] = str(
+            snapshot.get("업체명") or st.session_state["stock_company_name"]
+        )
+        st.session_state["stock_corporate_no"] = str(
+            snapshot.get("법인등록번호")
+            or st.session_state["stock_corporate_no"]
+        )
+        st.session_state["stock_address"] = str(
+            snapshot.get("사업장 소재지")
+            or st.session_state["stock_address"]
+        )
+        st.session_state["stock_establishment"] = str(
+            snapshot.get("설립일")
+            or st.session_state["stock_establishment"]
+        )
+        st.session_state["stock_total_assets"] = _format_number(
+            snapshot.get("자산총계")
+        ) or st.session_state["stock_total_assets"]
+        st.session_state["stock_total_liabilities"] = _format_number(
+            snapshot.get("부채총계")
+        ) or st.session_state["stock_total_liabilities"]
+
+        history = snapshot.get("재무연도별", [])
+        history = sorted(
+            [item for item in history if isinstance(item, dict)],
+            key=lambda item: item.get("연도", 0),
+            reverse=True,
+        )[:3]
+
+        for index in range(1, 4):
+            st.session_state[f"stock_year_{index}"] = ""
+            st.session_state[f"stock_net_income_{index}"] = ""
+            st.session_state[f"stock_shares_{index}"] = ""
+
+        for index, item in enumerate(history, start=1):
+            st.session_state[f"stock_year_{index}"] = str(
+                item.get("연도", "") or ""
+            )
+            st.session_state[f"stock_net_income_{index}"] = _format_number(
+                item.get("당기순이익")
+            )
+
+        return True, "기존 고객DB와 크레탑 재무 캐시에서 정보를 불러왔습니다."
+
+    # Legacy customer: use only latest flat financial values.
+    latest_net_income = defaults.get("최근당기순이익")
+    if latest_net_income not in (None, ""):
+        st.session_state["stock_year_1"] = str(datetime.now().year - 1)
+        st.session_state["stock_net_income_1"] = _format_number(
+            latest_net_income
+        )
+
+    return (
+        True,
+        "기존 고객DB에서 기본 재무정보를 불러왔습니다. "
+        "과거 3개년 정보가 없으면 크레탑 PDF를 한 번 분석해주세요.",
+    )
 
 
 def _storage_path(user_id: str) -> Path:
@@ -287,7 +454,7 @@ def _apply_loaded_record(record: dict[str, Any]) -> None:
     )
 
     for index, row in enumerate(record.get("annual_rows", [])[:3], start=1):
-        st.session_state[f"stock_year_{index}"] = row.get("year", "")
+        st.session_state[f"stock_year_{index}"] = str(row.get("year", "") or "")
         st.session_state[f"stock_net_income_{index}"] = _format_number(
             row.get("adjusted_net_income")
         )
@@ -345,26 +512,22 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
         if selected_label != "직접 입력":
             selected_row = customers.loc[row_map[selected_label]]
             selector_key = f"{selected_label}:{row_map[selected_label]}"
-            if st.session_state.get("stock_last_customer_key") != selector_key:
-                defaults = _customer_defaults(selected_row)
-                st.session_state["stock_company_name"] = defaults.get("법인명", "")
-                st.session_state["stock_business_no"] = defaults.get(
-                    "사업자등록번호", ""
+            st.session_state["stock_last_customer_key"] = selector_key
+
+            if st.button(
+                "기존 고객DB에서 재무정보 불러오기",
+                key="stock_load_customer_financials",
+                use_container_width=True,
+            ):
+                loaded, message = _apply_customer_financial_data(
+                    user_id,
+                    selected_row,
                 )
-                st.session_state["stock_corporate_no"] = defaults.get(
-                    "법인등록번호", ""
-                )
-                st.session_state["stock_address"] = defaults.get("본점소재지", "")
-                st.session_state["stock_establishment"] = defaults.get(
-                    "설립일", ""
-                )
-                st.session_state["stock_total_assets"] = _format_number(
-                    defaults.get("총자산")
-                )
-                st.session_state["stock_total_liabilities"] = _format_number(
-                    defaults.get("총부채")
-                )
-                st.session_state["stock_last_customer_key"] = selector_key
+                if loaded:
+                    st.success(message)
+                    st.rerun()
+                else:
+                    st.error(message)
 
     with st.expander("크레탑 PDF에서 재무정보 불러오기", expanded=False):
         uploaded_pdf = st.file_uploader(
@@ -423,7 +586,7 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
                     reverse=True,
                 )[:3]
                 for index, row in enumerate(history, start=1):
-                    st.session_state[f"stock_year_{index}"] = row.get("연도", "")
+                    st.session_state[f"stock_year_{index}"] = str(row.get("연도", "") or "")
                     st.session_state[f"stock_net_income_{index}"] = _format_number(
                         row.get("당기순이익")
                     )
@@ -520,22 +683,28 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
 
     for index, column in enumerate(annual_columns, start=1):
         with column:
+            year_key = f"stock_year_{index}"
+            _ensure_text_state(
+                year_key,
+                str(current_year - index + 1),
+            )
             year = st.text_input(
                 f"{index}번째 연도",
-                value=st.session_state.get(
-                    f"stock_year_{index}",
-                    str(current_year - index + 1),
-                ),
-                key=f"stock_year_{index}",
+                key=year_key,
             )
+            net_income_key = f"stock_net_income_{index}"
+            shares_key = f"stock_shares_{index}"
+            _ensure_text_state(net_income_key, "")
+            _ensure_text_state(shares_key, "")
+
             adjusted_net_income = st.text_input(
                 "세법상 조정 후 순손익액(원)",
-                key=f"stock_net_income_{index}",
+                key=net_income_key,
                 placeholder="공란이면 직접 입력",
             )
             shares = st.text_input(
                 "해당 연도 발행주식총수(주)",
-                key=f"stock_shares_{index}",
+                key=shares_key,
                 placeholder="공란이면 현재 주식수 적용",
             )
             annual_rows.append({
