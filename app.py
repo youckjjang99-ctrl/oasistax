@@ -29,7 +29,7 @@ from utils import (
     get_user_dirs, get_user_cumulative_db_path, append_user_customer_db,
     append_cretop_to_user_customer_db,
     check_user_customer_duplicate, link_business_no_to_legacy_customer,
-    ensure_user_cumulative_db_format,
+    ensure_user_cumulative_db_format, update_user_customer_record,
     count_user_cumulative_rows
 )
 
@@ -714,6 +714,26 @@ def render_customer_management_page(user_id):
     with m4:
         st.metric("신청/계약", f"{crm_summary.get('신청완료', 0) + crm_summary.get('계약완료', 0)}건")
 
+    due_summary = get_due_action_summary(user_id)
+    st.markdown("#### 후속관리 알림")
+    d1, d2, d3 = st.columns(3)
+    d1.metric("오늘 연락", f"{len(due_summary.get('today', []))}건")
+    d2.metric("기한 경과", f"{len(due_summary.get('overdue', []))}건")
+    d3.metric("7일 이내 예정", f"{len(due_summary.get('week', []))}건")
+
+    alert_rows = (
+        due_summary.get("overdue", [])
+        + due_summary.get("today", [])
+        + due_summary.get("week", [])
+    )
+    if alert_rows:
+        with st.expander("후속관리 대상 고객 보기", expanded=False):
+            st.dataframe(
+                pd.DataFrame(alert_rows),
+                hide_index=True,
+                width='stretch',
+            )
+
     st.markdown("#### 고객 검색/필터")
     f1, f2 = st.columns([2, 1])
     with f1:
@@ -819,6 +839,161 @@ def render_customer_management_page(user_id):
                     st.write(f"**{col}**")
                     st.write(str(val))
 
+    with st.expander("고객 기본정보 직접 수정", expanded=False):
+        edit_left, edit_right = st.columns(2)
+        with edit_left:
+            edit_company = st.text_input(
+                "업체명",
+                value=format_customer_display_value(selected_row.get("업체명", "")),
+                key=f"edit_company_{selected_idx}",
+            )
+            edit_representative = st.text_input(
+                "대표자명",
+                value=format_customer_display_value(selected_row.get("대표자명", "")),
+                key=f"edit_representative_{selected_idx}",
+            )
+            edit_business_no = st.text_input(
+                "사업자등록번호",
+                value=format_customer_display_value(selected_row.get("사업자등록번호", "")),
+                key=f"edit_business_no_{selected_idx}",
+            )
+            edit_industry = st.text_input(
+                "업종명",
+                value=format_customer_display_value(selected_row.get("업종명", "")),
+                key=f"edit_industry_{selected_idx}",
+            )
+            edit_address = st.text_area(
+                "사업장 소재지",
+                value=format_customer_display_value(selected_row.get("사업장 소재지", "")),
+                height=90,
+                key=f"edit_address_{selected_idx}",
+            )
+        with edit_right:
+            edit_employee = st.text_input(
+                "종업원수",
+                value=format_customer_display_value(
+                    selected_row.get("종업원수", selected_row.get("상시근로자수", ""))
+                ),
+                key=f"edit_employee_{selected_idx}",
+            )
+            edit_sales = st.text_input(
+                "매출액",
+                value=format_customer_display_value(selected_row.get("매출액", ""), number=True),
+                key=f"edit_sales_{selected_idx}",
+            )
+            edit_operating = st.text_input(
+                "영업이익",
+                value=format_customer_display_value(selected_row.get("영업이익", ""), number=True),
+                key=f"edit_operating_{selected_idx}",
+            )
+            edit_net = st.text_input(
+                "당기순이익",
+                value=format_customer_display_value(selected_row.get("당기순이익", ""), number=True),
+                key=f"edit_net_{selected_idx}",
+            )
+            edit_establishment = st.text_input(
+                "설립일",
+                value=format_customer_display_value(
+                    selected_row.get("설립일", selected_row.get("설립년도", ""))
+                ),
+                placeholder="YYYY-MM-DD",
+                key=f"edit_establishment_{selected_idx}",
+            )
+
+        if st.button(
+            "고객 기본정보 저장",
+            key=f"save_customer_edit_{selected_idx}",
+            width='stretch',
+        ):
+            def parse_numeric_input(value):
+                text = str(value or "").replace(",", "").strip()
+                if not text:
+                    return ""
+                try:
+                    return int(float(text))
+                except ValueError:
+                    return text
+
+            update_values = {
+                "업체명": edit_company,
+                "대표자명": edit_representative,
+                "사업자등록번호": edit_business_no,
+                "업종명": edit_industry,
+                "사업장 소재지": edit_address,
+                "종업원수": parse_numeric_input(edit_employee),
+                "매출액": parse_numeric_input(edit_sales),
+                "영업이익": parse_numeric_input(edit_operating),
+                "당기순이익": parse_numeric_input(edit_net),
+                "설립일": edit_establishment,
+            }
+            ok, msg = update_user_customer_record(
+                user_id,
+                selected_idx,
+                update_values,
+            )
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+
+    st.markdown("##### AI 기업분석 카드")
+    analysis_points = []
+    risk_points = []
+    question_points = []
+
+    employee_number = selected_row.get("종업원수", selected_row.get("상시근로자수", ""))
+    try:
+        employee_number = int(float(str(employee_number).replace(",", "")))
+    except Exception:
+        employee_number = 0
+
+    sales_number = selected_row.get("매출액", selected_row.get("연매출", ""))
+    try:
+        sales_number = int(float(str(sales_number).replace(",", "")))
+    except Exception:
+        sales_number = 0
+
+    industry_text = str(selected_row.get("업종명", "") or "")
+    if sales_number:
+        analysis_points.append(f"최근 확인 매출액은 {sales_number:,}원입니다.")
+    if employee_number:
+        analysis_points.append(f"종업원수는 {employee_number:,}명입니다.")
+    if any(word in industry_text for word in ["제조", "건설", "운송", "물류"]):
+        analysis_points.append("시설·운전자금 및 보증기관 연계 검토 가치가 있습니다.")
+    if str(selected_row.get("벤처", "")).upper() == "Y":
+        analysis_points.append("벤처기업 우대가 가능한 사업을 우선 검토할 수 있습니다.")
+    if str(selected_row.get("기업부설연구소", "")).upper() == "Y" or str(selected_row.get("연구개발전담부서", "")).upper() == "Y":
+        analysis_points.append("R&D 및 기술개발 지원사업 검토에 유리한 요소가 있습니다.")
+    if not format_customer_display_value(selected_row.get("당기순이익", "")):
+        risk_points.append("당기순이익이 비어 있어 재무건전성 판단 전 확인이 필요합니다.")
+    if not format_customer_display_value(selected_row.get("사업장 소재지", "")):
+        risk_points.append("사업장 소재지가 비어 있어 지역 제한 사업 매칭 전 보완이 필요합니다.")
+    if not format_customer_display_value(selected_row.get("설립일", selected_row.get("설립년도", ""))):
+        risk_points.append("설립일이 비어 있어 업력 요건 확인이 필요합니다.")
+
+    question_points.extend([
+        "최근 1년 이내 시설·기계·차량 투자계획이 있나요?",
+        "향후 6개월 내 신규채용 또는 고용유지 계획이 있나요?",
+        "기존 정책자금·보증기관 대출 잔액과 만기는 어떻게 되나요?",
+    ])
+
+    a1, a2, a3 = st.columns(3)
+    with a1:
+        st.markdown("**검토 포인트**")
+        for item in analysis_points or ["현재 입력정보를 기준으로 추가 검토가 필요합니다."]:
+            st.write(f"• {item}")
+    with a2:
+        st.markdown("**확인 필요사항**")
+        for item in risk_points or ["현재 주요 누락정보는 확인되지 않았습니다."]:
+            st.write(f"• {item}")
+    with a3:
+        st.markdown("**대표 질문**")
+        for item in question_points:
+            st.write(f"• {item}")
+
+    st.caption("기업분석 카드는 현재 고객DB 값에 따른 규칙 기반 사전 검토입니다. 최종 추천은 정책자금 매칭 결과와 함께 판단합니다.")
+
     st.markdown("##### CRM 관리")
     with st.form(key=f"crm_form_{selected_key}"):
         c1, c2, c3 = st.columns([1, 1, 1])
@@ -831,7 +1006,18 @@ def render_customer_management_page(user_id):
             action_idx = ACTION_OPTIONS.index(current_action) if current_action in ACTION_OPTIONS else len(ACTION_OPTIONS) - 1
             new_action = st.selectbox("다음 액션", ACTION_OPTIONS, index=action_idx)
         with c3:
-            new_next_date = st.text_input("다음 예정일", value=str(crm_record.get("next_date", "") or ""), placeholder="예: 2026-07-15")
+            from datetime import date, datetime
+            raw_next_date = str(crm_record.get("next_date", "") or "")
+            try:
+                default_next_date = datetime.strptime(raw_next_date[:10], "%Y-%m-%d").date()
+            except ValueError:
+                default_next_date = None
+            selected_next_date = st.date_input(
+                "다음 예정일",
+                value=default_next_date,
+                key=f"crm_next_date_{selected_key}",
+            )
+            new_next_date = selected_next_date.strftime("%Y-%m-%d") if selected_next_date else ""
 
         new_memo = st.text_area("상담 메모", value=str(crm_record.get("memo", "") or ""), height=140, placeholder="대표 상담내용, 니즈, 후속조치 등을 기록하세요.")
         submitted = st.form_submit_button("CRM 정보 저장", width='stretch')

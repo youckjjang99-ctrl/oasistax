@@ -1166,3 +1166,39 @@ def append_cretop_to_user_customer_db(pdf_path, user_id, manager_name="", duplic
         data,
         df_new,
     )
+
+
+def update_user_customer_record(user_id, row_index, updates):
+    """
+    고객관리 화면에서 수정한 값을 누적 고객DB에 반영한다.
+    기존 고객DB 서식과 다른 시트는 그대로 유지한다.
+    """
+    cumulative_path = get_user_cumulative_db_path(user_id)
+    columns = get_customer_db_columns()
+    df = _read_cumulative_customer_db(cumulative_path, columns)
+
+    if df.empty:
+        return False, "수정할 고객DB가 없습니다."
+
+    try:
+        row_index = int(row_index)
+    except (TypeError, ValueError):
+        return False, "고객 행 번호가 올바르지 않습니다."
+
+    if row_index not in df.index:
+        return False, "수정할 고객을 찾지 못했습니다."
+
+    changed = []
+    for key, value in (updates or {}).items():
+        if key not in columns:
+            continue
+        if isinstance(value, str):
+            value = value.strip()
+        df.at[row_index, key] = value
+        changed.append(key)
+
+    if not changed:
+        return False, "변경할 항목이 없습니다."
+
+    _write_cumulative_customer_db(cumulative_path, df, columns)
+    return True, f"고객정보 {len(changed)}개 항목을 수정했습니다."
