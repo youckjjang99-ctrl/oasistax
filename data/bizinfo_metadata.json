@@ -1,0 +1,92 @@
+{
+  "status": "success",
+  "generated_at": "2026-07-13T18:28:01+09:00",
+  "source": "manual:oasistax",
+  "record_count": 1000,
+  "successful_pages": 10,
+  "failed_pages": 0,
+  "page_logs": [
+    {
+      "page": 1,
+      "success": true,
+      "status_code": 200,
+      "elapsed_seconds": 0.37,
+      "row_count": 100,
+      "message": "정상"
+    },
+    {
+      "page": 2,
+      "success": true,
+      "status_code": 200,
+      "elapsed_seconds": 0.15,
+      "row_count": 100,
+      "message": "정상"
+    },
+    {
+      "page": 3,
+      "success": true,
+      "status_code": 200,
+      "elapsed_seconds": 0.15,
+      "row_count": 100,
+      "message": "정상"
+    },
+    {
+      "page": 4,
+      "success": true,
+      "status_code": 200,
+      "elapsed_seconds": 0.15,
+      "row_count": 100,
+      "message": "정상"
+    },
+    {
+      "page": 5,
+      "success": true,
+      "status_code": 200,
+      "elapsed_seconds": 0.22,
+      "row_count": 100,
+      "message": "정상"
+    },
+    {
+      "page": 6,
+      "success": true,
+      "status_code": 200,
+      "elapsed_seconds": 0.15,
+      "row_count": 100,
+      "message": "정상"
+    },
+    {
+      "page": 7,
+      "success": true,
+      "status_code": 200,
+      "elapsed_seconds": 0.16,
+      "row_count": 100,
+      "message": "정상"
+    },
+    {
+      "page": 8,
+      "success": true,
+      "status_code": 200,
+      "elapsed_seconds": 0.15,
+      "row_count": 100,
+      "message": "정상"
+    },
+    {
+      "page": 9,
+      "success": true,
+      "status_code": 200,
+      "elapsed_seconds": 0.15,
+      "row_count": 100,
+      "message": "정상"
+    },
+    {
+      "page": 10,
+      "success": true,
+      "status_code": 200,
+      "elapsed_seconds": 0.16,
+      "row_count": 100,
+      "message": "정상"
+    }
+  ],
+  "json_file": "bizinfo_programs.json",
+  "xlsx_file": "기업마당_공고DB.xlsx"
+}

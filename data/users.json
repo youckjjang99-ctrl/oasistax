@@ -16,9 +16,9 @@
     "salt": "1395e7501cf90738efef42957d34a76a",
     "password_hash": "fee799d77d4bb1a9e31745529dcdbb176ad8912b7f85853d8e7c1e1678dd6772",
     "role": "member",
-    "status": "pending",
+    "status": "approved",
     "created_at": "2026-07-10 12:53:11",
-    "approved_at": "",
-    "approved_by": ""
+    "approved_at": "2026-07-13 18:28:35",
+    "approved_by": "oasistax"
   }
 }

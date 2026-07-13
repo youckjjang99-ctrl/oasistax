@@ -1267,6 +1267,7 @@ with st.sidebar:
     if CURRENT_USER_IS_ADMIN:
         menu_label_map["회원 승인 관리"] = "회원 승인 관리"
         menu_label_map["시스템 관리"] = "시스템 관리"
+        menu_label_map["클라우드 DB 관리"] = "클라우드 DB 관리"
 
     selected_menu_label = st.radio(
         "메뉴",
@@ -1880,6 +1881,12 @@ elif CURRENT_USER_IS_ADMIN and active_tab == "시스템 관리":
     render_system_management_page(
         project_root=ROOT_DIR,
         current_user_id=CURRENT_USER_ID,
+    )
+
+elif CURRENT_USER_IS_ADMIN and active_tab == "클라우드 DB 관리":
+    render_cloud_database_page(
+        CURRENT_USER_ID,
+        CURRENT_USER_NAME,
     )
 
 st.markdown("""
