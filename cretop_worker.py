@@ -196,6 +196,118 @@ def extract_certifications(text):
     return result
 
 
+
+def _extract_row_values(block, aliases, years):
+    """요약 재무표에서 계정별 연도 값을 추출한다."""
+    if not block or not years:
+        return {}
+
+    for alias in aliases:
+        pattern = rf"(?m)^\s*{re.escape(alias)}(?:\(.*?\))?\s+(.+)$"
+        match = re.search(pattern, block)
+        if not match:
+            continue
+
+        tokens = re.findall(r"-?\d[\d,]*(?:\.\d+)?|(?<!\S)-(?!\S)", match.group(1))
+        if len(tokens) < len(years):
+            continue
+
+        tokens = tokens[-len(years):]
+        result = {}
+        for year, token in zip(years, tokens):
+            if token.strip() == "-":
+                result[str(year)] = None
+                continue
+            try:
+                result[str(year)] = int(round(float(token.replace(",", "")) * 1_000_000))
+            except ValueError:
+                result[str(year)] = None
+        return result
+
+    return {}
+
+
+def extract_annual_financial_history(text):
+    """
+    크레탑 요약 재무상태표·손익계산서의 최근 연도별 값을 반환한다.
+    단위는 원이다.
+    """
+    income_block = extract_block(
+        text,
+        r"요약\s*손익계산서",
+        [r"요약\s*현금흐름", r"요약\s*재무비율", r"연혁", r"재무상태표"],
+    )
+    balance_block = extract_block(
+        text,
+        r"요약\s*재무상태표",
+        [r"요약\s*손익계산서", r"요약\s*현금흐름", r"요약\s*재무비율"],
+    )
+
+    income_years = []
+    balance_years = []
+
+    for value in re.findall(r"\b(20\d{2})\b", income_block):
+        if value not in income_years:
+            income_years.append(value)
+    for value in re.findall(r"\b(20\d{2})\b", balance_block):
+        if value not in balance_years:
+            balance_years.append(value)
+
+    income_years = income_years[-3:]
+    balance_years = balance_years[-3:]
+
+    rows = {
+        "매출액": _extract_row_values(
+            income_block,
+            ["매출액", "매출", "영업수익"],
+            income_years,
+        ),
+        "당기순이익": _extract_row_values(
+            income_block,
+            [
+                "당기순이익",
+                "당기순이익(순손실)",
+                "당기순손익",
+                "법인세차감후순이익",
+                "법인세비용차감후순이익",
+                "순이익",
+            ],
+            income_years,
+        ),
+        "자산총계": _extract_row_values(
+            balance_block,
+            ["자산총계", "자산"],
+            balance_years,
+        ),
+        "부채총계": _extract_row_values(
+            balance_block,
+            ["부채총계", "부채"],
+            balance_years,
+        ),
+        "자본총계": _extract_row_values(
+            balance_block,
+            ["자본총계", "자본"],
+            balance_years,
+        ),
+    }
+
+    years = sorted(
+        set(income_years + balance_years),
+        reverse=True,
+    )
+
+    history = []
+    for year in years:
+        history.append({
+            "연도": int(year),
+            "매출액": rows["매출액"].get(year),
+            "당기순이익": rows["당기순이익"].get(year),
+            "자산총계": rows["자산총계"].get(year),
+            "부채총계": rows["부채총계"].get(year),
+            "자본총계": rows["자본총계"].get(year),
+        })
+    return history
+
 def parse_document_text(text):
     data = {}
     data["업체명"] = regex_first(r"기업명\s+(.+?)\s+영문기업명", text)
@@ -294,6 +406,7 @@ def parse_document_text(text):
     if data.get("특허보유") == "Y":
         keywords.append("특허")
     data["키워드메모"] = " / ".join(item for item in keywords if item)
+    data["재무연도별"] = extract_annual_financial_history(text)
     data["PDF추출일시"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return data
 

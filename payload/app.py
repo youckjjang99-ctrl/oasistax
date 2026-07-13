@@ -10,6 +10,7 @@ from pathlib import Path
 from ui import apply_oasis_ui
 from maintenance import render_system_management_page
 from cretop_runner import run_cretop_worker
+from stock_valuation import render_stock_valuation_page
 from crm import (
     STATUS_OPTIONS, ACTION_OPTIONS, make_customer_key, get_customer_record,
     upsert_customer_record, append_timeline_event, get_crm_summary,
@@ -1254,6 +1255,7 @@ with st.sidebar:
         "크레탑 자동등록": "크레탑 자동등록",
         "고객관리": "고객관리",
         "정책자금 매칭": "고객DB 업로드/매칭",
+        "주가평가": "주가평가",
         "내 누적 고객DB": "내 누적 고객DB",
         "실행이력": "실행이력",
         "담당자 통계": "담당자 통계",
@@ -1473,6 +1475,13 @@ elif active_tab == "고객DB 업로드/매칭":
                 width='stretch'
             )
 
+
+
+elif active_tab == "주가평가":
+    render_stock_valuation_page(
+        CURRENT_USER_ID,
+        CURRENT_USER_NAME,
+    )
 
 elif active_tab == "크레탑 자동등록":
     st.markdown("### 📄 크레탑 PDF로 고객 자동등록")
