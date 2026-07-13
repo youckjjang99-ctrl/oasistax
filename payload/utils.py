@@ -914,6 +914,8 @@ def get_customer_db_columns():
             df = pd.read_excel(template, sheet_name="고객DB", nrows=0)
             cols = [str(c).strip() for c in df.columns if str(c).strip()]
             if cols:
+                if "사업자등록번호" not in cols:
+                    cols.append("사업자등록번호")
                 return cols
         except Exception:
             pass
@@ -1001,16 +1003,104 @@ def normalize_business_no(value):
     return str(value or "").strip()
 
 
-def check_user_customer_duplicate(user_id, business_no):
-    """사업자등록번호 열만 읽어 중복 여부를 빠르게 확인한다."""
+def normalize_company_name(value):
+    import re
+    text = str(value or "").strip().lower()
+    text = re.sub(r"주식회사|\(주\)|㈜|（주）", "", text)
+    return re.sub(r"[^0-9a-z가-힣]", "", text)
+
+
+def normalize_person_name(value):
+    import re
+    return re.sub(r"[^0-9a-z가-힣]", "", str(value or "").strip().lower())
+
+
+def _find_legacy_customer_matches(
+    cumulative_path,
+    company_name="",
+    representative_name="",
+):
+    columns = get_customer_db_columns()
+    df = _read_cumulative_customer_db(cumulative_path, columns)
+    if df.empty or "업체명" not in df.columns:
+        return pd.DataFrame(columns=columns)
+
+    company_key = normalize_company_name(company_name)
+    representative_key = normalize_person_name(representative_name)
+    if not company_key:
+        return pd.DataFrame(columns=columns)
+
+    mask = df["업체명"].apply(normalize_company_name).eq(company_key)
+    if representative_key and "대표자명" in df.columns:
+        mask = mask & df["대표자명"].apply(normalize_person_name).eq(
+            representative_key
+        )
+    return df.loc[mask].copy()
+
+
+def check_user_customer_duplicate(
+    user_id,
+    business_no,
+    company_name="",
+    representative_name="",
+):
     cumulative_path = get_user_cumulative_db_path(user_id)
     target = normalize_business_no(business_no)
-    if not cumulative_path.exists() or len(target.replace("-", "")) != 10:
+
+    if not cumulative_path.exists():
         return False
+
     try:
-        return target in _read_business_numbers_only(cumulative_path)
+        if len(target.replace("-", "")) == 10:
+            if target in _read_business_numbers_only(cumulative_path):
+                return True
+
+        legacy_matches = _find_legacy_customer_matches(
+            cumulative_path,
+            company_name=company_name,
+            representative_name=representative_name,
+        )
+        return not legacy_matches.empty
     except Exception:
         return False
+
+
+def link_business_no_to_legacy_customer(
+    user_id,
+    business_no,
+    company_name="",
+    representative_name="",
+):
+    cumulative_path = get_user_cumulative_db_path(user_id)
+    target = normalize_business_no(business_no)
+
+    if not cumulative_path.exists() or len(target.replace("-", "")) != 10:
+        return False
+
+    columns = get_customer_db_columns()
+    df = _read_cumulative_customer_db(cumulative_path, columns)
+    if df.empty or "업체명" not in df.columns:
+        return False
+
+    company_key = normalize_company_name(company_name)
+    representative_key = normalize_person_name(representative_name)
+
+    mask = df["업체명"].apply(normalize_company_name).eq(company_key)
+    if representative_key and "대표자명" in df.columns:
+        mask = mask & df["대표자명"].apply(normalize_person_name).eq(
+            representative_key
+        )
+
+    indexes = list(df.index[mask])
+    if not indexes:
+        return False
+
+    index = indexes[0]
+    current = normalize_business_no(df.at[index, "사업자등록번호"])
+    if len(current.replace("-", "")) != 10:
+        df.at[index, "사업자등록번호"] = target
+        _write_cumulative_customer_db(cumulative_path, df, columns)
+    return True
 
 
 def append_cretop_to_user_customer_db(pdf_path, user_id, manager_name="", duplicate_action="skip", extracted_data=None):
@@ -1035,10 +1125,23 @@ def append_cretop_to_user_customer_db(pdf_path, user_id, manager_name="", duplic
     df_new = _normalize_customer_db_frame(df_new, columns)
 
     business_no = normalize_business_no(row.get("사업자등록번호", ""))
-    valid_business_no = len(business_no.replace("-", "")) == 10
-    is_dup = valid_business_no and business_no in _read_business_numbers_only(cumulative_path)
+    company_name = row.get("업체명", data.get("업체명", ""))
+    representative_name = row.get("대표자명", data.get("대표자명", ""))
+
+    is_dup = check_user_customer_duplicate(
+        user_id,
+        business_no,
+        company_name=company_name,
+        representative_name=representative_name,
+    )
 
     if is_dup:
+        link_business_no_to_legacy_customer(
+            user_id,
+            business_no,
+            company_name=company_name,
+            representative_name=representative_name,
+        )
         return (
             cumulative_path,
             0,

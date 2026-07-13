@@ -28,7 +28,8 @@ from utils import (
     move_result_files_to_results, extract_company_previews,
     get_user_dirs, get_user_cumulative_db_path, append_user_customer_db,
     append_cretop_to_user_customer_db,
-    check_user_customer_duplicate, ensure_user_cumulative_db_format,
+    check_user_customer_duplicate, link_business_no_to_legacy_customer,
+    ensure_user_cumulative_db_format,
     count_user_cumulative_rows
 )
 
@@ -1258,10 +1259,25 @@ elif active_tab == "크레탑 자동등록":
                 )
 
             business_no = identity_data.get("사업자등록번호", "")
+            company_name = identity_data.get("업체명", "")
+            representative_name = identity_data.get("대표자명", "")
             is_dup = (
                 not identity_error
-                and check_user_customer_duplicate(CURRENT_USER_ID, business_no)
+                and check_user_customer_duplicate(
+                    CURRENT_USER_ID,
+                    business_no,
+                    company_name=company_name,
+                    representative_name=representative_name,
+                )
             )
+
+            if is_dup:
+                link_business_no_to_legacy_customer(
+                    CURRENT_USER_ID,
+                    business_no,
+                    company_name=company_name,
+                    representative_name=representative_name,
+                )
 
             if is_dup:
                 extracted_data = identity_data

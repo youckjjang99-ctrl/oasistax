@@ -261,8 +261,13 @@ def main():
 
             emit_progress(index, total, "사업자정보 탐색 중")
             if business_no:
+                representative_name = regex_first(
+                    r"대표자명\s+(.+?)\s+종업원수",
+                    joined,
+                )
                 result = {
                     "업체명": company_name,
+                    "대표자명": representative_name,
                     "사업자등록번호": normalize_business_no(business_no),
                 }
                 output_path.write_text(
@@ -279,6 +284,7 @@ def main():
         result = parse_document_text(joined)
         result = {
             "업체명": result.get("업체명", ""),
+            "대표자명": result.get("대표자명", ""),
             "사업자등록번호": result.get("사업자등록번호", ""),
         }
     else:
