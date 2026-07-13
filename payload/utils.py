@@ -573,26 +573,139 @@ def _regex_first(pattern, text, default="", flags=0):
     return _clean_text(m.group(1))
 
 
-def _latest_amount_million(label, text):
-    """요약 재무표의 백만원 단위 최신년도 값을 원 단위 숫자로 변환한다."""
+def _parse_latest_number_from_line(label, block):
+    """표 안에서 지정 계정명의 가장 오른쪽 숫자를 반환한다."""
     import re
+
+    escaped = re.escape(label)
     patterns = [
-        rf"{label}\s*-\s*([0-9,]+)\s+([0-9,]+)",
-        rf"{label}\(.*?\)\s*-\s*([0-9,]+)\s+([0-9,]+)",
+        rf"(?m)^\s*{escaped}(?:\(손실\)|\(순손실\)|\(\*\)|\(.*?\))?\s+((?:-?\s*[0-9][0-9,]*(?:\.[0-9]+)?\s+)+)",
+        rf"{escaped}(?:\(손실\)|\(순손실\)|\(\*\)|\(.*?\))?\s+((?:-?\s*[0-9][0-9,]*(?:\.[0-9]+)?\s+)+)",
     ]
+
     for pattern in patterns:
-        m = re.search(pattern, text)
-        if m:
-            raw = m.group(2).replace(",", "")
-            try:
-                return int(float(raw) * 1_000_000)
-            except Exception:
-                return ""
-    return ""
+        match = re.search(pattern, block)
+        if not match:
+            continue
+
+        raw_values = re.findall(r"-?\s*[0-9][0-9,]*(?:\.[0-9]+)?", match.group(1))
+        if not raw_values:
+            continue
+
+        raw = raw_values[-1].replace(" ", "").replace(",", "")
+        try:
+            return float(raw)
+        except ValueError:
+            continue
+
+    return None
+
+
+def _extract_financial_block(text, start_heading, end_headings):
+    """특정 재무표 제목부터 다음 표 제목 전까지의 텍스트를 잘라낸다."""
+    import re
+
+    start = re.search(start_heading, text)
+    if not start:
+        return ""
+
+    tail = text[start.end():]
+    end_positions = []
+    for heading in end_headings:
+        end_match = re.search(heading, tail)
+        if end_match:
+            end_positions.append(end_match.start())
+
+    end = min(end_positions) if end_positions else min(len(tail), 6000)
+    return tail[:end]
 
 
 def _latest_summary_amount_million(label, text):
-    return _latest_amount_million(label, text)
+    """
+    크레탑 요약 재무표의 최신년도 값을 원 단위로 변환한다.
+
+    우선순위:
+    1. 요약 손익계산서/요약 재무상태표(백만원)
+    2. 상세 손익계산서/재무상태표(천원)
+    3. MY 재무 Data(백만원)
+    """
+    income_labels = {"매출액", "영업이익", "당기순이익"}
+    balance_labels = {"자산총계", "부채총계", "자본총계"}
+
+    # 1) 요약표: 단위 백만원
+    if label in income_labels:
+        summary_block = _extract_financial_block(
+            text,
+            r"요약\s*손익계산서",
+            [r"요약\s*현금흐름", r"요약\s*재무비율", r"연혁"],
+        )
+    elif label in balance_labels:
+        summary_block = _extract_financial_block(
+            text,
+            r"요약\s*재무상태표",
+            [r"요약\s*손익계산서", r"요약\s*현금흐름", r"요약\s*재무비율"],
+        )
+    else:
+        summary_block = ""
+
+    value = _parse_latest_number_from_line(label, summary_block)
+    if value is not None:
+        return int(round(value * 1_000_000))
+
+    # 2) 상세표: 단위 천원
+    if label in income_labels:
+        detail_label = {
+            "영업이익": "영업이익",
+            "당기순이익": "당기순이익",
+        }.get(label, label)
+        detail_block = _extract_financial_block(
+            text,
+            r"손익계산서\s+단위\s*:?\s*천원",
+            [r"현금흐름표", r"자본변동표", r"이익잉여금처분계산서"],
+        )
+        value = _parse_latest_number_from_line(detail_label, detail_block)
+        if value is None and label == "당기순이익":
+            value = _parse_latest_number_from_line("당기순이익(순손실)", detail_block)
+    else:
+        detail_name = {
+            "자산총계": "자산",
+            "부채총계": "부채",
+            "자본총계": "자본",
+        }.get(label, label)
+        detail_block = _extract_financial_block(
+            text,
+            r"재무상태표\s+단위\s*:?\s*천원",
+            [r"손익계산서", r"현금흐름표"],
+        )
+        value = _parse_latest_number_from_line(detail_name, detail_block)
+
+    if value is not None:
+        return int(round(value * 1_000))
+
+    # 3) MY 재무 Data: 단위 백만원
+    my_data_block = _extract_financial_block(
+        text,
+        r"MY\s*재무\s*Data",
+        [r"기술력", r"기업인증", r"주요\s*주주"],
+    )
+    fallback_names = {
+        "자산총계": "자산",
+        "부채총계": "부채",
+        "자본총계": "자본",
+    }
+    value = _parse_latest_number_from_line(
+        fallback_names.get(label, label),
+        my_data_block,
+    )
+    if value is not None:
+        return int(round(value * 1_000_000))
+
+    return ""
+
+
+def _latest_amount_million(label, text):
+    """기존 호출부 호환용."""
+    return _latest_summary_amount_million(label, text)
 
 
 def _yn_from_status(status):

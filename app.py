@@ -646,6 +646,33 @@ def render_home_page():
         """, unsafe_allow_html=True)
 
 
+def format_customer_display_value(value, number=False):
+    """고객 상세화면에서 NaN/None을 숨기고 숫자에는 천 단위 콤마를 표시한다."""
+    if value is None:
+        return ""
+
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "nat"}:
+        return ""
+
+    if not number:
+        return text
+
+    try:
+        numeric = float(text.replace(",", ""))
+        if numeric.is_integer():
+            return f"{int(numeric):,}"
+        return f"{numeric:,.2f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return text
+
+
 def render_customer_management_page(user_id):
     st.markdown("### 👥 고객관리 CRM")
     st.caption("내 누적 고객DB를 기준으로 고객을 검색하고, 고객 상태·상담메모·다음 액션·타임라인을 관리합니다.")
@@ -762,11 +789,19 @@ def render_customer_management_page(user_id):
         st.write(f"**사업장 소재지**: {selected_row.get('사업장 소재지', '')}")
     with detail_right:
         st.markdown("##### 재무/규모")
-        st.write(f"**종업원수**: {selected_row.get('종업원수', '')}")
-        st.write(f"**매출액**: {selected_row.get('매출액', selected_row.get('연매출', ''))}")
-        st.write(f"**영업이익**: {selected_row.get('영업이익', '')}")
-        st.write(f"**당기순이익**: {selected_row.get('당기순이익', '')}")
-        st.write(f"**설립일**: {selected_row.get('설립일', selected_row.get('설립년도', ''))}")
+        employee_value = selected_row.get("종업원수", selected_row.get("상시근로자수", ""))
+        sales_value = selected_row.get("매출액", "")
+        if not format_customer_display_value(sales_value):
+            sales_value = selected_row.get("연매출", selected_row.get("전년도매출", ""))
+
+        st.write(f"**종업원수**: {format_customer_display_value(employee_value, number=True)}")
+        st.write(f"**매출액**: {format_customer_display_value(sales_value, number=True)}")
+        st.write(f"**영업이익**: {format_customer_display_value(selected_row.get('영업이익', ''), number=True)}")
+        st.write(f"**당기순이익**: {format_customer_display_value(selected_row.get('당기순이익', ''), number=True)}")
+        st.write(
+            f"**설립일**: "
+            f"{format_customer_display_value(selected_row.get('설립일', selected_row.get('설립년도', '')))}"
+        )
 
     y_cols = [c for c in ["벤처", "이노비즈", "메인비즈", "기업부설연구소", "연구개발전담부서", "특허보유", "상표", "R&D수행", "스마트공장도입"] if c in df.columns]
     if y_cols:
@@ -899,9 +934,9 @@ with st.sidebar:
     st.markdown('<div class="sidebar-section-label">MAIN</div>', unsafe_allow_html=True)
     menu_label_map = {
         "홈": "홈",
-        "고객관리": "고객관리",
-        "고객DB 매칭": "고객DB 업로드/매칭",
         "크레탑 자동등록": "크레탑 자동등록",
+        "고객관리": "고객관리",
+        "정책자금 매칭": "고객DB 업로드/매칭",
         "내 누적 고객DB": "내 누적 고객DB",
         "실행이력": "실행이력",
         "담당자 통계": "담당자 통계",
