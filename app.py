@@ -26,7 +26,7 @@ from utils import (
     make_basic_customer_template_bytes, run_cleanup,
     move_result_files_to_results, extract_company_previews,
     get_user_dirs, get_user_cumulative_db_path, append_user_customer_db,
-    extract_cretop_pdf_data, append_cretop_to_user_customer_db,
+    extract_cretop_pdf_data, extract_cretop_identity, append_cretop_to_user_customer_db,
     check_user_customer_duplicate, ensure_user_cumulative_db_format,
     count_user_cumulative_rows
 )
@@ -1213,85 +1213,146 @@ elif active_tab == "크레탑 자동등록":
             st.stop()
 
         st.caption("PDF 업로드가 완료되었습니다. 아래 버튼을 눌러 분석을 시작하세요.")
-        analyze_requested = st.button("크레탑 PDF 분석하기", key="cretop_analyze_button", width='stretch')
+        analyze_requested = st.button(
+            "크레탑 PDF 분석하기",
+            key="cretop_analyze_button",
+            width='stretch',
+        )
 
-        # v2.3.6: PDF 업로드만으로 바로 분석하지 않고, 사용자가 분석 버튼을 누른 경우 또는 같은 PDF 분석 캐시가 있는 경우만 처리한다.
         import hashlib
         pdf_bytes = cretop_pdf.getvalue()
         pdf_hash = hashlib.md5(pdf_bytes).hexdigest()
 
         has_cached_pdf = st.session_state.get("cretop_pdf_hash") == pdf_hash
         if not analyze_requested and not has_cached_pdf:
-            st.info("분석 버튼을 누르면 추출값 미리보기가 표시됩니다.")
+            st.info("분석 버튼을 누르면 사업자번호 중복 확인 후 추출값 미리보기가 표시됩니다.")
             st.stop()
 
-        if st.session_state.get("cretop_pdf_hash") != pdf_hash:
-            pdf_save_name = make_upload_filename(cretop_pdf.name).replace("업로드고객DB_", "크레탑PDF_")
+        if not has_cached_pdf:
+            pdf_save_name = make_upload_filename(cretop_pdf.name).replace(
+                "업로드고객DB_",
+                "크레탑PDF_",
+            )
             pdf_save_path = USER_UPLOAD_DIR / pdf_save_name
-            with open(pdf_save_path, "wb") as f:
-                f.write(pdf_bytes)
+            with open(pdf_save_path, "wb") as file:
+                file.write(pdf_bytes)
 
-            with st.spinner("크레탑 PDF를 분석 중입니다..."):
-                extracted_data, extract_error = extract_cretop_pdf_data(pdf_save_path)
+            with st.spinner("사업자등록번호 중복 여부를 먼저 확인하고 있습니다..."):
+                identity_data, identity_error = extract_cretop_identity(
+                    pdf_save_path,
+                    max_pages=2,
+                )
+
+            business_no = identity_data.get("사업자등록번호", "")
+            is_dup = (
+                not identity_error
+                and check_user_customer_duplicate(CURRENT_USER_ID, business_no)
+            )
+
+            if is_dup:
+                extracted_data = identity_data
+                extract_error = ""
+            else:
+                with st.spinner("신규 고객의 크레탑 PDF를 분석 중입니다..."):
+                    extracted_data, extract_error = extract_cretop_pdf_data(
+                        pdf_save_path
+                    )
 
             st.session_state["cretop_pdf_hash"] = pdf_hash
             st.session_state["cretop_pdf_save_path"] = str(pdf_save_path)
-            st.session_state["cretop_extracted_data"] = extracted_data
+            st.session_state["cretop_extracted_data"] = dict(extracted_data or {})
             st.session_state["cretop_extract_error"] = extract_error
+            st.session_state["cretop_is_duplicate"] = bool(is_dup)
+            st.session_state["cretop_identity_error"] = identity_error
+            del pdf_bytes
         else:
             pdf_save_path = Path(st.session_state.get("cretop_pdf_save_path", ""))
-            extracted_data = st.session_state.get("cretop_extracted_data", {})
+            extracted_data = dict(st.session_state.get("cretop_extracted_data", {}) or {})
             extract_error = st.session_state.get("cretop_extract_error", "")
+            is_dup = bool(st.session_state.get("cretop_is_duplicate", False))
+            identity_error = st.session_state.get("cretop_identity_error", "")
+
+        if identity_error:
+            st.warning("사업자번호 사전 확인이 어려워 전체 분석 결과에서 다시 확인했습니다.")
+
         if extract_error:
             st.error(extract_error)
+        elif is_dup:
+            st.markdown("#### 중복 고객 확인")
+            st.warning(
+                f"{extracted_data.get('업체명', '해당 업체')} "
+                f"({extracted_data.get('사업자등록번호', '')})는 이미 "
+                "내 누적 고객DB에 등록되어 있습니다."
+            )
+            st.info(
+                "중복 고객은 전체 재무분석과 엑셀 저장을 진행하지 않았습니다. "
+                "기존 정보는 고객관리 메뉴에서 확인해주세요."
+            )
+            st.button(
+                "이미 등록된 고객입니다",
+                disabled=True,
+                key="cretop_duplicate_disabled_button",
+                width='stretch',
+            )
         else:
             st.markdown("#### 2. 추출값 미리보기")
             preview_keys = [
-                "업체명", "대표자명", "사업자등록번호", "법인등록번호", "업종명", "사업장 소재지",
-                "종업원수", "설립일", "기업유형", "기업규모", "매출액", "영업이익", "당기순이익",
-                "자산총계", "부채총계", "자본총계", "벤처", "이노비즈", "메인비즈",
-                "연구개발전담부서", "기업부설연구소", "특허보유", "상표"
+                "업체명", "대표자명", "사업자등록번호", "법인등록번호",
+                "업종명", "사업장 소재지", "종업원수", "설립일",
+                "기업유형", "기업규모", "매출액", "영업이익",
+                "당기순이익", "자산총계", "부채총계", "자본총계",
+                "벤처", "이노비즈", "메인비즈", "연구개발전담부서",
+                "기업부설연구소", "특허보유", "상표",
             ]
-            preview_df = pd.DataFrame(
-                [{"항목": key, "추출값": extracted_data.get(key, "")} for key in preview_keys]
-            )
+            numeric_preview_keys = {
+                "매출액", "영업이익", "당기순이익",
+                "자산총계", "부채총계", "자본총계",
+            }
+            preview_df = pd.DataFrame([
+                {
+                    "항목": key,
+                    "추출값": (
+                        f"{int(extracted_data.get(key)):,}"
+                        if key in numeric_preview_keys
+                        and isinstance(extracted_data.get(key), (int, float))
+                        else extracted_data.get(key, "")
+                    ),
+                }
+                for key in preview_keys
+            ])
             st.dataframe(preview_df, width='stretch', hide_index=True)
 
-            business_no = extracted_data.get("사업자등록번호", "")
-            is_dup = check_user_customer_duplicate(CURRENT_USER_ID, business_no)
-
-            duplicate_action = "skip"
-            if is_dup:
-                st.warning(
-                    "이미 내 누적 고객DB에 같은 사업자등록번호가 있습니다. "
-                    "중복 고객은 자동으로 추가하지 않습니다."
-                )
-
             add_customer_clicked = st.button(
-                "이미 등록된 고객입니다" if is_dup else "내 누적 고객DB에 추가",
+                "내 누적 고객DB에 추가",
                 width='stretch',
-                disabled=is_dup,
                 key="cretop_add_to_cumulative_db",
             )
 
             if add_customer_clicked:
-                before_count = count_user_cumulative_rows(CURRENT_USER_ID)
-                with st.spinner("크레탑 PDF 추출값을 누적 고객DB에 저장 중입니다..."):
-                    cumulative_path, saved_count, message, _, saved_preview = append_cretop_to_user_customer_db(
-                        pdf_save_path,
-                        CURRENT_USER_ID,
-                        manager_name=cretop_manager_name.strip() or CURRENT_USER_NAME,
-                        duplicate_action="skip"
+                with st.spinner("누적 고객DB에 저장 중입니다..."):
+                    cumulative_path, saved_count, message, _, saved_preview = (
+                        append_cretop_to_user_customer_db(
+                            pdf_save_path,
+                            CURRENT_USER_ID,
+                            manager_name=(
+                                cretop_manager_name.strip()
+                                or CURRENT_USER_NAME
+                            ),
+                            duplicate_action="skip",
+                            extracted_data=extracted_data,
+                        )
                     )
-                    cumulative_path, total_count, _ = ensure_user_cumulative_db_format(CURRENT_USER_ID)
 
-                st.session_state["cretop_last_message"] = message
-                st.session_state["cretop_last_saved_count"] = saved_count
-                st.session_state["cretop_last_total_count"] = total_count
+                if saved_count > 0:
+                    total_count = count_user_cumulative_rows(CURRENT_USER_ID)
+                    st.success(f"{message} 현재 누적 고객 수: {total_count}건")
+                    st.session_state["cretop_last_message"] = message
+                    st.session_state["cretop_last_saved_count"] = saved_count
+                    st.session_state["cretop_last_total_count"] = total_count
+                else:
+                    st.info(message)
 
-                # v2.3.4: 이 시점의 상단 다운로드 버튼은 이미 과거 파일을 읽은 상태일 수 있다.
-                # 저장 완료 후 즉시 rerun하여 모든 다운로드 버튼이 최신 누적DB를 다시 읽게 한다.
-                st.rerun()
+                # 저장 후 st.rerun()을 호출하지 않아 PDF 재분석과 앱 전체 재실행을 방지한다.
 
 elif active_tab == "실행이력":
     st.markdown("### 📚 실행이력")

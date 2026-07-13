@@ -752,6 +752,94 @@ def _extract_certifications(text):
     return cert
 
 
+def extract_cretop_identity(pdf_path, max_pages=2):
+    """PDF 앞부분만 읽어 업체명과 사업자등록번호를 빠르게 추출한다."""
+    pdf_path = Path(pdf_path)
+    errors = []
+    text = ""
+
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(str(pdf_path))
+        text = "\n".join((page.extract_text() or "") for page in reader.pages[:max_pages])
+    except Exception as exc:
+        errors.append(f"pypdf: {exc}")
+
+    if not text.strip():
+        try:
+            from PyPDF2 import PdfReader
+            reader = PdfReader(str(pdf_path))
+            text = "\n".join((page.extract_text() or "") for page in reader.pages[:max_pages])
+        except Exception as exc:
+            errors.append(f"PyPDF2: {exc}")
+
+    if not text.strip():
+        return {}, "PDF 앞부분에서 사업자정보를 읽지 못했습니다. " + " / ".join(errors[:2])
+
+    company_name = _regex_first(r"기업명\s+(.+?)\s+영문기업명", text)
+    if not company_name:
+        company_name = _regex_first(r"기업명\s*[:：]\s*(.+?)\s+사업자번호", text)
+
+    business_no = _regex_first(
+        r"사업자번호\s+([0-9]{3}-[0-9]{2}-[0-9]{5})",
+        text,
+    )
+    if not business_no:
+        business_no = _regex_first(r"([0-9]{3}-[0-9]{2}-[0-9]{5})", text)
+
+    return {
+        "업체명": company_name,
+        "사업자등록번호": normalize_business_no(business_no),
+    }, ""
+
+
+def _read_business_numbers_only(cumulative_path):
+    """누적DB 전체가 아닌 사업자등록번호 열만 읽는다."""
+    from openpyxl import load_workbook
+
+    path = Path(cumulative_path)
+    if not path.exists():
+        return set()
+
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        if CUSTOMER_DB_SHEET_NAME not in workbook.sheetnames:
+            return set()
+
+        worksheet = workbook[CUSTOMER_DB_SHEET_NAME]
+        header_row = None
+        business_col = None
+
+        for row_index, row in enumerate(
+            worksheet.iter_rows(min_row=1, max_row=min(10, worksheet.max_row), values_only=True),
+            start=1,
+        ):
+            for col_index, value in enumerate(row, start=1):
+                if str(value or "").strip() == "사업자등록번호":
+                    header_row = row_index
+                    business_col = col_index
+                    break
+            if business_col:
+                break
+
+        if not business_col:
+            return set()
+
+        numbers = set()
+        for row in worksheet.iter_rows(
+            min_row=(header_row or 1) + 1,
+            min_col=business_col,
+            max_col=business_col,
+            values_only=True,
+        ):
+            number = normalize_business_no(row[0])
+            if len(number.replace("-", "")) == 10:
+                numbers.add(number)
+        return numbers
+    finally:
+        workbook.close()
+
+
 def extract_cretop_pdf_data(pdf_path):
     """크레탑 기업종합보고서 PDF에서 고객DB 자동입력용 값을 추출한다."""
     text, error = extract_pdf_text(pdf_path)
@@ -914,27 +1002,29 @@ def normalize_business_no(value):
 
 
 def check_user_customer_duplicate(user_id, business_no):
+    """사업자등록번호 열만 읽어 중복 여부를 빠르게 확인한다."""
     cumulative_path = get_user_cumulative_db_path(user_id)
-    if not cumulative_path.exists() or not business_no:
+    target = normalize_business_no(business_no)
+    if not cumulative_path.exists() or len(target.replace("-", "")) != 10:
         return False
     try:
-        df = _read_cumulative_customer_db(cumulative_path)
-        if "사업자등록번호" not in df.columns:
-            return False
-        target = normalize_business_no(business_no)
-        exists = df["사업자등록번호"].apply(normalize_business_no).eq(target).any()
-        return bool(exists)
+        return target in _read_business_numbers_only(cumulative_path)
     except Exception:
         return False
 
 
-def append_cretop_to_user_customer_db(pdf_path, user_id, manager_name="", duplicate_action="skip"):
+def append_cretop_to_user_customer_db(pdf_path, user_id, manager_name="", duplicate_action="skip", extracted_data=None):
     """
     v3.5.2:
     크레탑 자동등록 시 동일 사업자등록번호가 누적DB에 있으면
     사용자의 선택과 관계없이 새 행을 추가하지 않는다.
     """
-    data, error = extract_cretop_pdf_data(pdf_path)
+    if extracted_data is None:
+        data, error = extract_cretop_pdf_data(pdf_path)
+    else:
+        data = dict(extracted_data)
+        error = ""
+
     cumulative_path = get_user_cumulative_db_path(user_id)
     if error:
         return cumulative_path, 0, error, data, pd.DataFrame()
@@ -945,21 +1035,8 @@ def append_cretop_to_user_customer_db(pdf_path, user_id, manager_name="", duplic
     df_new = _normalize_customer_db_frame(df_new, columns)
 
     business_no = normalize_business_no(row.get("사업자등록번호", ""))
-    df_old = _read_cumulative_customer_db(cumulative_path, columns)
-
     valid_business_no = len(business_no.replace("-", "")) == 10
-    is_dup = False
-    if (
-        not df_old.empty
-        and valid_business_no
-        and "사업자등록번호" in df_old.columns
-    ):
-        is_dup = (
-            df_old["사업자등록번호"]
-            .apply(normalize_business_no)
-            .eq(business_no)
-            .any()
-        )
+    is_dup = valid_business_no and business_no in _read_business_numbers_only(cumulative_path)
 
     if is_dup:
         return (
@@ -970,6 +1047,8 @@ def append_cretop_to_user_customer_db(pdf_path, user_id, manager_name="", duplic
             df_new,
         )
 
+    # 신규 고객일 때만 누적DB 전체를 읽는다.
+    df_old = _read_cumulative_customer_db(cumulative_path, columns)
     df_all = (
         pd.concat([df_old, df_new], ignore_index=True, sort=False)
         if not df_old.empty
