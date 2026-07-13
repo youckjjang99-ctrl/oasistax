@@ -12,6 +12,24 @@ from maintenance import render_system_management_page
 from cretop_runner import run_cretop_worker
 from cloud_admin import render_cloud_database_page
 from cloud_restore import restore_customer_db_if_needed
+from address_tools import (
+    enrich_address_fields,
+    repair_user_customer_addresses,
+)
+from crm_enhancements import (
+    PIPELINE_OPTIONS,
+    PRIORITY_OPTIONS,
+    get_crm_profile,
+    save_crm_profile,
+    merge_profile_into_crm_record,
+    get_profile_summary,
+)
+from customer_history import (
+    save_customer_snapshot,
+    get_customer_history,
+    build_history_table,
+    build_change_summary,
+)
 from consulting_report import render_ai_consulting_report_page
 from cloud_sync import (
     get_cloud_sync_status,
@@ -741,6 +759,12 @@ def render_customer_management_page(user_id):
     with m4:
         st.metric("신청/계약", f"{crm_summary.get('신청완료', 0) + crm_summary.get('계약완료', 0)}건")
 
+    profile_summary = get_profile_summary(user_id)
+    p1, p2, p3 = st.columns(3)
+    p1.metric("중요 고객", f"{profile_summary.get('high_priority', 0)}건")
+    p2.metric("진행 중", f"{profile_summary.get('active_pipeline', 0)}건")
+    p3.metric("계약 완료", f"{profile_summary.get('completed', 0)}건")
+
     due_summary = get_due_action_summary(user_id)
     st.markdown("#### 후속관리 알림")
     d1, d2, d3 = st.columns(3)
@@ -827,6 +851,11 @@ def render_customer_management_page(user_id):
     selected_biz = str(selected_row.get(biz_col, "") or "") if biz_col else ""
     selected_key = make_customer_key(selected_company, selected_biz)
     crm_record = get_customer_record(user_id, selected_key)
+    crm_profile = get_crm_profile(
+        user_id,
+        selected_key,
+        selected_biz,
+    )
 
     detail_left, detail_right = st.columns([1, 1])
     with detail_left:
@@ -1148,6 +1177,30 @@ def render_customer_management_page(user_id):
         "최종 정책자금 추천은 정책자금 매칭 결과와 함께 판단합니다."
     )
 
+    st.markdown("##### 기업 히스토리")
+    customer_history = get_customer_history(
+        user_id,
+        selected_biz,
+    )
+    if customer_history:
+        for change_message in build_change_summary(
+            customer_history
+        ):
+            st.write(f"• {change_message}")
+
+        with st.expander("기업 데이터 변경이력 보기", expanded=False):
+            history_df = build_history_table(customer_history)
+            st.dataframe(
+                history_df,
+                hide_index=True,
+                width='stretch',
+            )
+    else:
+        st.info(
+            "아직 저장된 기업 히스토리가 없습니다. "
+            "크레탑 PDF를 다시 분석하면 스냅샷이 생성됩니다."
+        )
+
     st.markdown("##### CRM 관리")
     with st.form(key=f"crm_form_{selected_key}"):
         c1, c2, c3 = st.columns([1, 1, 1])
@@ -1173,11 +1226,58 @@ def render_customer_management_page(user_id):
             )
             new_next_date = selected_next_date.strftime("%Y-%m-%d") if selected_next_date else ""
 
+        e1, e2, e3 = st.columns([1, 1, 1])
+        with e1:
+            current_stage = crm_profile.get("pipeline_stage", "신규")
+            stage_index = (
+                PIPELINE_OPTIONS.index(current_stage)
+                if current_stage in PIPELINE_OPTIONS
+                else 0
+            )
+            pipeline_stage = st.selectbox(
+                "상담 진행단계",
+                PIPELINE_OPTIONS,
+                index=stage_index,
+            )
+        with e2:
+            current_priority = str(crm_profile.get("priority", "3"))
+            priority_index = (
+                PRIORITY_OPTIONS.index(current_priority)
+                if current_priority in PRIORITY_OPTIONS
+                else 2
+            )
+            priority = st.selectbox(
+                "중요도",
+                PRIORITY_OPTIONS,
+                index=priority_index,
+                format_func=lambda value: "★" * int(value),
+            )
+        with e3:
+            assigned_manager = st.text_input(
+                "담당자",
+                value=str(
+                    crm_profile.get("assigned_manager", "")
+                    or CURRENT_USER_NAME
+                    or ""
+                ),
+            )
+
         new_memo = st.text_area("상담 메모", value=str(crm_record.get("memo", "") or ""), height=140, placeholder="대표 상담내용, 니즈, 후속조치 등을 기록하세요.")
         submitted = st.form_submit_button("CRM 정보 저장", width='stretch')
 
     if submitted:
-        detail = f"상태: {new_status} / 다음 액션: {new_action} / 예정일: {new_next_date}"
+        saved_profile = save_crm_profile(
+            user_id,
+            selected_key,
+            pipeline_stage,
+            priority,
+            assigned_manager,
+        )
+        detail = (
+            f"상태: {new_status} / 진행단계: {pipeline_stage} / "
+            f"중요도: {priority} / 담당자: {assigned_manager} / "
+            f"다음 액션: {new_action} / 예정일: {new_next_date}"
+        )
         ok, msg = upsert_customer_record(
             user_id=user_id,
             customer_key=selected_key,
@@ -1194,6 +1294,10 @@ def render_customer_management_page(user_id):
             updated_crm = get_customer_record(
                 user_id,
                 selected_key,
+            )
+            updated_crm = merge_profile_into_crm_record(
+                updated_crm,
+                saved_profile,
             )
             sync_crm_record(
                 user_id,
@@ -1222,6 +1326,10 @@ def render_customer_management_page(user_id):
                     updated_crm = get_customer_record(
                         user_id,
                         selected_key,
+                    )
+                    updated_crm = merge_profile_into_crm_record(
+                        updated_crm,
+                        crm_profile,
                     )
                     sync_crm_record(
                         user_id,
@@ -1256,6 +1364,9 @@ def render_cumulative_db_page(user_id):
         return
 
     cumulative_db_path, total_count, _ = ensure_user_cumulative_db_format(user_id)
+    address_repair = repair_user_customer_addresses(user_id)
+    if address_repair.get("updated_rows", 0) > 0:
+        st.success(address_repair.get("message", ""))
     st.success(f"현재 누적 고객 수: {total_count}건")
     with open(cumulative_db_path, "rb") as f:
         st.download_button(
@@ -2032,9 +2143,15 @@ elif active_tab == "크레탑 자동등록":
 
             # 작은 JSON 결과만 세션에 보관
             if not extract_error and extracted_data:
+                extracted_data = enrich_address_fields(extracted_data)
                 save_cretop_financial_snapshot(
                     CURRENT_USER_ID,
                     extracted_data,
+                )
+                save_customer_snapshot(
+                    CURRENT_USER_ID,
+                    extracted_data,
+                    source="cretop",
                 )
 
             st.session_state["cretop_pdf_hash"] = pdf_hash
