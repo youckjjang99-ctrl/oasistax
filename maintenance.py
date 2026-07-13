@@ -10,6 +10,9 @@ from typing import Iterable
 
 import streamlit as st
 
+from bizinfo_cache import get_bizinfo_cache_status
+from collector import sync_bizinfo_cache
+
 
 CORE_FILES = (
     "app.py",
@@ -218,6 +221,52 @@ def render_system_management_page(
     st.markdown("#### 프로젝트 상태")
     st.dataframe(health, hide_index=True, use_container_width=True)
 
+    st.markdown("#### 기업마당 공고DB 자동 동기화")
+    bizinfo_status = get_bizinfo_cache_status(project_root / "data")
+    b1, b2, b3 = st.columns(3)
+    b1.metric("내부 공고 수", f"{bizinfo_status.get('record_count', 0)}건")
+    b2.metric(
+        "마지막 갱신",
+        bizinfo_status.get("generated_at")
+        or bizinfo_status.get("file_modified_at")
+        or "미생성",
+    )
+    b3.metric(
+        "동기화 상태",
+        "정상" if bizinfo_status.get("status") == "success" else "확인 필요",
+    )
+
+    if bizinfo_status.get("message"):
+        st.warning(bizinfo_status.get("message"))
+
+    st.caption(
+        "GitHub Actions가 매일 한국시간 오전 3시에 기업마당 공고DB를 자동 갱신합니다. "
+        "매칭은 저장된 내부 DB를 사용하므로 기업마당이 일시적으로 느려도 계속 실행됩니다."
+    )
+
+    if st.button(
+        "기업마당 DB 지금 동기화",
+        key="system_sync_bizinfo",
+        use_container_width=True,
+    ):
+        with st.spinner("기업마당 공고를 수집하고 내부 DB를 갱신하고 있습니다..."):
+            try:
+                result = sync_bizinfo_cache(
+                    output_dir=project_root / "data",
+                    api_key=os.getenv("BIZINFO_API_KEY", ""),
+                    page_count=10,
+                    page_size=100,
+                    source=f"manual:{current_user_id}",
+                    strict=True,
+                )
+                st.success(
+                    f"동기화 완료: {result.get('record_count', 0)}건 / "
+                    f"{result.get('generated_at', '')}"
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(f"동기화 실패: {type(exc).__name__}: {exc}")
+
     st.markdown("#### 수동 백업")
     col1, col2 = st.columns([1.4, 1])
     with col1:
@@ -289,7 +338,7 @@ def render_system_management_page(
     st.markdown("#### Git 반영 안내")
     st.code(
         'git add .\n'
-        'git commit -m "v3.4.0 업데이트 시스템"\n'
+        'git commit -m "v3.5.0 기업마당 자동 동기화"\n'
         'git push',
         language="powershell",
     )
