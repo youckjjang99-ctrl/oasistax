@@ -1109,81 +1109,263 @@ def render_audio_consultation_journal(
                 "25MB를 초과한 파일은 ffmpeg로 자동 분할한 뒤 순서대로 녹취합니다."
             )
 
-    if st.button(
-        "녹취 및 상담일지 생성",
+    job_key = f"consultation_job_{business_no}"
+    running_key = f"consultation_running_{business_no}"
+    error_key = f"consultation_job_error_{business_no}"
+
+    pending_job = st.session_state.get(job_key)
+    is_running = bool(st.session_state.get(running_key))
+    is_pending = isinstance(pending_job, dict)
+
+    button_label = (
+        "상담일지 생성 중..."
+        if is_running or is_pending
+        else "녹취 및 상담일지 생성"
+    )
+
+    clicked = st.button(
+        button_label,
         type="primary",
         use_container_width=True,
-        disabled=uploaded is None,
+        disabled=(
+            uploaded is None
+            or is_running
+            or is_pending
+        ),
         key=f"generate_consultation_journal_{business_no}",
-    ):
-        try:
+    )
+
+    if clicked and uploaded is not None:
+        # 첫 번째 실행에서는 작업자료만 세션에 저장하고 즉시 rerun한다.
+        # 다음 실행에서 진행상태 UI를 먼저 표시한 뒤 실제 작업을 시작한다.
+        st.session_state[job_key] = {
+            "audio_bytes": uploaded.getvalue(),
+            "filename": uploaded.name,
+            "noise_reduction": bool(noise_reduction),
+            "aggressive_noise_reduction": bool(
+                aggressive_noise_reduction
+            ),
+            "reuse_transcript_cache": bool(
+                reuse_transcript_cache
+            ),
+            "reuse_journal_cache": bool(
+                reuse_journal_cache
+            ),
+            "queued_at": datetime.now().isoformat(
+                timespec="seconds"
+            ),
+        }
+        st.session_state[running_key] = False
+        st.session_state.pop(error_key, None)
+        st.rerun()
+
+    pending_job = st.session_state.get(job_key)
+    if isinstance(pending_job, dict):
+        st.session_state[running_key] = True
+
+        with st.status(
+            "녹음파일 상담일지를 생성하고 있습니다.",
+            expanded=True,
+        ) as generation_status:
             progress = st.progress(0)
-            status_box = st.empty()
+            stage_message = st.empty()
 
-            def update_progress(index: int, total: int, name: str) -> None:
-                progress.progress(min(index / max(total, 1), 1.0))
-                status_box.info(f"녹취 중: {index}/{total} 구간")
-
-            audio_bytes = uploaded.getvalue()
-            transcript, transcript_cached, transcript_cache_key = (
-                transcribe_audio_with_cache(
-                    user_id,
-                    consultant_name,
-                    business_no,
-                    audio_bytes,
-                    uploaded.name,
-                    company_name,
-                    progress_callback=update_progress,
-                    noise_reduction=noise_reduction,
-                    aggressive_noise_reduction=aggressive_noise_reduction,
-                    reuse_cache=reuse_transcript_cache,
-                )
+            st.info(
+                "작업이 끝날 때까지 이 화면을 닫지 마세요. "
+                "중복 실행을 막기 위해 생성 버튼은 잠시 비활성화됩니다."
             )
 
-            if transcript_cached:
-                progress.progress(0.65)
-                status_box.info(
-                    "기존 녹취록을 재사용했습니다. 상담일지를 확인하고 있습니다."
-                )
-            else:
-                status_box.info("상담일지를 정리하고 있습니다.")
+            try:
+                audio_bytes = pending_job["audio_bytes"]
+                filename = pending_job["filename"]
 
-            journal, journal_cached, journal_cache_key = (
-                summarize_consultation_with_cache(
-                    user_id,
-                    consultant_name,
-                    transcript,
-                    company_name,
-                    business_no,
-                    consultant_name,
-                    reuse_cache=reuse_journal_cache,
+                progress.progress(0.03)
+                stage_message.info(
+                    "1단계 · 녹음파일을 확인하고 있습니다."
                 )
-            )
 
-            journal["_cache_info"] = {
-                "transcript_cached": transcript_cached,
-                "journal_cached": journal_cached,
-                "transcript_cache_key": transcript_cache_key,
-                "journal_cache_key": journal_cache_key,
-            }
+                if not audio_bytes:
+                    raise RuntimeError(
+                        "업로드된 녹음파일의 내용이 비어 있습니다."
+                    )
 
-            st.session_state[f"consultation_journal_{business_no}"] = journal
-            progress.progress(1.0)
+                progress.progress(0.08)
+                stage_message.info(
+                    "2단계 · 캐시와 음성 전처리 조건을 확인하고 있습니다."
+                )
 
-            if transcript_cached and journal_cached:
-                status_box.success(
-                    "API를 호출하지 않고 기존 녹취·상담일지를 즉시 불러왔습니다."
+                def update_progress(
+                    index: int,
+                    total: int,
+                    name: str,
+                ) -> None:
+                    ratio = index / max(total, 1)
+                    visible_progress = 0.12 + (ratio * 0.53)
+                    progress.progress(
+                        min(visible_progress, 0.65)
+                    )
+                    stage_message.info(
+                        f"3단계 · 음성을 녹취하고 있습니다. "
+                        f"({index}/{total} 구간)"
+                    )
+
+                transcript, transcript_cached, transcript_cache_key = (
+                    transcribe_audio_with_cache(
+                        user_id,
+                        consultant_name,
+                        business_no,
+                        audio_bytes,
+                        filename,
+                        company_name,
+                        progress_callback=update_progress,
+                        noise_reduction=bool(
+                            pending_job.get(
+                                "noise_reduction",
+                                True,
+                            )
+                        ),
+                        aggressive_noise_reduction=bool(
+                            pending_job.get(
+                                "aggressive_noise_reduction",
+                                False,
+                            )
+                        ),
+                        reuse_cache=bool(
+                            pending_job.get(
+                                "reuse_transcript_cache",
+                                True,
+                            )
+                        ),
+                    )
                 )
-            elif transcript_cached:
-                status_box.success(
-                    "기존 녹취를 재사용하고 상담일지만 새로 생성했습니다."
+
+                if transcript_cached:
+                    progress.progress(0.66)
+                    stage_message.info(
+                        "3단계 · 기존 녹취록을 불러왔습니다."
+                    )
+                else:
+                    progress.progress(0.66)
+                    stage_message.success(
+                        "3단계 · 음성 녹취가 완료되었습니다."
+                    )
+
+                progress.progress(0.72)
+                stage_message.info(
+                    "4단계 · 상담주제와 고객 니즈를 분석하고 있습니다."
                 )
-            else:
-                status_box.success(
-                    "새 녹음의 녹취와 상담일지 초안이 생성되었습니다."
+
+                journal, journal_cached, journal_cache_key = (
+                    summarize_consultation_with_cache(
+                        user_id,
+                        consultant_name,
+                        transcript,
+                        company_name,
+                        business_no,
+                        consultant_name,
+                        reuse_cache=bool(
+                            pending_job.get(
+                                "reuse_journal_cache",
+                                True,
+                            )
+                        ),
+                    )
                 )
-        except Exception as exc:
-            st.error(f"상담일지 생성 중 오류가 발생했습니다: {exc}")
+
+                progress.progress(0.94)
+                stage_message.info(
+                    "5단계 · 상담일지 초안을 화면에 준비하고 있습니다."
+                )
+
+                journal["_cache_info"] = {
+                    "transcript_cached": transcript_cached,
+                    "journal_cached": journal_cached,
+                    "transcript_cache_key": transcript_cache_key,
+                    "journal_cache_key": journal_cache_key,
+                }
+
+                st.session_state[
+                    f"consultation_journal_{business_no}"
+                ] = journal
+
+                progress.progress(1.0)
+
+                if transcript_cached and journal_cached:
+                    completion_message = (
+                        "기존 녹취와 상담일지를 재사용해 "
+                        "API 호출 없이 완료했습니다."
+                    )
+                elif transcript_cached:
+                    completion_message = (
+                        "기존 녹취를 재사용하고 상담일지만 "
+                        "새로 생성했습니다."
+                    )
+                else:
+                    completion_message = (
+                        "녹취와 상담일지 초안 생성이 완료되었습니다."
+                    )
+
+                stage_message.success(completion_message)
+                generation_status.update(
+                    label="상담일지 초안 생성 완료",
+                    state="complete",
+                    expanded=True,
+                )
+
+                st.session_state.pop(job_key, None)
+                st.session_state[running_key] = False
+                st.session_state.pop(error_key, None)
+
+            except Exception as exc:
+                error_message = str(exc)
+                st.session_state[error_key] = error_message
+                st.session_state.pop(job_key, None)
+                st.session_state[running_key] = False
+
+                progress.empty()
+                stage_message.error(
+                    "상담일지 생성이 중단되었습니다."
+                )
+                generation_status.update(
+                    label="상담일지 생성 실패",
+                    state="error",
+                    expanded=True,
+                )
+
+                if (
+                    "insufficient_quota" in error_message
+                    or "exceeded your current quota"
+                    in error_message
+                ):
+                    st.error(
+                        "OpenAI API 잔액 또는 월 사용한도가 부족합니다. "
+                        "OpenAI Platform의 Billing과 Usage limit을 "
+                        "확인한 뒤 다시 실행해주세요."
+                    )
+                elif "429" in error_message:
+                    st.error(
+                        "OpenAI 요청 한도에 도달했습니다. "
+                        "잠시 후 다시 실행해주세요."
+                    )
+                else:
+                    st.error(
+                        f"상담일지 생성 중 오류가 발생했습니다: "
+                        f"{error_message}"
+                    )
+
+        # 작업이 끝난 뒤 버튼·초안 화면을 즉시 정상상태로 다시 그린다.
+        if not st.session_state.get(running_key):
+            st.rerun()
+
+    previous_error = st.session_state.get(error_key)
+    if previous_error and not st.session_state.get(running_key):
+        if st.button(
+            "오류 메시지 닫기",
+            use_container_width=True,
+            key=f"dismiss_consultation_error_{business_no}",
+        ):
+            st.session_state.pop(error_key, None)
+            st.rerun()
 
     journal_key = f"consultation_journal_{business_no}"
     draft = st.session_state.get(journal_key)
