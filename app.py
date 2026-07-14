@@ -11,6 +11,7 @@ from ui import apply_oasis_ui
 from maintenance import render_system_management_page
 from cretop_runner import run_cretop_worker
 from cloud_admin import render_cloud_database_page
+from ai_usage import render_ai_usage_page
 from cloud_restore import restore_customer_db_if_needed
 from cloud_crm_restore import restore_crm_from_cloud
 from enterprise_center import render_enterprise_management_center
@@ -1437,6 +1438,7 @@ with st.sidebar:
         menu_label_map["회원 승인 관리"] = "회원 승인 관리"
         menu_label_map["시스템 관리"] = "시스템 관리"
         menu_label_map["클라우드 DB 관리"] = "클라우드 DB 관리"
+        menu_label_map["AI 사용량"] = "AI 사용량"
 
     selected_menu_label = st.radio(
         "메뉴",
@@ -2506,6 +2508,12 @@ elif CURRENT_USER_IS_ADMIN and active_tab == "시스템 관리":
     render_system_management_page(
         project_root=ROOT_DIR,
         current_user_id=CURRENT_USER_ID,
+    )
+
+elif CURRENT_USER_IS_ADMIN and active_tab == "AI 사용량":
+    render_ai_usage_page(
+        CURRENT_USER_ID,
+        CURRENT_USER_NAME,
     )
 
 elif CURRENT_USER_IS_ADMIN and active_tab == "클라우드 DB 관리":

@@ -15,6 +15,11 @@ import requests
 import streamlit as st
 
 from cloud_sync import sync_crm_record
+from ai_usage import (
+    estimate_summary_cost,
+    estimate_transcription_cost,
+    record_ai_usage,
+)
 from crm import (
     append_timeline_event,
     get_customer_record,
@@ -476,6 +481,27 @@ def _split_audio_if_needed(path: Path, output_dir: Path) -> list[Path]:
     return chunks
 
 
+def _audio_minutes_from_bytes(
+    audio_bytes: bytes,
+    filename: str,
+) -> float:
+    suffix = Path(filename).suffix.lower() or ".m4a"
+    if not _ffmpeg_available():
+        return 0.0
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="oasis_duration_"
+        ) as temp_dir_name:
+            path = Path(temp_dir_name) / f"audio{suffix}"
+            path.write_bytes(audio_bytes)
+            return max(
+                _audio_duration_seconds(path),
+                0.0,
+            ) / 60.0
+    except Exception:
+        return 0.0
+
+
 def _transcribe_chunk(
     api_key: str,
     path: Path,
@@ -668,7 +694,37 @@ def summarize_consultation(
             f"상담일지 생성 실패 HTTP {response.status_code}: {response.text[:800]}"
         )
 
-    result = _extract_json(_extract_response_text(response.json()))
+    response_data = response.json()
+    result = _extract_json(
+        _extract_response_text(response_data)
+    )
+    usage = response_data.get("usage", {})
+    if not isinstance(usage, dict):
+        usage = {}
+    input_tokens = int(
+        usage.get(
+            "input_tokens",
+            usage.get("prompt_tokens", 0),
+        )
+        or 0
+    )
+    output_tokens = int(
+        usage.get(
+            "output_tokens",
+            usage.get("completion_tokens", 0),
+        )
+        or 0
+    )
+    result["_api_usage"] = {
+        "model": model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "estimated_cost_usd": estimate_summary_cost(
+            input_tokens,
+            output_tokens,
+            model,
+        ),
+    }
     result["transcript"] = transcript
     result["generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return result
@@ -677,6 +733,8 @@ def summarize_consultation(
 
 def transcribe_audio_with_cache(
     user_id: str,
+    user_name: str,
+    business_no: str,
     audio_bytes: bytes,
     filename: str,
     company_name: str,
@@ -704,8 +762,32 @@ def transcribe_audio_with_cache(
             "transcript",
         )
         if isinstance(cached_transcript, str) and cached_transcript.strip():
+            audio_minutes = _audio_minutes_from_bytes(
+                audio_bytes,
+                filename,
+            )
+            record_ai_usage(
+                user_id=user_id,
+                user_name=user_name,
+                feature="녹음 상담일지",
+                operation="음성 녹취",
+                model=transcription_model,
+                company_name=company_name,
+                business_no=business_no,
+                cached=True,
+                audio_minutes=audio_minutes,
+                saved_cost_usd=estimate_transcription_cost(
+                    audio_minutes,
+                    transcription_model,
+                ),
+                metadata={"filename": filename},
+            )
             return cached_transcript, True, cache_key
 
+    audio_minutes = _audio_minutes_from_bytes(
+        audio_bytes,
+        filename,
+    )
     transcript = transcribe_audio(
         audio_bytes,
         filename,
@@ -713,6 +795,26 @@ def transcribe_audio_with_cache(
         progress_callback=progress_callback,
         noise_reduction=noise_reduction,
         aggressive_noise_reduction=aggressive_noise_reduction,
+    )
+
+    record_ai_usage(
+        user_id=user_id,
+        user_name=user_name,
+        feature="녹음 상담일지",
+        operation="음성 녹취",
+        model=transcription_model,
+        company_name=company_name,
+        business_no=business_no,
+        cached=False,
+        audio_minutes=audio_minutes,
+        estimated_cost_usd=estimate_transcription_cost(
+            audio_minutes,
+            transcription_model,
+        ),
+        metadata={
+            "filename": filename,
+            "size_bytes": len(audio_bytes),
+        },
     )
 
     _set_cached_value(
@@ -732,6 +834,7 @@ def transcribe_audio_with_cache(
 
 def summarize_consultation_with_cache(
     user_id: str,
+    user_name: str,
     transcript: str,
     company_name: str,
     business_no: str,
@@ -755,6 +858,37 @@ def summarize_consultation_with_cache(
             "journal",
         )
         if isinstance(cached_journal, dict) and cached_journal:
+            api_usage = cached_journal.get(
+                "_api_usage",
+                {},
+            )
+            if not isinstance(api_usage, dict):
+                api_usage = {}
+            record_ai_usage(
+                user_id=user_id,
+                user_name=user_name,
+                feature="녹음 상담일지",
+                operation="상담일지 생성",
+                model=summary_model,
+                company_name=company_name,
+                business_no=business_no,
+                cached=True,
+                input_tokens=int(
+                    api_usage.get("input_tokens", 0)
+                    or 0
+                ),
+                output_tokens=int(
+                    api_usage.get("output_tokens", 0)
+                    or 0
+                ),
+                saved_cost_usd=float(
+                    api_usage.get(
+                        "estimated_cost_usd",
+                        0,
+                    )
+                    or 0
+                ),
+            )
             return dict(cached_journal), True, cache_key
 
     journal = summarize_consultation(
@@ -762,6 +896,32 @@ def summarize_consultation_with_cache(
         company_name,
         business_no,
         consultant_name,
+    )
+
+    api_usage = journal.get("_api_usage", {})
+    if not isinstance(api_usage, dict):
+        api_usage = {}
+    record_ai_usage(
+        user_id=user_id,
+        user_name=user_name,
+        feature="녹음 상담일지",
+        operation="상담일지 생성",
+        model=summary_model,
+        company_name=company_name,
+        business_no=business_no,
+        cached=False,
+        input_tokens=int(
+            api_usage.get("input_tokens", 0)
+            or 0
+        ),
+        output_tokens=int(
+            api_usage.get("output_tokens", 0)
+            or 0
+        ),
+        estimated_cost_usd=float(
+            api_usage.get("estimated_cost_usd", 0)
+            or 0
+        ),
     )
 
     _set_cached_value(
@@ -968,6 +1128,8 @@ def render_audio_consultation_journal(
             transcript, transcript_cached, transcript_cache_key = (
                 transcribe_audio_with_cache(
                     user_id,
+                    consultant_name,
+                    business_no,
                     audio_bytes,
                     uploaded.name,
                     company_name,
@@ -989,6 +1151,7 @@ def render_audio_consultation_journal(
             journal, journal_cached, journal_cache_key = (
                 summarize_consultation_with_cache(
                     user_id,
+                    consultant_name,
                     transcript,
                     company_name,
                     business_no,
@@ -1166,6 +1329,45 @@ def render_audio_consultation_journal(
                 company_name,
                 business_no,
                 consultant_name,
+            )
+            api_usage = regenerated.get(
+                "_api_usage",
+                {},
+            )
+            if not isinstance(api_usage, dict):
+                api_usage = {}
+            record_ai_usage(
+                user_id=user_id,
+                user_name=consultant_name,
+                feature="녹음 상담일지",
+                operation="상담일지 재생성",
+                model=str(
+                    api_usage.get(
+                        "model",
+                        _read_secret(
+                            "OPENAI_SUMMARY_MODEL",
+                            DEFAULT_SUMMARY_MODEL,
+                        ),
+                    )
+                ),
+                company_name=company_name,
+                business_no=business_no,
+                cached=False,
+                input_tokens=int(
+                    api_usage.get("input_tokens", 0)
+                    or 0
+                ),
+                output_tokens=int(
+                    api_usage.get("output_tokens", 0)
+                    or 0
+                ),
+                estimated_cost_usd=float(
+                    api_usage.get(
+                        "estimated_cost_usd",
+                        0,
+                    )
+                    or 0
+                ),
             )
             regenerated["_cache_info"] = {
                 "transcript_cached": True,
