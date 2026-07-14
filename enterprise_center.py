@@ -13,6 +13,9 @@ from consulting_report import (
     build_consulting_analysis,
     build_consulting_excel_report,
 )
+from enterprise_consulting_engine import (
+    reconcile_enterprise_consulting_context,
+)
 from consultation_journal import (
     get_company_consultation_context,
     render_audio_consultation_journal,
@@ -380,13 +383,15 @@ def render_enterprise_management_center(
     )
     customer_key = make_customer_key(company_name, business_no)
 
+    integration = reconcile_enterprise_consulting_context(
+        user_id=user_id,
+        business_no=business_no,
+        company_name=company_name,
+    )
     financial = _financial_snapshot(user_id, business_no)
     registry = _registry_snapshot(user_id, business_no)
     stock = _stock_record(user_id, business_no)
-    preferences = get_matching_preferences(
-        user_id,
-        business_no,
-    )
+    preferences = integration.get("preferences", {}) or {}
     crm_record = get_customer_record(
         user_id,
         customer_key,
@@ -715,12 +720,28 @@ def render_enterprise_management_center(
 
     with tab_policy:
         st.markdown("#### 고객별 정책자금 매칭설정")
+        added_keywords = integration.get("added_keywords", []) or []
+        added_interests = integration.get("added_interests", []) or []
+        consultation_count = int(
+            integration.get("consultation_context", {}).get("count", 0) or 0
+        )
+        st.caption(
+            f"상담일지 {consultation_count}건 연동 · "
+            f"자동추가 키워드 {len(added_keywords)}개 · "
+            f"자동추가 관심분야 {len(added_interests)}개"
+        )
+
+        widget_suffix = (
+            business_no.replace("-", "")
+            if business_no
+            else company_name
+        )
         matching_keywords = st.text_area(
             "매칭키워드",
             value=", ".join(
                 preferences.get("매칭키워드", []) or []
             ),
-            key="enterprise_match_keywords",
+            key=f"enterprise_match_keywords_v650_{widget_suffix}",
         )
         interest_fields = st.multiselect(
             "관심지원분야",
@@ -732,14 +753,14 @@ def render_enterprise_management_center(
                 )
                 if item in INTEREST_OPTIONS
             ],
-            key="enterprise_interest_fields",
+            key=f"enterprise_interest_fields_v650_{widget_suffix}",
         )
         exclusion_keywords = st.text_area(
             "제외키워드",
             value=", ".join(
                 preferences.get("제외키워드", []) or []
             ),
-            key="enterprise_exclusion_keywords",
+            key=f"enterprise_exclusion_keywords_v650_{widget_suffix}",
         )
 
         p1, p2, p3 = st.columns(3)
@@ -749,7 +770,7 @@ def render_enterprise_management_center(
                 value=_clean(
                     preferences.get("자금사용목적", "")
                 ),
-                key="enterprise_fund_purpose",
+                key=f"enterprise_fund_purpose_v650_{widget_suffix}",
             )
         with p2:
             planned_amount = st.text_input(
@@ -757,7 +778,7 @@ def render_enterprise_management_center(
                 value=_clean(
                     preferences.get("투자예정금액", "")
                 ),
-                key="enterprise_planned_amount",
+                key=f"enterprise_planned_amount_v650_{widget_suffix}",
             )
         with p3:
             planned_timing = st.text_input(
@@ -765,13 +786,13 @@ def render_enterprise_management_center(
                 value=_clean(
                     preferences.get("투자예정시기", "")
                 ),
-                key="enterprise_planned_timing",
+                key=f"enterprise_planned_timing_v650_{widget_suffix}",
             )
 
         if st.button(
             "정책자금 매칭설정 저장",
             use_container_width=True,
-            key="enterprise_save_preferences",
+            key=f"enterprise_save_preferences_v650_{widget_suffix}",
         ):
             save_matching_preferences(
                 user_id,
@@ -888,10 +909,9 @@ def render_enterprise_management_center(
             )
 
     with tab_ai:
-        consultation_context = get_company_consultation_context(
-            user_id=user_id,
-            business_no=business_no,
-            company_name=company_name,
+        consultation_context = integration.get(
+            "consultation_context",
+            {},
         )
         consulting_analysis = build_consulting_analysis(
             selected_row,
