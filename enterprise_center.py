@@ -708,6 +708,10 @@ def render_enterprise_management_center(
                 business_no=business_no,
                 company_name=company_name,
             )
+            st.caption(
+                "재연동 후 정책자금 탭과 정책자금매칭 메뉴를 다시 열면 "
+                "최신 키워드와 추천 결과가 반영됩니다."
+            )
 
     with tab_policy:
         st.markdown("#### 고객별 정책자금 매칭설정")
