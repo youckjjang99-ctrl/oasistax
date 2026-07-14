@@ -13,6 +13,7 @@ from consulting_report import (
     build_consulting_analysis,
     build_consulting_excel_report,
 )
+from consultation_journal import render_audio_consultation_journal
 
 from cloud_sync import sync_crm_record
 from crm import (
@@ -240,176 +241,65 @@ def _render_enterprise_dashboard_styles() -> None:
     st.markdown(
         """
         <style>
-        .block-container {
-            padding-top: 1.5rem;
-            max-width: 1320px;
-        }
+        .block-container {padding-top: 1.4rem; max-width: 1320px;}
         .oasis-hero {
-            padding: 24px 28px;
-            border: 1px solid #e7edf7;
-            border-radius: 22px;
-            background:
-                radial-gradient(circle at 88% 14%, rgba(99,102,241,.13), transparent 34%),
-                linear-gradient(135deg, #ffffff 0%, #f6f9ff 100%);
-            box-shadow: 0 12px 34px rgba(31, 64, 124, .08);
-            margin: 8px 0 18px 0;
+            padding: 24px 28px; border: 1px solid #e7edf7; border-radius: 22px;
+            background: radial-gradient(circle at 88% 14%, rgba(99,102,241,.13), transparent 34%),
+                        linear-gradient(135deg, #ffffff 0%, #f6f9ff 100%);
+            box-shadow: 0 12px 34px rgba(31,64,124,.08); margin: 8px 0 18px;
         }
-        .oasis-title {
-            color: #172033;
-            font-size: 1.72rem;
-            font-weight: 850;
-            letter-spacing: -.03em;
-        }
-        .oasis-meta {
-            color: #6b768c;
-            font-size: .93rem;
-            margin-top: 8px;
-        }
+        .oasis-title {color:#172033; font-size:1.72rem; font-weight:850; letter-spacing:-.03em;}
+        .oasis-meta {color:#6b768c; font-size:.93rem; margin-top:8px;}
         .oasis-metric-grid {
-            display: grid;
-            grid-template-columns: repeat(4, minmax(0, 1fr));
-            gap: 14px;
-            margin: 8px 0 20px 0;
+            display:grid; grid-template-columns:repeat(4,minmax(0,1fr));
+            gap:14px; margin:8px 0 20px;
         }
         .oasis-metric-card {
-            min-height: 132px;
-            padding: 18px 20px;
-            border-radius: 18px;
-            border: 1px solid #e1e9f6;
-            box-shadow: 0 7px 22px rgba(42, 70, 120, .06);
-            background: #fff;
+            min-height:132px; padding:18px 20px; border-radius:18px;
+            border:1px solid #e1e9f6; box-shadow:0 7px 22px rgba(42,70,120,.06);
+            background:#fff;
         }
-        .oasis-metric-card.status {
-            background: linear-gradient(145deg, #f5f9ff, #edf5ff);
-            border-color: #cfe0ff;
-        }
-        .oasis-metric-card.stage {
-            background: linear-gradient(145deg, #f8f8ff, #f1f0ff);
-            border-color: #dcd8ff;
-        }
-        .oasis-metric-card.sales {
-            background: linear-gradient(145deg, #f4fff9, #edf9f3);
-            border-color: #ceeadd;
-        }
-        .oasis-metric-card.profit {
-            background: linear-gradient(145deg, #fff9f2, #fff4e8);
-            border-color: #f3ddc1;
-        }
-        .oasis-metric-label {
-            color: #69758c;
-            font-size: .86rem;
-            font-weight: 700;
-            margin-bottom: 15px;
-        }
-        .oasis-metric-value {
-            color: #182338;
-            font-size: 1.62rem;
-            font-weight: 850;
-            line-height: 1.15;
-            word-break: keep-all;
-        }
+        .oasis-metric-card.status {background:linear-gradient(145deg,#f5f9ff,#edf5ff); border-color:#cfe0ff;}
+        .oasis-metric-card.stage {background:linear-gradient(145deg,#f8f8ff,#f1f0ff); border-color:#dcd8ff;}
+        .oasis-metric-card.sales {background:linear-gradient(145deg,#f4fff9,#edf9f3); border-color:#ceeadd;}
+        .oasis-metric-card.profit {background:linear-gradient(145deg,#fff9f2,#fff4e8); border-color:#f3ddc1;}
+        .oasis-metric-label {color:#69758c; font-size:.86rem; font-weight:700; margin-bottom:15px;}
+        .oasis-metric-value {color:#182338; font-size:1.56rem; font-weight:850; line-height:1.15;}
         .oasis-badge {
-            display: inline-block;
-            margin-top: 11px;
-            padding: 5px 10px;
-            border-radius: 999px;
-            color: #3568c8;
-            background: rgba(76, 132, 237, .11);
-            font-size: .78rem;
-            font-weight: 750;
+            display:inline-block; margin-top:11px; padding:5px 10px; border-radius:999px;
+            color:#3568c8; background:rgba(76,132,237,.11); font-size:.78rem; font-weight:750;
         }
         .oasis-section-card {
-            height: 100%;
-            min-height: 245px;
-            padding: 20px 22px;
-            border: 1px solid #e4eaf3;
-            border-radius: 18px;
-            background: #fff;
-            box-shadow: 0 7px 22px rgba(42, 70, 120, .055);
+            height:100%; min-height:245px; padding:20px 22px; border:1px solid #e4eaf3;
+            border-radius:18px; background:#fff; box-shadow:0 7px 22px rgba(42,70,120,.055);
         }
-        .oasis-section-card.blue {
-            background: linear-gradient(145deg, #ffffff, #f5f9ff);
-            border-color: #d7e4fb;
-        }
-        .oasis-section-card.amber {
-            background: linear-gradient(145deg, #fffefa, #fff9ef);
-            border-color: #f0dfbf;
-        }
-        .oasis-section-card.violet {
-            background: linear-gradient(145deg, #ffffff, #f9f7ff);
-            border-color: #e2dcfb;
-        }
-        .oasis-section-title {
-            color: #1f2c43;
-            font-size: 1.13rem;
-            font-weight: 850;
-            margin-bottom: 14px;
-        }
-        .oasis-item {
-            position: relative;
-            padding: 8px 0 8px 22px;
-            color: #344158;
-            line-height: 1.5;
-        }
-        .oasis-item:before {
-            content: "✓";
-            position: absolute;
-            left: 0;
-            top: 8px;
-            color: #3478e5;
-            font-weight: 900;
-        }
+        .oasis-section-card.blue {background:linear-gradient(145deg,#fff,#f5f9ff); border-color:#d7e4fb;}
+        .oasis-section-card.amber {background:linear-gradient(145deg,#fffefa,#fff9ef); border-color:#f0dfbf;}
+        .oasis-section-card.violet {background:linear-gradient(145deg,#fff,#f9f7ff); border-color:#e2dcfb;}
+        .oasis-section-title {color:#1f2c43; font-size:1.13rem; font-weight:850; margin-bottom:14px;}
+        .oasis-item {position:relative; padding:8px 0 8px 22px; color:#344158; line-height:1.5;}
+        .oasis-item:before {content:"✓"; position:absolute; left:0; top:8px; color:#3478e5; font-weight:900;}
         .oasis-question-card {
-            padding: 20px 22px;
-            border-radius: 18px;
-            border: 1px solid #e4eaf3;
-            background: linear-gradient(145deg, #ffffff, #f8faff);
-            box-shadow: 0 7px 22px rgba(42, 70, 120, .055);
+            padding:20px 22px; border-radius:18px; border:1px solid #e4eaf3;
+            background:linear-gradient(145deg,#fff,#f8faff);
+            box-shadow:0 7px 22px rgba(42,70,120,.055);
         }
-        .oasis-question {
-            display: flex;
-            gap: 12px;
-            align-items: flex-start;
-            padding: 9px 0;
-            color: #354158;
-        }
+        .oasis-question {display:flex; gap:12px; align-items:flex-start; padding:9px 0; color:#354158;}
         .oasis-question-number {
-            min-width: 25px;
-            height: 25px;
-            border-radius: 8px;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            background: #eaf2ff;
-            color: #2867cf;
-            font-size: .82rem;
-            font-weight: 850;
+            min-width:25px; height:25px; border-radius:8px; display:inline-flex;
+            align-items:center; justify-content:center; background:#eaf2ff;
+            color:#2867cf; font-size:.82rem; font-weight:850;
         }
-        div[data-baseweb="tab-list"] {
-            gap: 10px;
-            border-bottom: 1px solid #e6ebf3;
-        }
-        button[data-baseweb="tab"] {
-            padding: 10px 12px 12px 12px;
-            font-weight: 750;
-        }
-        @media (max-width: 900px) {
-            .oasis-metric-grid {
-                grid-template-columns: repeat(2, minmax(0, 1fr));
-            }
-        }
+        div[data-baseweb="tab-list"] {gap:10px; border-bottom:1px solid #e6ebf3;}
+        button[data-baseweb="tab"] {padding:10px 12px 12px; font-weight:750;}
+        @media (max-width:900px) {.oasis-metric-grid {grid-template-columns:repeat(2,minmax(0,1fr));}}
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 
-def _render_metric_dashboard(
-    crm_status: str,
-    pipeline_stage: str,
-    sales_text: str,
-    profit_text: str,
-) -> None:
+def _render_metric_dashboard(crm_status: str, pipeline_stage: str, sales_text: str, profit_text: str) -> None:
     st.markdown(
         f"""
         <div class="oasis-metric-grid">
@@ -439,17 +329,9 @@ def _render_metric_dashboard(
     )
 
 
-def _render_list_card(
-    title: str,
-    items: list[str],
-    theme: str,
-    fallback: str,
-) -> None:
+def _render_list_card(title: str, items: list[str], theme: str, fallback: str) -> None:
     safe_items = items or [fallback]
-    item_html = "".join(
-        f'<div class="oasis-item">{item}</div>'
-        for item in safe_items
-    )
+    item_html = "".join(f'<div class="oasis-item">{item}</div>' for item in safe_items)
     st.markdown(
         f"""
         <div class="oasis-section-card {theme}">
@@ -796,6 +678,20 @@ def render_enterprise_management_center(
             else:
                 st.error(message)
 
+        st.divider()
+        render_audio_consultation_journal(
+            user_id=user_id,
+            customer_key=customer_key,
+            company_name=company_name,
+            business_no=business_no,
+            consultant_name=(
+                crm_profile.get("assigned_manager")
+                or user_name
+                or ""
+            ),
+            current_crm=crm_record,
+        )
+
     with tab_policy:
         st.markdown("#### 고객별 정책자금 매칭설정")
         matching_keywords = st.text_area(
@@ -1038,14 +934,8 @@ def render_enterprise_management_center(
                 f"{consulting_analysis.get('completeness', 0)}%",
             )
 
-        report_bytes = build_consulting_excel_report(
-            consulting_analysis
-        )
-        safe_company = re.sub(
-            r'[\\/:*?"<>|]',
-            "_",
-            company_name or "고객",
-        )
+        report_bytes = build_consulting_excel_report(consulting_analysis)
+        safe_company = re.sub(r'[\\/:*?"<>|]', "_", company_name or "고객")
         report_filename = (
             f"AI컨설팅리포트_{safe_company}_"
             f"{datetime.now().strftime('%Y%m%d')}.xlsx"
