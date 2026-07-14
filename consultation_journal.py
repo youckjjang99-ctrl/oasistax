@@ -549,8 +549,12 @@ def _transcribe_chunk(
 
     data = response.json()
     text = data.get("text", "")
+
+    # 녹음을 늦게 종료해 무음 구간만 들어 있는 조각은 정상적으로 건너뛴다.
+    # 한 조각이 비어 있다고 전체 상담 녹취를 실패시키지 않는다.
     if not isinstance(text, str) or not text.strip():
-        raise RuntimeError("음성 변환 결과가 비어 있습니다.")
+        return ""
+
     return text.strip()
 
 
@@ -589,25 +593,46 @@ def transcribe_audio(
         )
 
         chunks = _split_audio_if_needed(processing_path, temp_dir)
-        transcript_parts = []
+        transcript_parts: list[tuple[int, str]] = []
+        skipped_silence_chunks = 0
 
         for index, chunk in enumerate(chunks, start=1):
             if progress_callback:
                 progress_callback(index, len(chunks), chunk.name)
-            transcript_parts.append(
-                _transcribe_chunk(
-                    api_key,
-                    chunk,
-                    company_name,
-                    index,
-                    len(chunks),
-                )
+
+            chunk_text = _transcribe_chunk(
+                api_key,
+                chunk,
+                company_name,
+                index,
+                len(chunks),
             )
 
-    return "\n\n".join(
-        f"[구간 {index}]\n{text}"
-        for index, text in enumerate(transcript_parts, start=1)
+            if not chunk_text:
+                skipped_silence_chunks += 1
+                continue
+
+            transcript_parts.append((index, chunk_text))
+
+    if not transcript_parts:
+        raise RuntimeError(
+            "녹음파일 전체에서 인식 가능한 음성을 찾지 못했습니다. "
+            "마이크 음량과 녹음내용을 확인해주세요."
+        )
+
+    transcript = "\n\n".join(
+        f"[구간 {chunk_index}]\n{chunk_text}"
+        for chunk_index, chunk_text in transcript_parts
     )
+
+    if skipped_silence_chunks:
+        transcript += (
+            "\n\n[처리 안내]\n"
+            f"음성이 없는 구간 {skipped_silence_chunks}개는 "
+            "자동으로 제외했습니다."
+        )
+
+    return transcript
 
 
 def summarize_consultation(
@@ -1098,7 +1123,8 @@ def render_audio_consultation_journal(
 
     st.info(
         "비용 절감 모드: 동일 녹음은 녹취·상담일지 결과를 재사용하고, "
-        "새 파일도 음성인식용 저용량 포맷으로 자동 압축합니다."
+        "새 파일도 음성인식용 저용량 포맷으로 자동 압축합니다. "
+        "녹음을 늦게 종료해 생긴 무음 구간은 자동으로 제외합니다."
     )
 
     if uploaded is not None:
