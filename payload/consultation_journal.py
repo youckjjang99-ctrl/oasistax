@@ -61,6 +61,7 @@ DEFAULT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
 DEFAULT_SUMMARY_MODEL = "gpt-5-mini"
 CACHE_VERSION = "v1"
 CONSULTATION_JOURNAL_TABLE = "oasis_consultation_journals"
+CONSULTATION_AI_CACHE_TABLE = "oasis_consultation_ai_cache"
 
 CONSULTING_TOPIC_TAXONOMY = [
     "정책자금",
@@ -207,6 +208,55 @@ def _journal_cache_key(
     )
 
 
+def _load_cloud_cache_record(
+    user_id: str,
+    key: str,
+) -> dict[str, Any]:
+    if not cloud_is_configured():
+        return {}
+    try:
+        rows = CloudDatabase().select(
+            CONSULTATION_AI_CACHE_TABLE,
+            filters={
+                "owner_user_id": user_id,
+                "cache_key": key,
+            },
+            limit=1,
+        )
+    except Exception:
+        return {}
+    if not rows or not isinstance(rows[0], dict):
+        return {}
+    payload = rows[0].get("cache_data", {})
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            payload = {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _save_cloud_cache_record(
+    user_id: str,
+    key: str,
+    record: dict[str, Any],
+) -> None:
+    if not cloud_is_configured():
+        return
+    cache_type = "transcript" if "|transcript|" in key else "journal"
+    CloudDatabase().upsert(
+        CONSULTATION_AI_CACHE_TABLE,
+        [{
+            "owner_user_id": user_id,
+            "cache_key": key,
+            "cache_type": cache_type,
+            "cache_data": record,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }],
+        on_conflict="owner_user_id,cache_key",
+    )
+
+
 def _get_cached_value(
     user_id: str,
     key: str,
@@ -214,9 +264,17 @@ def _get_cached_value(
 ) -> Any:
     cache = _load_cache(user_id)
     record = cache.get(key, {})
-    if not isinstance(record, dict):
+    if isinstance(record, dict) and record.get(field) not in (None, "", [], {}):
+        return record.get(field)
+
+    cloud_record = _load_cloud_cache_record(user_id, key)
+    if not cloud_record:
         return None
-    return record.get(field)
+
+    # 클라우드 캐시를 로컬에도 복원해 다음 조회는 네트워크 없이 처리한다.
+    cache[key] = cloud_record
+    _save_cache(user_id, cache)
+    return cloud_record.get(field)
 
 
 def _set_cached_value(
@@ -240,6 +298,12 @@ def _set_cached_value(
 
     cache[key] = record
     _save_cache(user_id, cache)
+
+    try:
+        _save_cloud_cache_record(user_id, key, record)
+    except Exception:
+        # 클라우드 캐시 저장 실패가 상담 생성 자체를 막지 않도록 한다.
+        pass
 
 
 def _delete_cached_value(
@@ -306,6 +370,47 @@ def _load_cloud_journals(
                 record[key] = row.get(key)
         result.append(record)
     return result
+
+
+def _find_transcript_in_saved_journals(
+    user_id: str,
+    business_no: str,
+    audio_digest: str,
+) -> str:
+    """v6.3.1 이전에 저장된 상담일지에서 동일 원본 음성의 녹취록을 복구한다."""
+    for record in _load_cloud_journals(user_id, business_no=business_no, limit=500):
+        audio_storage = record.get("_audio_storage", {})
+        if not isinstance(audio_storage, dict):
+            continue
+        audio_record = audio_storage.get("record", {})
+        if not isinstance(audio_record, dict):
+            continue
+        saved_digest = str(audio_record.get("audio_sha256", "")).strip()
+        transcript = str(record.get("transcript", "") or "").strip()
+        if saved_digest and saved_digest == audio_digest and transcript:
+            return transcript
+    return ""
+
+
+def _find_journal_by_transcript(
+    user_id: str,
+    business_no: str,
+    company_name: str,
+    transcript: str,
+) -> dict[str, Any]:
+    target_digest = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
+    for record in _load_cloud_journals(user_id, business_no=business_no, limit=500):
+        saved_transcript = str(record.get("transcript", "") or "").strip()
+        if not saved_transcript:
+            continue
+        saved_digest = hashlib.sha256(saved_transcript.encode("utf-8")).hexdigest()
+        if saved_digest != target_digest:
+            continue
+        saved_company = str(record.get("company_name", "") or "").strip()
+        if company_name.strip() and saved_company and saved_company != company_name.strip():
+            continue
+        return dict(record)
+    return {}
 
 
 def _merge_journal_rows(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -998,6 +1103,26 @@ def transcribe_audio_with_cache(
             cache_key,
             "transcript",
         )
+        if not (isinstance(cached_transcript, str) and cached_transcript.strip()):
+            cached_transcript = _find_transcript_in_saved_journals(
+                user_id,
+                business_no,
+                digest,
+            )
+            if cached_transcript:
+                _set_cached_value(
+                    user_id,
+                    cache_key,
+                    "transcript",
+                    cached_transcript,
+                    metadata={
+                        "filename": filename,
+                        "company_name": company_name,
+                        "model": transcription_model,
+                        "restored_from": "saved_cloud_journal",
+                    },
+                )
+
         if isinstance(cached_transcript, str) and cached_transcript.strip():
             audio_minutes = _audio_minutes_from_bytes(
                 audio_bytes,
@@ -1094,6 +1219,27 @@ def summarize_consultation_with_cache(
             cache_key,
             "journal",
         )
+        if not (isinstance(cached_journal, dict) and cached_journal):
+            cached_journal = _find_journal_by_transcript(
+                user_id,
+                business_no,
+                company_name,
+                transcript,
+            )
+            if cached_journal:
+                _set_cached_value(
+                    user_id,
+                    cache_key,
+                    "journal",
+                    cached_journal,
+                    metadata={
+                        "company_name": company_name,
+                        "business_no": business_no,
+                        "model": summary_model,
+                        "restored_from": "saved_cloud_journal",
+                    },
+                )
+
         if isinstance(cached_journal, dict) and cached_journal:
             api_usage = cached_journal.get(
                 "_api_usage",
