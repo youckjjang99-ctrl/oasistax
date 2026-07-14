@@ -51,6 +51,7 @@ from matching_preferences import (
     save_matching_preferences,
     preference_summary,
 )
+from multi_source_policy import render_multi_source_match
 from stock_valuation import (
     render_stock_valuation_page,
     save_cretop_financial_snapshot,
@@ -1660,6 +1661,30 @@ elif active_tab == "고객DB 업로드/매칭":
                 st.success("고객별 정책자금 매칭설정을 저장했습니다.")
             except Exception as exc:
                 st.error(f"매칭설정 저장 중 오류가 발생했습니다: {exc}")
+
+        current_multi_source_preferences = {
+            "매칭키워드": [
+                item.strip()
+                for item in matching_keywords_text.split(",")
+                if item.strip()
+            ],
+            "관심지원분야": selected_interests,
+            "제외키워드": [
+                item.strip()
+                for item in exclusion_keywords_text.split(",")
+                if item.strip()
+            ],
+            "자금사용목적": fund_purpose,
+            "투자예정금액": planned_amount,
+            "투자예정시기": planned_timing,
+        }
+
+        with st.container(border=True):
+            render_multi_source_match(
+                CURRENT_USER_ID,
+                selected_customer_row,
+                current_multi_source_preferences,
+            )
 
         registered_manager_name = st.text_input(
             "담당자명",
