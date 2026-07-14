@@ -1537,8 +1537,61 @@ def render_audio_consultation_journal(
     error_key = f"consultation_job_error_{business_no}"
 
     pending_job = st.session_state.get(job_key)
+
+    # 이전 실행이 비정상 종료되면서 running 값만 남은 경우 자동 복구한다.
+    if (
+        bool(st.session_state.get(running_key))
+        and not isinstance(pending_job, dict)
+    ):
+        st.session_state[running_key] = False
+
     is_running = bool(st.session_state.get(running_key))
     is_pending = isinstance(pending_job, dict)
+
+    uploaded_bytes = b""
+    upload_ready = False
+    upload_status_message = "녹음파일을 선택해주세요."
+
+    if uploaded is not None:
+        try:
+            uploaded_bytes = uploaded.getvalue()
+            upload_ready = len(uploaded_bytes) > 0
+            if upload_ready:
+                upload_status_message = (
+                    f"업로드 완료 · {len(uploaded_bytes) / 1024 / 1024:.1f}MB"
+                )
+            else:
+                upload_status_message = (
+                    "파일 정보는 표시되지만 내용이 아직 준비되지 않았습니다."
+                )
+        except Exception as upload_exc:
+            upload_ready = False
+            upload_status_message = (
+                f"업로드 파일 확인 중 오류: {upload_exc}"
+            )
+
+    status_col, reset_col = st.columns([4, 1])
+    with status_col:
+        if is_running or is_pending:
+            st.info("상담일지를 생성하고 있습니다. 중복 실행은 차단됩니다.")
+        elif upload_ready:
+            st.success(upload_status_message)
+        elif uploaded is not None:
+            st.warning(upload_status_message)
+        else:
+            st.caption(upload_status_message)
+
+    with reset_col:
+        if st.button(
+            "상태 초기화",
+            use_container_width=True,
+            key=f"reset_consultation_state_{business_no}",
+            help="이전 작업상태가 남아 버튼이 비활성화될 때 사용합니다.",
+        ):
+            st.session_state.pop(job_key, None)
+            st.session_state[running_key] = False
+            st.session_state.pop(error_key, None)
+            st.rerun()
 
     button_label = (
         "상담일지 생성 중..."
@@ -1551,18 +1604,18 @@ def render_audio_consultation_journal(
         type="primary",
         use_container_width=True,
         disabled=(
-            uploaded is None
+            not upload_ready
             or is_running
             or is_pending
         ),
         key=f"generate_consultation_journal_{business_no}",
     )
 
-    if clicked and uploaded is not None:
+    if clicked and upload_ready:
         # 첫 번째 실행에서는 작업자료만 세션에 저장하고 즉시 rerun한다.
         # 다음 실행에서 진행상태 UI를 먼저 표시한 뒤 실제 작업을 시작한다.
         st.session_state[job_key] = {
-            "audio_bytes": uploaded.getvalue(),
+            "audio_bytes": uploaded_bytes,
             "filename": uploaded.name,
             "content_type": (
                 uploaded.type
@@ -1592,6 +1645,22 @@ def render_audio_consultation_journal(
 
     pending_job = st.session_state.get(job_key)
     if isinstance(pending_job, dict):
+        queued_at_text = str(pending_job.get("queued_at", "") or "")
+        try:
+            queued_at = datetime.fromisoformat(queued_at_text)
+            if (
+                datetime.now() - queued_at
+            ).total_seconds() > 1800:
+                st.session_state.pop(job_key, None)
+                st.session_state[running_key] = False
+                st.session_state[error_key] = (
+                    "이전 상담일지 작업이 30분 이상 완료되지 않아 "
+                    "자동으로 초기화했습니다. 다시 실행해주세요."
+                )
+                st.rerun()
+        except Exception:
+            pass
+
         st.session_state[running_key] = True
 
         with st.status(
