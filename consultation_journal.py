@@ -515,6 +515,86 @@ def _audio_minutes_from_bytes(
         return 0.0
 
 
+
+def _prepare_fast_cloud_audio(
+    audio_bytes: bytes,
+    filename: str,
+) -> tuple[bytes, str, str, bool]:
+    """
+    Supabase 보관용 음성을 모노·16kHz·48kbps m4a로 압축한다.
+    브라우저에서 Streamlit로 들어온 뒤의 2차 업로드 시간을 줄인다.
+    변환 실패 시 원본을 그대로 반환한다.
+    """
+    if not _ffmpeg_available():
+        return (
+            audio_bytes,
+            filename,
+            "application/octet-stream",
+            False,
+        )
+
+    suffix = Path(filename).suffix.lower() or ".m4a"
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="oasis_cloud_audio_"
+        ) as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            source = temp_dir / f"source{suffix}"
+            output = temp_dir / "cloud_optimized.m4a"
+            source.write_bytes(audio_bytes)
+
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(source),
+                    "-vn",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "16000",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "48k",
+                    str(output),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=1200,
+            )
+
+            if (
+                result.returncode != 0
+                or not output.exists()
+                or output.stat().st_size <= 0
+            ):
+                return (
+                    audio_bytes,
+                    filename,
+                    "application/octet-stream",
+                    False,
+                )
+
+            optimized_name = (
+                f"{Path(filename).stem}_cloud_optimized.m4a"
+            )
+            return (
+                output.read_bytes(),
+                optimized_name,
+                "audio/mp4",
+                True,
+            )
+    except Exception:
+        return (
+            audio_bytes,
+            filename,
+            "application/octet-stream",
+            False,
+        )
+
+
 def _transcribe_chunk(
     api_key: str,
     path: Path,
@@ -699,7 +779,7 @@ def summarize_consultation(
   "pipeline_stage": "신규|초기상담|자료수집|제안준비|제안완료|정책자금 진행|고용지원금 진행|주가평가 진행|계약완료|보류 중 하나",
   "crm_memo": "CRM 상담메모에 저장할 5~10문장 요약",
   "follow_up_message": "상담 후 고객에게 보낼 짧고 정중한 카카오톡 문안",
-  "policy_fund_recommendation": {
+  "policy_fund_recommendation": {{
     "eligible": true,
     "confidence": 0,
     "matching_keywords": [
@@ -715,7 +795,7 @@ def summarize_consultation(
     "recommended_questions": [
       "정책자금 매칭 정확도를 높이기 위해 추가로 확인할 질문"
     ]
-  }
+  }}
 }}
 
 주제 분류 원칙:
@@ -1398,6 +1478,22 @@ def render_audio_consultation_journal(
             help="같은 녹취와 같은 모델이면 요약 API를 다시 호출하지 않습니다.",
         )
 
+    storage_col1, storage_col2 = st.columns(2)
+    with storage_col1:
+        fast_cloud_storage = st.checkbox(
+            "빠른 클라우드 보관",
+            value=True,
+            key=f"fast_cloud_storage_{business_no}",
+            help=(
+                "원본을 음성인식용 고효율 m4a로 압축해 Supabase에 저장합니다. "
+                "78MB 파일도 보통 훨씬 작아져 2차 업로드가 빨라집니다."
+            ),
+        )
+    with storage_col2:
+        st.caption(
+            "체크 해제 시 원본 파일을 그대로 보관하지만 업로드 시간이 길어집니다."
+        )
+
     option_col1, option_col2 = st.columns(2)
     with option_col1:
         noise_reduction = st.checkbox(
@@ -1422,9 +1518,10 @@ def render_audio_consultation_journal(
     )
 
     st.info(
-        "비용 절감 모드: 동일 녹음은 녹취·상담일지 결과를 재사용하고, "
-        "새 파일도 음성인식용 저용량 포맷으로 자동 압축합니다. "
-        "녹음을 늦게 종료해 생긴 무음 구간은 자동으로 제외합니다."
+        "비용·시간 절감 모드: 동일 녹음은 기존 결과를 재사용하고, "
+        "녹취를 먼저 진행한 뒤 Supabase에는 저용량 압축본을 저장합니다. "
+        "녹음을 늦게 종료해 생긴 무음 구간은 자동 제외합니다. "
+        "단, PC에서 Streamlit로 처음 파일을 올리는 시간은 인터넷 업로드 속도에 따라 달라집니다."
     )
 
     if uploaded is not None:
@@ -1471,6 +1568,9 @@ def render_audio_consultation_journal(
                 uploaded.type
                 if getattr(uploaded, "type", None)
                 else "application/octet-stream"
+            ),
+            "fast_cloud_storage": bool(
+                fast_cloud_storage
             ),
             "noise_reduction": bool(noise_reduction),
             "aggressive_noise_reduction": bool(
@@ -1520,44 +1620,14 @@ def render_audio_consultation_journal(
                         "업로드된 녹음파일의 내용이 비어 있습니다."
                     )
 
-                progress.progress(0.06)
-                stage_message.info(
-                    "2단계 · 원본 녹음파일을 클라우드에 보관하고 있습니다."
-                )
+                audio_storage_result = {
+                    "stored": False,
+                    "message": "클라우드 보관 대기 중",
+                }
 
-                try:
-                    audio_storage_result = upload_audio(
-                        user_id=user_id,
-                        user_name=consultant_name,
-                        company_name=company_name,
-                        business_no=business_no,
-                        filename=filename,
-                        audio_bytes=audio_bytes,
-                        content_type=str(
-                            pending_job.get(
-                                "content_type",
-                                "application/octet-stream",
-                            )
-                        ),
-                    )
-                except Exception as storage_exc:
-                    # 원본 보관 실패가 녹취와 상담일지 생성까지 막지 않도록 한다.
-                    audio_storage_result = {
-                        "stored": False,
-                        "message": (
-                            "원본 녹음파일의 클라우드 보관은 실패했지만 "
-                            "녹취와 상담일지 생성을 계속합니다. "
-                            f"원인: {storage_exc}"
-                        ),
-                        "error": str(storage_exc),
-                    }
-                    stage_message.warning(
-                        audio_storage_result["message"]
-                    )
-
-                progress.progress(0.10)
+                progress.progress(0.08)
                 stage_message.info(
-                    "3단계 · 캐시와 음성 전처리 조건을 확인하고 있습니다."
+                    "2단계 · 캐시와 음성 전처리 조건을 확인하고 있습니다."
                 )
 
                 def update_progress(
@@ -1571,7 +1641,7 @@ def render_audio_consultation_journal(
                         min(visible_progress, 0.65)
                     )
                     stage_message.info(
-                        f"4단계 · 음성을 녹취하고 있습니다. "
+                        f"3단계 · 음성을 녹취하고 있습니다. "
                         f"({index}/{total} 구간)"
                     )
 
@@ -1608,17 +1678,17 @@ def render_audio_consultation_journal(
                 if transcript_cached:
                     progress.progress(0.66)
                     stage_message.info(
-                        "4단계 · 기존 녹취록을 불러왔습니다."
+                        "3단계 · 기존 녹취록을 불러왔습니다."
                     )
                 else:
                     progress.progress(0.66)
                     stage_message.success(
-                        "4단계 · 음성 녹취가 완료되었습니다."
+                        "3단계 · 음성 녹취가 완료되었습니다."
                     )
 
                 progress.progress(0.72)
                 stage_message.info(
-                    "5단계 · 상담주제와 고객 니즈를 분석하고 있습니다."
+                    "4단계 · 상담주제와 고객 니즈를 분석하고 있습니다."
                 )
 
                 journal, journal_cached, journal_cache_key = (
@@ -1638,7 +1708,73 @@ def render_audio_consultation_journal(
                     )
                 )
 
-                progress.progress(0.94)
+                progress.progress(0.88)
+                stage_message.info(
+                    "5단계 · 녹음파일을 클라우드에 보관하고 있습니다."
+                )
+
+                storage_bytes = audio_bytes
+                storage_filename = filename
+                storage_content_type = str(
+                    pending_job.get(
+                        "content_type",
+                        "application/octet-stream",
+                    )
+                )
+                compressed_for_storage = False
+
+                if bool(
+                    pending_job.get(
+                        "fast_cloud_storage",
+                        True,
+                    )
+                ):
+                    (
+                        storage_bytes,
+                        storage_filename,
+                        storage_content_type,
+                        compressed_for_storage,
+                    ) = _prepare_fast_cloud_audio(
+                        audio_bytes,
+                        filename,
+                    )
+
+                try:
+                    audio_storage_result = upload_audio(
+                        user_id=user_id,
+                        user_name=consultant_name,
+                        company_name=company_name,
+                        business_no=business_no,
+                        filename=storage_filename,
+                        audio_bytes=storage_bytes,
+                        content_type=storage_content_type,
+                    )
+                    audio_storage_result[
+                        "compressed_for_storage"
+                    ] = compressed_for_storage
+                    audio_storage_result[
+                        "original_filename"
+                    ] = filename
+                    audio_storage_result[
+                        "original_size_bytes"
+                    ] = len(audio_bytes)
+                    audio_storage_result[
+                        "stored_size_bytes"
+                    ] = len(storage_bytes)
+                except Exception as storage_exc:
+                    audio_storage_result = {
+                        "stored": False,
+                        "message": (
+                            "클라우드 보관은 실패했지만 녹취와 상담일지 생성은 완료했습니다. "
+                            f"원인: {storage_exc}"
+                        ),
+                        "error": str(storage_exc),
+                    }
+                    stage_message.warning(
+                        audio_storage_result["message"]
+                    )
+
+                progress.progress(0.96)
                 stage_message.info(
                     "6단계 · 상담일지 초안을 화면에 준비하고 있습니다."
                 )
