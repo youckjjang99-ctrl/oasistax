@@ -153,6 +153,7 @@ def build_consulting_analysis(
     registry: dict[str, Any],
     stock_record: dict[str, Any],
     preferences: dict[str, Any],
+    consultation_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     company_name = _clean(customer.get("업체명", "")) or _clean(
         financial.get("업체명", "")
@@ -224,6 +225,17 @@ def build_consulting_analysis(
     cautions: list[str] = []
     strategy: list[str] = []
     questions: list[str] = []
+
+    consultation_context = (
+        consultation_context if isinstance(consultation_context, dict) else {}
+    )
+    consultation_count = int(consultation_context.get("count", 0) or 0)
+    latest_consultation = _clean(consultation_context.get("latest_saved_at", ""))
+    latest_summary = _clean(consultation_context.get("latest_summary", ""))
+    consultation_keywords = consultation_context.get("matching_keywords", []) or []
+    consultation_interests = consultation_context.get("interest_fields", []) or []
+    consultation_needs = consultation_context.get("client_needs", []) or []
+    consultation_actions = consultation_context.get("next_actions", []) or []
 
     sales_number = _number(sales)
     operating_number = _number(operating_profit)
@@ -309,6 +321,48 @@ def build_consulting_analysis(
             f"대표가 입력한 자금사용목적은 '{fund_purpose}'입니다."
         )
 
+    if consultation_count:
+        strengths.append(
+            f"최근 상담이 {consultation_count}건 축적되어 있으며 "
+            f"최신 상담일은 {latest_consultation[:10] or '미확인'}입니다."
+        )
+        if latest_summary:
+            strategy.append("최근 상담 요약 반영: " + latest_summary[:220])
+        if consultation_keywords:
+            strategy.append(
+                "상담 기반 정책자금 키워드: "
+                + ", ".join(str(item) for item in consultation_keywords[:12])
+            )
+        if consultation_interests:
+            strategy.append(
+                "상담 기반 관심지원분야: "
+                + ", ".join(str(item) for item in consultation_interests[:8])
+            )
+        if consultation_needs:
+            questions.append(
+                "최근 상담에서 확인된 고객 니즈가 현재도 유효한지 확인해 주세요: "
+                + ", ".join(str(item) for item in consultation_needs[:5])
+            )
+        if consultation_actions:
+            strategy.append(
+                "상담 후속조치: "
+                + ", ".join(str(item) for item in consultation_actions[:5])
+            )
+    else:
+        cautions.append(
+            "저장된 상담일지가 없어 크레탑·등기·주가자료 중심으로만 진단했습니다."
+        )
+
+    if registry:
+        strengths.append("등기정보가 종합진단에 반영되었습니다.")
+    else:
+        cautions.append("등기정보가 없어 지배구조·자본정보 진단이 제한됩니다.")
+
+    if stock_record:
+        strengths.append("최신 주가평가 결과가 종합진단에 반영되었습니다.")
+    else:
+        cautions.append("저장된 주가평가 결과가 없어 기업가치 진단이 제한됩니다.")
+
     if not strategy:
         strategy.append(
             "운전자금·시설투자·채용계획을 확인한 뒤 지원사업 우선순위를 정하는 것이 좋습니다."
@@ -378,6 +432,15 @@ def build_consulting_analysis(
         "preferences": preferences,
         "registry": registry,
         "stock_summary": stock_summary,
+        "consultation_context": consultation_context,
+        "data_sources": {
+            "cretop": bool(len(customer.index)),
+            "financial": bool(financial),
+            "registry": bool(registry),
+            "stock": bool(stock_record),
+            "consultation": bool(consultation_count),
+            "matching_preferences": bool(preferences),
+        },
         "completeness": completeness,
     }
 

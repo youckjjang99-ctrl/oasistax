@@ -1,0 +1,11 @@
+{
+  "version": "v6.4.0",
+  "base_version": "v6.3.3",
+  "modified_files": [
+    "consultation_journal.py",
+    "enterprise_center.py",
+    "consulting_report.py",
+    "VERSION.txt"
+  ],
+  "sql_required": false
+}

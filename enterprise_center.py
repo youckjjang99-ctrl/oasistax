@@ -14,6 +14,7 @@ from consulting_report import (
     build_consulting_excel_report,
 )
 from consultation_journal import (
+    get_company_consultation_context,
     render_audio_consultation_journal,
     render_saved_consultation_journals,
 )
@@ -883,12 +884,18 @@ def render_enterprise_management_center(
             )
 
     with tab_ai:
+        consultation_context = get_company_consultation_context(
+            user_id=user_id,
+            business_no=business_no,
+            company_name=company_name,
+        )
         consulting_analysis = build_consulting_analysis(
             selected_row,
             financial,
             registry,
             stock,
             preferences,
+            consultation_context=consultation_context,
         )
 
         st.markdown("### AI 종합진단")
