@@ -234,7 +234,7 @@ def render_enterprise_management_center(
     user_id: str,
     user_name: str = "",
 ) -> None:
-    st.markdown("## 기업관리센터")
+    st.markdown("## 기업 컨설팅")
     st.caption(
         "고객 한 곳을 선택해 기업정보·CRM·정책자금 설정·주가평가·"
         "기업 히스토리를 한 화면에서 관리합니다."

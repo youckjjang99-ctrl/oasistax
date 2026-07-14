@@ -1427,8 +1427,7 @@ with st.sidebar:
     menu_label_map = {
         "홈": "홈",
         "크레탑 자동등록": "크레탑 자동등록",
-        "고객관리": "고객관리",
-        "기업관리센터": "기업관리센터",
+        "기업 컨설팅": "기업관리센터",
         "정책자금 매칭": "고객DB 업로드/매칭",
         "주가평가": "주가평가",
         "AI 컨설팅 리포트": "AI 컨설팅 리포트",
@@ -1448,6 +1447,11 @@ with st.sidebar:
         label_visibility="collapsed"
     )
     active_tab = menu_label_map[selected_menu_label]
+
+    # v5.0 호환 처리: 이전 세션의 고객관리 메뉴는 통합 화면으로 이동
+    if active_tab == "고객관리":
+        active_tab = "기업관리센터"
+
     st.divider()
     logout_button()
 
@@ -1456,7 +1460,7 @@ st.markdown(f"""
     <div class="oasis-topbar-logo">{logo_html(365)}</div>
     <div style="margin-left:22px;">
         <div class="oasis-topbar-title">오아시스 내부 업무 시스템</div>
-        <div class="oasis-topbar-sub">CRM · 크레탑 자동등록 · 정책자금 매칭 · 실행이력 관리</div>
+        <div class="oasis-topbar-sub">기업 컨설팅 · 크레탑 자동등록 · 정책자금 매칭 · 주가평가</div>
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -1477,9 +1481,6 @@ if active_tab == "홈":
         st.success(crm_restore_notice.get("message", ""))
 
     render_home_page()
-
-elif active_tab == "고객관리":
-    render_customer_management_page(CURRENT_USER_ID)
 
 elif active_tab == "기업관리센터":
     render_enterprise_management_center(
