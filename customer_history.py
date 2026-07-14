@@ -112,15 +112,115 @@ def save_customer_snapshot(
     return snapshot
 
 
+
+def save_customer_event(
+    user_id: str,
+    business_no: str,
+    company_name: str,
+    event_id: str,
+    event_title: str,
+    event_detail: str,
+    occurred_at: str = "",
+    source: str = "consultation",
+) -> dict[str, Any]:
+    normalized = _normalize_business_no(business_no)
+    if not normalized:
+        return {}
+    all_history = _load_all(user_id)
+    items = all_history.get(normalized, [])
+    if not isinstance(items, list):
+        items = []
+    event_id = str(event_id or "").strip()
+    for item in items:
+        data = item.get("data", {}) if isinstance(item, dict) else {}
+        if isinstance(data, dict) and str(data.get("이벤트ID", "")) == event_id:
+            return item
+    captured_at = occurred_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    event_data = {
+        "히스토리유형": "상담",
+        "이벤트ID": event_id,
+        "상담제목": event_title,
+        "상담내용": event_detail,
+    }
+    snapshot = {
+        "captured_at": captured_at,
+        "source": source,
+        "company_name": company_name,
+        "business_no": normalized,
+        "data": event_data,
+    }
+    items.insert(0, snapshot)
+    all_history[normalized] = items[:200]
+    _save_all(user_id, all_history)
+    if cloud_is_configured():
+        try:
+            CloudDatabase().insert(
+                TABLE_HISTORY,
+                [{
+                    "owner_user_id": user_id,
+                    "business_no": normalized,
+                    "company_name": company_name,
+                    "source": source,
+                    "snapshot_data": event_data,
+                    "captured_at": captured_at,
+                }],
+            )
+        except Exception:
+            pass
+    return snapshot
+
 def get_customer_history(
     user_id: str,
     business_no: str,
 ) -> list[dict[str, Any]]:
+    normalized = _normalize_business_no(business_no)
     all_history = _load_all(user_id)
-    return all_history.get(
-        _normalize_business_no(business_no),
-        [],
-    ) or []
+    local_items = all_history.get(normalized, []) or []
+    if not isinstance(local_items, list):
+        local_items = []
+    cloud_items = []
+    if normalized and cloud_is_configured():
+        try:
+            rows = CloudDatabase().select(
+                TABLE_HISTORY,
+                filters={"owner_user_id": user_id, "business_no": normalized},
+                order="captured_at.desc",
+                limit=200,
+            )
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                data = row.get("snapshot_data", {})
+                if isinstance(data, str):
+                    data = json.loads(data)
+                cloud_items.append({
+                    "captured_at": row.get("captured_at", ""),
+                    "source": row.get("source", ""),
+                    "company_name": row.get("company_name", ""),
+                    "business_no": row.get("business_no", normalized),
+                    "data": data if isinstance(data, dict) else {},
+                })
+        except Exception:
+            cloud_items = []
+    merged = []
+    seen = set()
+    for item in cloud_items + local_items:
+        if not isinstance(item, dict):
+            continue
+        data = item.get("data", {}) if isinstance(item.get("data"), dict) else {}
+        unique_key = str(data.get("이벤트ID") or (
+            str(item.get("captured_at", "")) + "|" + str(item.get("source", "")) + "|" +
+            json.dumps(data, ensure_ascii=False, sort_keys=True, default=str)
+        ))
+        if unique_key in seen:
+            continue
+        seen.add(unique_key)
+        merged.append(item)
+    merged.sort(key=lambda item: str(item.get("captured_at", "")), reverse=True)
+    if merged:
+        all_history[normalized] = merged[:200]
+        _save_all(user_id, all_history)
+    return merged[:200]
 
 
 def build_history_table(history: list[dict[str, Any]]) -> pd.DataFrame:

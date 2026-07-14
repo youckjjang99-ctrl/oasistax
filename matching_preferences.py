@@ -80,7 +80,29 @@ def get_matching_preferences(
     key = normalize_business_no(business_no)
     data = _load_all(user_id)
     value = data.get(key, {}) if key else {}
-    return value if isinstance(value, dict) else {}
+    if isinstance(value, dict) and value:
+        return value
+
+    if key:
+        try:
+            from cloud_db import CloudDatabase, TABLE_MATCHING_PREFERENCES, cloud_is_configured
+            if cloud_is_configured():
+                rows = CloudDatabase().select(
+                    TABLE_MATCHING_PREFERENCES,
+                    filters={"owner_user_id": user_id, "business_no": key},
+                    limit=1,
+                )
+                if rows and isinstance(rows[0], dict):
+                    cloud_value = rows[0].get("preference_data", {})
+                    if isinstance(cloud_value, str):
+                        cloud_value = json.loads(cloud_value)
+                    if isinstance(cloud_value, dict) and cloud_value:
+                        data[key] = cloud_value
+                        _save_all(user_id, data)
+                        return cloud_value
+        except Exception:
+            pass
+    return {}
 
 
 def save_matching_preferences(

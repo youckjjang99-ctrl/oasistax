@@ -1,9 +1,10 @@
 {
-  "version": "v6.4.1",
-  "base_version": "v6.4.0",
+  "version": "v6.4.2",
+  "base_version": "v6.4.1",
   "modified_files": [
+    "matching_preferences.py",
+    "customer_history.py",
     "consultation_journal.py",
-    "enterprise_center.py",
     "VERSION.txt"
   ],
   "sql_required": false

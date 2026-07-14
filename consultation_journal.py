@@ -37,6 +37,7 @@ from matching_preferences import (
     get_matching_preferences,
     save_matching_preferences,
 )
+from customer_history import save_customer_event
 from consultation_audio_storage import (
     create_signed_audio_url,
     delete_audio,
@@ -1694,11 +1695,17 @@ def save_consultation_journal(
 
     title = record.get("consultation_title") or "녹음 상담일지"
     history_title = f"{str(record.get('saved_at', ''))[:10]} 상담 · {title}"
-    append_timeline_event(
-        user_id,
-        customer_key,
-        history_title,
-        _journal_to_timeline_detail(record),
+    history_detail = _journal_to_timeline_detail(record)
+    append_timeline_event(user_id, customer_key, history_title, history_detail)
+    save_customer_event(
+        user_id=user_id,
+        business_no=business_no,
+        company_name=company_name,
+        event_id=str(record.get("journal_id", "")),
+        event_title=history_title,
+        event_detail=history_detail,
+        occurred_at=str(record.get("saved_at", "")),
+        source="consultation",
     )
 
     next_actions = record.get("next_actions", []) or []
@@ -1840,11 +1847,18 @@ def relink_saved_consultation_journals(
             try:
                 title = str(record.get("consultation_title", "") or "녹음 상담일지")
                 saved_at = str(record.get("saved_at", "") or "")[:10]
-                append_timeline_event(
-                    user_id,
-                    customer_key,
-                    f"{saved_at} 상담 · {title}",
-                    _journal_to_timeline_detail(record),
+                history_title = f"{saved_at} 상담 · {title}"
+                history_detail = _journal_to_timeline_detail(record)
+                append_timeline_event(user_id, customer_key, history_title, history_detail)
+                save_customer_event(
+                    user_id=user_id,
+                    business_no=business_no,
+                    company_name=company_name,
+                    event_id=journal_id,
+                    event_title=history_title,
+                    event_detail=history_detail,
+                    occurred_at=str(record.get("saved_at", "")),
+                    source="consultation",
                 )
                 processed.add(journal_id)
                 history_added += 1
@@ -1941,9 +1955,10 @@ def render_saved_consultation_journals(
 ) -> None:
     journals = _load_journals(user_id)
     if business_no:
+        target_business_no = normalize_business_no(business_no)
         journals = [
             item for item in journals
-            if str(item.get("business_no", "")) == str(business_no)
+            if normalize_business_no(item.get("business_no", "")) == target_business_no
         ]
     if company_name and not business_no:
         journals = [
