@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -37,8 +38,9 @@ SUPPORTED_AUDIO_TYPES = [
     "webm",
 ]
 MAX_API_FILE_BYTES = 24 * 1024 * 1024
-TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
+DEFAULT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
 DEFAULT_SUMMARY_MODEL = "gpt-5-mini"
+CACHE_VERSION = "v1"
 
 CONSULTING_TOPIC_TAXONOMY = [
     "정책자금",
@@ -99,6 +101,135 @@ def _read_secret(name: str, default: str = "") -> str:
         pass
 
     return default
+
+
+
+def _cache_path(user_id: str) -> Path:
+    return get_user_dirs(user_id)["base"] / "consultation_ai_cache.json"
+
+
+def _load_cache(user_id: str) -> dict[str, Any]:
+    path = _cache_path(user_id)
+    if not path.exists():
+        return {}
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_cache(user_id: str, cache: dict[str, Any]) -> None:
+    path = _cache_path(user_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 최근 사용 200개까지만 보관해 파일이 무한히 커지는 것을 막는다.
+    sorted_items = sorted(
+        cache.items(),
+        key=lambda item: str(
+            item[1].get("updated_at", "")
+            if isinstance(item[1], dict)
+            else ""
+        ),
+        reverse=True,
+    )[:200]
+
+    path.write_text(
+        json.dumps(
+            dict(sorted_items),
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _audio_hash(audio_bytes: bytes) -> str:
+    return hashlib.sha256(audio_bytes).hexdigest()
+
+
+def _transcript_cache_key(
+    audio_digest: str,
+    transcription_model: str,
+    noise_reduction: bool,
+    aggressive_noise_reduction: bool,
+) -> str:
+    return "|".join(
+        [
+            CACHE_VERSION,
+            "transcript",
+            audio_digest,
+            transcription_model,
+            str(bool(noise_reduction)),
+            str(bool(aggressive_noise_reduction)),
+        ]
+    )
+
+
+def _journal_cache_key(
+    transcript: str,
+    summary_model: str,
+    company_name: str,
+) -> str:
+    transcript_digest = hashlib.sha256(
+        transcript.encode("utf-8")
+    ).hexdigest()
+
+    return "|".join(
+        [
+            CACHE_VERSION,
+            "journal",
+            transcript_digest,
+            summary_model,
+            company_name.strip(),
+        ]
+    )
+
+
+def _get_cached_value(
+    user_id: str,
+    key: str,
+    field: str,
+) -> Any:
+    cache = _load_cache(user_id)
+    record = cache.get(key, {})
+    if not isinstance(record, dict):
+        return None
+    return record.get(field)
+
+
+def _set_cached_value(
+    user_id: str,
+    key: str,
+    field: str,
+    value: Any,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    cache = _load_cache(user_id)
+    record = cache.get(key, {})
+    if not isinstance(record, dict):
+        record = {}
+
+    record[field] = value
+    record["updated_at"] = datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    if metadata:
+        record["metadata"] = metadata
+
+    cache[key] = record
+    _save_cache(user_id, cache)
+
+
+def _delete_cached_value(
+    user_id: str,
+    key: str,
+) -> None:
+    cache = _load_cache(user_id)
+    if key in cache:
+        cache.pop(key, None)
+        _save_cache(user_id, cache)
 
 
 def _journal_path(user_id: str) -> Path:
@@ -187,6 +318,46 @@ def _audio_duration_seconds(path: Path) -> float:
 
 
 
+
+def _optimize_audio_for_api(
+    source_path: Path,
+    output_path: Path,
+) -> Path:
+    """
+    음성인식에 필요한 대역만 남기고 모노·16kHz·48kbps로 압축한다.
+    대화 인식 품질을 유지하면서 업로드 용량과 전송시간을 크게 줄인다.
+    """
+    if not _ffmpeg_available():
+        return source_path
+
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(source_path),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "48k",
+            str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=1200,
+    )
+
+    if result.returncode != 0 or not output_path.exists():
+        return source_path
+
+    return output_path
+
+
 def _preprocess_audio(
     source_path: Path,
     output_path: Path,
@@ -224,10 +395,14 @@ def _preprocess_audio(
             "-vn",
             "-af",
             audio_filter,
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
             "-c:a",
             "aac",
             "-b:a",
-            "96k",
+            "48k",
             str(output_path),
         ],
         capture_output=True,
@@ -330,7 +505,10 @@ def _transcribe_chunk(
                 )
             },
             data={
-                "model": TRANSCRIPTION_MODEL,
+                "model": _read_secret(
+                    "OPENAI_TRANSCRIPTION_MODEL",
+                    DEFAULT_TRANSCRIPTION_MODEL,
+                ),
                 "response_format": "json",
                 "language": "ko",
                 "prompt": prompt,
@@ -378,6 +556,11 @@ def transcribe_audio(
                 temp_dir / "noise_reduced.m4a",
                 aggressive=aggressive_noise_reduction,
             )
+
+        processing_path = _optimize_audio_for_api(
+            processing_path,
+            temp_dir / "api_optimized.m4a",
+        )
 
         chunks = _split_audio_if_needed(processing_path, temp_dir)
         transcript_parts = []
@@ -489,6 +672,110 @@ def summarize_consultation(
     result["transcript"] = transcript
     result["generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return result
+
+
+
+def transcribe_audio_with_cache(
+    user_id: str,
+    audio_bytes: bytes,
+    filename: str,
+    company_name: str,
+    progress_callback=None,
+    noise_reduction: bool = True,
+    aggressive_noise_reduction: bool = False,
+    reuse_cache: bool = True,
+) -> tuple[str, bool, str]:
+    transcription_model = _read_secret(
+        "OPENAI_TRANSCRIPTION_MODEL",
+        DEFAULT_TRANSCRIPTION_MODEL,
+    )
+    digest = _audio_hash(audio_bytes)
+    cache_key = _transcript_cache_key(
+        digest,
+        transcription_model,
+        noise_reduction,
+        aggressive_noise_reduction,
+    )
+
+    if reuse_cache:
+        cached_transcript = _get_cached_value(
+            user_id,
+            cache_key,
+            "transcript",
+        )
+        if isinstance(cached_transcript, str) and cached_transcript.strip():
+            return cached_transcript, True, cache_key
+
+    transcript = transcribe_audio(
+        audio_bytes,
+        filename,
+        company_name,
+        progress_callback=progress_callback,
+        noise_reduction=noise_reduction,
+        aggressive_noise_reduction=aggressive_noise_reduction,
+    )
+
+    _set_cached_value(
+        user_id,
+        cache_key,
+        "transcript",
+        transcript,
+        metadata={
+            "filename": filename,
+            "company_name": company_name,
+            "model": transcription_model,
+            "size_bytes": len(audio_bytes),
+        },
+    )
+    return transcript, False, cache_key
+
+
+def summarize_consultation_with_cache(
+    user_id: str,
+    transcript: str,
+    company_name: str,
+    business_no: str,
+    consultant_name: str,
+    reuse_cache: bool = True,
+) -> tuple[dict[str, Any], bool, str]:
+    summary_model = _read_secret(
+        "OPENAI_SUMMARY_MODEL",
+        DEFAULT_SUMMARY_MODEL,
+    )
+    cache_key = _journal_cache_key(
+        transcript,
+        summary_model,
+        company_name,
+    )
+
+    if reuse_cache:
+        cached_journal = _get_cached_value(
+            user_id,
+            cache_key,
+            "journal",
+        )
+        if isinstance(cached_journal, dict) and cached_journal:
+            return dict(cached_journal), True, cache_key
+
+    journal = summarize_consultation(
+        transcript,
+        company_name,
+        business_no,
+        consultant_name,
+    )
+
+    _set_cached_value(
+        user_id,
+        cache_key,
+        "journal",
+        journal,
+        metadata={
+            "company_name": company_name,
+            "business_no": business_no,
+            "model": summary_model,
+        },
+    )
+    return journal, False, cache_key
 
 
 def _list_text(value: Any) -> str:
@@ -610,6 +897,22 @@ def render_audio_consultation_journal(
             '`OPENAI_API_KEY = "sk-..."`를 등록해야 합니다.'
         )
 
+    cache_col1, cache_col2 = st.columns(2)
+    with cache_col1:
+        reuse_transcript_cache = st.checkbox(
+            "같은 녹음파일 녹취 재사용",
+            value=True,
+            key=f"reuse_transcript_cache_{business_no}",
+            help="같은 파일과 같은 노이즈 옵션이면 음성 API를 다시 호출하지 않습니다.",
+        )
+    with cache_col2:
+        reuse_journal_cache = st.checkbox(
+            "같은 녹취 상담일지 재사용",
+            value=True,
+            key=f"reuse_journal_cache_{business_no}",
+            help="같은 녹취와 같은 모델이면 요약 API를 다시 호출하지 않습니다.",
+        )
+
     option_col1, option_col2 = st.columns(2)
     with option_col1:
         noise_reduction = st.checkbox(
@@ -631,6 +934,11 @@ def render_audio_consultation_journal(
         type=SUPPORTED_AUDIO_TYPES,
         key=f"consultation_audio_{business_no}",
         help="mp3, mp4, mpeg, mpga, m4a, wav, webm 지원",
+    )
+
+    st.info(
+        "비용 절감 모드: 동일 녹음은 녹취·상담일지 결과를 재사용하고, "
+        "새 파일도 음성인식용 저용량 포맷으로 자동 압축합니다."
     )
 
     if uploaded is not None:
@@ -657,24 +965,60 @@ def render_audio_consultation_journal(
                 status_box.info(f"녹취 중: {index}/{total} 구간")
 
             audio_bytes = uploaded.getvalue()
-            transcript = transcribe_audio(
-                audio_bytes,
-                uploaded.name,
-                company_name,
-                progress_callback=update_progress,
-                noise_reduction=noise_reduction,
-                aggressive_noise_reduction=aggressive_noise_reduction,
+            transcript, transcript_cached, transcript_cache_key = (
+                transcribe_audio_with_cache(
+                    user_id,
+                    audio_bytes,
+                    uploaded.name,
+                    company_name,
+                    progress_callback=update_progress,
+                    noise_reduction=noise_reduction,
+                    aggressive_noise_reduction=aggressive_noise_reduction,
+                    reuse_cache=reuse_transcript_cache,
+                )
             )
-            status_box.info("상담일지를 정리하고 있습니다.")
-            journal = summarize_consultation(
-                transcript,
-                company_name,
-                business_no,
-                consultant_name,
+
+            if transcript_cached:
+                progress.progress(0.65)
+                status_box.info(
+                    "기존 녹취록을 재사용했습니다. 상담일지를 확인하고 있습니다."
+                )
+            else:
+                status_box.info("상담일지를 정리하고 있습니다.")
+
+            journal, journal_cached, journal_cache_key = (
+                summarize_consultation_with_cache(
+                    user_id,
+                    transcript,
+                    company_name,
+                    business_no,
+                    consultant_name,
+                    reuse_cache=reuse_journal_cache,
+                )
             )
+
+            journal["_cache_info"] = {
+                "transcript_cached": transcript_cached,
+                "journal_cached": journal_cached,
+                "transcript_cache_key": transcript_cache_key,
+                "journal_cache_key": journal_cache_key,
+            }
+
             st.session_state[f"consultation_journal_{business_no}"] = journal
             progress.progress(1.0)
-            status_box.success("상담일지 초안이 생성되었습니다.")
+
+            if transcript_cached and journal_cached:
+                status_box.success(
+                    "API를 호출하지 않고 기존 녹취·상담일지를 즉시 불러왔습니다."
+                )
+            elif transcript_cached:
+                status_box.success(
+                    "기존 녹취를 재사용하고 상담일지만 새로 생성했습니다."
+                )
+            else:
+                status_box.success(
+                    "새 녹음의 녹취와 상담일지 초안이 생성되었습니다."
+                )
         except Exception as exc:
             st.error(f"상담일지 생성 중 오류가 발생했습니다: {exc}")
 
@@ -682,6 +1026,17 @@ def render_audio_consultation_journal(
     draft = st.session_state.get(journal_key)
     if not isinstance(draft, dict):
         return
+
+    cache_info = draft.get("_cache_info", {})
+    if cache_info.get("transcript_cached") or cache_info.get("journal_cached"):
+        saved_parts = []
+        if cache_info.get("transcript_cached"):
+            saved_parts.append("음성 녹취 API")
+        if cache_info.get("journal_cached"):
+            saved_parts.append("상담일지 생성 API")
+        st.success(
+            "캐시 재사용으로 " + ", ".join(saved_parts) + " 호출을 절약했습니다."
+        )
 
     st.markdown("##### 자동 분류된 상담주제")
     detected_topics = draft.get("detected_topics", []) or []
@@ -796,6 +1151,33 @@ def render_audio_consultation_journal(
             height=360,
             key=f"journal_transcript_{business_no}",
         )
+
+    if st.button(
+        "녹취는 유지하고 상담일지만 다시 생성",
+        use_container_width=True,
+        key=f"regenerate_journal_only_{business_no}",
+        help="음성 API를 다시 호출하지 않고 현재 녹취록으로 상담일지만 새로 만듭니다.",
+    ):
+        try:
+            status_box = st.empty()
+            status_box.info("현재 녹취록으로 상담일지만 다시 작성하고 있습니다.")
+            regenerated = summarize_consultation(
+                transcript,
+                company_name,
+                business_no,
+                consultant_name,
+            )
+            regenerated["_cache_info"] = {
+                "transcript_cached": True,
+                "journal_cached": False,
+            }
+            st.session_state[journal_key] = regenerated
+            status_box.success(
+                "음성 재변환 없이 상담일지만 다시 생성했습니다."
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error(f"상담일지 재생성 중 오류가 발생했습니다: {exc}")
 
     if st.button(
         "상담일지 및 CRM 저장",
