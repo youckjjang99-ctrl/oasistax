@@ -13,7 +13,10 @@ from consulting_report import (
     build_consulting_analysis,
     build_consulting_excel_report,
 )
-from consultation_journal import render_audio_consultation_journal
+from consultation_journal import (
+    render_audio_consultation_journal,
+    render_saved_consultation_journals,
+)
 
 from cloud_sync import sync_crm_record
 from crm import (
@@ -533,164 +536,177 @@ def render_enterprise_management_center(
             )
 
     with tab_crm:
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            current_status = crm_record.get("status", "신규")
-            status_index = (
-                STATUS_OPTIONS.index(current_status)
-                if current_status in STATUS_OPTIONS
-                else 0
-            )
-            status = st.selectbox(
-                "고객 상태",
-                STATUS_OPTIONS,
-                index=status_index,
-                key="enterprise_status",
-            )
-        with c2:
-            current_stage = crm_profile.get(
-                "pipeline_stage",
-                "신규",
-            )
-            stage_index = (
-                PIPELINE_OPTIONS.index(current_stage)
-                if current_stage in PIPELINE_OPTIONS
-                else 0
-            )
-            pipeline_stage = st.selectbox(
-                "상담 진행단계",
-                PIPELINE_OPTIONS,
-                index=stage_index,
-                key="enterprise_pipeline",
-            )
-        with c3:
-            current_priority = str(
-                crm_profile.get("priority", "3")
-            )
-            priority_index = (
-                PRIORITY_OPTIONS.index(current_priority)
-                if current_priority in PRIORITY_OPTIONS
-                else 2
-            )
-            priority = st.selectbox(
-                "중요도",
-                PRIORITY_OPTIONS,
-                index=priority_index,
-                format_func=lambda value: "★" * int(value),
-                key="enterprise_priority",
+        crm_manage_tab, journal_view_tab = st.tabs(
+            ["CRM 관리", "녹음파일 상담일지 보기"]
+        )
+
+        with crm_manage_tab:
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                current_status = crm_record.get("status", "신규")
+                status_index = (
+                    STATUS_OPTIONS.index(current_status)
+                    if current_status in STATUS_OPTIONS
+                    else 0
+                )
+                status = st.selectbox(
+                    "고객 상태",
+                    STATUS_OPTIONS,
+                    index=status_index,
+                    key="enterprise_status",
+                )
+            with c2:
+                current_stage = crm_profile.get(
+                    "pipeline_stage",
+                    "신규",
+                )
+                stage_index = (
+                    PIPELINE_OPTIONS.index(current_stage)
+                    if current_stage in PIPELINE_OPTIONS
+                    else 0
+                )
+                pipeline_stage = st.selectbox(
+                    "상담 진행단계",
+                    PIPELINE_OPTIONS,
+                    index=stage_index,
+                    key="enterprise_pipeline",
+                )
+            with c3:
+                current_priority = str(
+                    crm_profile.get("priority", "3")
+                )
+                priority_index = (
+                    PRIORITY_OPTIONS.index(current_priority)
+                    if current_priority in PRIORITY_OPTIONS
+                    else 2
+                )
+                priority = st.selectbox(
+                    "중요도",
+                    PRIORITY_OPTIONS,
+                    index=priority_index,
+                    format_func=lambda value: "★" * int(value),
+                    key="enterprise_priority",
+                )
+
+            d1, d2, d3 = st.columns(3)
+            with d1:
+                current_action = crm_record.get(
+                    "next_action",
+                    "없음",
+                )
+                action_index = (
+                    ACTION_OPTIONS.index(current_action)
+                    if current_action in ACTION_OPTIONS
+                    else len(ACTION_OPTIONS) - 1
+                )
+                next_action = st.selectbox(
+                    "다음 액션",
+                    ACTION_OPTIONS,
+                    index=action_index,
+                    key="enterprise_action",
+                )
+            with d2:
+                current_date = _clean(
+                    crm_record.get(
+                        "next_date",
+                        crm_record.get("next_action_date", ""),
+                    )
+                )
+                try:
+                    default_date = datetime.strptime(
+                        current_date,
+                        "%Y-%m-%d",
+                    ).date()
+                except Exception:
+                    default_date = date.today()
+                next_date_value = st.date_input(
+                    "다음 예정일",
+                    value=default_date,
+                    key="enterprise_next_date",
+                )
+            with d3:
+                assigned_manager = st.text_input(
+                    "담당자",
+                    value=(
+                        crm_profile.get("assigned_manager")
+                        or user_name
+                        or ""
+                    ),
+                    key="enterprise_manager",
+                )
+
+            memo = st.text_area(
+                "상담 메모",
+                value=_clean(crm_record.get("memo", "")),
+                height=150,
+                key="enterprise_memo",
             )
 
-        d1, d2, d3 = st.columns(3)
-        with d1:
-            current_action = crm_record.get(
-                "next_action",
-                "없음",
-            )
-            action_index = (
-                ACTION_OPTIONS.index(current_action)
-                if current_action in ACTION_OPTIONS
-                else len(ACTION_OPTIONS) - 1
-            )
-            next_action = st.selectbox(
-                "다음 액션",
-                ACTION_OPTIONS,
-                index=action_index,
-                key="enterprise_action",
-            )
-        with d2:
-            current_date = _clean(
-                crm_record.get(
-                    "next_date",
-                    crm_record.get("next_action_date", ""),
+            if st.button(
+                "CRM 저장",
+                type="primary",
+                use_container_width=True,
+                key="enterprise_save_crm",
+            ):
+                profile = save_crm_profile(
+                    user_id,
+                    customer_key,
+                    pipeline_stage,
+                    priority,
+                    assigned_manager,
                 )
-            )
-            try:
-                default_date = datetime.strptime(
-                    current_date,
-                    "%Y-%m-%d",
-                ).date()
-            except Exception:
-                default_date = date.today()
-            next_date_value = st.date_input(
-                "다음 예정일",
-                value=default_date,
-                key="enterprise_next_date",
-            )
-        with d3:
-            assigned_manager = st.text_input(
-                "담당자",
-                value=(
+                ok, message = upsert_customer_record(
+                    user_id,
+                    customer_key,
+                    company_name,
+                    business_no,
+                    status,
+                    next_action,
+                    next_date_value.strftime("%Y-%m-%d"),
+                    memo,
+                )
+                if ok:
+                    updated_crm = get_customer_record(
+                        user_id,
+                        customer_key,
+                    )
+                    updated_crm = merge_profile_into_crm_record(
+                        updated_crm,
+                        profile,
+                    )
+                    sync_crm_record(
+                        user_id,
+                        business_no,
+                        updated_crm,
+                    )
+                    st.success(
+                        "CRM 내용을 로컬과 Supabase에 저장했습니다."
+                    )
+                    st.rerun()
+                else:
+                    st.error(message)
+
+            st.divider()
+            render_audio_consultation_journal(
+                user_id=user_id,
+                customer_key=customer_key,
+                company_name=company_name,
+                business_no=business_no,
+                consultant_name=(
                     crm_profile.get("assigned_manager")
                     or user_name
                     or ""
                 ),
-                key="enterprise_manager",
+                current_crm=crm_record,
             )
 
-        memo = st.text_area(
-            "상담 메모",
-            value=_clean(crm_record.get("memo", "")),
-            height=150,
-            key="enterprise_memo",
-        )
 
-        if st.button(
-            "CRM 저장",
-            type="primary",
-            use_container_width=True,
-            key="enterprise_save_crm",
-        ):
-            profile = save_crm_profile(
-                user_id,
-                customer_key,
-                pipeline_stage,
-                priority,
-                assigned_manager,
+        with journal_view_tab:
+            render_saved_consultation_journals(
+                user_id=user_id,
+                business_no=business_no,
+                company_name=company_name,
             )
-            ok, message = upsert_customer_record(
-                user_id,
-                customer_key,
-                company_name,
-                business_no,
-                status,
-                next_action,
-                next_date_value.strftime("%Y-%m-%d"),
-                memo,
-            )
-            if ok:
-                updated_crm = get_customer_record(
-                    user_id,
-                    customer_key,
-                )
-                updated_crm = merge_profile_into_crm_record(
-                    updated_crm,
-                    profile,
-                )
-                sync_crm_record(
-                    user_id,
-                    business_no,
-                    updated_crm,
-                )
-                st.success(
-                    "CRM 내용을 로컬과 Supabase에 저장했습니다."
-                )
-                st.rerun()
-            else:
-                st.error(message)
-
-        st.divider()
-        render_audio_consultation_journal(
-            user_id=user_id,
-            customer_key=customer_key,
-            company_name=company_name,
-            business_no=business_no,
-            consultant_name=(
-                crm_profile.get("assigned_manager")
-                or user_name
-                or ""
-            ),
-            current_crm=crm_record,
-        )
 
     with tab_policy:
         st.markdown("#### 고객별 정책자금 매칭설정")
