@@ -30,6 +30,11 @@ from crm_enhancements import (
     merge_profile_into_crm_record,
     save_crm_profile,
 )
+from matching_preferences import (
+    INTEREST_OPTIONS,
+    get_matching_preferences,
+    save_matching_preferences,
+)
 from utils import get_user_dirs
 
 
@@ -685,7 +690,24 @@ def summarize_consultation(
   "crm_status": "신규|상담중|자료수집|신청완료|계약완료|보류 중 하나",
   "pipeline_stage": "신규|초기상담|자료수집|제안준비|제안완료|정책자금 진행|고용지원금 진행|주가평가 진행|계약완료|보류 중 하나",
   "crm_memo": "CRM 상담메모에 저장할 5~10문장 요약",
-  "follow_up_message": "상담 후 고객에게 보낼 짧고 정중한 카카오톡 문안"
+  "follow_up_message": "상담 후 고객에게 보낼 짧고 정중한 카카오톡 문안",
+  "policy_fund_recommendation": {
+    "eligible": true,
+    "confidence": 0,
+    "matching_keywords": [
+      "녹취에서 확인된 정책자금 매칭용 핵심 키워드"
+    ],
+    "interest_fields": [
+      "운전자금|시설자금|기계·설비 구입|차량 구입|신규채용|고용유지|수출|판로|R&D|창업|스마트공장 중 해당 항목"
+    ],
+    "evidence": [
+      "녹취에서 판단한 정책자금 관련 근거"
+    ],
+    "fund_purpose_hint": "자금 사용 목적 추정 또는 빈 문자열",
+    "recommended_questions": [
+      "정책자금 매칭 정확도를 높이기 위해 추가로 확인할 질문"
+    ]
+  }
 }}
 
 주제 분류 원칙:
@@ -696,6 +718,11 @@ def summarize_consultation(
 - 보험은 단순 보장성보험과 법인 재무목적 보험을 구분하세요.
 - 법률·세무 결론을 단정하지 말고 필요한 서류와 확인사항을 제시하세요.
 - confidence는 0~100 정수로 작성하세요.
+- 정책자금과 직접 관련된 발언이 없으면 policy_fund_recommendation.eligible은 false로 작성하세요.
+- 단순히 기업이라는 이유만으로 정책자금 대상이라고 판단하지 마세요.
+- 시설투자, 기계구입, 차량구입, 신규채용, 연구개발, 수출, 판로확대, 운전자금 부족, 공장 증설, 스마트공장 등의 구체적 발언을 근거로 키워드를 작성하세요.
+- matching_keywords는 정책자금 공고문 검색에 실제 도움이 되는 짧은 단어 또는 구문으로 작성하세요.
+- 이익소각, 가지급금, 가업승계, 정관개정만 논의된 경우에는 정책자금 키워드로 억지 반영하지 마세요.
 
 녹취:
 {transcript}
@@ -978,15 +1005,228 @@ def _split_list_text(value: str) -> list[str]:
     return items
 
 
+
+POLICY_INTEREST_ALIASES = {
+    "운전자금": "운전자금",
+    "시설자금": "시설자금",
+    "시설투자": "시설자금",
+    "기계구입": "기계·설비 구입",
+    "설비구입": "기계·설비 구입",
+    "기계·설비": "기계·설비 구입",
+    "차량구입": "차량 구입",
+    "신규채용": "신규채용",
+    "채용": "신규채용",
+    "고용유지": "고용유지",
+    "수출": "수출",
+    "판로": "판로",
+    "R&D": "R&D",
+    "연구개발": "R&D",
+    "창업": "창업",
+    "스마트공장": "스마트공장",
+}
+
+
+def _normalize_keyword_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        raw_items = value
+    else:
+        raw_items = re.split(
+            r"[,\\n;/|]+",
+            str(value or ""),
+        )
+
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for item in raw_items:
+        cleaned = re.sub(
+            r"\\s+",
+            " ",
+            str(item or "").strip(),
+        )
+        if not cleaned:
+            continue
+
+        normalized_key = cleaned.lower()
+        if normalized_key in seen:
+            continue
+
+        seen.add(normalized_key)
+        result.append(cleaned)
+
+    return result
+
+
+def _normalize_interest_fields(value: Any) -> list[str]:
+    raw_items = _normalize_keyword_list(value)
+    normalized: list[str] = []
+
+    for item in raw_items:
+        candidate = item
+        if candidate not in INTEREST_OPTIONS:
+            for alias, mapped in POLICY_INTEREST_ALIASES.items():
+                if alias.lower() in candidate.lower():
+                    candidate = mapped
+                    break
+
+        if (
+            candidate in INTEREST_OPTIONS
+            and candidate not in normalized
+        ):
+            normalized.append(candidate)
+
+    return normalized
+
+
+def _policy_signal(journal: dict[str, Any]) -> dict[str, Any]:
+    value = journal.get(
+        "policy_fund_recommendation",
+        {},
+    )
+    return value if isinstance(value, dict) else {}
+
+
+def merge_policy_matching_preferences(
+    user_id: str,
+    business_no: str,
+    company_name: str,
+    journal: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    상담일지에서 정책자금 관련 신호를 찾아 기존 설정에 추가한다.
+
+    - 기존 키워드와 관심분야는 삭제하지 않는다.
+    - AI 신뢰도가 60점 이상인 경우에만 자동 반영한다.
+    - 동일 키워드는 중복 저장하지 않는다.
+    """
+    signal = _policy_signal(journal)
+    confidence = int(signal.get("confidence", 0) or 0)
+    eligible = bool(signal.get("eligible", False))
+
+    result = {
+        "updated": False,
+        "confidence": confidence,
+        "added_keywords": [],
+        "added_interests": [],
+        "message": "",
+    }
+
+    if not eligible or confidence < 60:
+        result["message"] = (
+            "정책자금 관련성이 낮아 매칭키워드에는 자동 반영하지 않았습니다."
+        )
+        return result
+
+    suggested_keywords = _normalize_keyword_list(
+        signal.get("matching_keywords", [])
+    )
+    suggested_interests = _normalize_interest_fields(
+        signal.get("interest_fields", [])
+    )
+
+    if not suggested_keywords and not suggested_interests:
+        result["message"] = (
+            "정책자금 관련 신호는 있으나 추가할 키워드를 찾지 못했습니다."
+        )
+        return result
+
+    current = get_matching_preferences(
+        user_id,
+        business_no,
+    )
+    if not isinstance(current, dict):
+        current = {}
+
+    current_keywords = _normalize_keyword_list(
+        current.get("매칭키워드", [])
+    )
+    current_interests = _normalize_interest_fields(
+        current.get("관심지원분야", [])
+    )
+    current_exclusions = _normalize_keyword_list(
+        current.get("제외키워드", [])
+    )
+
+    keyword_keys = {
+        item.lower()
+        for item in current_keywords
+    }
+    added_keywords = []
+
+    for keyword in suggested_keywords:
+        if keyword.lower() in keyword_keys:
+            continue
+        current_keywords.append(keyword)
+        keyword_keys.add(keyword.lower())
+        added_keywords.append(keyword)
+
+    added_interests = []
+
+    for interest in suggested_interests:
+        if interest in current_interests:
+            continue
+        current_interests.append(interest)
+        added_interests.append(interest)
+
+    if not added_keywords and not added_interests:
+        result["message"] = (
+            "추천된 정책자금 키워드가 이미 매칭설정에 반영되어 있습니다."
+        )
+        return result
+
+    save_matching_preferences(
+        user_id,
+        business_no,
+        company_name=company_name,
+        matching_keywords=", ".join(current_keywords),
+        interest_fields=current_interests,
+        exclusion_keywords=", ".join(current_exclusions),
+        fund_purpose=str(
+            current.get("자금사용목적", "")
+            or ""
+        ),
+        planned_amount=str(
+            current.get("투자예정금액", "")
+            or ""
+        ),
+        planned_timing=str(
+            current.get("투자예정시기", "")
+            or ""
+        ),
+    )
+
+    result.update(
+        {
+            "updated": True,
+            "added_keywords": added_keywords,
+            "added_interests": added_interests,
+            "message": (
+                f"정책자금 매칭키워드 {len(added_keywords)}개와 "
+                f"관심분야 {len(added_interests)}개를 자동 반영했습니다."
+            ),
+        }
+    )
+    return result
+
+
 def _journal_to_timeline_detail(journal: dict[str, Any]) -> str:
     topic_names = [
         item.get("topic", "")
         for item in journal.get("detected_topics", []) or []
         if isinstance(item, dict) and item.get("topic")
     ]
+    policy_signal = _policy_signal(journal)
+    policy_keywords = _normalize_keyword_list(
+        policy_signal.get(
+            "matching_keywords",
+            [],
+        )
+    )
+
     sections = [
         f"상담요약: {journal.get('summary', '')}",
         "상담주제: " + ", ".join(topic_names),
+        "정책자금 키워드: " + ", ".join(policy_keywords),
         "고객 니즈: " + ", ".join(journal.get("client_needs", []) or []),
         "주요 논의: " + ", ".join(journal.get("key_discussions", []) or []),
         "고객 약속: " + ", ".join(journal.get("client_promises", []) or []),
@@ -1059,7 +1299,34 @@ def save_consultation_journal(
     updated_crm = get_customer_record(user_id, customer_key)
     updated_crm = merge_profile_into_crm_record(updated_crm, updated_profile)
     sync_crm_record(user_id, business_no, updated_crm)
-    return True, "상담일지와 CRM 내용을 저장했습니다."
+
+    policy_result = {
+        "updated": False,
+        "message": "",
+    }
+
+    if bool(record.get("_auto_policy_keywords", False)):
+        try:
+            policy_result = merge_policy_matching_preferences(
+                user_id,
+                business_no,
+                company_name,
+                record,
+            )
+        except Exception as exc:
+            policy_result = {
+                "updated": False,
+                "message": (
+                    "상담일지는 저장했지만 정책자금 키워드 자동반영 중 "
+                    f"오류가 발생했습니다: {exc}"
+                ),
+            }
+
+    message = "상담일지와 CRM 내용을 저장했습니다."
+    if policy_result.get("message"):
+        message += " " + str(policy_result["message"])
+
+    return True, message
 
 
 def render_audio_consultation_journal(
@@ -1430,6 +1697,95 @@ def render_audio_consultation_journal(
     else:
         st.info("자동 분류된 상담주제가 없습니다.")
 
+    policy_signal = _policy_signal(draft)
+    if policy_signal:
+        st.markdown("##### 정책자금 매칭 신호")
+        policy_confidence = int(
+            policy_signal.get("confidence", 0)
+            or 0
+        )
+        policy_eligible = bool(
+            policy_signal.get("eligible", False)
+        )
+
+        signal_col1, signal_col2 = st.columns(2)
+        signal_col1.metric(
+            "정책자금 관련성",
+            (
+                "있음"
+                if policy_eligible
+                else "낮음"
+            ),
+        )
+        signal_col2.metric(
+            "AI 신뢰도",
+            f"{policy_confidence}%",
+        )
+
+        suggested_keywords = _normalize_keyword_list(
+            policy_signal.get(
+                "matching_keywords",
+                [],
+            )
+        )
+        suggested_interests = _normalize_interest_fields(
+            policy_signal.get(
+                "interest_fields",
+                [],
+            )
+        )
+
+        if suggested_keywords:
+            st.write(
+                "**추천 매칭키워드:** "
+                + ", ".join(suggested_keywords)
+            )
+        if suggested_interests:
+            st.write(
+                "**추천 관심분야:** "
+                + ", ".join(suggested_interests)
+            )
+
+        evidence_items = _normalize_keyword_list(
+            policy_signal.get("evidence", [])
+        )
+        if evidence_items:
+            with st.expander(
+                "정책자금 판단 근거",
+                expanded=False,
+            ):
+                for evidence in evidence_items:
+                    st.write(f"- {evidence}")
+
+        recommended_questions = _normalize_keyword_list(
+            policy_signal.get(
+                "recommended_questions",
+                [],
+            )
+        )
+        if recommended_questions:
+            with st.expander(
+                "추가 확인 질문",
+                expanded=False,
+            ):
+                for question in recommended_questions:
+                    st.write(f"- {question}")
+
+        auto_policy_keywords = st.checkbox(
+            "상담일지 저장 시 정책자금 추천키워드를 자동 반영",
+            value=(
+                policy_eligible
+                and policy_confidence >= 60
+            ),
+            key=f"auto_policy_keywords_{business_no}",
+            help=(
+                "기존 키워드는 삭제하지 않고 새로운 추천키워드만 "
+                "추가합니다. 신뢰도 60점 미만은 자동 반영하지 않습니다."
+            ),
+        )
+    else:
+        auto_policy_keywords = False
+
     st.markdown("##### 상담일지 검토·수정")
     title = st.text_input(
         "상담 제목",
@@ -1612,6 +1968,9 @@ def render_audio_consultation_journal(
                 "follow_up_message": follow_up_message,
                 "crm_memo": crm_memo,
                 "transcript": transcript,
+                "_auto_policy_keywords": bool(
+                    auto_policy_keywords
+                ),
             }
         )
         ok, message = save_consultation_journal(
