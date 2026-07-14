@@ -40,6 +40,52 @@ MAX_API_FILE_BYTES = 24 * 1024 * 1024
 TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
 DEFAULT_SUMMARY_MODEL = "gpt-5-mini"
 
+CONSULTING_TOPIC_TAXONOMY = [
+    "정책자금",
+    "고용지원금",
+    "통합고용세액공제",
+    "통합투자세액공제",
+    "연구인력개발비세액공제",
+    "경정청구",
+    "법인세·소득세 절세",
+    "이익소각",
+    "자기주식 취득·소각",
+    "가지급금 정리",
+    "가수금 정리",
+    "미처분이익잉여금 관리",
+    "배당정책",
+    "임원퇴직금",
+    "유족보상금",
+    "정관개정",
+    "주주총회·이사회 의사결정",
+    "가업승계",
+    "상속·증여",
+    "비상장주식 평가",
+    "명의신탁주식",
+    "차명주식 정리",
+    "법인전환",
+    "개인사업자 법인전환",
+    "합병·분할·조직재편",
+    "특허·상표·기업부설연구소",
+    "벤처·이노비즈·메인비즈 인증",
+    "R&D 정부지원사업",
+    "TIPS·LIPS",
+    "수출·판로지원",
+    "시설투자·기계구입·차량구입",
+    "공장등록·스마트공장",
+    "재무구조 개선",
+    "부채비율·현금흐름 관리",
+    "대표자 보장·법인보험",
+    "CEO정기보험·경영인정기보험",
+    "퇴직재원·승계재원 마련",
+    "노무·근로계약·취업규칙",
+    "중대재해·산업안전",
+    "4대보험·보수총액",
+    "기장·세무조정",
+    "기업가치평가",
+    "투자유치·재무제표 개선",
+]
+
 
 def _read_secret(name: str, default: str = "") -> str:
     value = os.environ.get(name, "")
@@ -140,6 +186,64 @@ def _audio_duration_seconds(path: Path) -> float:
     return float(result.stdout.strip())
 
 
+
+def _preprocess_audio(
+    source_path: Path,
+    output_path: Path,
+    aggressive: bool = False,
+) -> Path:
+    """
+    카페 배경음·에어컨·저주파 소음·작은 음량을 완화한다.
+    원본은 보존하고 전처리 복사본만 사용한다.
+    """
+    if not _ffmpeg_available():
+        return source_path
+
+    if aggressive:
+        audio_filter = (
+            "highpass=f=100,"
+            "lowpass=f=7800,"
+            "afftdn=nf=-30:tn=1,"
+            "dynaudnorm=f=200:g=12,"
+            "loudnorm=I=-18:TP=-2:LRA=11"
+        )
+    else:
+        audio_filter = (
+            "highpass=f=80,"
+            "lowpass=f=8200,"
+            "afftdn=nf=-24:tn=1,"
+            "dynaudnorm=f=250:g=8"
+        )
+
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(source_path),
+            "-vn",
+            "-af",
+            audio_filter,
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=1200,
+    )
+    if result.returncode != 0 or not output_path.exists():
+        return source_path
+
+    return output_path
+
+
+def _consulting_topics_prompt() -> str:
+    return ", ".join(CONSULTING_TOPIC_TAXONOMY)
+
+
 def _split_audio_if_needed(path: Path, output_dir: Path) -> list[Path]:
     if path.stat().st_size <= MAX_API_FILE_BYTES:
         return [path]
@@ -205,9 +309,12 @@ def _transcribe_chunk(
     total_chunks: int,
 ) -> str:
     prompt = (
-        f"한국어 기업 상담 녹음입니다. 업체명은 {company_name or '미확인'}입니다. "
-        "정책자금, 세무, 보험, 고용지원금, 주가평가, 재무상담 관련 용어를 "
-        "가능한 정확하게 받아쓰세요. "
+        f"한국어 기업 컨설팅 상담 녹음입니다. 업체명은 {company_name or '미확인'}입니다. "
+        "다음 분야의 전문용어를 문맥에 맞게 정확히 받아쓰세요: "
+        f"{_consulting_topics_prompt()}. "
+        "특히 이익소각, 자기주식, 가지급금, 가업승계, 정관개정, 임원퇴직금, "
+        "비상장주식평가, 경영인정기보험, 정책자금, 고용지원금, 세액공제 용어를 "
+        "일반 단어로 잘못 바꾸지 마세요. "
         f"전체 {total_chunks}개 중 {chunk_index}번째 구간입니다."
     )
 
@@ -248,6 +355,8 @@ def transcribe_audio(
     filename: str,
     company_name: str,
     progress_callback=None,
+    noise_reduction: bool = True,
+    aggressive_noise_reduction: bool = False,
 ) -> str:
     api_key = _read_secret("OPENAI_API_KEY")
     if not api_key:
@@ -262,7 +371,15 @@ def transcribe_audio(
         original_path = temp_dir / f"original{suffix}"
         original_path.write_bytes(audio_bytes)
 
-        chunks = _split_audio_if_needed(original_path, temp_dir)
+        processing_path = original_path
+        if noise_reduction:
+            processing_path = _preprocess_audio(
+                original_path,
+                temp_dir / "noise_reduced.m4a",
+                aggressive=aggressive_noise_reduction,
+            )
+
+        chunks = _split_audio_if_needed(processing_path, temp_dir)
         transcript_parts = []
 
         for index, chunk in enumerate(chunks, start=1):
@@ -295,34 +412,61 @@ def summarize_consultation(
         raise RuntimeError("OPENAI_API_KEY가 설정되지 않았습니다.")
 
     model = _read_secret("OPENAI_SUMMARY_MODEL", DEFAULT_SUMMARY_MODEL)
+    topic_taxonomy = _consulting_topics_prompt()
     prompt = f"""
-당신은 한국 중소기업 컨설팅 CRM의 상담일지 작성자입니다.
+당신은 한국 중소기업·법인 컨설팅 CRM의 상담일지 작성자입니다.
 아래 녹취를 근거로 사실만 정리하고, 녹취에 없는 내용을 만들어내지 마세요.
+정책자금 중심으로만 해석하지 말고 세무·법무·상법·승계·보험·노무·재무 주제를 모두 열어두고 분석하세요.
 
 업체명: {company_name}
 사업자등록번호: {business_no}
 상담자: {consultant_name}
 상담일: {datetime.now().strftime('%Y-%m-%d')}
 
+분석 가능한 주요 주제:
+{topic_taxonomy}
+
 반드시 아래 JSON 객체만 출력하세요.
 {{
   "consultation_title": "상담 제목",
   "summary": "전체 상담 요약",
+  "detected_topics": [
+    {{
+      "topic": "분류된 상담주제",
+      "confidence": 0,
+      "evidence": "녹취에서 판단한 근거",
+      "recommended_review": "추가 검토 방향"
+    }}
+  ],
   "client_needs": ["고객의 니즈"],
   "key_discussions": ["주요 논의사항"],
   "recommended_solutions": ["추천 검토사항"],
   "required_documents": ["추가 필요서류"],
-  "risks_and_checks": ["위험요소 및 확인사항"],
+  "client_promises": ["고객이 제출하거나 확인하기로 한 사항"],
+  "consultant_tasks": ["상담자가 해야 할 후속조치"],
+  "unresolved_questions": ["답변되지 않았거나 다음 상담에서 확인할 질문"],
+  "risks_and_checks": ["세무·상법·노무·보험·재무상 위험요소와 확인사항"],
   "next_actions": ["다음 액션"],
   "next_contact_date": "YYYY-MM-DD 또는 빈 문자열",
   "crm_status": "신규|상담중|자료수집|신청완료|계약완료|보류 중 하나",
   "pipeline_stage": "신규|초기상담|자료수집|제안준비|제안완료|정책자금 진행|고용지원금 진행|주가평가 진행|계약완료|보류 중 하나",
-  "crm_memo": "CRM 상담메모에 저장할 5~10문장 요약"
+  "crm_memo": "CRM 상담메모에 저장할 5~10문장 요약",
+  "follow_up_message": "상담 후 고객에게 보낼 짧고 정중한 카카오톡 문안"
 }}
+
+주제 분류 원칙:
+- 이익소각과 자기주식 취득·소각을 혼동하지 마세요.
+- 가지급금·가수금·미처분이익잉여금을 구분하세요.
+- 가업승계는 상속·증여·주식가치·대표자 유고재원과 연결해 보되, 녹취 근거가 있을 때만 기록하세요.
+- 정관개정은 임원퇴직금·유족보상금·주식양도제한·배당·주총·이사회 규정 등 구체 내용을 분리하세요.
+- 보험은 단순 보장성보험과 법인 재무목적 보험을 구분하세요.
+- 법률·세무 결론을 단정하지 말고 필요한 서류와 확인사항을 제시하세요.
+- confidence는 0~100 정수로 작성하세요.
 
 녹취:
 {transcript}
 """.strip()
+
 
     response = requests.post(
         "https://api.openai.com/v1/responses",
@@ -363,10 +507,18 @@ def _split_list_text(value: str) -> list[str]:
 
 
 def _journal_to_timeline_detail(journal: dict[str, Any]) -> str:
+    topic_names = [
+        item.get("topic", "")
+        for item in journal.get("detected_topics", []) or []
+        if isinstance(item, dict) and item.get("topic")
+    ]
     sections = [
         f"상담요약: {journal.get('summary', '')}",
+        "상담주제: " + ", ".join(topic_names),
         "고객 니즈: " + ", ".join(journal.get("client_needs", []) or []),
         "주요 논의: " + ", ".join(journal.get("key_discussions", []) or []),
+        "고객 약속: " + ", ".join(journal.get("client_promises", []) or []),
+        "상담자 업무: " + ", ".join(journal.get("consultant_tasks", []) or []),
         "다음 액션: " + ", ".join(journal.get("next_actions", []) or []),
     ]
     return "\n".join(section for section in sections if section.split(":", 1)[-1].strip())
@@ -458,6 +610,22 @@ def render_audio_consultation_journal(
             '`OPENAI_API_KEY = "sk-..."`를 등록해야 합니다.'
         )
 
+    option_col1, option_col2 = st.columns(2)
+    with option_col1:
+        noise_reduction = st.checkbox(
+            "카페·배경소음 감소 전처리",
+            value=True,
+            key=f"noise_reduction_{business_no}",
+            help="저주파 소음, 에어컨, 잔잔한 배경음, 작은 음량을 보정합니다.",
+        )
+    with option_col2:
+        aggressive_noise_reduction = st.checkbox(
+            "강한 노이즈 제거",
+            value=False,
+            key=f"aggressive_noise_reduction_{business_no}",
+            help="커피머신·주변 대화가 큰 경우 사용합니다. 음성이 다소 건조해질 수 있습니다.",
+        )
+
     uploaded = st.file_uploader(
         "상담 녹음파일",
         type=SUPPORTED_AUDIO_TYPES,
@@ -494,6 +662,8 @@ def render_audio_consultation_journal(
                 uploaded.name,
                 company_name,
                 progress_callback=update_progress,
+                noise_reduction=noise_reduction,
+                aggressive_noise_reduction=aggressive_noise_reduction,
             )
             status_box.info("상담일지를 정리하고 있습니다.")
             journal = summarize_consultation(
@@ -512,6 +682,27 @@ def render_audio_consultation_journal(
     draft = st.session_state.get(journal_key)
     if not isinstance(draft, dict):
         return
+
+    st.markdown("##### 자동 분류된 상담주제")
+    detected_topics = draft.get("detected_topics", []) or []
+    if detected_topics:
+        topic_rows = []
+        for item in detected_topics:
+            if isinstance(item, dict):
+                topic_rows.append({
+                    "상담주제": item.get("topic", ""),
+                    "신뢰도": f"{item.get('confidence', 0)}%",
+                    "판단근거": item.get("evidence", ""),
+                    "추가 검토": item.get("recommended_review", ""),
+                })
+        if topic_rows:
+            st.dataframe(
+                topic_rows,
+                hide_index=True,
+                use_container_width=True,
+            )
+    else:
+        st.info("자동 분류된 상담주제가 없습니다.")
 
     st.markdown("##### 상담일지 검토·수정")
     title = st.text_input(
@@ -555,6 +746,24 @@ def render_audio_consultation_journal(
         height=100,
         key=f"journal_checks_{business_no}",
     )
+    client_promises = st.text_area(
+        "고객이 약속한 제출·확인사항",
+        value=_list_text(draft.get("client_promises", [])),
+        height=100,
+        key=f"journal_client_promises_{business_no}",
+    )
+    consultant_tasks = st.text_area(
+        "상담자 후속업무",
+        value=_list_text(draft.get("consultant_tasks", [])),
+        height=100,
+        key=f"journal_consultant_tasks_{business_no}",
+    )
+    unresolved_questions = st.text_area(
+        "다음 상담에서 확인할 질문",
+        value=_list_text(draft.get("unresolved_questions", [])),
+        height=100,
+        key=f"journal_unresolved_questions_{business_no}",
+    )
     actions = st.text_area(
         "다음 액션",
         value=_list_text(draft.get("next_actions", [])),
@@ -566,6 +775,12 @@ def render_audio_consultation_journal(
         value=str(draft.get("next_contact_date", "") or ""),
         placeholder="YYYY-MM-DD",
         key=f"journal_next_date_{business_no}",
+    )
+    follow_up_message = st.text_area(
+        "상담 후 고객에게 보낼 카카오톡 문안",
+        value=str(draft.get("follow_up_message", "") or ""),
+        height=120,
+        key=f"journal_follow_up_message_{business_no}",
     )
     crm_memo = st.text_area(
         "CRM 저장 메모",
@@ -597,8 +812,12 @@ def render_audio_consultation_journal(
                 "recommended_solutions": _split_list_text(solutions),
                 "required_documents": _split_list_text(documents),
                 "risks_and_checks": _split_list_text(checks),
+                "client_promises": _split_list_text(client_promises),
+                "consultant_tasks": _split_list_text(consultant_tasks),
+                "unresolved_questions": _split_list_text(unresolved_questions),
                 "next_actions": _split_list_text(actions),
                 "next_contact_date": next_date.strip(),
+                "follow_up_message": follow_up_message,
                 "crm_memo": crm_memo,
                 "transcript": transcript,
             }
