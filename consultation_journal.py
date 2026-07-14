@@ -35,6 +35,14 @@ from matching_preferences import (
     get_matching_preferences,
     save_matching_preferences,
 )
+from consultation_audio_storage import (
+    create_signed_audio_url,
+    delete_audio,
+    link_audio_to_journal,
+    list_company_audio,
+    storage_is_configured,
+    upload_audio,
+)
 from utils import get_user_dirs
 
 
@@ -1260,6 +1268,20 @@ def save_consultation_journal(
     journals.insert(0, record)
     _save_journals(user_id, journals)
 
+    audio_storage = record.get("_audio_storage", {})
+    if isinstance(audio_storage, dict):
+        audio_record = audio_storage.get("record", {})
+        if isinstance(audio_record, dict):
+            link_audio_to_journal(
+                audio_id=str(audio_record.get("audio_id", "")),
+                journal_id=str(record.get("journal_id", "")),
+                consultation_title=str(
+                    record.get("consultation_title", "")
+                    or "녹음 상담일지"
+                ),
+                summary=str(record.get("summary", "") or ""),
+            )
+
     title = record.get("consultation_title") or "녹음 상담일지"
     append_timeline_event(
         user_id,
@@ -1342,6 +1364,17 @@ def render_audio_consultation_journal(
         "통화·미팅 녹음파일을 업로드하면 녹취, 상담요약, 고객 니즈, "
         "다음 액션을 작성하고 CRM에 저장합니다."
     )
+
+    if storage_is_configured():
+        st.success(
+            "원본 녹음파일은 Supabase Storage에 영구 보관되며 "
+            "버전 업데이트·Streamlit 재부팅 후에도 유지됩니다."
+        )
+    else:
+        st.warning(
+            "Supabase Storage 설정이 없어 원본 녹음파일은 현재 세션에서만 처리됩니다. "
+            "상담일지와 녹취록은 기존 방식으로 저장됩니다."
+        )
 
     if not _read_secret("OPENAI_API_KEY"):
         st.warning(
@@ -1482,9 +1515,28 @@ def render_audio_consultation_journal(
                         "업로드된 녹음파일의 내용이 비어 있습니다."
                     )
 
-                progress.progress(0.08)
+                progress.progress(0.06)
                 stage_message.info(
-                    "2단계 · 캐시와 음성 전처리 조건을 확인하고 있습니다."
+                    "2단계 · 원본 녹음파일을 클라우드에 보관하고 있습니다."
+                )
+
+                audio_storage_result = upload_audio(
+                    user_id=user_id,
+                    user_name=consultant_name,
+                    company_name=company_name,
+                    business_no=business_no,
+                    filename=filename,
+                    audio_bytes=audio_bytes,
+                    content_type=(
+                        uploaded.type
+                        if uploaded is not None and uploaded.type
+                        else "application/octet-stream"
+                    ),
+                )
+
+                progress.progress(0.10)
+                stage_message.info(
+                    "3단계 · 캐시와 음성 전처리 조건을 확인하고 있습니다."
                 )
 
                 def update_progress(
@@ -1498,7 +1550,7 @@ def render_audio_consultation_journal(
                         min(visible_progress, 0.65)
                     )
                     stage_message.info(
-                        f"3단계 · 음성을 녹취하고 있습니다. "
+                        f"4단계 · 음성을 녹취하고 있습니다. "
                         f"({index}/{total} 구간)"
                     )
 
@@ -1535,17 +1587,17 @@ def render_audio_consultation_journal(
                 if transcript_cached:
                     progress.progress(0.66)
                     stage_message.info(
-                        "3단계 · 기존 녹취록을 불러왔습니다."
+                        "4단계 · 기존 녹취록을 불러왔습니다."
                     )
                 else:
                     progress.progress(0.66)
                     stage_message.success(
-                        "3단계 · 음성 녹취가 완료되었습니다."
+                        "4단계 · 음성 녹취가 완료되었습니다."
                     )
 
                 progress.progress(0.72)
                 stage_message.info(
-                    "4단계 · 상담주제와 고객 니즈를 분석하고 있습니다."
+                    "5단계 · 상담주제와 고객 니즈를 분석하고 있습니다."
                 )
 
                 journal, journal_cached, journal_cache_key = (
@@ -1567,7 +1619,7 @@ def render_audio_consultation_journal(
 
                 progress.progress(0.94)
                 stage_message.info(
-                    "5단계 · 상담일지 초안을 화면에 준비하고 있습니다."
+                    "6단계 · 상담일지 초안을 화면에 준비하고 있습니다."
                 )
 
                 journal["_cache_info"] = {
@@ -1576,6 +1628,7 @@ def render_audio_consultation_journal(
                     "transcript_cache_key": transcript_cache_key,
                     "journal_cache_key": journal_cache_key,
                 }
+                journal["_audio_storage"] = audio_storage_result
 
                 st.session_state[
                     f"consultation_journal_{business_no}"
@@ -1988,6 +2041,60 @@ def render_audio_consultation_journal(
             st.rerun()
         else:
             st.error(message)
+
+    cloud_audio_rows = list_company_audio(
+        user_id,
+        business_no,
+    )
+    if cloud_audio_rows:
+        with st.expander(
+            f"클라우드 녹음 히스토리 {len(cloud_audio_rows)}건",
+            expanded=False,
+        ):
+            for index, audio_item in enumerate(
+                cloud_audio_rows,
+                start=1,
+            ):
+                title_text = (
+                    audio_item.get("consultation_title")
+                    or audio_item.get("original_filename")
+                    or f"상담녹음 {index}"
+                )
+                st.markdown(
+                    f"**{audio_item.get('created_at', '')} · {title_text}**"
+                )
+                st.caption(
+                    f"파일: {audio_item.get('original_filename', '-')} · "
+                    f"크기: {int(audio_item.get('size_bytes', 0) or 0) / 1024 / 1024:.1f}MB"
+                )
+                if audio_item.get("summary"):
+                    st.write(audio_item.get("summary"))
+
+                signed_url = create_signed_audio_url(
+                    str(audio_item.get("storage_path", "")),
+                    expires_in=3600,
+                )
+                if signed_url:
+                    st.audio(signed_url)
+
+                delete_key = (
+                    f"delete_cloud_audio_"
+                    f"{audio_item.get('audio_id', index)}"
+                )
+                if st.button(
+                    "이 녹음 삭제",
+                    key=delete_key,
+                ):
+                    ok, message = delete_audio(
+                        str(audio_item.get("audio_id", "")),
+                        str(audio_item.get("storage_path", "")),
+                    )
+                    if ok:
+                        st.success(message)
+                        st.rerun()
+                    else:
+                        st.error(message)
+                st.divider()
 
     journals = [
         item
