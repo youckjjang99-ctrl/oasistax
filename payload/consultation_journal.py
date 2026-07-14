@@ -15,6 +15,7 @@ import requests
 import streamlit as st
 
 from cloud_sync import sync_crm_record
+from cloud_db import CloudDatabase, cloud_is_configured
 from ai_usage import (
     estimate_summary_cost,
     estimate_transcription_cost,
@@ -59,6 +60,7 @@ MAX_API_FILE_BYTES = 24 * 1024 * 1024
 DEFAULT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
 DEFAULT_SUMMARY_MODEL = "gpt-5-mini"
 CACHE_VERSION = "v1"
+CONSULTATION_JOURNAL_TABLE = "oasis_consultation_journals"
 
 CONSULTING_TOPIC_TAXONOMY = [
     "정책자금",
@@ -254,7 +256,7 @@ def _journal_path(user_id: str) -> Path:
     return get_user_dirs(user_id)["base"] / "consultation_journals.json"
 
 
-def _load_journals(user_id: str) -> list[dict[str, Any]]:
+def _load_local_journals(user_id: str) -> list[dict[str, Any]]:
     path = _journal_path(user_id)
     if not path.exists():
         return []
@@ -263,6 +265,101 @@ def _load_journals(user_id: str) -> list[dict[str, Any]]:
         return data if isinstance(data, list) else []
     except Exception:
         return []
+
+
+def _load_cloud_journals(
+    user_id: str,
+    business_no: str = "",
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    if not cloud_is_configured():
+        return []
+    try:
+        filters = {"owner_user_id": user_id}
+        if business_no:
+            filters["business_no"] = business_no
+        rows = CloudDatabase().select(
+            CONSULTATION_JOURNAL_TABLE,
+            filters=filters,
+            order="saved_at.desc",
+            limit=limit,
+        )
+    except Exception:
+        return []
+
+    result = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        payload = row.get("journal_data", {})
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {}
+        record = dict(payload) if isinstance(payload, dict) else {}
+        for key in (
+            "journal_id", "company_name", "business_no",
+            "consultant_name", "saved_at",
+        ):
+            if row.get(key) not in (None, ""):
+                record[key] = row.get(key)
+        result.append(record)
+    return result
+
+
+def _merge_journal_rows(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for group in groups:
+        for item in group:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("journal_id", "")).strip()
+            if not key:
+                key = "|".join([
+                    str(item.get("business_no", "")),
+                    str(item.get("saved_at", "")),
+                    str(item.get("consultation_title", "")),
+                ])
+            if key not in merged:
+                merged[key] = dict(item)
+            else:
+                merged[key].update(
+                    {k: v for k, v in item.items() if v not in (None, "", [], {})}
+                )
+    return sorted(
+        merged.values(),
+        key=lambda row: str(row.get("saved_at", "")),
+        reverse=True,
+    )
+
+
+def _load_journals(user_id: str) -> list[dict[str, Any]]:
+    return _merge_journal_rows(
+        _load_cloud_journals(user_id),
+        _load_local_journals(user_id),
+    )
+
+
+def _save_cloud_journal(user_id: str, record: dict[str, Any]) -> None:
+    if not cloud_is_configured():
+        return
+    cloud_record = {
+        "journal_id": str(record.get("journal_id", "")),
+        "owner_user_id": user_id,
+        "company_name": str(record.get("company_name", "")),
+        "business_no": str(record.get("business_no", "")),
+        "consultant_name": str(record.get("consultant_name", "")),
+        "consultation_title": str(record.get("consultation_title", "") or "녹음 상담일지"),
+        "summary": str(record.get("summary", "")),
+        "saved_at": str(record.get("saved_at", "")),
+        "journal_data": record,
+    }
+    CloudDatabase().upsert(
+        CONSULTATION_JOURNAL_TABLE,
+        [cloud_record],
+        on_conflict="journal_id",
+    )
 
 
 def _save_journals(user_id: str, journals: list[dict[str, Any]]) -> None:
@@ -1346,7 +1443,13 @@ def save_consultation_journal(
 
     journals = _load_journals(user_id)
     journals.insert(0, record)
-    _save_journals(user_id, journals)
+    _save_journals(user_id, _merge_journal_rows(journals))
+
+    cloud_save_warning = ""
+    try:
+        _save_cloud_journal(user_id, record)
+    except Exception as exc:
+        cloud_save_warning = f" 클라우드 상담일지 저장 확인 필요: {exc}"
 
     audio_storage = record.get("_audio_storage", {})
     if isinstance(audio_storage, dict):
@@ -1427,8 +1530,99 @@ def save_consultation_journal(
     message = "상담일지와 CRM 내용을 저장했습니다."
     if policy_result.get("message"):
         message += " " + str(policy_result["message"])
+    if cloud_save_warning:
+        message += cloud_save_warning
 
     return True, message
+
+
+def render_saved_consultation_journals(
+    user_id: str,
+    business_no: str = "",
+    company_name: str = "",
+) -> None:
+    journals = _load_journals(user_id)
+    if business_no:
+        journals = [
+            item for item in journals
+            if str(item.get("business_no", "")) == str(business_no)
+        ]
+    if company_name and not business_no:
+        journals = [
+            item for item in journals
+            if str(item.get("company_name", "")) == str(company_name)
+        ]
+
+    st.markdown("#### 녹음파일 상담일지 보기")
+    st.caption(
+        "저장된 상담일지를 클라우드와 로컬 기록에서 통합 조회합니다. "
+        "상담 저장 시 추출된 정책자금 키워드는 기업별 매칭설정에 반영됩니다."
+    )
+    if not journals:
+        st.info("이 기업에 저장된 녹음 상담일지가 없습니다.")
+        return
+
+    search = st.text_input(
+        "상담일지 검색",
+        placeholder="제목, 요약, 상담내용, 담당자 검색",
+        key=f"journal_search_{business_no or 'all'}",
+    ).strip().lower()
+    if search:
+        journals = [
+            item for item in journals
+            if search in json.dumps(item, ensure_ascii=False).lower()
+        ]
+
+    st.caption(f"조회 결과 {len(journals)}건")
+    for index, item in enumerate(journals[:100]):
+        title = str(item.get("consultation_title", "") or "녹음 상담일지")
+        saved_at = str(item.get("saved_at", ""))
+        consultant = str(item.get("consultant_name", "") or "담당자 미확인")
+        label = f"{saved_at} · {title} · {consultant}"
+        with st.expander(label, expanded=index == 0):
+            if item.get("summary"):
+                st.markdown("**상담 요약**")
+                st.write(item.get("summary"))
+
+            policy_signal = _policy_signal(item)
+            policy_keywords = _normalize_keyword_list(
+                policy_signal.get("matching_keywords", [])
+            )
+            interests = _normalize_interest_fields(
+                policy_signal.get("interest_fields", [])
+            )
+            if policy_keywords or interests:
+                st.markdown("**정책자금 자동 추출**")
+                if policy_keywords:
+                    st.write("매칭키워드: " + ", ".join(policy_keywords))
+                if interests:
+                    st.write("관심분야: " + ", ".join(interests))
+
+            detail_sections = [
+                ("고객 니즈", item.get("client_needs", [])),
+                ("주요 논의", item.get("key_discussions", [])),
+                ("추천 솔루션", item.get("recommended_solutions", [])),
+                ("필요 서류", item.get("required_documents", [])),
+                ("상담자 업무", item.get("consultant_tasks", [])),
+                ("다음 액션", item.get("next_actions", [])),
+            ]
+            for heading, values in detail_sections:
+                if values:
+                    st.markdown(f"**{heading}**")
+                    if isinstance(values, list):
+                        for value in values:
+                            st.write(f"- {value}")
+                    else:
+                        st.write(values)
+
+            if item.get("next_contact_date"):
+                st.write("다음 연락일: " + str(item.get("next_contact_date")))
+            if item.get("follow_up_message"):
+                st.markdown("**후속 안내문**")
+                st.write(item.get("follow_up_message"))
+            if item.get("transcript"):
+                with st.expander("전체 녹취록", expanded=False):
+                    st.write(item.get("transcript"))
 
 
 def render_audio_consultation_journal(
