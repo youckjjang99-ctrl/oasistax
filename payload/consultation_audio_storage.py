@@ -18,6 +18,15 @@ TABLE_NAME = "oasis_consultation_audio"
 REQUEST_TIMEOUT = 900
 
 
+def normalize_business_no(value: str) -> str:
+    """사업자번호를 숫자 10자리 기준으로 정규화한다."""
+    return re.sub(r"[^0-9]", "", str(value or ""))
+
+
+def _normalize_company_name(value: str) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip()).lower()
+
+
 def _secret(*names: str) -> str:
     for name in names:
         value = os.environ.get(name, "")
@@ -67,7 +76,7 @@ def _safe_segment(value: str, fallback: str) -> str:
 
 
 def _business_key(company_name: str, business_no: str) -> str:
-    digits = re.sub(r"[^0-9]", "", business_no or "")
+    digits = normalize_business_no(business_no)
     return digits or _safe_segment(company_name, "unknown_company")
 
 
@@ -98,34 +107,54 @@ def _rest_url(path: str) -> str:
     return f"{url}{path}"
 
 
+def _select_audio_rows(user_id: str, limit: int = 500) -> list[dict[str, Any]]:
+    if not storage_is_configured():
+        return []
+    response = requests.get(
+        _rest_url(f"/rest/v1/{TABLE_NAME}"),
+        headers=_headers(),
+        params={
+            "select": "*",
+            "owner_user_id": f"eq.{user_id}",
+            "order": "created_at.desc",
+            "limit": str(limit),
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    if not response.ok:
+        return []
+    rows = response.json()
+    return rows if isinstance(rows, list) else []
+
+
+def _same_company(row: dict[str, Any], company_name: str, business_no: str) -> bool:
+    target_no = normalize_business_no(business_no)
+    row_no = normalize_business_no(
+        str(row.get("business_no_normalized") or row.get("business_no") or "")
+    )
+    if target_no and row_no:
+        return target_no == row_no
+    target_name = _normalize_company_name(company_name)
+    row_name = _normalize_company_name(str(row.get("company_name", "")))
+    return bool(target_name and row_name and target_name == row_name)
+
+
 def find_existing_audio(
     user_id: str,
     business_no: str,
     digest: str,
+    company_name: str = "",
 ) -> dict[str, Any] | None:
-    if not storage_is_configured():
-        return None
-
-    params = {
-        "select": "*",
-        "owner_user_id": f"eq.{user_id}",
-        "business_no": f"eq.{business_no}",
-        "audio_sha256": f"eq.{digest}",
-        "order": "created_at.desc",
-        "limit": "1",
-    }
-    response = requests.get(
-        _rest_url(f"/rest/v1/{TABLE_NAME}"),
-        headers=_headers(),
-        params=params,
-        timeout=REQUEST_TIMEOUT,
-    )
-    if not response.ok:
-        return None
-
-    rows = response.json()
-    if isinstance(rows, list) and rows:
-        return rows[0]
+    """같은 사용자의 동일 기업·동일 원본/저장파일 해시를 찾는다."""
+    for row in _select_audio_rows(user_id):
+        if not _same_company(row, company_name, business_no):
+            continue
+        hashes = {
+            str(row.get("audio_sha256", "")).strip(),
+            str(row.get("original_audio_sha256", "")).strip(),
+        }
+        if digest and digest in hashes:
+            return row
     return None
 
 
@@ -137,6 +166,9 @@ def upload_audio(
     filename: str,
     audio_bytes: bytes,
     content_type: str = "application/octet-stream",
+    original_audio_sha256: str = "",
+    original_filename: str = "",
+    original_size_bytes: int | None = None,
 ) -> dict[str, Any]:
     """
     원본 녹음파일을 Supabase Storage에 저장하고 메타데이터를 기록한다.
@@ -151,10 +183,12 @@ def upload_audio(
         }
 
     digest = _audio_hash(audio_bytes)
+    source_digest = original_audio_sha256 or digest
     existing = find_existing_audio(
         user_id,
         business_no,
-        digest,
+        source_digest,
+        company_name=company_name,
     )
     if existing:
         return {
@@ -197,11 +231,14 @@ def upload_audio(
         "user_name": user_name,
         "company_name": company_name,
         "business_no": business_no,
-        "original_filename": filename,
+        "business_no_normalized": normalize_business_no(business_no),
+        "original_filename": original_filename or filename,
         "storage_bucket": BUCKET_NAME,
         "storage_path": object_path,
         "audio_sha256": digest,
+        "original_audio_sha256": source_digest,
         "size_bytes": len(audio_bytes),
+        "original_size_bytes": int(original_size_bytes or len(audio_bytes)),
         "content_type": content_type,
         "journal_id": "",
         "consultation_title": "",
@@ -276,27 +313,14 @@ def link_audio_to_journal(
 def list_company_audio(
     user_id: str,
     business_no: str,
+    company_name: str = "",
 ) -> list[dict[str, Any]]:
-    if not storage_is_configured():
-        return []
-
-    response = requests.get(
-        _rest_url(f"/rest/v1/{TABLE_NAME}"),
-        headers=_headers(),
-        params={
-            "select": "*",
-            "owner_user_id": f"eq.{user_id}",
-            "business_no": f"eq.{business_no}",
-            "order": "created_at.desc",
-            "limit": "100",
-        },
-        timeout=REQUEST_TIMEOUT,
-    )
-    if not response.ok:
-        return []
-
-    rows = response.json()
-    return rows if isinstance(rows, list) else []
+    """표기 차이를 무시하고 같은 기업의 클라우드 녹음을 조회한다."""
+    rows = _select_audio_rows(user_id, limit=1000)
+    return [
+        row for row in rows
+        if _same_company(row, company_name, business_no)
+    ][:100]
 
 
 def create_signed_audio_url(

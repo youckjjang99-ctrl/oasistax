@@ -41,6 +41,7 @@ from consultation_audio_storage import (
     delete_audio,
     link_audio_to_journal,
     list_company_audio,
+    normalize_business_no,
     storage_is_configured,
     upload_audio,
 )
@@ -340,8 +341,6 @@ def _load_cloud_journals(
         return []
     try:
         filters = {"owner_user_id": user_id}
-        if business_no:
-            filters["business_no"] = business_no
         rows = CloudDatabase().select(
             CONSULTATION_JOURNAL_TABLE,
             filters=filters,
@@ -362,6 +361,8 @@ def _load_cloud_journals(
             except Exception:
                 payload = {}
         record = dict(payload) if isinstance(payload, dict) else {}
+        if business_no and normalize_business_no(record.get("business_no", "")) != normalize_business_no(business_no):
+            continue
         for key in (
             "journal_id", "company_name", "business_no",
             "consultant_name", "saved_at",
@@ -2157,6 +2158,9 @@ def render_audio_consultation_journal(
                         filename=storage_filename,
                         audio_bytes=storage_bytes,
                         content_type=storage_content_type,
+                        original_audio_sha256=_audio_hash(audio_bytes),
+                        original_filename=filename,
+                        original_size_bytes=len(audio_bytes),
                     )
                     audio_storage_result[
                         "compressed_for_storage"
@@ -2644,6 +2648,7 @@ def render_audio_consultation_journal(
     cloud_audio_rows = list_company_audio(
         user_id,
         business_no,
+        company_name=company_name,
     )
     if cloud_audio_rows:
         with st.expander(
@@ -2698,7 +2703,8 @@ def render_audio_consultation_journal(
     journals = [
         item
         for item in _load_journals(user_id)
-        if item.get("business_no") == business_no
+        if normalize_business_no(item.get("business_no", ""))
+        == normalize_business_no(business_no)
     ]
     if journals:
         with st.expander(
