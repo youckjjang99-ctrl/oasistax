@@ -15,7 +15,7 @@ import streamlit as st
 
 BUCKET_NAME = "oasis-consultation-audio"
 TABLE_NAME = "oasis_consultation_audio"
-REQUEST_TIMEOUT = 180
+REQUEST_TIMEOUT = 900
 
 
 def _secret(*names: str) -> str:

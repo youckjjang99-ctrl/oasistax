@@ -1467,6 +1467,11 @@ def render_audio_consultation_journal(
         st.session_state[job_key] = {
             "audio_bytes": uploaded.getvalue(),
             "filename": uploaded.name,
+            "content_type": (
+                uploaded.type
+                if getattr(uploaded, "type", None)
+                else "application/octet-stream"
+            ),
             "noise_reduction": bool(noise_reduction),
             "aggressive_noise_reduction": bool(
                 aggressive_noise_reduction
@@ -1520,19 +1525,35 @@ def render_audio_consultation_journal(
                     "2단계 · 원본 녹음파일을 클라우드에 보관하고 있습니다."
                 )
 
-                audio_storage_result = upload_audio(
-                    user_id=user_id,
-                    user_name=consultant_name,
-                    company_name=company_name,
-                    business_no=business_no,
-                    filename=filename,
-                    audio_bytes=audio_bytes,
-                    content_type=(
-                        uploaded.type
-                        if uploaded is not None and uploaded.type
-                        else "application/octet-stream"
-                    ),
-                )
+                try:
+                    audio_storage_result = upload_audio(
+                        user_id=user_id,
+                        user_name=consultant_name,
+                        company_name=company_name,
+                        business_no=business_no,
+                        filename=filename,
+                        audio_bytes=audio_bytes,
+                        content_type=str(
+                            pending_job.get(
+                                "content_type",
+                                "application/octet-stream",
+                            )
+                        ),
+                    )
+                except Exception as storage_exc:
+                    # 원본 보관 실패가 녹취와 상담일지 생성까지 막지 않도록 한다.
+                    audio_storage_result = {
+                        "stored": False,
+                        "message": (
+                            "원본 녹음파일의 클라우드 보관은 실패했지만 "
+                            "녹취와 상담일지 생성을 계속합니다. "
+                            f"원인: {storage_exc}"
+                        ),
+                        "error": str(storage_exc),
+                    }
+                    stage_message.warning(
+                        audio_storage_result["message"]
+                    )
 
                 progress.progress(0.10)
                 stage_message.info(
@@ -1699,12 +1720,45 @@ def render_audio_consultation_journal(
                         f"{error_message}"
                     )
 
-        # 작업이 끝난 뒤 버튼·초안 화면을 즉시 정상상태로 다시 그린다.
-        if not st.session_state.get(running_key):
+        # 성공한 경우에만 초안 화면을 다시 그린다.
+        # 실패 시에는 현재 화면의 상세 오류를 유지한다.
+        if (
+            not st.session_state.get(running_key)
+            and not st.session_state.get(error_key)
+        ):
             st.rerun()
 
     previous_error = st.session_state.get(error_key)
     if previous_error and not st.session_state.get(running_key):
+        error_text = str(previous_error)
+
+        if (
+            "insufficient_quota" in error_text
+            or "exceeded your current quota" in error_text
+        ):
+            st.error(
+                "OpenAI API 잔액 또는 월 사용한도가 부족합니다. "
+                "OpenAI Platform의 Billing과 Usage limit을 확인해주세요."
+            )
+        elif "429" in error_text:
+            st.error(
+                "OpenAI 요청 한도에 도달했습니다. 잠시 후 다시 실행해주세요."
+            )
+        elif (
+            "Supabase" in error_text
+            or "Storage" in error_text
+            or "storage" in error_text
+        ):
+            st.error(
+                "원본 녹음파일의 Supabase 저장 과정에서 오류가 발생했습니다."
+            )
+            st.code(error_text)
+        else:
+            st.error(
+                "상담일지 생성이 중단되었습니다."
+            )
+            st.code(error_text)
+
         if st.button(
             "오류 메시지 닫기",
             use_container_width=True,
