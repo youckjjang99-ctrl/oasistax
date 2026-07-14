@@ -52,6 +52,7 @@ from matching_preferences import (
     preference_summary,
 )
 from multi_source_policy import render_multi_source_match
+from consulting_copilot import render_copilot_page
 from stock_valuation import (
     render_stock_valuation_page,
     save_cretop_financial_snapshot,
@@ -1429,6 +1430,7 @@ with st.sidebar:
         "홈": "홈",
         "크레탑 자동등록": "크레탑 자동등록",
         "기업 컨설팅": "기업관리센터",
+        "AI 코파일럿": "AI 코파일럿",
         "정책자금 매칭": "고객DB 업로드/매칭",
         "주가평가": "주가평가",
         "내 누적 고객DB": "내 누적 고객DB",
@@ -1485,6 +1487,12 @@ if active_tab == "홈":
 
 elif active_tab == "기업관리센터":
     render_enterprise_management_center(
+        CURRENT_USER_ID,
+        CURRENT_USER_NAME,
+    )
+
+elif active_tab == "AI 코파일럿":
+    render_copilot_page(
         CURRENT_USER_ID,
         CURRENT_USER_NAME,
     )
