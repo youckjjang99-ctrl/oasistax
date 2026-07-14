@@ -32,7 +32,6 @@ from customer_history import (
     build_history_table,
     build_change_summary,
 )
-from consulting_report import render_ai_consulting_report_page
 from cloud_sync import (
     get_cloud_sync_status,
     retry_cloud_sync_queue,
@@ -1430,7 +1429,6 @@ with st.sidebar:
         "기업 컨설팅": "기업관리센터",
         "정책자금 매칭": "고객DB 업로드/매칭",
         "주가평가": "주가평가",
-        "AI 컨설팅 리포트": "AI 컨설팅 리포트",
         "내 누적 고객DB": "내 누적 고객DB",
         "실행이력": "실행이력",
         "담당자 통계": "담당자 통계",
@@ -1986,12 +1984,6 @@ elif active_tab == "고객DB 업로드/매칭":
 
 elif active_tab == "주가평가":
     render_stock_valuation_page(
-        CURRENT_USER_ID,
-        CURRENT_USER_NAME,
-    )
-
-elif active_tab == "AI 컨설팅 리포트":
-    render_ai_consulting_report_page(
         CURRENT_USER_ID,
         CURRENT_USER_NAME,
     )

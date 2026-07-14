@@ -147,7 +147,7 @@ def _ratio(numerator: Any, denominator: Any) -> float | None:
     return num / den * 100
 
 
-def _build_analysis(
+def build_consulting_analysis(
     customer: pd.Series,
     financial: dict[str, Any],
     registry: dict[str, Any],
@@ -416,7 +416,7 @@ def _style_sheet(worksheet) -> None:
         )
 
 
-def _build_excel_report(analysis: dict[str, Any]) -> bytes:
+def build_consulting_excel_report(analysis: dict[str, Any]) -> bytes:
     workbook = Workbook()
     default_sheet = workbook.active
     workbook.remove(default_sheet)
@@ -580,7 +580,7 @@ def render_ai_consulting_report_page(
         business_no,
     )
 
-    analysis = _build_analysis(
+    analysis = build_consulting_analysis(
         customer,
         financial,
         registry,
@@ -719,7 +719,7 @@ def render_ai_consulting_report_page(
                 "저장된 고객별 매칭키워드가 없습니다."
             )
 
-    excel_bytes = _build_excel_report(analysis)
+    excel_bytes = build_consulting_excel_report(analysis)
     safe_company = re.sub(
         r'[\\/:*?"<>|]',
         "_",

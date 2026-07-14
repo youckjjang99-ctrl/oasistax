@@ -9,6 +9,11 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+from consulting_report import (
+    build_consulting_analysis,
+    build_consulting_excel_report,
+)
+
 from cloud_sync import sync_crm_record
 from crm import (
     ACTION_OPTIONS,
@@ -230,6 +235,232 @@ def _quick_diagnosis(
     return strengths, checks, actions
 
 
+
+def _render_enterprise_dashboard_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        .block-container {
+            padding-top: 1.5rem;
+            max-width: 1320px;
+        }
+        .oasis-hero {
+            padding: 24px 28px;
+            border: 1px solid #e7edf7;
+            border-radius: 22px;
+            background:
+                radial-gradient(circle at 88% 14%, rgba(99,102,241,.13), transparent 34%),
+                linear-gradient(135deg, #ffffff 0%, #f6f9ff 100%);
+            box-shadow: 0 12px 34px rgba(31, 64, 124, .08);
+            margin: 8px 0 18px 0;
+        }
+        .oasis-title {
+            color: #172033;
+            font-size: 1.72rem;
+            font-weight: 850;
+            letter-spacing: -.03em;
+        }
+        .oasis-meta {
+            color: #6b768c;
+            font-size: .93rem;
+            margin-top: 8px;
+        }
+        .oasis-metric-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 14px;
+            margin: 8px 0 20px 0;
+        }
+        .oasis-metric-card {
+            min-height: 132px;
+            padding: 18px 20px;
+            border-radius: 18px;
+            border: 1px solid #e1e9f6;
+            box-shadow: 0 7px 22px rgba(42, 70, 120, .06);
+            background: #fff;
+        }
+        .oasis-metric-card.status {
+            background: linear-gradient(145deg, #f5f9ff, #edf5ff);
+            border-color: #cfe0ff;
+        }
+        .oasis-metric-card.stage {
+            background: linear-gradient(145deg, #f8f8ff, #f1f0ff);
+            border-color: #dcd8ff;
+        }
+        .oasis-metric-card.sales {
+            background: linear-gradient(145deg, #f4fff9, #edf9f3);
+            border-color: #ceeadd;
+        }
+        .oasis-metric-card.profit {
+            background: linear-gradient(145deg, #fff9f2, #fff4e8);
+            border-color: #f3ddc1;
+        }
+        .oasis-metric-label {
+            color: #69758c;
+            font-size: .86rem;
+            font-weight: 700;
+            margin-bottom: 15px;
+        }
+        .oasis-metric-value {
+            color: #182338;
+            font-size: 1.62rem;
+            font-weight: 850;
+            line-height: 1.15;
+            word-break: keep-all;
+        }
+        .oasis-badge {
+            display: inline-block;
+            margin-top: 11px;
+            padding: 5px 10px;
+            border-radius: 999px;
+            color: #3568c8;
+            background: rgba(76, 132, 237, .11);
+            font-size: .78rem;
+            font-weight: 750;
+        }
+        .oasis-section-card {
+            height: 100%;
+            min-height: 245px;
+            padding: 20px 22px;
+            border: 1px solid #e4eaf3;
+            border-radius: 18px;
+            background: #fff;
+            box-shadow: 0 7px 22px rgba(42, 70, 120, .055);
+        }
+        .oasis-section-card.blue {
+            background: linear-gradient(145deg, #ffffff, #f5f9ff);
+            border-color: #d7e4fb;
+        }
+        .oasis-section-card.amber {
+            background: linear-gradient(145deg, #fffefa, #fff9ef);
+            border-color: #f0dfbf;
+        }
+        .oasis-section-card.violet {
+            background: linear-gradient(145deg, #ffffff, #f9f7ff);
+            border-color: #e2dcfb;
+        }
+        .oasis-section-title {
+            color: #1f2c43;
+            font-size: 1.13rem;
+            font-weight: 850;
+            margin-bottom: 14px;
+        }
+        .oasis-item {
+            position: relative;
+            padding: 8px 0 8px 22px;
+            color: #344158;
+            line-height: 1.5;
+        }
+        .oasis-item:before {
+            content: "✓";
+            position: absolute;
+            left: 0;
+            top: 8px;
+            color: #3478e5;
+            font-weight: 900;
+        }
+        .oasis-question-card {
+            padding: 20px 22px;
+            border-radius: 18px;
+            border: 1px solid #e4eaf3;
+            background: linear-gradient(145deg, #ffffff, #f8faff);
+            box-shadow: 0 7px 22px rgba(42, 70, 120, .055);
+        }
+        .oasis-question {
+            display: flex;
+            gap: 12px;
+            align-items: flex-start;
+            padding: 9px 0;
+            color: #354158;
+        }
+        .oasis-question-number {
+            min-width: 25px;
+            height: 25px;
+            border-radius: 8px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            background: #eaf2ff;
+            color: #2867cf;
+            font-size: .82rem;
+            font-weight: 850;
+        }
+        div[data-baseweb="tab-list"] {
+            gap: 10px;
+            border-bottom: 1px solid #e6ebf3;
+        }
+        button[data-baseweb="tab"] {
+            padding: 10px 12px 12px 12px;
+            font-weight: 750;
+        }
+        @media (max-width: 900px) {
+            .oasis-metric-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_metric_dashboard(
+    crm_status: str,
+    pipeline_stage: str,
+    sales_text: str,
+    profit_text: str,
+) -> None:
+    st.markdown(
+        f"""
+        <div class="oasis-metric-grid">
+            <div class="oasis-metric-card status">
+                <div class="oasis-metric-label">CRM 상태</div>
+                <div class="oasis-metric-value">{crm_status or '신규'}</div>
+                <div class="oasis-badge">고객 상태</div>
+            </div>
+            <div class="oasis-metric-card stage">
+                <div class="oasis-metric-label">상담 진행단계</div>
+                <div class="oasis-metric-value">{pipeline_stage or '신규'}</div>
+                <div class="oasis-badge">영업 파이프라인</div>
+            </div>
+            <div class="oasis-metric-card sales">
+                <div class="oasis-metric-label">최근 매출액</div>
+                <div class="oasis-metric-value">{sales_text}</div>
+                <div class="oasis-badge">재무 규모</div>
+            </div>
+            <div class="oasis-metric-card profit">
+                <div class="oasis-metric-label">최근 당기순이익</div>
+                <div class="oasis-metric-value">{profit_text}</div>
+                <div class="oasis-badge">수익성</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_list_card(
+    title: str,
+    items: list[str],
+    theme: str,
+    fallback: str,
+) -> None:
+    safe_items = items or [fallback]
+    item_html = "".join(
+        f'<div class="oasis-item">{item}</div>'
+        for item in safe_items
+    )
+    st.markdown(
+        f"""
+        <div class="oasis-section-card {theme}">
+            <div class="oasis-section-title">{title}</div>
+            {item_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_enterprise_management_center(
     user_id: str,
     user_name: str = "",
@@ -284,22 +515,24 @@ def render_enterprise_management_center(
         business_no,
     )
 
+    _render_enterprise_dashboard_styles()
+
+    importance = str(crm_profile.get("priority", "3") or "3")
+    try:
+        importance_stars = "★" * int(importance) + "☆" * (5 - int(importance))
+    except Exception:
+        importance_stars = "★★★☆☆"
+
     st.markdown(
         f"""
-        <div style="
-            padding:20px 22px;
-            border-radius:18px;
-            background:linear-gradient(135deg,#113b73,#2563eb);
-            color:white;
-            margin:6px 0 16px 0;
-            box-shadow:0 10px 24px rgba(37,99,235,.16);
-        ">
-            <div style="font-size:1.45rem;font-weight:800;">
-                {company_name or '기업명 미확인'}
-            </div>
-            <div style="margin-top:6px;opacity:.9;">
-                사업자번호 {business_no or '-'} · 담당자
-                {crm_profile.get('assigned_manager') or user_name or '-'}
+        <div class="oasis-hero">
+            <div class="oasis-title">{company_name or '기업명 미확인'}</div>
+            <div class="oasis-meta">
+                사업자번호 {business_no or '-'} &nbsp;·&nbsp;
+                대표자 {_clean(selected_row.get('대표자명', '')) or '-'} &nbsp;·&nbsp;
+                업종 {_clean(selected_row.get('업종명', '')) or '-'} &nbsp;·&nbsp;
+                중요도 {importance_stars} &nbsp;·&nbsp;
+                담당자 {crm_profile.get('assigned_manager') or user_name or '-'}
             </div>
         </div>
         """,
@@ -324,14 +557,12 @@ def render_enterprise_management_center(
         "당기순이익",
     )
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("CRM 상태", crm_record.get("status", "신규"))
-    m2.metric(
-        "진행단계",
+    _render_metric_dashboard(
+        crm_record.get("status", "신규"),
         crm_profile.get("pipeline_stage", "신규"),
+        _format_number(sales, "원"),
+        _format_number(net_income, "원"),
     )
-    m3.metric("매출액", _format_number(sales, "원"))
-    m4.metric("당기순이익", _format_number(net_income, "원"))
 
     tab_overview, tab_crm, tab_policy, tab_stock, tab_history, tab_ai = st.tabs(
         [
@@ -740,35 +971,100 @@ def render_enterprise_management_center(
             )
 
     with tab_ai:
-        strengths, checks, actions = _quick_diagnosis(
+        consulting_analysis = build_consulting_analysis(
             selected_row,
             financial,
+            registry,
+            stock,
             preferences,
         )
+
+        st.markdown("### AI 종합진단")
         a1, a2, a3 = st.columns(3)
         with a1:
-            with st.container(border=True):
-                st.markdown("#### 강점")
-                for item in strengths or ["추가 정보 확인 필요"]:
-                    st.markdown(f"- {item}")
+            _render_list_card(
+                "강점",
+                consulting_analysis.get("strengths", []),
+                "blue",
+                "추가 재무정보 확인이 필요합니다.",
+            )
         with a2:
-            with st.container(border=True):
-                st.markdown("#### 확인사항")
-                for item in checks or ["주요 누락정보 없음"]:
-                    st.markdown(f"- {item}")
+            _render_list_card(
+                "확인사항",
+                consulting_analysis.get("cautions", []),
+                "amber",
+                "현재 주요 경고사항은 확인되지 않았습니다.",
+            )
         with a3:
-            with st.container(border=True):
-                st.markdown("#### 우선 실행")
-                for item in actions:
-                    st.markdown(f"- {item}")
+            _render_list_card(
+                "우선 실행",
+                consulting_analysis.get("strategy", []),
+                "violet",
+                "자금수요와 투자계획을 우선 확인합니다.",
+            )
 
-        st.markdown("#### 대표 미팅 질문")
-        questions = [
-            "최근 1년 이내 시설·기계·차량 투자계획이 있습니까?",
-            "향후 6개월 내 신규채용 또는 고용유지 계획이 있습니까?",
-            "현재 정책자금·보증기관 대출 잔액과 만기는 어떻게 됩니까?",
-            "국세·지방세 체납이나 최근 연체 이력이 있습니까?",
-            "올해 예상 매출과 주요 거래처 변화는 어떻게 됩니까?",
-        ]
-        for index, question in enumerate(questions, start=1):
-            st.markdown(f"**{index}.** {question}")
+        st.markdown("### 대표 미팅 질문")
+        questions_html = "".join(
+            f"""
+            <div class="oasis-question">
+                <span class="oasis-question-number">{index}</span>
+                <span>{question}</span>
+            </div>
+            """
+            for index, question in enumerate(
+                consulting_analysis.get("questions", []),
+                start=1,
+            )
+        )
+        st.markdown(
+            f"""
+            <div class="oasis-question-card">
+                {questions_html}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("### AI 컨설팅 리포트")
+        report_left, report_right = st.columns([1.4, 1])
+        with report_left:
+            st.info(
+                "기업정보·재무정보·등기·주가평가·정책자금 매칭설정을 "
+                "통합한 상담용 리포트입니다."
+            )
+        with report_right:
+            st.metric(
+                "정보 완성도",
+                f"{consulting_analysis.get('completeness', 0)}%",
+            )
+
+        report_bytes = build_consulting_excel_report(
+            consulting_analysis
+        )
+        safe_company = re.sub(
+            r'[\\/:*?"<>|]',
+            "_",
+            company_name or "고객",
+        )
+        report_filename = (
+            f"AI컨설팅리포트_{safe_company}_"
+            f"{datetime.now().strftime('%Y%m%d')}.xlsx"
+        )
+        st.download_button(
+            "AI 컨설팅 리포트 엑셀 다운로드",
+            data=report_bytes,
+            file_name=report_filename,
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+            type="primary",
+            use_container_width=True,
+            key="enterprise_ai_report_download",
+        )
+
+        st.caption(
+            "현재 저장된 기업정보를 바탕으로 만든 상담용 사전진단입니다. "
+            "정책자금 신청과 세무·주가평가는 기준일 자료를 추가 확인해야 합니다."
+        )
+
