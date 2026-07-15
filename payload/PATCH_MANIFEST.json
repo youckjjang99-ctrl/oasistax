@@ -1,14 +1,14 @@
 {
-  "version": "v7.2.0",
-  "base_version": "v7.1.0",
+  "version": "v7.3.0",
+  "base_version": "v7.2.0",
   "modified_files": [
-    "enterprise_center.py",
-    "enterprise_customer_management.py",
-    "login_session_guard.py",
-    "app.py",
-    "auth.py",
+    "multi_source_policy.py",
+    "integrated_policy_repository.py",
+    "scheduled_policy_sync.py",
+    ".github/workflows/update_bizinfo_db.yml",
     "VERSION.txt"
   ],
-  "sql_required": true,
-  "data_deleted": false
+  "sql_required": false,
+  "live_api_calls_during_matching": false,
+  "schedule": "03:00 Asia/Seoul daily"
 }

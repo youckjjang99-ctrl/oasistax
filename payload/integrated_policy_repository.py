@@ -16,6 +16,10 @@ TABLE_POLICY_REPOSITORY = "oasis_policy_repository"
 SEED_PATH = ROOT_DIR / "data" / "internal_policy_seed.json"
 LOCAL_CACHE_PATH = ROOT_DIR / "data" / "internal_policy_cache.json"
 REFRESH_STATE_PATH = ROOT_DIR / "data" / "internal_policy_refresh_state.json"
+BIZINFO_CACHE_PATH = ROOT_DIR / "data" / "bizinfo_programs.json"
+BIZINFO_METADATA_PATH = ROOT_DIR / "data" / "bizinfo_metadata.json"
+EXTERNAL_CACHE_PATH = ROOT_DIR / "data" / "external_policy_programs.json"
+EXTERNAL_METADATA_PATH = ROOT_DIR / "data" / "external_policy_metadata.json"
 DEFAULT_REFRESH_HOURS = 24
 
 
@@ -107,8 +111,129 @@ def ensure_seed_loaded() -> dict[str, Any]:
         return {"loaded": len(seed), "cloud": False, "message": f"클라우드 동기화 실패, 로컬 DB 사용: {exc}"}
 
 
+
+def _first_value(row: dict[str, Any], keys: list[str]) -> str:
+    for key in keys:
+        value = _clean(row.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _scheduled_cache_records() -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    now = datetime.now().isoformat(timespec="seconds")
+
+    bizinfo_rows = _load_json(BIZINFO_CACHE_PATH, [])
+    if isinstance(bizinfo_rows, list):
+        for raw in bizinfo_rows:
+            if not isinstance(raw, dict):
+                continue
+            title = _first_value(
+                raw,
+                [
+                    "pblancNm", "pblanc_nm", "biz_pbanc_nm",
+                    "공고명", "사업명", "지원사업명",
+                ],
+            )
+            if not title:
+                continue
+            agency = _first_value(
+                raw,
+                [
+                    "jrsdInsttNm", "excInsttNm", "기관명",
+                    "주관기관", "수행기관명",
+                ],
+            )
+            url = _first_value(
+                raw,
+                ["detailUrl", "pblancUrl", "공고URL", "url"],
+            )
+            rid = hashlib.sha256(
+                f"bizinfo|{agency}|{title}|{url}".encode("utf-8")
+            ).hexdigest()[:24]
+            records.append(
+                {
+                    "record_id": rid,
+                    "source_type": "bizinfo",
+                    "source_name": "기업마당 새벽동기화",
+                    "title": title,
+                    "agency": agency,
+                    "active": True,
+                    "raw_data": raw,
+                    "updated_at": now,
+                }
+            )
+
+    external_rows = _load_json(EXTERNAL_CACHE_PATH, [])
+    if isinstance(external_rows, list):
+        for wrapper in external_rows:
+            if not isinstance(wrapper, dict):
+                continue
+            raw = wrapper.get("raw_data", {})
+            if not isinstance(raw, dict):
+                continue
+            source_name = _clean(wrapper.get("source_name")) or "외부 새벽동기화"
+            title = _first_value(
+                raw,
+                [
+                    "biz_pbanc_nm", "pblancNm", "pblanc_nm",
+                    "공고명", "사업명", "지원사업명",
+                    "제도명", "상품명", "title",
+                ],
+            )
+            if not title:
+                continue
+            agency = _first_value(
+                raw,
+                [
+                    "기관명", "주관기관", "수행기관명",
+                    "jrsdInsttNm", "excInsttNm",
+                    "agency", "organization",
+                ],
+            )
+            url = _first_value(
+                raw,
+                ["공고URL", "detailUrl", "pblancUrl", "url"],
+            )
+            source_type = (
+                "kstartup"
+                if "startup" in source_name.lower()
+                else "kosmes"
+                if "중진공" in source_name
+                else "external"
+            )
+            rid = hashlib.sha256(
+                f"{source_type}|{agency}|{title}|{url}".encode("utf-8")
+            ).hexdigest()[:24]
+            records.append(
+                {
+                    "record_id": rid,
+                    "source_type": source_type,
+                    "source_name": f"{source_name} 새벽동기화",
+                    "title": title,
+                    "agency": agency,
+                    "active": True,
+                    "raw_data": raw,
+                    "updated_at": now,
+                }
+            )
+
+    return records
+
+
+def scheduled_sync_status() -> dict[str, Any]:
+    biz_meta = _load_json(BIZINFO_METADATA_PATH, {})
+    ext_meta = _load_json(EXTERNAL_METADATA_PATH, {})
+    return {
+        "bizinfo": biz_meta if isinstance(biz_meta, dict) else {},
+        "external": ext_meta if isinstance(ext_meta, dict) else {},
+    }
+
+
 def load_repository_records() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     seed_result = ensure_seed_loaded()
+    scheduled_rows = _scheduled_cache_records()
     rows = []
     source = "앱 내부 정책DB"
     if cloud_is_configured():
@@ -123,14 +248,40 @@ def load_repository_records() -> tuple[list[dict[str, Any]], dict[str, Any]]:
             source = "Supabase 내부 정책DB"
         except Exception:
             rows = []
-    if not rows:
-        cached = _load_json(LOCAL_CACHE_PATH, [])
-        rows = [_normalize_record(row) for row in cached if isinstance(row, dict)]
-    rows = [row for row in rows if row.get("active") and row.get("title")]
+    cached = _load_json(LOCAL_CACHE_PATH, [])
+    cached_rows = [
+        _normalize_record(row)
+        for row in cached
+        if isinstance(row, dict)
+    ]
+    combined = {
+        row["record_id"]: row
+        for row in cached_rows + rows + scheduled_rows
+        if row.get("record_id")
+    }
+    rows = [
+        row
+        for row in combined.values()
+        if row.get("active") and row.get("title")
+    ]
+    _save_json(LOCAL_CACHE_PATH, rows)
+
+    if scheduled_rows and cloud_is_configured():
+        try:
+            CloudDatabase().upsert(
+                TABLE_POLICY_REPOSITORY,
+                scheduled_rows,
+                "record_id",
+            )
+        except Exception:
+            pass
     return rows, {
         "source": "내부 통합 정책DB",
         "status": "정상" if rows else "자료없음",
-        "message": f"{source} · {seed_result.get('message','')}",
+        "message": (
+            f"{source} · 새벽동기화 {len(scheduled_rows)}건 · "
+            f"{seed_result.get('message','')}"
+        ),
         "count": len(rows),
     }
 
@@ -189,34 +340,19 @@ def fetch_bizinfo_records() -> tuple[list[dict[str, Any]], dict[str, Any]]:
 
 
 def refresh_repository(force: bool = False) -> dict[str, Any]:
-    state = _load_json(REFRESH_STATE_PATH, {})
-    try:
-        last_attempt = datetime.fromisoformat(state.get("last_attempt_at",""))
-    except Exception:
-        last_attempt = None
-    if not force and last_attempt and datetime.now() - last_attempt < timedelta(hours=DEFAULT_REFRESH_HOURS):
-        rows, _ = load_repository_records()
-        return {"skipped":True,"message":"최근 24시간 이내 최신화 확인 완료","count":len(rows)}
-    existing, _ = load_repository_records()
-    bizinfo, biz_status = fetch_bizinfo_records()
-    merged = {row["record_id"]: row for row in existing}
-    for row in bizinfo:
-        merged[row["record_id"]] = _normalize_record(row)
-    rows = list(merged.values())
-    _save_json(LOCAL_CACHE_PATH, rows)
-    if bizinfo and cloud_is_configured():
-        try:
-            CloudDatabase().upsert(TABLE_POLICY_REPOSITORY, bizinfo, "record_id")
-        except Exception:
-            pass
-    _save_json(REFRESH_STATE_PATH, {
-        "last_attempt_at": datetime.now().isoformat(timespec="seconds"),
-        "last_success_at": datetime.now().isoformat(timespec="seconds") if biz_status.get("status") == "정상" else state.get("last_success_at",""),
-        "bizinfo_status": biz_status,
-        "record_count": len(rows),
-    })
-    return {"skipped":False,"message":biz_status.get("message",""),"count":len(rows),"bizinfo_status":biz_status}
-
+    rows, _ = load_repository_records()
+    sync = scheduled_sync_status()
+    bizinfo = sync.get("bizinfo", {})
+    external = sync.get("external", {})
+    return {
+        "skipped": True,
+        "message": (
+            "외부 API 직접 호출 없이 새벽 3시 동기화 자료를 다시 불러왔습니다."
+        ),
+        "count": len(rows),
+        "bizinfo_status": bizinfo,
+        "external_status": external,
+    }
 
 def repository_status() -> dict[str, Any]:
     rows, status = load_repository_records()
@@ -225,4 +361,19 @@ def repository_status() -> dict[str, Any]:
     for row in rows:
         key = str(row.get("source_type","unknown"))
         counts[key] = counts.get(key,0)+1
-    return {"count":len(rows),"counts":counts,"last_attempt_at":state.get("last_attempt_at",""),"last_success_at":state.get("last_success_at",""),"source_status":status}
+    sync = scheduled_sync_status()
+    bizinfo_meta = sync.get("bizinfo", {})
+    external_meta = sync.get("external", {})
+    last_success = (
+        bizinfo_meta.get("generated_at")
+        or external_meta.get("generated_at")
+        or state.get("last_success_at", "")
+    )
+    return {
+        "count": len(rows),
+        "counts": counts,
+        "last_attempt_at": last_success,
+        "last_success_at": last_success,
+        "source_status": status,
+        "scheduled_sync": sync,
+    }
