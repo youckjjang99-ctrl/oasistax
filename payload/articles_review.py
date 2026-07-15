@@ -484,6 +484,7 @@ def render_articles_review(
         "embedded_text": "PDF 내장텍스트",
         "ocr": "한글 OCR",
         "smart_ocr": "자동회전·보정 한글 OCR",
+        "smart_ocr_v2": "한글우선 다중모드 OCR",
         "docx": "DOCX 텍스트",
         "hwp": "HWP 텍스트",
         "text": "일반 텍스트",
@@ -495,7 +496,7 @@ def render_articles_review(
         f"{method_labels.get(extraction.get('method'), extraction.get('method', '-'))}"
     )
 
-    if extraction.get("method") in {"ocr", "smart_ocr"}:
+    if extraction.get("method") in {"ocr", "smart_ocr", "smart_ocr_v2"}:
         quality = extraction.get("quality", {}) or {}
         pages = extraction.get("pages", []) or []
         rotation_summary = {}
@@ -512,6 +513,7 @@ def render_articles_review(
             f"{extraction.get('recognized_pages', 0)}/"
             f"{extraction.get('processed_pages', 0)}페이지 문자 인식 · "
             f"품질 {quality.get('grade', '-')} · "
+            f"재검토페이지 {extraction.get('rejected_pages', 0)}개 · "
             f"페이지 방향 {rotation_text}"
         )
 
@@ -524,9 +526,14 @@ def render_articles_review(
                             "적용회전": f"{page.get('rotation', 0)}°",
                             "방향판정": page.get("orientation_method"),
                             "기울기보정": f"{page.get('deskew_angle', 0)}°",
+                            "OCR언어": page.get("selected_language"),
+                            "문단모드": page.get("selected_psm"),
                             "한글비율": page.get("korean_ratio"),
+                            "영문비율": page.get("latin_ratio"),
+                            "영문오인식": page.get("suspicious_latin_tokens"),
                             "문자수": page.get("text_length"),
                             "품질점수": page.get("quality_score"),
+                            "재검토": "필요" if page.get("rejected") else "정상",
                         }
                         for page in pages
                     ],

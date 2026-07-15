@@ -1,15 +1,10 @@
 {
-  "version": "v7.0.0",
-  "base_version": "v6.9.0",
+  "version": "v7.0.1",
+  "base_version": "v7.0.0",
   "modified_files": [
     "articles_review.py",
     "document_preprocessor.py",
-    "requirements.txt",
-    "packages.txt",
     "VERSION.txt"
   ],
-  "sql_required": false,
-  "new_dependencies": [
-    "opencv-python-headless==4.10.0.84"
-  ]
+  "sql_required": false
 }
