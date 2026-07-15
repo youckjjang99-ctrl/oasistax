@@ -1,10 +1,13 @@
 {
-  "version": "v6.5.0",
-  "base_version": "v6.4.2",
+  "version": "v6.6.0",
+  "base_version": "v6.5.0",
+  "seed_count": 34,
+  "sql_required": true,
   "modified_files": [
-    "enterprise_center.py",
-    "enterprise_consulting_engine.py",
+    "app.py",
+    "multi_source_policy.py",
+    "integrated_policy_repository.py",
+    "data/internal_policy_seed.json",
     "VERSION.txt"
-  ],
-  "sql_required": false
+  ]
 }

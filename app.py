@@ -1431,7 +1431,7 @@ with st.sidebar:
         "크레탑 자동등록": "크레탑 자동등록",
         "기업 컨설팅": "기업관리센터",
         "AI 코파일럿": "AI 코파일럿",
-        "정책자금 매칭": "고객DB 업로드/매칭",
+        "정책자금 매칭": "통합 정책자금 매칭",
         "주가평가": "주가평가",
         "내 누적 고객DB": "내 누적 고객DB",
         "실행이력": "실행이력",
@@ -1500,8 +1500,8 @@ elif active_tab == "AI 코파일럿":
 elif active_tab == "내 누적 고객DB":
     render_cumulative_db_page(CURRENT_USER_ID)
 
-elif active_tab == "고객DB 업로드/매칭":
-    st.markdown("### 등록 고객 정책자금 자동매칭")
+elif active_tab == "통합 정책자금 매칭":
+    st.markdown("### 등록 고객 통합 정책자금 AI 매칭")
     st.caption(
         "크레탑 자동등록으로 생성된 누적 고객DB에서 업체를 선택하면 "
         "별도 엑셀 업로드 없이 바로 정책자금 매칭을 실행합니다."
@@ -1700,7 +1700,7 @@ elif active_tab == "고객DB 업로드/매칭":
             key="policy_registered_manager_name",
         )
 
-        if st.button(
+        if False and st.button(
             "선택 고객 정책자금 매칭 실행",
             type="primary",
             width='stretch',
@@ -1826,6 +1826,18 @@ elif active_tab == "고객DB 업로드/매칭":
                     )
 
     st.divider()
+    show_legacy_upload = st.checkbox(
+        "관리자·레거시 고객DB 업로드 도구 보기",
+        value=False,
+        key="show_legacy_customer_upload_v660",
+    )
+    if not show_legacy_upload:
+        st.info(
+            "일반 매칭은 위 등록 고객 통합매칭을 사용합니다. "
+            "고객DB 업로드는 기존 호환과 일괄등록 용도로만 유지됩니다."
+        )
+        st.stop()
+
     with st.expander(
         "기존 방식: 고객DB 엑셀 파일 직접 업로드",
         expanded=False,

@@ -14,6 +14,12 @@ import requests
 import streamlit as st
 
 from utils import ROOT_DIR, get_user_dirs
+from integrated_policy_repository import (
+    fetch_bizinfo_records,
+    load_repository_records,
+    refresh_repository,
+    repository_status,
+)
 
 
 CACHE_FILE = "multi_source_policy_cache.json"
@@ -358,41 +364,29 @@ def _candidate_excel_files() -> list[Path]:
 
 
 def load_local_sources() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    repository_rows, status = load_repository_records()
     records: list[dict[str, Any]] = []
-    files = _candidate_excel_files()
-    loaded_sheets = 0
-
-    for path in files:
-        try:
-            excel = pd.ExcelFile(path)
-        except Exception:
+    for row in repository_rows:
+        raw = row.get("raw_data", {})
+        if not isinstance(raw, dict):
             continue
-
-        for sheet in excel.sheet_names:
-            sheet_key = _normalize_text(sheet)
-            if not any(
-                keyword in sheet_key
-                for keyword in [
-                    "지원", "정책", "고용", "공고", "상시",
-                ]
-            ):
-                continue
-            try:
-                frame = pd.read_excel(path, sheet_name=sheet)
-            except Exception:
-                continue
-
-            loaded_sheets += 1
-            source_name = f"내부DB:{sheet}"
-            for raw in frame.dropna(how="all").to_dict("records"):
-                normalized = normalize_record(raw, source_name)
-                if normalized:
-                    records.append(normalized)
-
+        enriched = dict(raw)
+        if not enriched.get("기관명") and enriched.get("기관"):
+            enriched["기관명"] = enriched.get("기관")
+        if not enriched.get("사업명") and enriched.get("상품명"):
+            enriched["사업명"] = enriched.get("상품명")
+        if not enriched.get("사업명") and enriched.get("제도명"):
+            enriched["사업명"] = enriched.get("제도명")
+        source_type = str(row.get("source_type", "internal"))
+        source_name = str(row.get("source_name", "") or source_type)
+        normalized = normalize_record(enriched, f"{source_name}:{source_type}")
+        if normalized:
+            normalized["repository_id"] = row.get("record_id")
+            records.append(normalized)
     return records, {
-        "source": "기존 내부DB",
+        "source": "내부 통합 정책DB",
         "status": "정상" if records else "자료없음",
-        "message": f"파일 {len(files)}개 / 시트 {loaded_sheets}개 확인",
+        "message": status.get("message", ""),
         "count": len(records),
     }
 
@@ -655,8 +649,11 @@ def collect_all_sources() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     all_records = []
     statuses = []
 
+    refresh_repository(force=False)
+
     for loader in [
         load_local_sources,
+        fetch_bizinfo_records,
         fetch_kstartup,
         fetch_kosmes,
     ]:
@@ -674,8 +671,8 @@ def render_multi_source_match(
 ) -> None:
     st.markdown("#### 다중소스 증거기반 매칭")
     st.caption(
-        "기존 내부DB에 K-Startup·중진공 OpenAPI를 결합하고, "
-        "고객정보·상담키워드·지역·업력·제외조건을 근거로 점수를 계산합니다."
+        "내부 상시정책자금·고용지원금 DB에 기업마당·K-Startup·중진공 API를 "
+        "결합하고, 고객정보·상담키워드·지역·업력·제외조건을 근거로 점수를 계산합니다."
     )
 
     with st.expander("공고소스 설정 및 작동방식", expanded=False):
@@ -705,6 +702,26 @@ def render_multi_source_match(
             ),
             language="toml",
         )
+
+    repository_info = repository_status()
+    st.caption(
+        f"내부 정책DB {repository_info.get('count', 0)}건 · "
+        f"최근 자동확인 {repository_info.get('last_attempt_at') or '미실행'}"
+    )
+    refresh_col, _ = st.columns([1, 3])
+    with refresh_col:
+        if st.button(
+            "정책DB 지금 최신화",
+            key=f"policy_repository_refresh_{customer.name}",
+            use_container_width=True,
+        ):
+            with st.spinner("기업마당 및 내부 정책DB를 최신화하고 있습니다..."):
+                refresh_result = refresh_repository(force=True)
+            st.info(
+                f"{refresh_result.get('message', '')} "
+                f"현재 {refresh_result.get('count', 0)}건"
+            )
+            st.rerun()
 
     if st.button(
         "다중소스 AI 매칭 실행",
