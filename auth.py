@@ -8,6 +8,11 @@ from pathlib import Path
 
 import streamlit as st
 
+from login_session_guard import (
+    end_login_session,
+    start_login_session,
+)
+
 
 ROOT_DIR = Path(__file__).parent
 DATA_DIR = ROOT_DIR / "data"
@@ -296,6 +301,9 @@ def login_form(logo_html_func):
                 st.session_state.current_user_id = user.get("user_id", "")
                 st.session_state.current_user_name = user.get("name", "")
                 st.session_state.current_user_role = user.get("role", "member")
+                st.session_state.login_session_token = start_login_session(
+                    user.get("user_id", "")
+                )
                 st.session_state.latest_result_file = None
                 st.session_state.latest_upload_file = None
                 st.rerun()
@@ -324,10 +332,15 @@ def login_form(logo_html_func):
 
 def logout_button():
     if st.button("로그아웃", use_container_width=True):
+        end_login_session(
+            st.session_state.get("current_user_id", ""),
+            st.session_state.get("login_session_token", ""),
+        )
         st.session_state.logged_in = False
         st.session_state.current_user_id = ""
         st.session_state.current_user_name = ""
         st.session_state.current_user_role = ""
+        st.session_state.login_session_token = ""
         st.session_state.latest_result_file = None
         st.session_state.latest_upload_file = None
         st.rerun()

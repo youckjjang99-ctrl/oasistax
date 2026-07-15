@@ -56,8 +56,9 @@ from registered_policy_match import (
     load_registered_customers,
 )
 from enterprise_customer_management import (
-    render_customer_directory,
-    render_selected_customer_delete,
+    get_active_customer_rows,
+    search_customer_rows,
+    soft_delete_customer_simple,
 )
 from utils import get_user_cumulative_db_path, get_user_dirs
 
@@ -377,16 +378,46 @@ def render_enterprise_management_center(
         )
         return
 
-    customers = render_customer_directory(
-        user_id=user_id,
-        user_name=user_name,
-        customers=all_customers,
+    customers = get_active_customer_rows(
+        user_id,
+        all_customers,
+    )
+
+    st.markdown(
+        """
+        <style>
+        .enterprise-manage-title {
+            font-size: 1.35rem;
+            font-weight: 850;
+            color: #1f2937;
+            padding-top: 0.35rem;
+            white-space: nowrap;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    title_col, search_col = st.columns([1.2, 3.8])
+    with title_col:
+        st.markdown(
+            '<div class="enterprise-manage-title">관리할 기업</div>',
+            unsafe_allow_html=True,
+        )
+    with search_col:
+        search_query = st.text_input(
+            "기업 검색",
+            placeholder="회사명·대표자·사업자번호 검색",
+            key="enterprise_customer_search_v720",
+            label_visibility="collapsed",
+        )
+
+    customers = search_customer_rows(
+        customers,
+        search_query,
     )
     if customers.empty:
-        st.info(
-            "현재 검색·필터 조건에 맞는 활성 고객이 없습니다. "
-            "검색조건을 초기화하거나 휴지통에서 고객을 복원해주세요."
-        )
+        st.info("검색 결과가 없습니다.")
         return
 
     labels, row_map = build_customer_labels(customers)
@@ -399,11 +430,14 @@ def render_enterprise_management_center(
             None,
         )
 
-    selected_label = st.selectbox(
-        "관리할 기업",
-        labels,
-        key="enterprise_center_customer",
-    )
+    select_col, delete_col = st.columns([20, 1])
+    with select_col:
+        selected_label = st.selectbox(
+            "관리할 기업 선택",
+            labels,
+            key="enterprise_center_customer",
+            label_visibility="collapsed",
+        )
     selected_row = customers.loc[row_map[selected_label]]
 
     company_name = _clean(selected_row.get("업체명", ""))
@@ -412,11 +446,50 @@ def render_enterprise_management_center(
     )
     customer_key = make_customer_key(company_name, business_no)
 
-    render_selected_customer_delete(
-        user_id=user_id,
-        user_name=user_name,
-        selected_row=selected_row,
-    )
+    @st.dialog("삭제하시겠습니까?")
+    def confirm_customer_delete() -> None:
+        st.write(f"**{company_name}** 고객을 휴지통으로 이동합니다.")
+        st.caption(
+            "고객DB 원본과 CRM·상담일지·정관·기업히스토리는 보존됩니다."
+        )
+        cancel_col, confirm_col = st.columns(2)
+        with cancel_col:
+            if st.button(
+                "취소",
+                use_container_width=True,
+                key=f"delete_cancel_v720_{customer_key}",
+            ):
+                st.rerun()
+        with confirm_col:
+            if st.button(
+                "삭제",
+                type="primary",
+                use_container_width=True,
+                key=f"delete_confirm_v720_{customer_key}",
+            ):
+                success, message = soft_delete_customer_simple(
+                    user_id,
+                    user_name,
+                    selected_row,
+                )
+                if success:
+                    st.session_state.pop(
+                        "enterprise_center_customer",
+                        None,
+                    )
+                    st.success(message)
+                    st.rerun()
+                else:
+                    st.error(message)
+
+    with delete_col:
+        if st.button(
+            "✕",
+            help=f"{company_name} 삭제",
+            key=f"enterprise_delete_x_v720_{customer_key}",
+            use_container_width=True,
+        ):
+            confirm_customer_delete()
 
     integration = reconcile_enterprise_consulting_context(
         user_id=user_id,

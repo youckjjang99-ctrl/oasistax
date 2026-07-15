@@ -635,3 +635,109 @@ def render_selected_customer_delete(
                 st.success(message)
                 st.rerun()
             st.error(message)
+
+
+# ============================================================
+# v7.2.0 simplified enterprise selector / trash page
+# ============================================================
+def get_active_customer_rows(
+    user_id: str,
+    customers: pd.DataFrame,
+) -> pd.DataFrame:
+    active_df, _ = active_customers(user_id, customers)
+    return active_df
+
+
+def search_customer_rows(
+    customers: pd.DataFrame,
+    query: str,
+) -> pd.DataFrame:
+    query_key = _normalize_for_search(query)
+    if not query_key or customers.empty:
+        return customers.copy()
+
+    columns = [
+        "업체명", "대표자명", "사업자등록번호", "전화번호",
+        "휴대전화", "연락처", "사업장 소재지", "업종명",
+        "담당자", "이메일",
+    ]
+    mask = []
+    for _, row in customers.iterrows():
+        combined = " ".join(
+            str(row.get(column, "") or "")
+            for column in columns
+        )
+        mask.append(query_key in _normalize_for_search(combined))
+    return customers.loc[mask].copy()
+
+
+def soft_delete_customer_simple(
+    user_id: str,
+    user_name: str,
+    selected_row: pd.Series,
+) -> tuple[bool, str]:
+    return soft_delete_customer(
+        user_id,
+        user_name,
+        selected_row,
+        "기업컨설팅 화면에서 삭제",
+    )
+
+
+def render_trash_page(
+    user_id: str,
+    user_name: str,
+) -> None:
+    st.markdown("## 휴지통")
+    st.caption(
+        "기업컨설팅에서 삭제한 고객을 복원합니다. "
+        "고객DB 원본과 CRM·상담일지·정관·기업히스토리는 보존됩니다."
+    )
+
+    records = [
+        record
+        for record in load_trash_records(user_id).values()
+        if bool(record.get("is_deleted", False))
+    ]
+    records.sort(
+        key=lambda row: str(row.get("deleted_at", "")),
+        reverse=True,
+    )
+
+    if not records:
+        st.info("휴지통에 있는 고객이 없습니다.")
+        return
+
+    for index, record in enumerate(records):
+        with st.container(border=True):
+            left, middle, right = st.columns([4.5, 2, 1.2])
+            with left:
+                st.markdown(
+                    f"**{record.get('company_name', '기업명 미확인')}**"
+                )
+                st.caption(
+                    f"사업자번호 {record.get('business_no', '-')}"
+                )
+            with middle:
+                st.caption(
+                    f"삭제일 {str(record.get('deleted_at', ''))[:19]}"
+                )
+                st.caption(
+                    f"처리자 {record.get('deleted_by', '-')}"
+                )
+            with right:
+                if st.button(
+                    "복원",
+                    key=f"trash_restore_v720_{index}_{record.get('customer_uid', '')}",
+                    use_container_width=True,
+                ):
+                    success, message = restore_customer(
+                        user_id,
+                        user_name,
+                        record,
+                    )
+                    if success:
+                        st.success(message)
+                        st.rerun()
+                    else:
+                        st.error(message)

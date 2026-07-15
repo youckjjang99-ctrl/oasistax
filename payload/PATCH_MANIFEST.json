@@ -1,9 +1,12 @@
 {
-  "version": "v7.1.0",
-  "base_version": "v7.0.1",
+  "version": "v7.2.0",
+  "base_version": "v7.1.0",
   "modified_files": [
     "enterprise_center.py",
     "enterprise_customer_management.py",
+    "login_session_guard.py",
+    "app.py",
+    "auth.py",
     "VERSION.txt"
   ],
   "sql_required": true,

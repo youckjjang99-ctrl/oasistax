@@ -15,6 +15,11 @@ from ai_usage import render_ai_usage_page
 from cloud_restore import restore_customer_db_if_needed
 from cloud_crm_restore import restore_crm_from_cloud
 from enterprise_center import render_enterprise_management_center
+from enterprise_customer_management import render_trash_page
+from login_session_guard import (
+    clear_streamlit_login_state,
+    validate_login_session,
+)
 from address_tools import (
     enrich_address_fields,
     repair_user_customer_addresses,
@@ -1385,6 +1390,16 @@ def render_cumulative_db_page(user_id):
 if not check_login():
     login_form(logo_html)
 
+if not validate_login_session(
+    st.session_state.get("current_user_id", ""),
+    st.session_state.get("login_session_token", ""),
+):
+    clear_streamlit_login_state()
+    st.warning(
+        "같은 아이디로 다른 기기에서 로그인하여 기존 접속이 종료되었습니다."
+    )
+    login_form(logo_html)
+
 CURRENT_USER_ID = st.session_state.get("current_user_id", "")
 CURRENT_USER_NAME = st.session_state.get("current_user_name", "")
 CURRENT_USER_IS_ADMIN = is_admin(CURRENT_USER_ID)
@@ -1443,6 +1458,8 @@ with st.sidebar:
         menu_label_map["클라우드 DB 관리"] = "클라우드 DB 관리"
         menu_label_map["AI 사용량"] = "AI 사용량"
 
+    menu_label_map["휴지통"] = "고객 휴지통"
+
     selected_menu_label = st.radio(
         "메뉴",
         list(menu_label_map.keys()),
@@ -1493,6 +1510,12 @@ elif active_tab == "기업관리센터":
 
 elif active_tab == "AI 코파일럿":
     render_copilot_page(
+        CURRENT_USER_ID,
+        CURRENT_USER_NAME,
+    )
+
+elif active_tab == "고객 휴지통":
+    render_trash_page(
         CURRENT_USER_ID,
         CURRENT_USER_NAME,
     )
