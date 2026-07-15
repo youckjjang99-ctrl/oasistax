@@ -1,17 +1,15 @@
 {
-  "version": "v7.4.0",
-  "base_version": "v7.3.0",
+  "version": "v7.4.1",
+  "base_version": "v7.4.0",
   "modified_files": [
-    "employee_status.py",
-    "enterprise_center.py",
-    "multi_source_policy.py",
-    "auth.py",
-    "app.py",
+    "enterprise_customer_management.py",
     "VERSION.txt"
   ],
-  "sql_required": true,
-  "personal_data_policy": {
-    "stores_full_resident_registration_number": false,
-    "masks_employee_name": true
-  }
+  "sql_required": false,
+  "data_deleted": false,
+  "fixes": [
+    "confirm_delete_dialog import",
+    "filter_active_customers import",
+    "render_customer_trash_page import"
+  ]
 }
