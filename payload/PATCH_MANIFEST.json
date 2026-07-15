@@ -1,19 +1,18 @@
 {
-  "version": "v6.8.0",
-  "base_version": "v6.7.0",
+  "version": "v6.9.0",
+  "base_version": "v6.8.0",
   "modified_files": [
     "articles_review.py",
+    "articles_editor.py",
+    "articles_pdf.py",
+    "data/articles_amendment_templates.json",
     "requirements.txt",
     "packages.txt",
     "VERSION.txt"
   ],
-  "sql_required": false,
-  "python_dependencies": [
-    "PyMuPDF==1.25.3",
-    "pytesseract==0.3.13"
-  ],
-  "system_dependencies": [
-    "tesseract-ocr",
-    "tesseract-ocr-kor"
+  "sql_required": true,
+  "new_dependencies": [
+    "reportlab==4.2.5",
+    "fonts-nanum"
   ]
 }

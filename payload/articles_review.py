@@ -13,6 +13,7 @@ import streamlit as st
 from pypdf import PdfReader
 
 from customer_history import save_customer_event
+from articles_editor import render_articles_editor
 from utils import ROOT_DIR, get_user_dirs
 
 CHECKLIST_PATH = ROOT_DIR / "data" / "articles_review_checklist.json"
@@ -331,6 +332,7 @@ def analyze_articles(
         "consulting_opportunities": opportunities[:6],
         "text_length": len(text),
         "extraction": extraction or {},
+        "source_text": text,
     }
 
 
@@ -585,3 +587,10 @@ def render_articles_review(
             st.write(
                 "- 핵심 조항이 전반적으로 확인되었습니다."
             )
+
+    render_articles_editor(
+        user_id=user_id,
+        business_no=business_no,
+        company_name=company_name,
+        review=review,
+    )
