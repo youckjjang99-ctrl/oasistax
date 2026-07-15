@@ -1,17 +1,19 @@
 {
-  "version": "v6.7.0",
-  "base_version": "v6.6.2",
+  "version": "v6.8.0",
+  "base_version": "v6.7.0",
   "modified_files": [
-    "enterprise_center.py",
-    "consulting_report.py",
-    "requirements.txt",
     "articles_review.py",
-    "data/articles_review_checklist.json",
+    "requirements.txt",
+    "packages.txt",
     "VERSION.txt"
   ],
   "sql_required": false,
-  "new_dependencies": [
-    "python-docx==1.1.2",
-    "olefile==0.47"
+  "python_dependencies": [
+    "PyMuPDF==1.25.3",
+    "pytesseract==0.3.13"
+  ],
+  "system_dependencies": [
+    "tesseract-ocr",
+    "tesseract-ocr-kor"
   ]
 }
