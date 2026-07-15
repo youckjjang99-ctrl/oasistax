@@ -13,6 +13,10 @@ from consulting_report import (
     build_consulting_analysis,
     build_consulting_excel_report,
 )
+from articles_review import (
+    get_latest_articles_review,
+    render_articles_review,
+)
 from enterprise_consulting_engine import (
     reconcile_enterprise_consulting_context,
 )
@@ -455,12 +459,21 @@ def render_enterprise_management_center(
         _format_number(net_income, "원"),
     )
 
-    tab_overview, tab_crm, tab_policy, tab_stock, tab_history, tab_ai = st.tabs(
+    (
+        tab_overview,
+        tab_crm,
+        tab_policy,
+        tab_stock,
+        tab_articles,
+        tab_history,
+        tab_ai,
+    ) = st.tabs(
         [
             "기업정보",
             "CRM",
             "정책자금",
             "주가평가·등기",
+            "정관검토",
             "기업히스토리",
             "AI 진단",
         ]
@@ -891,6 +904,13 @@ def render_enterprise_management_center(
                     "저장된 주가평가 결과가 없습니다."
                 )
 
+    with tab_articles:
+        render_articles_review(
+            user_id=user_id,
+            business_no=business_no,
+            company_name=company_name,
+        )
+
     with tab_history:
         if history:
             st.markdown("#### 직전 자료 대비 변화")
@@ -913,6 +933,11 @@ def render_enterprise_management_center(
             "consultation_context",
             {},
         )
+        articles_review = get_latest_articles_review(
+            user_id,
+            business_no,
+            company_name,
+        )
         consulting_analysis = build_consulting_analysis(
             selected_row,
             financial,
@@ -920,6 +945,7 @@ def render_enterprise_management_center(
             stock,
             preferences,
             consultation_context=consultation_context,
+            articles_review=articles_review,
         )
 
         st.markdown("### AI 종합진단")
@@ -972,7 +998,7 @@ def render_enterprise_management_center(
         report_left, report_right = st.columns([1.4, 1])
         with report_left:
             st.info(
-                "기업정보·재무정보·등기·주가평가·정책자금 매칭설정을 "
+                "기업정보·재무정보·등기·주가평가·정관·정책자금 매칭설정을 "
                 "통합한 상담용 리포트입니다."
             )
         with report_right:

@@ -1,10 +1,17 @@
 {
-  "version": "v6.6.2",
-  "base_version": "v6.6.1",
+  "version": "v6.7.0",
+  "base_version": "v6.6.2",
   "modified_files": [
-    "multi_source_policy.py",
+    "enterprise_center.py",
+    "consulting_report.py",
+    "requirements.txt",
+    "articles_review.py",
+    "data/articles_review_checklist.json",
     "VERSION.txt"
   ],
   "sql_required": false,
-  "dependency_added": false
+  "new_dependencies": [
+    "python-docx==1.1.2",
+    "olefile==0.47"
+  ]
 }

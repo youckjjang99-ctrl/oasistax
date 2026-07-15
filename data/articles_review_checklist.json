@@ -1,0 +1,165 @@
+{
+  "version": "2026-07-15",
+  "source": "선경내셔날 개정정관 분석 기반 컨설팅 체크리스트",
+  "items": [
+    {
+      "id": "executive_compensation",
+      "title": "임원보수 규정",
+      "weight": 10,
+      "terms": [
+        "임원보수",
+        "이사의 보수",
+        "감사의 보수",
+        "임원보수지급규정"
+      ],
+      "category": "절세·보수"
+    },
+    {
+      "id": "executive_bonus",
+      "title": "임원상여금·성과급 규정",
+      "weight": 9,
+      "terms": [
+        "임원상여금",
+        "성과상여금",
+        "특별성과급",
+        "임원상여금지급규정"
+      ],
+      "category": "절세·보수"
+    },
+    {
+      "id": "executive_retirement",
+      "title": "임원퇴직금 규정",
+      "weight": 12,
+      "terms": [
+        "임원퇴직금",
+        "퇴직금지급규정",
+        "지급배율",
+        "퇴직 전 급여"
+      ],
+      "category": "퇴직·승계"
+    },
+    {
+      "id": "survivor_compensation",
+      "title": "임원유족보상금 규정",
+      "weight": 12,
+      "terms": [
+        "유족보상금",
+        "임원유족보상금",
+        "재임 중 사망",
+        "산재법"
+      ],
+      "category": "보장·상속"
+    },
+    {
+      "id": "treasury_stock",
+      "title": "자기주식 취득·보유·처분·소각",
+      "weight": 11,
+      "terms": [
+        "자기주식의 취득",
+        "자기주식의 소각",
+        "자기주식 보유",
+        "자기주식의 처분"
+      ],
+      "category": "지배구조·승계"
+    },
+    {
+      "id": "stock_options",
+      "title": "주식매수선택권",
+      "weight": 7,
+      "terms": [
+        "주식매수선택권",
+        "스톡옵션",
+        "우리사주매수선택권"
+      ],
+      "category": "인재·투자"
+    },
+    {
+      "id": "preferred_shares",
+      "title": "종류주식·우선주",
+      "weight": 7,
+      "terms": [
+        "우선주식",
+        "상환우선주식",
+        "전환우선주식",
+        "종류주식"
+      ],
+      "category": "투자유치"
+    },
+    {
+      "id": "third_party_allotment",
+      "title": "제3자배정·신주인수권",
+      "weight": 6,
+      "terms": [
+        "주주 이외의 자에게 신주",
+        "제3자배정",
+        "신주인수권"
+      ],
+      "category": "투자유치"
+    },
+    {
+      "id": "convertible_bonds",
+      "title": "전환사채·신주인수권부사채",
+      "weight": 5,
+      "terms": [
+        "전환사채",
+        "신주인수권부사채"
+      ],
+      "category": "투자유치"
+    },
+    {
+      "id": "share_transfer",
+      "title": "주식양도·명의개서",
+      "weight": 5,
+      "terms": [
+        "주식의 양도",
+        "명의개서",
+        "주식 양도 승인"
+      ],
+      "category": "지배구조·승계"
+    },
+    {
+      "id": "dividend",
+      "title": "중간배당·차등배당 근거",
+      "weight": 6,
+      "terms": [
+        "중간 배당",
+        "배당률을 달리",
+        "이익 배당"
+      ],
+      "category": "배당·자금"
+    },
+    {
+      "id": "purpose_business",
+      "title": "목적사업 최신화",
+      "weight": 5,
+      "terms": [
+        "목적",
+        "전자상거래",
+        "소프트웨어",
+        "부동산임대업"
+      ],
+      "category": "사업목적"
+    },
+    {
+      "id": "director_liability",
+      "title": "이사 책임감면",
+      "weight": 3,
+      "terms": [
+        "이사의 회사에 대한 책임감면",
+        "상법 제399조"
+      ],
+      "category": "법률리스크"
+    },
+    {
+      "id": "anti_takeover",
+      "title": "경영권 방어·적대적 M&A",
+      "weight": 2,
+      "terms": [
+        "적대적 인수",
+        "인수 합병",
+        "퇴직 보상액"
+      ],
+      "category": "경영권"
+    }
+  ]
+}

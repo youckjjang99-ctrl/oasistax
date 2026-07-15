@@ -154,6 +154,7 @@ def build_consulting_analysis(
     stock_record: dict[str, Any],
     preferences: dict[str, Any],
     consultation_context: dict[str, Any] | None = None,
+    articles_review: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     company_name = _clean(customer.get("업체명", "")) or _clean(
         financial.get("업체명", "")
@@ -236,6 +237,15 @@ def build_consulting_analysis(
     consultation_interests = consultation_context.get("interest_fields", []) or []
     consultation_needs = consultation_context.get("client_needs", []) or []
     consultation_actions = consultation_context.get("next_actions", []) or []
+
+    articles_review = (
+        articles_review if isinstance(articles_review, dict) else {}
+    )
+    articles_score = int(articles_review.get("score", 0) or 0)
+    articles_priorities = articles_review.get("priority_items", []) or []
+    articles_opportunities = (
+        articles_review.get("consulting_opportunities", []) or []
+    )
 
     sales_number = _number(sales)
     operating_number = _number(operating_profit)
@@ -320,6 +330,24 @@ def build_consulting_analysis(
         strategy.append(
             f"대표가 입력한 자금사용목적은 '{fund_purpose}'입니다."
         )
+
+    if articles_review:
+        strengths.append(f"정관검토 결과 {articles_score}점이 반영되었습니다.")
+        if articles_score < 70:
+            cautions.append(
+                "정관의 핵심 절세·퇴직·유족보상·승계 조항 보완이 필요합니다."
+            )
+        for item in articles_priorities[:4]:
+            title = str(item.get("title", "") or "").strip()
+            if title:
+                strategy.append(f"정관 우선검토: {title}")
+        for opportunity in articles_opportunities[:3]:
+            strategy.append(f"연계 컨설팅: {opportunity}")
+        questions.append(
+            "정관 개정일, 주주총회 의사록, 별도 임원규정의 실제 제정 여부를 확인해 주세요."
+        )
+    else:
+        cautions.append("저장된 정관검토 결과가 없어 정관 리스크는 미반영 상태입니다.")
 
     if consultation_count:
         strengths.append(
@@ -439,6 +467,7 @@ def build_consulting_analysis(
             "registry": bool(registry),
             "stock": bool(stock_record),
             "consultation": bool(consultation_count),
+            "articles_review": bool(articles_review),
             "matching_preferences": bool(preferences),
         },
         "completeness": completeness,
