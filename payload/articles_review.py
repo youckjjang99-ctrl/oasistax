@@ -12,6 +12,11 @@ from typing import Any
 import streamlit as st
 from pypdf import PdfReader
 
+from document_preprocessor import (
+    document_quality,
+    preprocess_document,
+)
+
 from customer_history import save_customer_event
 from articles_editor import render_articles_editor
 from utils import ROOT_DIR, get_user_dirs
@@ -44,76 +49,15 @@ def _review_path(user_id: str) -> Path:
     return get_user_dirs(user_id)["base"] / "articles_reviews.json"
 
 
-def _extract_pdf_text(data: bytes) -> str:
-    reader = PdfReader(io.BytesIO(data))
-    return "\n".join((page.extract_text() or "") for page in reader.pages)
-
-
-def _ocr_pdf(
-    data: bytes,
-    progress_callback=None,
-    max_pages: int = 120,
-) -> tuple[str, dict[str, Any]]:
-    import fitz
-    import pytesseract
-    from PIL import Image
-
-    document = fitz.open(stream=data, filetype="pdf")
-    page_count = min(len(document), max_pages)
-    texts: list[str] = []
-    successful_pages = 0
-
-    for index in range(page_count):
-        page = document[index]
-        pixmap = page.get_pixmap(
-            matrix=fitz.Matrix(2.0, 2.0),
-            alpha=False,
-        )
-        image = Image.frombytes(
-            "RGB",
-            [pixmap.width, pixmap.height],
-            pixmap.samples,
-        )
-        page_text = pytesseract.image_to_string(
-            image,
-            lang="kor+eng",
-            config="--oem 1 --psm 6",
-        )
-        if page_text.strip():
-            successful_pages += 1
-            texts.append(f"\n[페이지 {index + 1}]\n{page_text}")
-
-        if progress_callback:
-            progress_callback(index + 1, page_count)
-
-    return "\n".join(texts), {
-        "method": "ocr",
-        "page_count": len(document),
-        "processed_pages": page_count,
-        "recognized_pages": successful_pages,
-        "truncated": len(document) > max_pages,
-    }
-
-
 def _extract_pdf(
     data: bytes,
     progress_callback=None,
 ) -> tuple[str, dict[str, Any]]:
-    text = _extract_pdf_text(data)
-    meaningful_length = len(re.sub(r"\s+", "", text))
-    page_count = len(PdfReader(io.BytesIO(data)).pages)
-
-    if meaningful_length >= 100:
-        return text, {
-            "method": "embedded_text",
-            "page_count": page_count,
-            "processed_pages": page_count,
-            "recognized_pages": page_count,
-            "truncated": False,
-        }
-
-    return _ocr_pdf(data, progress_callback=progress_callback)
-
+    return preprocess_document(
+        "uploaded.pdf",
+        data,
+        progress_callback=progress_callback,
+    )
 
 def _extract_docx(data: bytes) -> str:
     from docx import Document
@@ -178,29 +122,48 @@ def extract_articles_text(
 ) -> tuple[str, dict[str, Any]]:
     suffix = Path(filename).suffix.lower()
 
-    if suffix == ".pdf":
-        return _extract_pdf(
+    if suffix in {
+        ".pdf",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
+        ".tif",
+        ".tiff",
+    }:
+        return preprocess_document(
+            filename,
             data,
             progress_callback=progress_callback,
         )
     if suffix == ".docx":
-        return _extract_docx(data), {
+        text = _extract_docx(data)
+        return text, {
             "method": "docx",
             "page_count": 0,
+            "quality": document_quality(text),
+            "pages": [],
         }
     if suffix == ".hwp":
-        return _extract_hwp(data), {
+        text = _extract_hwp(data)
+        return text, {
             "method": "hwp",
             "page_count": 0,
+            "quality": document_quality(text),
+            "pages": [],
         }
     if suffix in {".txt", ".md"}:
-        return data.decode("utf-8", errors="ignore"), {
+        text = data.decode("utf-8", errors="ignore")
+        return text, {
             "method": "text",
             "page_count": 0,
+            "quality": document_quality(text),
+            "pages": [],
         }
 
-    raise ValueError("지원 형식은 PDF, HWP, DOCX, TXT입니다.")
-
+    raise ValueError(
+        "지원 형식은 PDF, HWP, DOCX, TXT, PNG, JPG, WEBP, TIFF입니다."
+    )
 
 def _clause_excerpt(text: str, terms: list[str]) -> str:
     compact = re.sub(r"\s+", " ", text)
@@ -419,7 +382,10 @@ def render_articles_review(
 
     uploaded = st.file_uploader(
         "정관 파일 업로드",
-        type=["pdf", "hwp", "docx", "txt"],
+        type=[
+            "pdf", "hwp", "docx", "txt",
+            "png", "jpg", "jpeg", "webp", "tif", "tiff",
+        ],
         key=f"articles_upload_{business_no or company_name}",
     )
 
@@ -437,11 +403,12 @@ def render_articles_review(
         def update_ocr_progress(
             current: int,
             total: int,
+            message: str = "",
         ) -> None:
             progress.progress(
-                current / max(total, 1),
-                text=(
-                    f"스캔 PDF OCR 처리 중 · "
+                min(current / max(total, 1), 1.0),
+                text=message or (
+                    f"문서 전처리·OCR 진행 중 · "
                     f"{current}/{total}페이지"
                 ),
             )
@@ -455,10 +422,15 @@ def render_articles_review(
                     uploaded.getvalue(),
                     progress_callback=update_ocr_progress,
                 )
-                if len(re.sub(r"\s+", "", text)) < 100:
+                quality = extraction.get("quality", {}) or {}
+                if (
+                    len(re.sub(r"\s+", "", text)) < 100
+                    or quality.get("grade") == "실패"
+                ):
                     raise ValueError(
-                        "OCR을 실행했지만 읽을 수 있는 정관 문자가 충분하지 않습니다. "
-                        "페이지 해상도와 문서 방향을 확인해주세요."
+                        "자동회전·기울기보정·한글 OCR을 수행했지만 "
+                        "문서 품질이 분석 기준에 미달했습니다. "
+                        "해상도가 더 높은 원본 또는 다른 스캔본을 사용해주세요."
                     )
 
                 analysis = analyze_articles(
@@ -511,6 +483,7 @@ def render_articles_review(
     method_labels = {
         "embedded_text": "PDF 내장텍스트",
         "ocr": "한글 OCR",
+        "smart_ocr": "자동회전·보정 한글 OCR",
         "docx": "DOCX 텍스트",
         "hwp": "HWP 텍스트",
         "text": "일반 텍스트",
@@ -522,12 +495,44 @@ def render_articles_review(
         f"{method_labels.get(extraction.get('method'), extraction.get('method', '-'))}"
     )
 
-    if extraction.get("method") == "ocr":
+    if extraction.get("method") in {"ocr", "smart_ocr"}:
+        quality = extraction.get("quality", {}) or {}
+        pages = extraction.get("pages", []) or []
+        rotation_summary = {}
+        for page in pages:
+            angle = int(page.get("rotation", 0) or 0)
+            rotation_summary[angle] = rotation_summary.get(angle, 0) + 1
+        rotation_text = ", ".join(
+            f"{angle}° {count}페이지"
+            for angle, count in sorted(rotation_summary.items())
+        ) or "회전정보 없음"
+
         st.info(
-            "스캔 PDF 자동 OCR 완료 · "
+            "문서 자동 전처리 완료 · "
             f"{extraction.get('recognized_pages', 0)}/"
-            f"{extraction.get('processed_pages', 0)}페이지에서 문자 인식"
+            f"{extraction.get('processed_pages', 0)}페이지 문자 인식 · "
+            f"품질 {quality.get('grade', '-')} · "
+            f"페이지 방향 {rotation_text}"
         )
+
+        with st.expander("페이지별 방향·OCR 품질 확인", expanded=False):
+            if pages:
+                st.dataframe(
+                    [
+                        {
+                            "페이지": page.get("page_number"),
+                            "적용회전": f"{page.get('rotation', 0)}°",
+                            "방향판정": page.get("orientation_method"),
+                            "기울기보정": f"{page.get('deskew_angle', 0)}°",
+                            "한글비율": page.get("korean_ratio"),
+                            "문자수": page.get("text_length"),
+                            "품질점수": page.get("quality_score"),
+                        }
+                        for page in pages
+                    ],
+                    hide_index=True,
+                    use_container_width=True,
+                )
 
     rows = []
     for item in review.get("items", []):

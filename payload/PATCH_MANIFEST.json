@@ -1,18 +1,15 @@
 {
-  "version": "v6.9.0",
-  "base_version": "v6.8.0",
+  "version": "v7.0.0",
+  "base_version": "v6.9.0",
   "modified_files": [
     "articles_review.py",
-    "articles_editor.py",
-    "articles_pdf.py",
-    "data/articles_amendment_templates.json",
+    "document_preprocessor.py",
     "requirements.txt",
     "packages.txt",
     "VERSION.txt"
   ],
-  "sql_required": true,
+  "sql_required": false,
   "new_dependencies": [
-    "reportlab==4.2.5",
-    "fonts-nanum"
+    "opencv-python-headless==4.10.0.84"
   ]
 }
