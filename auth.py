@@ -3,15 +3,13 @@ import json
 import hashlib
 import secrets
 import re
+import uuid
 from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
 
-from login_session_guard import (
-    end_login_session,
-    start_login_session,
-)
+from cloud_db import CloudDatabase, cloud_is_configured
 
 
 ROOT_DIR = Path(__file__).parent
@@ -251,6 +249,134 @@ def reject_user(user_id, approved_by=""):
     return True, f"{user_id} 회원을 거절 처리했습니다."
 
 
+TABLE_LOGIN_SESSIONS = "oasis_login_sessions"
+
+
+def _register_login_session(user_id: str) -> str:
+    token = uuid.uuid4().hex
+    if cloud_is_configured():
+        try:
+            CloudDatabase().upsert(
+                TABLE_LOGIN_SESSIONS,
+                [{
+                    "user_id": _safe_user_id(user_id),
+                    "session_token": token,
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                }],
+                "user_id",
+            )
+        except Exception:
+            pass
+    return token
+
+
+def _session_is_current(user_id: str, token: str) -> bool:
+    if not user_id or not token or not cloud_is_configured():
+        return True
+    try:
+        rows = CloudDatabase().select(
+            TABLE_LOGIN_SESSIONS,
+            filters={"user_id": _safe_user_id(user_id)},
+            columns="session_token",
+            limit=1,
+        )
+        if not rows:
+            return True
+        return str(rows[0].get("session_token", "")) == str(token)
+    except Exception:
+        return True
+
+
+def _clear_local_login_state() -> None:
+    st.session_state.logged_in = False
+    st.session_state.current_user_id = ""
+    st.session_state.current_user_name = ""
+    st.session_state.current_user_role = ""
+    st.session_state.login_session_token = ""
+    st.session_state.latest_result_file = None
+    st.session_state.latest_upload_file = None
+
+
+
+def change_password(
+    user_id: str,
+    current_password: str,
+    new_password: str,
+) -> tuple[bool, str]:
+    ensure_default_admin()
+    user_id = _safe_user_id(user_id)
+    users = load_users()
+    user = users.get(user_id)
+
+    if not user:
+        return False, "계정정보를 찾을 수 없습니다."
+    if not _verify_password(
+        current_password,
+        user.get("salt", ""),
+        user.get("password_hash", ""),
+    ):
+        return False, "현재 비밀번호가 일치하지 않습니다."
+    if len(str(new_password)) < 8:
+        return False, "새 비밀번호는 8자리 이상으로 입력해주세요."
+    if current_password == new_password:
+        return False, "현재 비밀번호와 다른 비밀번호를 입력해주세요."
+
+    salt, password_hash = _hash_password(new_password)
+    user["salt"] = salt
+    user["password_hash"] = password_hash
+    user["password_changed_at"] = datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    users[user_id] = user
+    save_users(users)
+
+    # 비밀번호 변경 즉시 새 토큰을 발급해 다른 기기의 기존 세션을 만료
+    new_token = _register_login_session(user_id)
+    st.session_state.login_session_token = new_token
+    return True, "비밀번호가 변경되었습니다. 다시 로그인해주세요."
+
+
+def render_password_change(user_id: str) -> None:
+    with st.expander("비밀번호 변경", expanded=False):
+        current_password = st.text_input(
+            "현재 비밀번호",
+            type="password",
+            key="password_change_current_v740",
+        )
+        new_password = st.text_input(
+            "새 비밀번호",
+            type="password",
+            placeholder="8자리 이상",
+            key="password_change_new_v740",
+        )
+        new_password_confirm = st.text_input(
+            "새 비밀번호 확인",
+            type="password",
+            key="password_change_confirm_v740",
+        )
+
+        if st.button(
+            "비밀번호 변경",
+            use_container_width=True,
+            key="password_change_button_v740",
+        ):
+            if new_password != new_password_confirm:
+                st.error("새 비밀번호 확인이 일치하지 않습니다.")
+                return
+
+            ok, message = change_password(
+                user_id,
+                current_password,
+                new_password,
+            )
+            if not ok:
+                st.error(message)
+                return
+
+            _clear_local_login_state()
+            st.success(message)
+            st.rerun()
+
 def check_login():
     if "logged_in" not in st.session_state:
         st.session_state.logged_in = False
@@ -270,7 +396,22 @@ def check_login():
     if "latest_upload_file" not in st.session_state:
         st.session_state.latest_upload_file = None
 
+    if "login_session_token" not in st.session_state:
+        st.session_state.login_session_token = ""
+
     ensure_default_admin()
+
+    if st.session_state.logged_in:
+        if not _session_is_current(
+            st.session_state.current_user_id,
+            st.session_state.login_session_token,
+        ):
+            _clear_local_login_state()
+            st.warning(
+                "동일 계정으로 새 로그인이 확인되어 현재 기기에서 자동 로그아웃되었습니다."
+            )
+            return False
+
     return st.session_state.logged_in
 
 
@@ -301,7 +442,7 @@ def login_form(logo_html_func):
                 st.session_state.current_user_id = user.get("user_id", "")
                 st.session_state.current_user_name = user.get("name", "")
                 st.session_state.current_user_role = user.get("role", "member")
-                st.session_state.login_session_token = start_login_session(
+                st.session_state.login_session_token = _register_login_session(
                     user.get("user_id", "")
                 )
                 st.session_state.latest_result_file = None
@@ -332,15 +473,5 @@ def login_form(logo_html_func):
 
 def logout_button():
     if st.button("로그아웃", use_container_width=True):
-        end_login_session(
-            st.session_state.get("current_user_id", ""),
-            st.session_state.get("login_session_token", ""),
-        )
-        st.session_state.logged_in = False
-        st.session_state.current_user_id = ""
-        st.session_state.current_user_name = ""
-        st.session_state.current_user_role = ""
-        st.session_state.login_session_token = ""
-        st.session_state.latest_result_file = None
-        st.session_state.latest_upload_file = None
+        _clear_local_login_state()
         st.rerun()

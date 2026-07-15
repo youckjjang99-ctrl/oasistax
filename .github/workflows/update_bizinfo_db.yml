@@ -1,4 +1,4 @@
-name: Update Bizinfo Funding DB
+name: Update Internal Policy DB
 
 on:
   workflow_dispatch:
@@ -10,13 +10,13 @@ permissions:
   contents: write
 
 concurrency:
-  group: update-bizinfo-funding-db
+  group: update-internal-policy-db
   cancel-in-progress: false
 
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
 
     steps:
       - name: Checkout repository
@@ -37,16 +37,37 @@ jobs:
         env:
           BIZINFO_API_KEY: ${{ secrets.BIZINFO_API_KEY }}
         run: |
-          python collector.py --output-dir data --pages 10 --page-size 100 --source github-actions --strict
+          python collector.py \
+            --output-dir data \
+            --pages 10 \
+            --page-size 100 \
+            --source github-actions \
+            --strict
 
-      - name: Commit updated DB
+      - name: Collect optional external policy sources
+        env:
+          KSTARTUP_API_URL: ${{ secrets.KSTARTUP_API_URL }}
+          KSTARTUP_API_KEY: ${{ secrets.KSTARTUP_API_KEY }}
+          KSTARTUP_API_PARAMS_JSON: ${{ secrets.KSTARTUP_API_PARAMS_JSON }}
+          KOSMES_API_URL: ${{ secrets.KOSMES_API_URL }}
+          KOSMES_API_KEY: ${{ secrets.KOSMES_API_KEY }}
+          KOSMES_API_PARAMS_JSON: ${{ secrets.KOSMES_API_PARAMS_JSON }}
+        run: |
+          python scheduled_policy_sync.py
+
+      - name: Commit refreshed internal DB
         run: |
           git config user.name "oasistax-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add data/bizinfo_programs.json data/bizinfo_metadata.json data/기업마당_공고DB.xlsx
+          git add \
+            data/bizinfo_programs.json \
+            data/bizinfo_metadata.json \
+            data/기업마당_공고DB.xlsx \
+            data/external_policy_programs.json \
+            data/external_policy_metadata.json
           if git diff --cached --quiet; then
-            echo "변경된 기업마당 DB가 없습니다."
+            echo "변경된 내부 정책DB가 없습니다."
           else
-            git commit -m "chore: 기업마당 공고DB 자동 갱신"
+            git commit -m "chore: 새벽 3시 내부 정책DB 자동 갱신"
             git push
           fi

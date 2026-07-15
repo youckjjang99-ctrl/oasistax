@@ -17,6 +17,7 @@ from articles_review import (
     get_latest_articles_review,
     render_articles_review,
 )
+from employee_status import render_employee_status
 from enterprise_consulting_engine import (
     reconcile_enterprise_consulting_context,
 )
@@ -56,9 +57,8 @@ from registered_policy_match import (
     load_registered_customers,
 )
 from enterprise_customer_management import (
-    get_active_customer_rows,
-    search_customer_rows,
-    soft_delete_customer_simple,
+    confirm_delete_dialog,
+    filter_active_customers,
 )
 from utils import get_user_cumulative_db_path, get_user_dirs
 
@@ -378,59 +378,52 @@ def render_enterprise_management_center(
         )
         return
 
-    customers = get_active_customer_rows(
-        user_id,
-        all_customers,
-    )
-
     st.markdown(
         """
         <style>
-        .enterprise-manage-title {
-            font-size: 1.35rem;
+        .enterprise-selector-title {
+            font-size: 1.28rem;
             font-weight: 850;
-            color: #1f2937;
-            padding-top: 0.35rem;
-            white-space: nowrap;
+            color: #182235;
+            margin: 0.2rem 0 0.25rem 0;
+        }
+        div[data-testid="stButton"] button[kind="secondary"] {
+            min-height: 40px;
         }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-    title_col, search_col = st.columns([1.2, 3.8])
+    title_col, search_col = st.columns([1.05, 2.2], vertical_alignment="end")
     with title_col:
         st.markdown(
-            '<div class="enterprise-manage-title">관리할 기업</div>',
+            '<div class="enterprise-selector-title">관리할 기업</div>',
             unsafe_allow_html=True,
         )
     with search_col:
-        search_query = st.text_input(
+        search_text = st.text_input(
             "기업 검색",
             placeholder="회사명·대표자·사업자번호 검색",
             key="enterprise_customer_search_v720",
             label_visibility="collapsed",
         )
 
-    customers = search_customer_rows(
-        customers,
-        search_query,
+    customers = filter_active_customers(
+        user_id=user_id,
+        customers=all_customers,
+        search_text=search_text,
     )
     if customers.empty:
         st.info("검색 결과가 없습니다.")
         return
 
     labels, row_map = build_customer_labels(customers)
-    current_selected = st.session_state.get(
-        "enterprise_center_customer"
-    )
+    current_selected = st.session_state.get("enterprise_center_customer")
     if current_selected not in labels:
-        st.session_state.pop(
-            "enterprise_center_customer",
-            None,
-        )
+        st.session_state.pop("enterprise_center_customer", None)
 
-    select_col, delete_col = st.columns([20, 1])
+    select_col, delete_col = st.columns([12, 0.65], vertical_alignment="bottom")
     with select_col:
         selected_label = st.selectbox(
             "관리할 기업 선택",
@@ -439,57 +432,24 @@ def render_enterprise_management_center(
             label_visibility="collapsed",
         )
     selected_row = customers.loc[row_map[selected_label]]
+    with delete_col:
+        if st.button(
+            "×",
+            help="선택 회사 삭제",
+            key=f"enterprise_delete_x_v720_{selected_label}",
+            use_container_width=True,
+        ):
+            confirm_delete_dialog(
+                user_id=user_id,
+                user_name=user_name,
+                selected_row=selected_row,
+            )
 
     company_name = _clean(selected_row.get("업체명", ""))
     business_no = _normalize_business_no(
         selected_row.get("사업자등록번호", "")
     )
     customer_key = make_customer_key(company_name, business_no)
-
-    @st.dialog("삭제하시겠습니까?")
-    def confirm_customer_delete() -> None:
-        st.write(f"**{company_name}** 고객을 휴지통으로 이동합니다.")
-        st.caption(
-            "고객DB 원본과 CRM·상담일지·정관·기업히스토리는 보존됩니다."
-        )
-        cancel_col, confirm_col = st.columns(2)
-        with cancel_col:
-            if st.button(
-                "취소",
-                use_container_width=True,
-                key=f"delete_cancel_v720_{customer_key}",
-            ):
-                st.rerun()
-        with confirm_col:
-            if st.button(
-                "삭제",
-                type="primary",
-                use_container_width=True,
-                key=f"delete_confirm_v720_{customer_key}",
-            ):
-                success, message = soft_delete_customer_simple(
-                    user_id,
-                    user_name,
-                    selected_row,
-                )
-                if success:
-                    st.session_state.pop(
-                        "enterprise_center_customer",
-                        None,
-                    )
-                    st.success(message)
-                    st.rerun()
-                else:
-                    st.error(message)
-
-    with delete_col:
-        if st.button(
-            "✕",
-            help=f"{company_name} 삭제",
-            key=f"enterprise_delete_x_v720_{customer_key}",
-            use_container_width=True,
-        ):
-            confirm_customer_delete()
 
     integration = reconcile_enterprise_consulting_context(
         user_id=user_id,
@@ -571,6 +531,7 @@ def render_enterprise_management_center(
         tab_articles,
         tab_history,
         tab_ai,
+        tab_employees,
     ) = st.tabs(
         [
             "기업정보",
@@ -580,6 +541,7 @@ def render_enterprise_management_center(
             "정관검토",
             "기업히스토리",
             "AI 진단",
+            "직원현황",
         ]
     )
 
@@ -1135,3 +1097,11 @@ def render_enterprise_management_center(
             "정책자금 신청과 세무·주가평가는 기준일 자료를 추가 확인해야 합니다."
         )
 
+
+
+    with tab_employees:
+        render_employee_status(
+            user_id=user_id,
+            business_no=business_no,
+            company_name=company_name,
+        )

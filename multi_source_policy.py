@@ -15,8 +15,8 @@ import streamlit as st
 import xml.etree.ElementTree as ET
 
 from utils import ROOT_DIR, get_user_dirs
+from employee_status import employee_matching_context
 from integrated_policy_repository import (
-    fetch_bizinfo_records,
     load_repository_records,
     refresh_repository,
     repository_status,
@@ -424,47 +424,37 @@ def load_local_sources() -> tuple[list[dict[str, Any]], dict[str, Any]]:
 
 
 def load_bizinfo_source() -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    # 기업마당 저장소 형식을 다중소스 매칭 공통 형식으로 변환
-    repository_rows, status = fetch_bizinfo_records()
+    repository_rows, status = load_repository_records()
+    bizinfo_rows = [
+        row
+        for row in repository_rows
+        if str(row.get("source_type", "")).lower() == "bizinfo"
+    ]
     records: list[dict[str, Any]] = []
-
-    for row in repository_rows:
-        if not isinstance(row, dict):
-            continue
-
+    for row in bizinfo_rows:
         raw = row.get("raw_data", {})
         if not isinstance(raw, dict):
-            raw = {}
-
-        enriched = dict(raw)
-        title = _clean(row.get("title", ""))
-        agency = _clean(row.get("agency", ""))
-
-        if title:
-            enriched.setdefault("사업명", title)
-            enriched.setdefault("공고명", title)
-        if agency:
-            enriched.setdefault("기관명", agency)
-
-        normalized = normalize_record(enriched, "기업마당 API")
-        if not normalized:
             continue
-
-        normalized["repository_id"] = row.get("record_id")
-        normalized["source"] = "기업마당 API"
-        normalized["source_name"] = "기업마당 API"
-        normalized["source_type"] = "bizinfo"
-        records.append(normalized)
-
-    result_status = dict(status or {})
-    result_status["source"] = "기업마당 API"
-    result_status["count"] = len(records)
-    if result_status.get("status") == "정상" and repository_rows and not records:
-        result_status["status"] = "형식오류"
-        result_status["message"] = (
-            "기업마당 응답은 받았지만 매칭 공고 형식으로 변환하지 못했습니다."
+        enriched = dict(raw)
+        enriched.setdefault("사업명", row.get("title", ""))
+        enriched.setdefault("공고명", row.get("title", ""))
+        enriched.setdefault("기관명", row.get("agency", ""))
+        normalized = normalize_record(
+            enriched,
+            str(row.get("source_name", "") or "기업마당 새벽동기화"),
         )
-    return records, result_status
+        if normalized:
+            normalized["repository_id"] = row.get("record_id")
+            normalized["source_type"] = "bizinfo"
+            normalized["source_name"] = row.get("source_name", "")
+            records.append(normalized)
+
+    return records, {
+        "source": "기업마당 새벽동기화",
+        "status": "정상" if records else "자료없음",
+        "message": status.get("message", ""),
+        "count": len(records),
+    }
 
 def _deduplicate(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     groups: dict[str, dict[str, Any]] = {}
@@ -556,6 +546,7 @@ def score_record(
     record: dict[str, Any],
     customer: pd.Series,
     preferences: dict[str, Any],
+    employee_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     title = record.get("title", "")
     combined = " ".join(
@@ -662,6 +653,91 @@ def score_record(
         score += 5
         evidence.append("복수 공고소스에서 확인")
 
+    employee_context = employee_context or {}
+    employee_summary = employee_context.get("summary", {}) or {}
+    employment_text = _normalize_text(combined)
+    is_employment_program = any(
+        term in employment_text
+        for term in [
+            "고용", "채용", "장려금", "근로자", "일자리",
+            "청년", "고령자", "중장년", "계속고용",
+            "고용촉진", "육아휴직", "대체인력",
+        ]
+    )
+
+    if is_employment_program and employee_summary:
+        active_count = int(
+            employee_summary.get("active_count", 0) or 0
+        )
+        recent_3m = int(
+            employee_summary.get("recent_3m_count", 0) or 0
+        )
+        recent_6m = int(
+            employee_summary.get("recent_6m_count", 0) or 0
+        )
+        youth_count = int(
+            employee_summary.get("youth_count", 0) or 0
+        )
+        senior_count = int(
+            employee_summary.get("senior_count", 0) or 0
+        )
+        middle_count = int(
+            employee_summary.get("middle_aged_count", 0) or 0
+        )
+        long_tenure = int(
+            employee_summary.get("long_tenure_count", 0) or 0
+        )
+
+        score += min(active_count, 10) * 0.5
+        evidence.append(
+            f"4대보험 가입자명부 기준 현재 가입중 {active_count}명"
+        )
+
+        if recent_6m:
+            score += min(recent_6m * 4, 16)
+            evidence.append(
+                f"최근 6개월 자격취득 {recent_6m}명"
+            )
+
+        if "청년" in employment_text and youth_count:
+            score += min(youth_count * 5, 20)
+            evidence.append(
+                f"청년 연령구간 추정 직원 {youth_count}명"
+            )
+
+        if any(
+            term in employment_text
+            for term in ["고령", "계속고용", "60세"]
+        ) and senior_count:
+            score += min(senior_count * 6, 20)
+            evidence.append(
+                f"고령자 연령구간 추정 직원 {senior_count}명"
+            )
+
+        if "중장년" in employment_text and middle_count:
+            score += min(middle_count * 4, 16)
+            evidence.append(
+                f"중장년 연령구간 추정 직원 {middle_count}명"
+            )
+
+        if any(
+            term in employment_text
+            for term in ["고용유지", "계속고용", "장기근속"]
+        ) and long_tenure:
+            score += min(long_tenure * 2, 10)
+            evidence.append(
+                f"2년 이상 장기근속 직원 {long_tenure}명"
+            )
+
+        if recent_3m:
+            evidence.append(
+                f"최근 3개월 자격취득 {recent_3m}명"
+            )
+
+        penalties.append(
+            "지원 확정 전 채용일·실업기간·임금·근로계약·사업주 제외요건 추가 확인"
+        )
+
     completeness = sum(
         bool(_clean(record.get(field)))
         for field in ["summary", "target", "region", "industry", "end_date"]
@@ -734,23 +810,8 @@ def save_results(
 
 
 def collect_all_sources() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    all_records = []
-    statuses = []
-
-    refresh_repository(force=False)
-
-    for loader in [
-        load_local_sources,
-        load_bizinfo_source,
-        fetch_kstartup,
-        fetch_kosmes,
-    ]:
-        records, status = loader()
-        all_records.extend(records)
-        statuses.append(status)
-
-    return _deduplicate(all_records), statuses
-
+    records, status = load_local_sources()
+    return _deduplicate(records), [status]
 
 
 _EMPLOYMENT_TERMS = {
@@ -876,57 +937,41 @@ def render_multi_source_match(
 ) -> None:
     st.markdown("#### 다중소스 증거기반 매칭")
     st.caption(
-        "내부 상시정책자금·고용지원금 DB에 기업마당·K-Startup·중진공 API를 "
-        "결합하고, 고객정보·상담키워드·지역·업력·제외조건을 근거로 점수를 계산합니다."
+        "매일 새벽 3시에 수집된 내부 정책DB를 사용합니다. "
+        "매칭 실행 중에는 기업마당·K-Startup·중진공 API를 직접 호출하지 않습니다."
     )
 
-    with st.expander("공고소스 설정 및 작동방식", expanded=False):
+    with st.expander("공고소스 업데이트 방식", expanded=False):
         st.markdown(
             """
-            **현재 사용 소스**
-            - 기존 기업마당·상시형 정책자금·고용지원금 내부DB
-            - K-Startup OpenAPI
-            - 중소벤처기업진흥공단 OpenAPI
+            **자동 업데이트 구조**
+            - 매일 한국시간 새벽 3시 GitHub Actions 실행
+            - 기업마당·K-Startup·중진공 자료를 내부 캐시에 저장
+            - 외부 API 장애 시 마지막 정상 자료를 그대로 유지
+            - 낮 시간의 정책자금 매칭은 내부 DB만 조회
 
-            외부 API는 Streamlit Secrets에 URL과 인증키를 등록하면 활성화됩니다.
-            기업마당 공공데이터 API는 기존 기업마당 자료와 중복 가능성이 높아
-            별도 중복소스로 추가하지 않고 기존 동기화 데이터를 사용합니다.
+            따라서 매칭 버튼을 눌러도 외부 사이트에 접속하지 않습니다.
             """
-        )
-        st.code(
-            '\n'.join(
-                [
-                    'KSTARTUP_API_URL = "발급받은 K-Startup API 호출 URL"',
-                    'KSTARTUP_API_KEY = "인증키"',
-                    'KSTARTUP_API_PARAMS_JSON = \'{"pageNo":1,"numOfRows":1000,"type":"json"}\'',
-                    '',
-                    'KOSMES_API_URL = "사용할 중진공 OpenAPI 호출 URL"',
-                    'KOSMES_API_KEY = "인증키"',
-                    'KOSMES_API_PARAMS_JSON = \'{"pageNo":1,"numOfRows":1000}\'',
-                ]
-            ),
-            language="toml",
         )
 
     repository_info = repository_status()
-    st.caption(
-        f"내부 정책DB {repository_info.get('count', 0)}건 · "
-        f"최근 자동확인 {repository_info.get('last_attempt_at') or '미실행'}"
+    sync_info = repository_info.get("scheduled_sync", {}) or {}
+    bizinfo_meta = sync_info.get("bizinfo", {}) or {}
+    external_meta = sync_info.get("external", {}) or {}
+    last_sync = (
+        bizinfo_meta.get("generated_at")
+        or external_meta.get("generated_at")
+        or repository_info.get("last_success_at")
+        or "미실행"
     )
-    refresh_col, _ = st.columns([1, 3])
-    with refresh_col:
-        if st.button(
-            "정책DB 지금 최신화",
-            key=f"policy_repository_refresh_{customer.name}",
-            use_container_width=True,
-        ):
-            with st.spinner("기업마당 및 내부 정책DB를 최신화하고 있습니다..."):
-                refresh_result = refresh_repository(force=True)
-            st.info(
-                f"{refresh_result.get('message', '')} "
-                f"현재 {refresh_result.get('count', 0)}건"
-            )
-            st.rerun()
+    st.caption(
+        f"내부 정책DB {repository_info.get('count', 0):,}건 · "
+        f"최근 새벽 동기화 {last_sync}"
+    )
+    if bizinfo_meta.get("status") == "failed":
+        st.warning(
+            "오늘 기업마당 새벽 동기화가 실패하여 마지막 정상 자료를 사용합니다."
+        )
 
     if st.button(
         "다중소스 AI 매칭 실행",
@@ -938,15 +983,39 @@ def render_multi_source_match(
             "공고소스를 통합하고 매칭점수를 계산하고 있습니다.",
             expanded=True,
         ) as status:
-            st.write("1. 기존 내부DB를 확인합니다.")
+            st.write("1. 새벽 3시에 저장된 내부 정책DB를 확인합니다.")
             records, source_status = collect_all_sources()
 
             st.write("2. 중복 공고를 통합합니다.")
             st.write(f"통합 공고 {len(records):,}건")
 
             st.write("3. 기업정보와 상담키워드로 적합도를 계산합니다.")
+            company_name = _customer_value(customer, "업체명")
+            business_no = _customer_value(
+                customer,
+                "사업자등록번호",
+            )
+            employee_context = employee_matching_context(
+                user_id,
+                business_no,
+                company_name,
+            )
+            if employee_context:
+                summary = employee_context.get("summary", {}) or {}
+                st.write(
+                    "4대보험 직원현황 연동: "
+                    f"가입중 {summary.get('active_count', 0)}명 · "
+                    f"최근 6개월 취득 "
+                    f"{summary.get('recent_6m_count', 0)}명"
+                )
+
             scored = [
-                score_record(record, customer, preferences)
+                score_record(
+                    record,
+                    customer,
+                    preferences,
+                    employee_context=employee_context,
+                )
                 for record in records
             ]
             scored.sort(key=lambda item: item["score"], reverse=True)
