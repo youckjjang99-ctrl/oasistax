@@ -395,7 +395,7 @@ def render_enterprise_management_center(
         unsafe_allow_html=True,
     )
 
-    title_col, search_col = st.columns([1.05, 2.2], vertical_alignment="end")
+    title_col, search_col = st.columns([1.05, 2.2], vertical_alignment="bottom")
     with title_col:
         st.markdown(
             '<div class="enterprise-selector-title">관리할 기업</div>',

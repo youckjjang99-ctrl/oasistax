@@ -1,15 +1,11 @@
 {
-  "version": "v7.4.1",
-  "base_version": "v7.4.0",
+  "version": "v7.4.2",
+  "base_version": "v7.4.1",
   "modified_files": [
-    "enterprise_customer_management.py",
+    "enterprise_center.py",
     "VERSION.txt"
   ],
   "sql_required": false,
   "data_deleted": false,
-  "fixes": [
-    "confirm_delete_dialog import",
-    "filter_active_customers import",
-    "render_customer_trash_page import"
-  ]
+  "fix": "vertical_alignment=\"end\" to vertical_alignment=\"bottom\""
 }
