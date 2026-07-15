@@ -13,7 +13,15 @@ from consulting_report import (
     build_consulting_analysis,
     build_consulting_excel_report,
 )
+from articles_review import (
+    get_latest_articles_review,
+    render_articles_review,
+)
+from enterprise_consulting_engine import (
+    reconcile_enterprise_consulting_context,
+)
 from consultation_journal import (
+    get_company_consultation_context,
     render_audio_consultation_journal,
     render_saved_consultation_journals,
 )
@@ -46,6 +54,10 @@ from matching_preferences import (
 from registered_policy_match import (
     build_customer_labels,
     load_registered_customers,
+)
+from enterprise_customer_management import (
+    render_customer_directory,
+    render_selected_customer_delete,
 )
 from utils import get_user_cumulative_db_path, get_user_dirs
 
@@ -356,16 +368,37 @@ def render_enterprise_management_center(
         "기업 히스토리를 한 화면에서 관리합니다."
     )
 
-    customers = load_registered_customers(
+    all_customers = load_registered_customers(
         get_user_cumulative_db_path(user_id)
     )
-    if customers.empty:
+    if all_customers.empty:
         st.info(
             "등록된 고객이 없습니다. 크레탑 자동등록으로 고객을 먼저 등록해주세요."
         )
         return
 
+    customers = render_customer_directory(
+        user_id=user_id,
+        user_name=user_name,
+        customers=all_customers,
+    )
+    if customers.empty:
+        st.info(
+            "현재 검색·필터 조건에 맞는 활성 고객이 없습니다. "
+            "검색조건을 초기화하거나 휴지통에서 고객을 복원해주세요."
+        )
+        return
+
     labels, row_map = build_customer_labels(customers)
+    current_selected = st.session_state.get(
+        "enterprise_center_customer"
+    )
+    if current_selected not in labels:
+        st.session_state.pop(
+            "enterprise_center_customer",
+            None,
+        )
+
     selected_label = st.selectbox(
         "관리할 기업",
         labels,
@@ -379,13 +412,21 @@ def render_enterprise_management_center(
     )
     customer_key = make_customer_key(company_name, business_no)
 
+    render_selected_customer_delete(
+        user_id=user_id,
+        user_name=user_name,
+        selected_row=selected_row,
+    )
+
+    integration = reconcile_enterprise_consulting_context(
+        user_id=user_id,
+        business_no=business_no,
+        company_name=company_name,
+    )
     financial = _financial_snapshot(user_id, business_no)
     registry = _registry_snapshot(user_id, business_no)
     stock = _stock_record(user_id, business_no)
-    preferences = get_matching_preferences(
-        user_id,
-        business_no,
-    )
+    preferences = integration.get("preferences", {}) or {}
     crm_record = get_customer_record(
         user_id,
         customer_key,
@@ -449,12 +490,21 @@ def render_enterprise_management_center(
         _format_number(net_income, "원"),
     )
 
-    tab_overview, tab_crm, tab_policy, tab_stock, tab_history, tab_ai = st.tabs(
+    (
+        tab_overview,
+        tab_crm,
+        tab_policy,
+        tab_stock,
+        tab_articles,
+        tab_history,
+        tab_ai,
+    ) = st.tabs(
         [
             "기업정보",
             "CRM",
             "정책자금",
             "주가평가·등기",
+            "정관검토",
             "기업히스토리",
             "AI 진단",
         ]
@@ -707,15 +757,35 @@ def render_enterprise_management_center(
                 business_no=business_no,
                 company_name=company_name,
             )
+            st.caption(
+                "재연동 후 정책자금 탭과 정책자금매칭 메뉴를 다시 열면 "
+                "최신 키워드와 추천 결과가 반영됩니다."
+            )
 
     with tab_policy:
         st.markdown("#### 고객별 정책자금 매칭설정")
+        added_keywords = integration.get("added_keywords", []) or []
+        added_interests = integration.get("added_interests", []) or []
+        consultation_count = int(
+            integration.get("consultation_context", {}).get("count", 0) or 0
+        )
+        st.caption(
+            f"상담일지 {consultation_count}건 연동 · "
+            f"자동추가 키워드 {len(added_keywords)}개 · "
+            f"자동추가 관심분야 {len(added_interests)}개"
+        )
+
+        widget_suffix = (
+            business_no.replace("-", "")
+            if business_no
+            else company_name
+        )
         matching_keywords = st.text_area(
             "매칭키워드",
             value=", ".join(
                 preferences.get("매칭키워드", []) or []
             ),
-            key="enterprise_match_keywords",
+            key=f"enterprise_match_keywords_v650_{widget_suffix}",
         )
         interest_fields = st.multiselect(
             "관심지원분야",
@@ -727,14 +797,14 @@ def render_enterprise_management_center(
                 )
                 if item in INTEREST_OPTIONS
             ],
-            key="enterprise_interest_fields",
+            key=f"enterprise_interest_fields_v650_{widget_suffix}",
         )
         exclusion_keywords = st.text_area(
             "제외키워드",
             value=", ".join(
                 preferences.get("제외키워드", []) or []
             ),
-            key="enterprise_exclusion_keywords",
+            key=f"enterprise_exclusion_keywords_v650_{widget_suffix}",
         )
 
         p1, p2, p3 = st.columns(3)
@@ -744,7 +814,7 @@ def render_enterprise_management_center(
                 value=_clean(
                     preferences.get("자금사용목적", "")
                 ),
-                key="enterprise_fund_purpose",
+                key=f"enterprise_fund_purpose_v650_{widget_suffix}",
             )
         with p2:
             planned_amount = st.text_input(
@@ -752,7 +822,7 @@ def render_enterprise_management_center(
                 value=_clean(
                     preferences.get("투자예정금액", "")
                 ),
-                key="enterprise_planned_amount",
+                key=f"enterprise_planned_amount_v650_{widget_suffix}",
             )
         with p3:
             planned_timing = st.text_input(
@@ -760,13 +830,13 @@ def render_enterprise_management_center(
                 value=_clean(
                     preferences.get("투자예정시기", "")
                 ),
-                key="enterprise_planned_timing",
+                key=f"enterprise_planned_timing_v650_{widget_suffix}",
             )
 
         if st.button(
             "정책자금 매칭설정 저장",
             use_container_width=True,
-            key="enterprise_save_preferences",
+            key=f"enterprise_save_preferences_v650_{widget_suffix}",
         ):
             save_matching_preferences(
                 user_id,
@@ -865,6 +935,13 @@ def render_enterprise_management_center(
                     "저장된 주가평가 결과가 없습니다."
                 )
 
+    with tab_articles:
+        render_articles_review(
+            user_id=user_id,
+            business_no=business_no,
+            company_name=company_name,
+        )
+
     with tab_history:
         if history:
             st.markdown("#### 직전 자료 대비 변화")
@@ -883,12 +960,23 @@ def render_enterprise_management_center(
             )
 
     with tab_ai:
+        consultation_context = integration.get(
+            "consultation_context",
+            {},
+        )
+        articles_review = get_latest_articles_review(
+            user_id,
+            business_no,
+            company_name,
+        )
         consulting_analysis = build_consulting_analysis(
             selected_row,
             financial,
             registry,
             stock,
             preferences,
+            consultation_context=consultation_context,
+            articles_review=articles_review,
         )
 
         st.markdown("### AI 종합진단")
@@ -941,7 +1029,7 @@ def render_enterprise_management_center(
         report_left, report_right = st.columns([1.4, 1])
         with report_left:
             st.info(
-                "기업정보·재무정보·등기·주가평가·정책자금 매칭설정을 "
+                "기업정보·재무정보·등기·주가평가·정관·정책자금 매칭설정을 "
                 "통합한 상담용 리포트입니다."
             )
         with report_right:

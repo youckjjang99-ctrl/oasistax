@@ -55,6 +55,10 @@ from registered_policy_match import (
     build_customer_labels,
     load_registered_customers,
 )
+from enterprise_customer_management import (
+    render_customer_directory,
+    render_selected_customer_delete,
+)
 from utils import get_user_cumulative_db_path, get_user_dirs
 
 
@@ -364,16 +368,37 @@ def render_enterprise_management_center(
         "기업 히스토리를 한 화면에서 관리합니다."
     )
 
-    customers = load_registered_customers(
+    all_customers = load_registered_customers(
         get_user_cumulative_db_path(user_id)
     )
-    if customers.empty:
+    if all_customers.empty:
         st.info(
             "등록된 고객이 없습니다. 크레탑 자동등록으로 고객을 먼저 등록해주세요."
         )
         return
 
+    customers = render_customer_directory(
+        user_id=user_id,
+        user_name=user_name,
+        customers=all_customers,
+    )
+    if customers.empty:
+        st.info(
+            "현재 검색·필터 조건에 맞는 활성 고객이 없습니다. "
+            "검색조건을 초기화하거나 휴지통에서 고객을 복원해주세요."
+        )
+        return
+
     labels, row_map = build_customer_labels(customers)
+    current_selected = st.session_state.get(
+        "enterprise_center_customer"
+    )
+    if current_selected not in labels:
+        st.session_state.pop(
+            "enterprise_center_customer",
+            None,
+        )
+
     selected_label = st.selectbox(
         "관리할 기업",
         labels,
@@ -386,6 +411,12 @@ def render_enterprise_management_center(
         selected_row.get("사업자등록번호", "")
     )
     customer_key = make_customer_key(company_name, business_no)
+
+    render_selected_customer_delete(
+        user_id=user_id,
+        user_name=user_name,
+        selected_row=selected_row,
+    )
 
     integration = reconcile_enterprise_consulting_context(
         user_id=user_id,

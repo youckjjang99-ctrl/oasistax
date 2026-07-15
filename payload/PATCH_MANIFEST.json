@@ -1,10 +1,11 @@
 {
-  "version": "v7.0.1",
-  "base_version": "v7.0.0",
+  "version": "v7.1.0",
+  "base_version": "v7.0.1",
   "modified_files": [
-    "articles_review.py",
-    "document_preprocessor.py",
+    "enterprise_center.py",
+    "enterprise_customer_management.py",
     "VERSION.txt"
   ],
-  "sql_required": false
+  "sql_required": true,
+  "data_deleted": false
 }
