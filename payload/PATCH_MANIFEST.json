@@ -1,13 +1,10 @@
 {
-  "version": "v6.6.0",
-  "base_version": "v6.5.0",
-  "seed_count": 34,
-  "sql_required": true,
+  "version": "v6.6.1",
+  "base_version": "v6.6.0",
   "modified_files": [
-    "app.py",
     "multi_source_policy.py",
-    "integrated_policy_repository.py",
-    "data/internal_policy_seed.json",
     "VERSION.txt"
-  ]
+  ],
+  "sql_required": false,
+  "data_migration_required": false
 }

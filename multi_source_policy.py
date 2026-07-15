@@ -382,6 +382,14 @@ def load_local_sources() -> tuple[list[dict[str, Any]], dict[str, Any]]:
         normalized = normalize_record(enriched, f"{source_name}:{source_type}")
         if normalized:
             normalized["repository_id"] = row.get("record_id")
+            normalized["source"] = (
+                normalized.get("source")
+                or source_name
+                or source_type
+                or "내부 통합 정책DB"
+            )
+            normalized["source_name"] = source_name
+            normalized["source_type"] = source_type
             records.append(normalized)
     return records, {
         "source": "내부 통합 정책DB",
@@ -390,6 +398,50 @@ def load_local_sources() -> tuple[list[dict[str, Any]], dict[str, Any]]:
         "count": len(records),
     }
 
+
+
+def load_bizinfo_source() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    # 기업마당 저장소 형식을 다중소스 매칭 공통 형식으로 변환
+    repository_rows, status = fetch_bizinfo_records()
+    records: list[dict[str, Any]] = []
+
+    for row in repository_rows:
+        if not isinstance(row, dict):
+            continue
+
+        raw = row.get("raw_data", {})
+        if not isinstance(raw, dict):
+            raw = {}
+
+        enriched = dict(raw)
+        title = _clean(row.get("title", ""))
+        agency = _clean(row.get("agency", ""))
+
+        if title:
+            enriched.setdefault("사업명", title)
+            enriched.setdefault("공고명", title)
+        if agency:
+            enriched.setdefault("기관명", agency)
+
+        normalized = normalize_record(enriched, "기업마당 API")
+        if not normalized:
+            continue
+
+        normalized["repository_id"] = row.get("record_id")
+        normalized["source"] = "기업마당 API"
+        normalized["source_name"] = "기업마당 API"
+        normalized["source_type"] = "bizinfo"
+        records.append(normalized)
+
+    result_status = dict(status or {})
+    result_status["source"] = "기업마당 API"
+    result_status["count"] = len(records)
+    if result_status.get("status") == "정상" and repository_rows and not records:
+        result_status["status"] = "형식오류"
+        result_status["message"] = (
+            "기업마당 응답은 받았지만 매칭 공고 형식으로 변환하지 못했습니다."
+        )
+    return records, result_status
 
 def _deduplicate(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     groups: dict[str, dict[str, Any]] = {}
@@ -410,14 +462,27 @@ def _deduplicate(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not title_key:
             continue
 
+        source = _clean(
+            record.get("source")
+            or record.get("source_name")
+            or record.get("source_type")
+            or "출처 미확인"
+        )
+        record["source"] = source
+
         existing = groups.get(key)
         if existing is None:
-            record["source_list"] = [record["source"]]
+            record["source_list"] = [source]
             groups[key] = record
             continue
 
-        if record["source"] not in existing["source_list"]:
-            existing["source_list"].append(record["source"])
+        existing_sources = existing.get("source_list", [])
+        if not isinstance(existing_sources, list):
+            existing_sources = _list_value(existing_sources)
+            existing["source_list"] = existing_sources
+
+        if source not in existing_sources:
+            existing_sources.append(source)
 
         for field in [
             "summary", "target", "region", "industry",
@@ -653,7 +718,7 @@ def collect_all_sources() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
 
     for loader in [
         load_local_sources,
-        fetch_bizinfo_records,
+        load_bizinfo_source,
         fetch_kstartup,
         fetch_kosmes,
     ]:
