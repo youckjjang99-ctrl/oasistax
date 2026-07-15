@@ -15,6 +15,7 @@ from ai_usage import render_ai_usage_page
 from cloud_restore import restore_customer_db_if_needed
 from cloud_crm_restore import restore_crm_from_cloud
 from enterprise_center import render_enterprise_management_center
+from enterprise_customer_management import render_customer_trash_page
 from address_tools import (
     enrich_address_fields,
     repair_user_customer_addresses,
@@ -66,7 +67,7 @@ from crm import (
 from auth import (
     apply_env_secrets, check_login, login_form, logout_button,
     is_admin, list_pending_users, list_all_users_for_admin,
-    approve_user, reject_user
+    approve_user, reject_user, render_password_change
 )
 from history import append_run_history, read_run_history, get_manager_stats
 from utils import (
@@ -1431,7 +1432,7 @@ with st.sidebar:
         "크레탑 자동등록": "크레탑 자동등록",
         "기업 컨설팅": "기업관리센터",
         "AI 코파일럿": "AI 코파일럿",
-        "정책자금 매칭": "고객DB 업로드/매칭",
+        "정책자금 매칭": "통합 정책자금 매칭",
         "주가평가": "주가평가",
         "내 누적 고객DB": "내 누적 고객DB",
         "실행이력": "실행이력",
@@ -1442,6 +1443,9 @@ with st.sidebar:
         menu_label_map["시스템 관리"] = "시스템 관리"
         menu_label_map["클라우드 DB 관리"] = "클라우드 DB 관리"
         menu_label_map["AI 사용량"] = "AI 사용량"
+
+    # 휴지통은 좌측 메뉴의 가장 마지막 항목으로 유지
+    menu_label_map["휴지통"] = "휴지통"
 
     selected_menu_label = st.radio(
         "메뉴",
@@ -1456,6 +1460,7 @@ with st.sidebar:
         active_tab = "기업관리센터"
 
     st.divider()
+    render_password_change(CURRENT_USER_ID)
     logout_button()
 
 st.markdown(f"""
@@ -1491,6 +1496,12 @@ elif active_tab == "기업관리센터":
         CURRENT_USER_NAME,
     )
 
+elif active_tab == "휴지통":
+    render_customer_trash_page(
+        CURRENT_USER_ID,
+        CURRENT_USER_NAME,
+    )
+
 elif active_tab == "AI 코파일럿":
     render_copilot_page(
         CURRENT_USER_ID,
@@ -1500,8 +1511,8 @@ elif active_tab == "AI 코파일럿":
 elif active_tab == "내 누적 고객DB":
     render_cumulative_db_page(CURRENT_USER_ID)
 
-elif active_tab == "고객DB 업로드/매칭":
-    st.markdown("### 등록 고객 정책자금 자동매칭")
+elif active_tab == "통합 정책자금 매칭":
+    st.markdown("### 등록 고객 통합 정책자금 AI 매칭")
     st.caption(
         "크레탑 자동등록으로 생성된 누적 고객DB에서 업체를 선택하면 "
         "별도 엑셀 업로드 없이 바로 정책자금 매칭을 실행합니다."
@@ -1700,7 +1711,7 @@ elif active_tab == "고객DB 업로드/매칭":
             key="policy_registered_manager_name",
         )
 
-        if st.button(
+        if False and st.button(
             "선택 고객 정책자금 매칭 실행",
             type="primary",
             width='stretch',
@@ -1826,6 +1837,18 @@ elif active_tab == "고객DB 업로드/매칭":
                     )
 
     st.divider()
+    show_legacy_upload = st.checkbox(
+        "관리자·레거시 고객DB 업로드 도구 보기",
+        value=False,
+        key="show_legacy_customer_upload_v660",
+    )
+    if not show_legacy_upload:
+        st.info(
+            "일반 매칭은 위 등록 고객 통합매칭을 사용합니다. "
+            "고객DB 업로드는 기존 호환과 일괄등록 용도로만 유지됩니다."
+        )
+        st.stop()
+
     with st.expander(
         "기존 방식: 고객DB 엑셀 파일 직접 업로드",
         expanded=False,

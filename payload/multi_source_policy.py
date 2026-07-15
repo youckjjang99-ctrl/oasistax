@@ -15,6 +15,7 @@ import streamlit as st
 import xml.etree.ElementTree as ET
 
 from utils import ROOT_DIR, get_user_dirs
+from employee_status import employee_matching_context
 from integrated_policy_repository import (
     load_repository_records,
     refresh_repository,
@@ -545,6 +546,7 @@ def score_record(
     record: dict[str, Any],
     customer: pd.Series,
     preferences: dict[str, Any],
+    employee_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     title = record.get("title", "")
     combined = " ".join(
@@ -650,6 +652,91 @@ def score_record(
     if len(source_list) >= 2:
         score += 5
         evidence.append("복수 공고소스에서 확인")
+
+    employee_context = employee_context or {}
+    employee_summary = employee_context.get("summary", {}) or {}
+    employment_text = _normalize_text(combined)
+    is_employment_program = any(
+        term in employment_text
+        for term in [
+            "고용", "채용", "장려금", "근로자", "일자리",
+            "청년", "고령자", "중장년", "계속고용",
+            "고용촉진", "육아휴직", "대체인력",
+        ]
+    )
+
+    if is_employment_program and employee_summary:
+        active_count = int(
+            employee_summary.get("active_count", 0) or 0
+        )
+        recent_3m = int(
+            employee_summary.get("recent_3m_count", 0) or 0
+        )
+        recent_6m = int(
+            employee_summary.get("recent_6m_count", 0) or 0
+        )
+        youth_count = int(
+            employee_summary.get("youth_count", 0) or 0
+        )
+        senior_count = int(
+            employee_summary.get("senior_count", 0) or 0
+        )
+        middle_count = int(
+            employee_summary.get("middle_aged_count", 0) or 0
+        )
+        long_tenure = int(
+            employee_summary.get("long_tenure_count", 0) or 0
+        )
+
+        score += min(active_count, 10) * 0.5
+        evidence.append(
+            f"4대보험 가입자명부 기준 현재 가입중 {active_count}명"
+        )
+
+        if recent_6m:
+            score += min(recent_6m * 4, 16)
+            evidence.append(
+                f"최근 6개월 자격취득 {recent_6m}명"
+            )
+
+        if "청년" in employment_text and youth_count:
+            score += min(youth_count * 5, 20)
+            evidence.append(
+                f"청년 연령구간 추정 직원 {youth_count}명"
+            )
+
+        if any(
+            term in employment_text
+            for term in ["고령", "계속고용", "60세"]
+        ) and senior_count:
+            score += min(senior_count * 6, 20)
+            evidence.append(
+                f"고령자 연령구간 추정 직원 {senior_count}명"
+            )
+
+        if "중장년" in employment_text and middle_count:
+            score += min(middle_count * 4, 16)
+            evidence.append(
+                f"중장년 연령구간 추정 직원 {middle_count}명"
+            )
+
+        if any(
+            term in employment_text
+            for term in ["고용유지", "계속고용", "장기근속"]
+        ) and long_tenure:
+            score += min(long_tenure * 2, 10)
+            evidence.append(
+                f"2년 이상 장기근속 직원 {long_tenure}명"
+            )
+
+        if recent_3m:
+            evidence.append(
+                f"최근 3개월 자격취득 {recent_3m}명"
+            )
+
+        penalties.append(
+            "지원 확정 전 채용일·실업기간·임금·근로계약·사업주 제외요건 추가 확인"
+        )
 
     completeness = sum(
         bool(_clean(record.get(field)))
@@ -903,8 +990,32 @@ def render_multi_source_match(
             st.write(f"통합 공고 {len(records):,}건")
 
             st.write("3. 기업정보와 상담키워드로 적합도를 계산합니다.")
+            company_name = _customer_value(customer, "업체명")
+            business_no = _customer_value(
+                customer,
+                "사업자등록번호",
+            )
+            employee_context = employee_matching_context(
+                user_id,
+                business_no,
+                company_name,
+            )
+            if employee_context:
+                summary = employee_context.get("summary", {}) or {}
+                st.write(
+                    "4대보험 직원현황 연동: "
+                    f"가입중 {summary.get('active_count', 0)}명 · "
+                    f"최근 6개월 취득 "
+                    f"{summary.get('recent_6m_count', 0)}명"
+                )
+
             scored = [
-                score_record(record, customer, preferences)
+                score_record(
+                    record,
+                    customer,
+                    preferences,
+                    employee_context=employee_context,
+                )
                 for record in records
             ]
             scored.sort(key=lambda item: item["score"], reverse=True)
