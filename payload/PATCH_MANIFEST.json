@@ -1,14 +1,9 @@
 {
-  "version": "v7.4.4",
-  "base_versions": [
-    "v7.4.2",
-    "v7.4.3"
+  "version": "v7.4.5",
+  "base_version": "v7.4.4",
+  "modified_files": [
+    "maintenance.py",
+    "VERSION.txt"
   ],
-  "sql_required": false,
-  "auto_rollback": true,
-  "fixes": [
-    "constants and variables recognized",
-    "AST-based Streamlit option validation",
-    "self-match false positive removed"
-  ]
+  "sql_required": false
 }

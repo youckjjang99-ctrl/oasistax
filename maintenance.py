@@ -223,8 +223,8 @@ def render_system_management_page(
     precheck_report = run_precheck(project_root, save_report=True)
     p1, p2, p3 = st.columns(3)
     p1.metric("배포 가능 여부", "가능" if precheck_report.get("status") == "PASS" else "차단")
-    p2.metric("오류", f"{precheck_report.get("error_count", 0)}개")
-    p3.metric("경고", f"{precheck_report.get("warning_count", 0)}개")
+    p2.metric("오류", f"{precheck_report.get('error_count', 0)}개")
+    p3.metric("경고", f"{precheck_report.get('warning_count', 0)}개")
     failed_checks = [row for row in precheck_report.get("checks", []) if not row.get("ok")]
     if failed_checks:
         st.dataframe(failed_checks, hide_index=True, use_container_width=True)

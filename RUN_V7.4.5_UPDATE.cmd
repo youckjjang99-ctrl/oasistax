@@ -2,13 +2,13 @@
 setlocal
 cd /d "%~dp0"
 echo ================================================
-echo OASIS v7.0.0 UPDATE
+echo OASIS v7.4.5 HOTFIX
 echo ================================================
 where py >nul 2>nul
 if %errorlevel%==0 (
-  py -3 update_v7.0.0.py
+  py -3 update_v7.4.5.py
 ) else (
-  python update_v7.0.0.py
+  python update_v7.4.5.py
 )
 if not %errorlevel%==0 (
   echo UPDATE FAILED
