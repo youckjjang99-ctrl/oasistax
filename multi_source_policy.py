@@ -31,6 +31,7 @@ COLUMN_ALIASES = {
     "title": [
         "공고명", "사업명", "지원사업명", "사업공고명", "통합공고사업명",
         "제도명", "상품명", "사업 제목", "title", "biz_pbanc_nm",
+        "pblancNm", "pblanc_nm",
     ],
     "agency": [
         "기관명", "수행기관명", "소관명", "주관기관", "전담기관",
@@ -394,6 +395,23 @@ def load_local_sources() -> tuple[list[dict[str, Any]], dict[str, Any]]:
         if not isinstance(raw, dict):
             continue
         enriched = dict(raw)
+
+        # Supabase 저장소의 정규화 필드를 raw_data에 다시 주입한다.
+        # 기업마당 원본 필드명이 pblancNm 등으로 달라도
+        # 제목·기관 누락으로 공고가 탈락하지 않도록 한다.
+        enriched.setdefault(
+            "사업명",
+            str(row.get("title", "") or ""),
+        )
+        enriched.setdefault(
+            "공고명",
+            str(row.get("title", "") or ""),
+        )
+        enriched.setdefault(
+            "기관명",
+            str(row.get("agency", "") or ""),
+        )
+
         if not enriched.get("기관명") and enriched.get("기관"):
             enriched["기관명"] = enriched.get("기관")
         if not enriched.get("사업명") and enriched.get("상품명"):
@@ -414,11 +432,26 @@ def load_local_sources() -> tuple[list[dict[str, Any]], dict[str, Any]]:
             normalized["source_name"] = source_name
             normalized["source_type"] = source_type
             records.append(normalized)
+    repository_count = len(repository_rows)
+    converted_count = len(records)
+    dropped_count = max(
+        repository_count - converted_count,
+        0,
+    )
+
     return records, {
         "source": "내부 통합 정책DB",
         "status": "정상" if records else "자료없음",
-        "message": status.get("message", ""),
-        "count": len(records),
+        "message": (
+            f"{status.get('message', '')} · "
+            f"변환 {converted_count:,}건"
+            + (
+                f" · 제외 {dropped_count:,}건"
+                if dropped_count
+                else ""
+            )
+        ),
+        "count": converted_count,
     }
 
 

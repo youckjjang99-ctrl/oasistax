@@ -1,6 +1,10 @@
 {
-  "target_version": "v8.2.0",
+  "target_version": "v8.2.1",
   "runner": "RUN_UPDATE.cmd",
   "updater": "update.py",
+  "modified_files": [
+    "multi_source_policy.py",
+    "VERSION.txt"
+  ],
   "sql_required": false
 }
