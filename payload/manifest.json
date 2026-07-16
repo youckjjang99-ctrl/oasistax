@@ -1,0 +1,6 @@
+{
+  "target_version": "v8.2.0",
+  "runner": "RUN_UPDATE.cmd",
+  "updater": "update.py",
+  "sql_required": false
+}

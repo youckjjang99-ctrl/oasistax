@@ -60,6 +60,10 @@ SUPPORTED_AUDIO_TYPES = [
     "webm",
 ]
 MAX_API_FILE_BYTES = 24 * 1024 * 1024
+LONG_AUDIO_SEGMENT_SECONDS = 600
+SUMMARY_SECTION_CHARS = 16000
+SUMMARY_SECTION_OVERLAP = 800
+TRANSCRIPTION_RETRY_COUNT = 3
 DEFAULT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
 DEFAULT_SUMMARY_MODEL = "gpt-5-mini"
 CACHE_VERSION = "v1"
@@ -187,6 +191,47 @@ def _transcript_cache_key(
             transcription_model,
             str(bool(noise_reduction)),
             str(bool(aggressive_noise_reduction)),
+        ]
+    )
+
+
+def _chunk_transcript_cache_key(
+    audio_digest: str,
+    transcription_model: str,
+    noise_reduction: bool,
+    aggressive_noise_reduction: bool,
+    chunk_index: int,
+    total_chunks: int,
+) -> str:
+    return "|".join(
+        [
+            CACHE_VERSION,
+            "transcript_chunk",
+            audio_digest,
+            transcription_model,
+            str(bool(noise_reduction)),
+            str(bool(aggressive_noise_reduction)),
+            str(chunk_index),
+            str(total_chunks),
+        ]
+    )
+
+
+def _summary_section_cache_key(
+    section: str,
+    summary_model: str,
+    section_index: int,
+    total_sections: int,
+) -> str:
+    digest = hashlib.sha256(section.encode("utf-8")).hexdigest()
+    return "|".join(
+        [
+            CACHE_VERSION,
+            "summary_section",
+            digest,
+            summary_model,
+            str(section_index),
+            str(total_sections),
         ]
     )
 
@@ -642,44 +687,45 @@ def _consulting_topics_prompt() -> str:
     return ", ".join(CONSULTING_TOPIC_TAXONOMY)
 
 
-def _split_audio_if_needed(path: Path, output_dir: Path) -> list[Path]:
-    if path.stat().st_size <= MAX_API_FILE_BYTES:
-        return [path]
-
+def _split_audio_if_needed(
+    path: Path,
+    output_dir: Path,
+) -> list[Path]:
+    """Split long audio by duration as well as file size."""
     if not _ffmpeg_available():
+        if path.stat().st_size <= MAX_API_FILE_BYTES:
+            return [path]
         raise RuntimeError(
-            "25MB를 초과하는 녹음파일을 분할하려면 ffmpeg가 필요합니다. "
-            "Streamlit Cloud 재부팅 후 다시 시도해주세요."
+            "장시간 또는 24MB 초과 녹음을 처리하려면 ffmpeg가 필요합니다."
         )
 
     duration = _audio_duration_seconds(path)
-    target_ratio = MAX_API_FILE_BYTES / max(path.stat().st_size, 1)
-    segment_seconds = max(120, int(duration * target_ratio * 0.82))
-    segment_seconds = min(segment_seconds, 900)
+    needs_time_split = duration > LONG_AUDIO_SEGMENT_SECONDS
+    needs_size_split = path.stat().st_size > MAX_API_FILE_BYTES
+
+    if not needs_time_split and not needs_size_split:
+        return [path]
+
+    segment_seconds = LONG_AUDIO_SEGMENT_SECONDS
+    if needs_size_split:
+        target_ratio = MAX_API_FILE_BYTES / max(path.stat().st_size, 1)
+        size_based_seconds = max(120, int(duration * target_ratio * 0.80))
+        segment_seconds = min(segment_seconds, size_based_seconds)
 
     output_pattern = output_dir / "audio_part_%03d.m4a"
     result = subprocess.run(
         [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(path),
-            "-vn",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "64k",
-            "-f",
-            "segment",
-            "-segment_time",
-            str(segment_seconds),
-            "-reset_timestamps",
-            "1",
+            "ffmpeg", "-y", "-i", str(path), "-vn",
+            "-ac", "1", "-ar", "16000",
+            "-c:a", "aac", "-b:a", "48k",
+            "-f", "segment",
+            "-segment_time", str(segment_seconds),
+            "-reset_timestamps", "1",
             str(output_pattern),
         ],
         capture_output=True,
         text=True,
-        timeout=600,
+        timeout=1200,
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -689,13 +735,16 @@ def _split_audio_if_needed(path: Path, output_dir: Path) -> list[Path]:
 
     chunks = sorted(output_dir.glob("audio_part_*.m4a"))
     if not chunks:
-        raise RuntimeError("분할된 오디오 파일을 찾지 못했습니다.")
+        raise RuntimeError("분할된 녹음파일을 찾지 못했습니다.")
 
-    oversized = [chunk for chunk in chunks if chunk.stat().st_size > 25 * 1024 * 1024]
+    oversized = [
+        chunk
+        for chunk in chunks
+        if chunk.stat().st_size > MAX_API_FILE_BYTES
+    ]
     if oversized:
-        raise RuntimeError(
-            "일부 분할파일이 25MB를 초과했습니다. 원본을 더 낮은 음질로 압축해주세요."
-        )
+        raise RuntimeError("분할된 일부 파일이 24MB를 초과했습니다.")
+
     return chunks
 
 
@@ -808,52 +857,70 @@ def _transcribe_chunk(
     total_chunks: int,
 ) -> str:
     prompt = (
-        f"한국어 기업 컨설팅 상담 녹음입니다. 업체명은 {company_name or '미확인'}입니다. "
-        "다음 분야의 전문용어를 문맥에 맞게 정확히 받아쓰세요: "
-        f"{_consulting_topics_prompt()}. "
-        "특히 이익소각, 자기주식, 가지급금, 가업승계, 정관개정, 임원퇴직금, "
-        "비상장주식평가, 경영인정기보험, 정책자금, 고용지원금, 세액공제 용어를 "
-        "일반 단어로 잘못 바꾸지 마세요. "
+        "한국어 기업 컨설팅 상담 녹음입니다. "
+        f"업체명은 {company_name or '미확인'}입니다. "
+        "기업 상담 전문용어를 문맥에 맞게 정확히 받아쓰세요. "
+        "이익소각, 자기주식, 가지급금, 가업승계, 정관개정, "
+        "임원퇴직금, 비상장주식평가, 경영인정기보험, 정책자금, "
+        "고용지원금, 세액공제 용어를 일반 단어로 바꾸지 마세요. "
         f"전체 {total_chunks}개 중 {chunk_index}번째 구간입니다."
     )
 
-    with path.open("rb") as audio_file:
-        response = requests.post(
-            "https://api.openai.com/v1/audio/transcriptions",
-            headers={"Authorization": f"Bearer {api_key}"},
-            files={
-                "file": (
-                    path.name,
-                    audio_file,
-                    "audio/mp4" if path.suffix.lower() == ".m4a" else "application/octet-stream",
+    last_error = ""
+    for attempt in range(1, TRANSCRIPTION_RETRY_COUNT + 1):
+        try:
+            with path.open("rb") as audio_file:
+                response = requests.post(
+                    "https://api.openai.com/v1/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    files={
+                        "file": (
+                            path.name,
+                            audio_file,
+                            "audio/mp4"
+                            if path.suffix.lower() == ".m4a"
+                            else "application/octet-stream",
+                        )
+                    },
+                    data={
+                        "model": _read_secret(
+                            "OPENAI_TRANSCRIPTION_MODEL",
+                            DEFAULT_TRANSCRIPTION_MODEL,
+                        ),
+                        "response_format": "json",
+                        "language": "ko",
+                        "prompt": prompt,
+                    },
+                    timeout=900,
                 )
-            },
-            data={
-                "model": _read_secret(
-                    "OPENAI_TRANSCRIPTION_MODEL",
-                    DEFAULT_TRANSCRIPTION_MODEL,
-                ),
-                "response_format": "json",
-                "language": "ko",
-                "prompt": prompt,
-            },
-            timeout=900,
+        except requests.RequestException as exc:
+            last_error = str(exc)
+            if attempt < TRANSCRIPTION_RETRY_COUNT:
+                import time
+                time.sleep(attempt * 2)
+                continue
+            raise RuntimeError(
+                f"{chunk_index}/{total_chunks} 구간 연결 실패: {last_error}"
+            ) from exc
+
+        if response.ok:
+            value = response.json().get("text", "")
+            return value.strip() if isinstance(value, str) else ""
+
+        last_error = f"HTTP {response.status_code}: {response.text[:800]}"
+        retryable = (
+            response.status_code >= 500
+            or response.status_code in {408, 409, 429}
         )
+        if retryable and attempt < TRANSCRIPTION_RETRY_COUNT:
+            import time
+            time.sleep(attempt * 3)
+            continue
+        break
 
-    if not response.ok:
-        raise RuntimeError(
-            f"음성 변환 실패 HTTP {response.status_code}: {response.text[:800]}"
-        )
-
-    data = response.json()
-    text = data.get("text", "")
-
-    # 녹음을 늦게 종료해 무음 구간만 들어 있는 조각은 정상적으로 건너뛴다.
-    # 한 조각이 비어 있다고 전체 상담 녹취를 실패시키지 않는다.
-    if not isinstance(text, str) or not text.strip():
-        return ""
-
-    return text.strip()
+    raise RuntimeError(
+        f"{chunk_index}/{total_chunks} 구간 음성 변환 실패: {last_error}"
+    )
 
 
 def transcribe_audio(
@@ -863,15 +930,20 @@ def transcribe_audio(
     progress_callback=None,
     noise_reduction: bool = True,
     aggressive_noise_reduction: bool = False,
+    user_id: str = "",
+    audio_digest: str = "",
 ) -> str:
     api_key = _read_secret("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError(
-            "OPENAI_API_KEY가 설정되지 않았습니다. "
-            "Streamlit Cloud의 Settings → Secrets에 등록해주세요."
-        )
+        raise RuntimeError("OPENAI_API_KEY가 설정되지 않았습니다.")
 
+    transcription_model = _read_secret(
+        "OPENAI_TRANSCRIPTION_MODEL",
+        DEFAULT_TRANSCRIPTION_MODEL,
+    )
+    digest = audio_digest or _audio_hash(audio_bytes)
     suffix = Path(filename).suffix.lower() or ".m4a"
+
     with tempfile.TemporaryDirectory(prefix="oasis_audio_") as temp_dir_name:
         temp_dir = Path(temp_dir_name)
         original_path = temp_dir / f"original{suffix}"
@@ -889,22 +961,59 @@ def transcribe_audio(
             processing_path,
             temp_dir / "api_optimized.m4a",
         )
-
         chunks = _split_audio_if_needed(processing_path, temp_dir)
-        transcript_parts: list[tuple[int, str]] = []
+        transcript_parts = []
         skipped_silence_chunks = 0
 
         for index, chunk in enumerate(chunks, start=1):
             if progress_callback:
-                progress_callback(index, len(chunks), chunk.name)
+                progress_callback(
+                    index,
+                    len(chunks),
+                    f"{index}/{len(chunks)} 구간 처리 중",
+                )
 
-            chunk_text = _transcribe_chunk(
-                api_key,
-                chunk,
-                company_name,
+            chunk_key = _chunk_transcript_cache_key(
+                digest,
+                transcription_model,
+                noise_reduction,
+                aggressive_noise_reduction,
                 index,
                 len(chunks),
             )
+
+            chunk_text = ""
+            if user_id:
+                cached_chunk = _get_cached_value(
+                    user_id,
+                    chunk_key,
+                    "chunk_transcript",
+                )
+                if isinstance(cached_chunk, str):
+                    chunk_text = cached_chunk.strip()
+
+            if not chunk_text:
+                chunk_text = _transcribe_chunk(
+                    api_key,
+                    chunk,
+                    company_name,
+                    index,
+                    len(chunks),
+                )
+                if user_id:
+                    _set_cached_value(
+                        user_id,
+                        chunk_key,
+                        "chunk_transcript",
+                        chunk_text,
+                        metadata={
+                            "filename": filename,
+                            "company_name": company_name,
+                            "chunk_index": index,
+                            "total_chunks": len(chunks),
+                            "model": transcription_model,
+                        },
+                    )
 
             if not chunk_text:
                 skipped_silence_chunks += 1
@@ -914,23 +1023,149 @@ def transcribe_audio(
 
     if not transcript_parts:
         raise RuntimeError(
-            "녹음파일 전체에서 인식 가능한 음성을 찾지 못했습니다. "
-            "마이크 음량과 녹음내용을 확인해주세요."
+            "녹음파일 전체에서 인식 가능한 음성을 찾지 못했습니다."
         )
 
     transcript = "\n\n".join(
         f"[구간 {chunk_index}]\n{chunk_text}"
         for chunk_index, chunk_text in transcript_parts
     )
-
     if skipped_silence_chunks:
         transcript += (
             "\n\n[처리 안내]\n"
-            f"음성이 없는 구간 {skipped_silence_chunks}개는 "
-            "자동으로 제외했습니다."
+            f"음성이 없는 구간 {skipped_silence_chunks}개는 자동 제외했습니다."
         )
-
     return transcript
+
+
+def _split_text_sections(transcript: str) -> list[str]:
+    if len(transcript) <= SUMMARY_SECTION_CHARS:
+        return [transcript]
+
+    sections = []
+    start = 0
+    while start < len(transcript):
+        end = min(start + SUMMARY_SECTION_CHARS, len(transcript))
+        if end < len(transcript):
+            boundary = transcript.rfind(
+                "\n",
+                start + SUMMARY_SECTION_CHARS // 2,
+                end,
+            )
+            if boundary > start:
+                end = boundary
+
+        section = transcript[start:end].strip()
+        if section:
+            sections.append(section)
+
+        if end >= len(transcript):
+            break
+        start = max(end - SUMMARY_SECTION_OVERLAP, start + 1)
+
+    return sections
+
+
+def _summarize_transcript_section(
+    api_key: str,
+    model: str,
+    section: str,
+    section_index: int,
+    total_sections: int,
+    company_name: str,
+) -> str:
+    prompt = f"""
+한국 중소기업·법인 컨설팅 상담 녹취 일부입니다.
+전체 {total_sections}개 텍스트 구간 중 {section_index}번째입니다.
+업체명: {company_name or '미확인'}
+
+최종 상담일지를 위해 다음 항목만 간결하게 정리하세요.
+- 고객이 말한 사실과 수치
+- 고객 니즈와 질문
+- 컨설턴트가 제안한 내용
+- 정책자금·고용지원금·세액공제 관련 근거
+- 정관·주가평가·등기·가지급금·승계·보험 언급
+- 고객과 컨설턴트 후속조치
+- 추가 확인사항
+녹취에 없는 내용은 만들지 마세요.
+
+녹취:
+{section}
+""".strip()
+
+    response = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={"model": model, "input": prompt},
+        timeout=900,
+    )
+    if not response.ok:
+        raise RuntimeError(
+            f"긴 녹취 {section_index}/{total_sections} 구간 요약 실패 "
+            f"HTTP {response.status_code}: {response.text[:500]}"
+        )
+    return _extract_response_text(response.json()).strip()
+
+
+def _compact_transcript_for_summary(
+    transcript: str,
+    company_name: str,
+    model: str,
+    api_key: str,
+    user_id: str = "",
+) -> str:
+    sections = _split_text_sections(transcript)
+    if len(sections) == 1:
+        return transcript
+
+    notes = []
+    for index, section in enumerate(sections, start=1):
+        cache_key = _summary_section_cache_key(
+            section,
+            model,
+            index,
+            len(sections),
+        )
+        note = ""
+        if user_id:
+            cached_note = _get_cached_value(
+                user_id,
+                cache_key,
+                "section_summary",
+            )
+            if isinstance(cached_note, str):
+                note = cached_note.strip()
+
+        if not note:
+            note = _summarize_transcript_section(
+                api_key,
+                model,
+                section,
+                index,
+                len(sections),
+                company_name,
+            )
+            if user_id:
+                _set_cached_value(
+                    user_id,
+                    cache_key,
+                    "section_summary",
+                    note,
+                    metadata={
+                        "company_name": company_name,
+                        "section_index": index,
+                        "total_sections": len(sections),
+                        "model": model,
+                    },
+                )
+
+        notes.append(
+            f"[장시간 녹취 요약 {index}/{len(sections)}]\n{note}"
+        )
+    return "\n\n".join(notes)
 
 
 def summarize_consultation(
@@ -938,6 +1173,7 @@ def summarize_consultation(
     company_name: str,
     business_no: str,
     consultant_name: str,
+    user_id: str = "",
 ) -> dict[str, Any]:
     api_key = _read_secret("OPENAI_API_KEY")
     if not api_key:
@@ -945,6 +1181,9 @@ def summarize_consultation(
 
     model = _read_secret("OPENAI_SUMMARY_MODEL", DEFAULT_SUMMARY_MODEL)
     topic_taxonomy = _consulting_topics_prompt()
+    analysis_transcript = _compact_transcript_for_summary(
+        transcript, company_name, model, api_key, user_id=user_id
+    )
     prompt = f"""
 당신은 한국 중소기업·법인 컨설팅 CRM의 상담일지 작성자입니다.
 아래 녹취를 근거로 사실만 정리하고, 녹취에 없는 내용을 만들어내지 마세요.
@@ -1017,8 +1256,8 @@ def summarize_consultation(
 - matching_keywords는 정책자금 공고문 검색에 실제 도움이 되는 짧은 단어 또는 구문으로 작성하세요.
 - 이익소각, 가지급금, 가업승계, 정관개정만 논의된 경우에는 정책자금 키워드로 억지 반영하지 마세요.
 
-녹취:
-{transcript}
+녹취 또는 장시간 녹취 구간요약:
+{analysis_transcript}
 """.strip()
 
 
@@ -1160,6 +1399,8 @@ def transcribe_audio_with_cache(
         progress_callback=progress_callback,
         noise_reduction=noise_reduction,
         aggressive_noise_reduction=aggressive_noise_reduction,
+        user_id=user_id,
+        audio_digest=digest,
     )
 
     record_ai_usage(
@@ -1282,6 +1523,7 @@ def summarize_consultation_with_cache(
         company_name,
         business_no,
         consultant_name,
+        user_id=user_id,
     )
 
     api_usage = journal.get("_api_usage", {})

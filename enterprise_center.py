@@ -52,6 +52,8 @@ from matching_preferences import (
     get_matching_preferences,
     save_matching_preferences,
 )
+from multi_source_policy import render_multi_source_match
+from stock_valuation import render_stock_valuation_page
 from registered_policy_match import (
     build_customer_labels,
     load_registered_customers,
@@ -498,6 +500,17 @@ def render_enterprise_management_center(
         unsafe_allow_html=True,
     )
 
+    if st.button(
+        "이 기업 AI 코파일럿으로 분석하기",
+        type="primary",
+        use_container_width=True,
+        key=f"enterprise_open_copilot_{business_no or company_name}",
+    ):
+        st.session_state["_oasis_copilot_business_no"] = business_no
+        st.session_state["_oasis_copilot_company_name"] = company_name
+        st.session_state["_oasis_pending_main_menu"] = "AI 코파일럿"
+        st.rerun()
+
     sales = _first_value(
         selected_row,
         financial,
@@ -530,7 +543,6 @@ def render_enterprise_management_center(
         tab_stock,
         tab_articles,
         tab_history,
-        tab_ai,
         tab_employees,
     ) = st.tabs(
         [
@@ -540,7 +552,6 @@ def render_enterprise_management_center(
             "주가평가·등기",
             "정관검토",
             "기업히스토리",
-            "AI 진단",
             "직원현황",
         ]
     )
@@ -793,7 +804,7 @@ def render_enterprise_management_center(
                 company_name=company_name,
             )
             st.caption(
-                "재연동 후 정책자금 탭과 정책자금매칭 메뉴를 다시 열면 "
+                "재연동 후 기업컨설팅의 정책자금 탭을 다시 열면 "
                 "최신 키워드와 추천 결과가 반영됩니다."
             )
 
@@ -888,87 +899,46 @@ def render_enterprise_management_center(
                 "정책자금 매칭설정을 로컬과 Supabase에 저장했습니다."
             )
 
-    with tab_stock:
-        left, right = st.columns(2)
-        with left:
-            st.markdown("#### 등기정보")
-            if registry:
-                registry_rows = [
-                    ["법인등록번호", registry.get("법인등록번호", "")],
-                    ["본점소재지", registry.get("본점소재지", "")],
-                    ["법인설립일", registry.get("법인설립일", "")],
-                    [
-                        "자본금",
-                        _format_number(registry.get("자본금"), "원"),
-                    ],
-                    [
-                        "발행주식총수",
-                        _format_number(
-                            registry.get("발행주식총수"),
-                            "주",
-                        ),
-                    ],
-                    [
-                        "1주당 액면가액",
-                        _format_number(
-                            registry.get("1주당액면가액"),
-                            "원",
-                        ),
-                    ],
-                ]
-                st.dataframe(
-                    pd.DataFrame(
-                        registry_rows,
-                        columns=["항목", "내용"],
-                    ),
-                    hide_index=True,
-                    use_container_width=True,
-                )
-            else:
-                st.info(
-                    "저장된 등기정보가 없습니다. 주가평가 메뉴에서 등기를 분석해주세요."
-                )
+        current_policy_preferences = {
+            "매칭키워드": [
+                item.strip()
+                for item in matching_keywords.split(",")
+                if item.strip()
+            ],
+            "관심지원분야": interest_fields,
+            "제외키워드": [
+                item.strip()
+                for item in exclusion_keywords.split(",")
+                if item.strip()
+            ],
+            "자금사용목적": fund_purpose,
+            "투자예정금액": planned_amount,
+            "투자예정시기": planned_timing,
+        }
 
-        with right:
-            st.markdown("#### 주가평가")
-            if stock:
-                result = stock.get("result", {})
-                stock_rows = [
-                    ["평가기준일", stock.get("valuation_date", "")],
-                    [
-                        "발행주식총수",
-                        _format_number(
-                            stock.get("current_shares"),
-                            "주",
-                        ),
-                    ],
-                    [
-                        "1주당 평가액",
-                        _format_number(
-                            result.get("final_value_per_share"),
-                            "원",
-                        ),
-                    ],
-                    [
-                        "기업 전체 주식가치",
-                        _format_number(
-                            result.get("total_equity_value"),
-                            "원",
-                        ),
-                    ],
-                ]
-                st.dataframe(
-                    pd.DataFrame(
-                        stock_rows,
-                        columns=["항목", "내용"],
-                    ),
-                    hide_index=True,
-                    use_container_width=True,
-                )
-            else:
-                st.info(
-                    "저장된 주가평가 결과가 없습니다."
-                )
+        st.divider()
+        st.markdown("#### 다중소스 정책자금·고용지원금 매칭")
+        render_multi_source_match(
+            user_id,
+            selected_row,
+            current_policy_preferences,
+        )
+
+    with tab_stock:
+        selected_stock_label = (
+            f"{company_name} · {business_no}"
+            if business_no
+            else company_name
+        )
+        if selected_stock_label:
+            st.session_state["stock_customer_selector"] = (
+                selected_stock_label
+            )
+
+        render_stock_valuation_page(
+            user_id=user_id,
+            user_name=user_name,
+        )
 
     with tab_articles:
         render_articles_review(
@@ -993,111 +963,6 @@ def render_enterprise_management_center(
             st.info(
                 "기업 히스토리가 없습니다. 크레탑 PDF를 다시 분석하면 기록됩니다."
             )
-
-    with tab_ai:
-        consultation_context = integration.get(
-            "consultation_context",
-            {},
-        )
-        articles_review = get_latest_articles_review(
-            user_id,
-            business_no,
-            company_name,
-        )
-        consulting_analysis = build_consulting_analysis(
-            selected_row,
-            financial,
-            registry,
-            stock,
-            preferences,
-            consultation_context=consultation_context,
-            articles_review=articles_review,
-        )
-
-        st.markdown("### AI 종합진단")
-        a1, a2, a3 = st.columns(3)
-        with a1:
-            _render_list_card(
-                "강점",
-                consulting_analysis.get("strengths", []),
-                "blue",
-                "추가 재무정보 확인이 필요합니다.",
-            )
-        with a2:
-            _render_list_card(
-                "확인사항",
-                consulting_analysis.get("cautions", []),
-                "amber",
-                "현재 주요 경고사항은 확인되지 않았습니다.",
-            )
-        with a3:
-            _render_list_card(
-                "우선 실행",
-                consulting_analysis.get("strategy", []),
-                "violet",
-                "자금수요와 투자계획을 우선 확인합니다.",
-            )
-
-        st.markdown("### 대표 미팅 질문")
-        questions_html = "".join(
-            f"""
-            <div class="oasis-question">
-                <span class="oasis-question-number">{index}</span>
-                <span>{question}</span>
-            </div>
-            """
-            for index, question in enumerate(
-                consulting_analysis.get("questions", []),
-                start=1,
-            )
-        )
-        st.markdown(
-            f"""
-            <div class="oasis-question-card">
-                {questions_html}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        st.markdown("### AI 컨설팅 리포트")
-        report_left, report_right = st.columns([1.4, 1])
-        with report_left:
-            st.info(
-                "기업정보·재무정보·등기·주가평가·정관·정책자금 매칭설정을 "
-                "통합한 상담용 리포트입니다."
-            )
-        with report_right:
-            st.metric(
-                "정보 완성도",
-                f"{consulting_analysis.get('completeness', 0)}%",
-            )
-
-        report_bytes = build_consulting_excel_report(consulting_analysis)
-        safe_company = re.sub(r'[\\/:*?"<>|]', "_", company_name or "고객")
-        report_filename = (
-            f"AI컨설팅리포트_{safe_company}_"
-            f"{datetime.now().strftime('%Y%m%d')}.xlsx"
-        )
-        st.download_button(
-            "AI 컨설팅 리포트 엑셀 다운로드",
-            data=report_bytes,
-            file_name=report_filename,
-            mime=(
-                "application/vnd.openxmlformats-officedocument."
-                "spreadsheetml.sheet"
-            ),
-            type="primary",
-            use_container_width=True,
-            key="enterprise_ai_report_download",
-        )
-
-        st.caption(
-            "현재 저장된 기업정보를 바탕으로 만든 상담용 사전진단입니다. "
-            "정책자금 신청과 세무·주가평가는 기준일 자료를 추가 확인해야 합니다."
-        )
-
-
 
     with tab_employees:
         render_employee_status(

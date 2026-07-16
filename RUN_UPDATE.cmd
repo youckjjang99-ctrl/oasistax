@@ -2,13 +2,13 @@
 setlocal
 cd /d "%~dp0"
 echo ================================================
-echo OASIS COMMON UPDATE
+echo OASIS UPDATE
 echo ================================================
 where py >nul 2>nul
 if %errorlevel%==0 (
-  py -3 update_engine.py
+  py -3 update.py
 ) else (
-  python update_engine.py
+  python update.py
 )
 if not %errorlevel%==0 (
   echo UPDATE FAILED OR ROLLED BACK

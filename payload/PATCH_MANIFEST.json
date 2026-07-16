@@ -1,0 +1,16 @@
+{
+  "version": "v8.2.0",
+  "allowed_from_versions": [
+    "v7.4.5",
+    "7.4.5",
+    "v8.0.0",
+    "8.0.0",
+    "v8.1.0",
+    "8.1.0"
+  ],
+  "sql_required": false,
+  "data_deleted": false,
+  "audio_segment_seconds": 600,
+  "chunk_cache": true,
+  "chunk_retry_count": 3
+}

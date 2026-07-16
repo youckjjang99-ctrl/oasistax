@@ -1432,8 +1432,6 @@ with st.sidebar:
         "크레탑 자동등록": "크레탑 자동등록",
         "기업 컨설팅": "기업관리센터",
         "AI 코파일럿": "AI 코파일럿",
-        "정책자금 매칭": "통합 정책자금 매칭",
-        "주가평가": "주가평가",
         "내 누적 고객DB": "내 누적 고객DB",
         "실행이력": "실행이력",
         "담당자 통계": "담당자 통계",
@@ -1447,6 +1445,19 @@ with st.sidebar:
     # 휴지통은 좌측 메뉴의 가장 마지막 항목으로 유지
     menu_label_map["휴지통"] = "휴지통"
 
+    pending_menu = st.session_state.pop(
+        "_oasis_pending_main_menu",
+        None,
+    )
+    if pending_menu in menu_label_map:
+        st.session_state["active_main_menu_v311"] = pending_menu
+
+    current_sidebar_value = st.session_state.get(
+        "active_main_menu_v311"
+    )
+    if current_sidebar_value not in menu_label_map:
+        st.session_state["active_main_menu_v311"] = "기업 컨설팅"
+
     selected_menu_label = st.radio(
         "메뉴",
         list(menu_label_map.keys()),
@@ -1456,7 +1467,11 @@ with st.sidebar:
     active_tab = menu_label_map[selected_menu_label]
 
     # v5.0 호환 처리: 이전 세션의 고객관리 메뉴는 통합 화면으로 이동
-    if active_tab == "고객관리":
+    if active_tab in {
+        "고객관리",
+        "통합 정책자금 매칭",
+        "주가평가",
+    }:
         active_tab = "기업관리센터"
 
     st.divider()
@@ -1468,7 +1483,7 @@ st.markdown(f"""
     <div class="oasis-topbar-logo">{logo_html(365)}</div>
     <div style="margin-left:22px;">
         <div class="oasis-topbar-title">오아시스 내부 업무 시스템</div>
-        <div class="oasis-topbar-sub">기업 컨설팅 · 크레탑 자동등록 · 정책자금 매칭 · 주가평가</div>
+        <div class="oasis-topbar-sub">기업 컨설팅 · 크레탑 자동등록 · AI 코파일럿</div>
     </div>
 </div>
 """, unsafe_allow_html=True)
