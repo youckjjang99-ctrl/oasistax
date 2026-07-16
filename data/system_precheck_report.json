@@ -1,0 +1,2282 @@
+{
+  "checked_at": "2026-07-16T20:25:03",
+  "version": "v7.4.4",
+  "status": "PASS",
+  "error_count": 0,
+  "warning_count": 2,
+  "check_count": 284,
+  "checks": [
+    {
+      "category": "필수파일",
+      "item": "app.py",
+      "ok": true,
+      "status": "정상",
+      "message": "파일 존재",
+      "level": "error"
+    },
+    {
+      "category": "필수파일",
+      "item": "auth.py",
+      "ok": true,
+      "status": "정상",
+      "message": "파일 존재",
+      "level": "error"
+    },
+    {
+      "category": "필수파일",
+      "item": "enterprise_center.py",
+      "ok": true,
+      "status": "정상",
+      "message": "파일 존재",
+      "level": "error"
+    },
+    {
+      "category": "필수파일",
+      "item": "enterprise_customer_management.py",
+      "ok": true,
+      "status": "정상",
+      "message": "파일 존재",
+      "level": "error"
+    },
+    {
+      "category": "필수파일",
+      "item": "employee_status.py",
+      "ok": true,
+      "status": "정상",
+      "message": "파일 존재",
+      "level": "error"
+    },
+    {
+      "category": "필수파일",
+      "item": "multi_source_policy.py",
+      "ok": true,
+      "status": "정상",
+      "message": "파일 존재",
+      "level": "error"
+    },
+    {
+      "category": "필수파일",
+      "item": "integrated_policy_repository.py",
+      "ok": true,
+      "status": "정상",
+      "message": "파일 존재",
+      "level": "error"
+    },
+    {
+      "category": "필수파일",
+      "item": "maintenance.py",
+      "ok": true,
+      "status": "정상",
+      "message": "파일 존재",
+      "level": "error"
+    },
+    {
+      "category": "필수파일",
+      "item": "VERSION.txt",
+      "ok": true,
+      "status": "정상",
+      "message": "파일 존재",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "address_tools.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "ai_usage.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "app.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "articles_editor.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "articles_pdf.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "articles_review.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "auth.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "bizinfo_cache.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "cloud_admin.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "cloud_crm_restore.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "cloud_db.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "cloud_migration.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "cloud_restore.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "cloud_sync.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "collector.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "consultation_audio_storage.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "consultation_journal.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "consulting_copilot.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "consulting_report.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "cretop_runner.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "cretop_worker.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "crm.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "crm_enhancements.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "customer_history.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "document_preprocessor.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "employee_status.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "enterprise_center.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "enterprise_consulting_engine.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "enterprise_customer_management.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "history.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "integrated_policy_repository.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "login_session_guard.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "main.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "maintenance.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "matching_preferences.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "multi_source_policy.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "registered_policy_match.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "registry_runner.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "registry_worker.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "restore_oasis_backup.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "scheduled_policy_sync.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "stock_valuation.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "system_precheck.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "ui.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_safety.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v340.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v341.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v350.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v352.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v353.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v354.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v360.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v362.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v370.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v371.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v372.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v373.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v380.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v381.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v382.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v383.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v400.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v401.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v410.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v412.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v420.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v430.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v431.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v440.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v450.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v500.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v510.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v520.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v530.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v540.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v550.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v551.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v552.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v560.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v6.3.0.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v6.3.1.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v6.3.2.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v6.3.3.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v6.4.0.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v6.4.1.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v6.4.2.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v6.5.0.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v6.6.0.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v6.6.1.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v6.6.2.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v6.7.0.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v6.8.0.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v6.9.0.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v600.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v610.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v620.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v621.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v622.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v623.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v7.0.0.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v7.0.1.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v7.1.0.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v7.2.0.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v7.3.0.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v7.4.0.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v7.4.1.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v7.4.2.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v7.4.3.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "update_v7.4.4.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "utils.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "문법",
+      "item": "verify_v351.py",
+      "ok": true,
+      "status": "정상",
+      "message": "Python 문법 정상",
+      "level": "error"
+    },
+    {
+      "category": "필수심볼",
+      "item": "enterprise_customer_management.py:confirm_delete_dialog",
+      "ok": true,
+      "status": "정상",
+      "message": "심볼 존재",
+      "level": "error"
+    },
+    {
+      "category": "필수심볼",
+      "item": "enterprise_customer_management.py:filter_active_customers",
+      "ok": true,
+      "status": "정상",
+      "message": "심볼 존재",
+      "level": "error"
+    },
+    {
+      "category": "필수심볼",
+      "item": "enterprise_customer_management.py:render_customer_trash_page",
+      "ok": true,
+      "status": "정상",
+      "message": "심볼 존재",
+      "level": "error"
+    },
+    {
+      "category": "필수심볼",
+      "item": "employee_status.py:render_employee_status",
+      "ok": true,
+      "status": "정상",
+      "message": "심볼 존재",
+      "level": "error"
+    },
+    {
+      "category": "필수심볼",
+      "item": "employee_status.py:employee_matching_context",
+      "ok": true,
+      "status": "정상",
+      "message": "심볼 존재",
+      "level": "error"
+    },
+    {
+      "category": "필수심볼",
+      "item": "auth.py:render_password_change",
+      "ok": true,
+      "status": "정상",
+      "message": "심볼 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_customer_management.py → cloud_db.CloudDatabase",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_customer_management.py → cloud_db.cloud_is_configured",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_customer_management.py → crm.get_crm_file_path",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_customer_management.py → crm.load_crm_data",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_customer_management.py → crm.make_customer_key",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_customer_management.py → customer_history.save_customer_event",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_customer_management.py → utils.get_user_dirs",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "employee_status.py → cloud_db.CloudDatabase",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "employee_status.py → cloud_db.cloud_is_configured",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "employee_status.py → customer_history.save_customer_event",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "employee_status.py → document_preprocessor.preprocess_document",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "employee_status.py → utils.get_user_dirs",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → consulting_report.build_consulting_analysis",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → consulting_report.build_consulting_excel_report",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → articles_review.get_latest_articles_review",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → articles_review.render_articles_review",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → employee_status.render_employee_status",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → enterprise_consulting_engine.reconcile_enterprise_consulting_context",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → consultation_journal.get_company_consultation_context",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → consultation_journal.render_audio_consultation_journal",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → consultation_journal.render_saved_consultation_journals",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → cloud_sync.sync_crm_record",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → crm.ACTION_OPTIONS",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → crm.STATUS_OPTIONS",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → crm.get_customer_record",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → crm.make_customer_key",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → crm.upsert_customer_record",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → crm_enhancements.PIPELINE_OPTIONS",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → crm_enhancements.PRIORITY_OPTIONS",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → crm_enhancements.get_crm_profile",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → crm_enhancements.merge_profile_into_crm_record",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → crm_enhancements.save_crm_profile",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → customer_history.build_change_summary",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → customer_history.build_history_table",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → customer_history.get_customer_history",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → matching_preferences.INTEREST_OPTIONS",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → matching_preferences.get_matching_preferences",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → matching_preferences.save_matching_preferences",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → registered_policy_match.build_customer_labels",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → registered_policy_match.load_registered_customers",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → enterprise_customer_management.confirm_delete_dialog",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → enterprise_customer_management.filter_active_customers",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → utils.get_user_cumulative_db_path",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "enterprise_center.py → utils.get_user_dirs",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "multi_source_policy.py → utils.ROOT_DIR",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "multi_source_policy.py → utils.get_user_dirs",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "multi_source_policy.py → employee_status.employee_matching_context",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "multi_source_policy.py → integrated_policy_repository.load_repository_records",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "multi_source_policy.py → integrated_policy_repository.refresh_repository",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "multi_source_policy.py → integrated_policy_repository.repository_status",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "maintenance.py → bizinfo_cache.get_bizinfo_cache_status",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "maintenance.py → collector.sync_bizinfo_cache",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Import",
+      "item": "maintenance.py → system_precheck.run_precheck",
+      "ok": true,
+      "status": "정상",
+      "message": "Import 대상 존재",
+      "level": "error"
+    },
+    {
+      "category": "Streamlit옵션",
+      "item": "enterprise_center.py:vertical_alignment=\"bottom\"",
+      "ok": true,
+      "status": "정상",
+      "message": "허용된 정렬값",
+      "level": "error"
+    },
+    {
+      "category": "Streamlit옵션",
+      "item": "enterprise_center.py:vertical_alignment=\"bottom\"",
+      "ok": true,
+      "status": "정상",
+      "message": "허용된 정렬값",
+      "level": "error"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "active_main_menu_v311",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: app.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "ai_report_customer_selector",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: consulting_report.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "ai_usage_end",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: ai_usage.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "ai_usage_start",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: ai_usage.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "ai_usage_users",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: ai_usage.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "copilot_customer",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: consulting_copilot.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "cretop_add_to_cumulative_db",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: app.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "cretop_analyze_button",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: app.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "cretop_exclusion_keywords",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: app.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "cretop_fund_purpose",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: app.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "cretop_interest_fields",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: app.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "cretop_latest_download_after_save",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: app.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "cretop_manager_name",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: app.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "cretop_matching_keywords",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: app.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "cretop_pdf_uploader",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: app.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "cretop_planned_amount",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: app.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "cretop_planned_timing",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: app.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "cretop_prepare_latest_download",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: app.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "customer_delete_cancel_v741",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: enterprise_customer_management.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "customer_delete_confirm_v741",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: enterprise_customer_management.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_action",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: enterprise_center.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_ai_report_download",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: enterprise_center.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_center_customer",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: enterprise_center.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_customer_search_v710",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: enterprise_customer_management.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_customer_search_v720",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: enterprise_center.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_exclusion_keywords",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: update_v6.5.0.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_fund_purpose",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: update_v6.5.0.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_interest_fields",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: update_v6.5.0.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_manager",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: enterprise_center.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_manager_filter_v710",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: enterprise_customer_management.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_match_keywords",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: update_v6.5.0.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_memo",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: enterprise_center.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_next_date",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: enterprise_center.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_pipeline",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: enterprise_center.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_planned_amount",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: update_v6.5.0.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_planned_timing",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: update_v6.5.0.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_priority",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: enterprise_center.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_priority_filter_v710",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: enterprise_customer_management.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_quick_filter_v710",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: enterprise_customer_management.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_restore_customer_v710",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: enterprise_customer_management.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_save_crm",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: enterprise_center.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_save_preferences",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: update_v6.5.0.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_stage_filter_v710",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: enterprise_customer_management.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_status",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: enterprise_center.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_status_filter_v710",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: enterprise_customer_management.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "enterprise_trash_customer_v710",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: enterprise_customer_management.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "login_user_id",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: auth.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "login_user_pw",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: auth.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "password_change_button_v740",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: auth.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "password_change_confirm_v740",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: auth.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "password_change_current_v740",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: auth.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "password_change_new_v740",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: auth.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "policy_registered_customer_selector",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: app.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "policy_registered_manager_name",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: app.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "policy_registered_match_button",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: app.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "retry_cloud_sync_queue_button",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: app.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "show_legacy_customer_upload_v660",
+      "ok": false,
+      "status": "경고",
+      "message": "고정 widget key 중복 가능성: app.py, update_v6.6.0.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "signup_name",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: auth.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "signup_user_id",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: auth.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "signup_user_pw",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: auth.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "signup_user_pw2",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: auth.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_address",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_analyze_pdf",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_analyze_registry",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_asset_additions",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_asset_deductions",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_authorized_shares",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_business_no",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_calculate",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_cap_rate_pct",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_capital",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_company_name",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_corporate_no",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_cretop_pdf",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_current_shares",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_customer_selector",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_establishment",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_goodwill",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_liability_additions",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_liability_deductions",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_load_customer_financials",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_load_record",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_nav_floor_pct",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_other_adjustments",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_par_value",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_premium_exempt",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_premium_pct",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_registry_pdf",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_save_record",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_saved_record_selector",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_total_assets",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_total_liabilities",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_valuation_date",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "stock_valuation_type",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: stock_valuation.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "system_backup_include_data",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: maintenance.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "system_backup_label",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: maintenance.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "system_create_backup",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: maintenance.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "system_restore_backup",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: maintenance.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "system_restore_backup_name",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: maintenance.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "system_restore_confirm",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: maintenance.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "system_run_precheck_v743",
+      "ok": false,
+      "status": "경고",
+      "message": "고정 widget key 중복 가능성: maintenance.py, update_v7.4.3.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "system_sync_bizinfo",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: maintenance.py",
+      "level": "warning"
+    },
+    {
+      "category": "WidgetKey",
+      "item": "|",
+      "ok": true,
+      "status": "정상",
+      "message": "사용 파일: consultation_journal.py",
+      "level": "warning"
+    }
+  ]
+}

@@ -12,6 +12,7 @@ import streamlit as st
 
 from bizinfo_cache import get_bizinfo_cache_status
 from collector import sync_bizinfo_cache
+from system_precheck import run_precheck
 
 
 CORE_FILES = (
@@ -218,6 +219,20 @@ def render_system_management_page(
     c2.metric("저장된 백업", f"{len(backups)}개")
     c3.metric("필수파일 점검", "정상" if missing_count == 0 else f"{missing_count}개 누락")
 
+    st.markdown("#### 배포 사전점검")
+    precheck_report = run_precheck(project_root, save_report=True)
+    p1, p2, p3 = st.columns(3)
+    p1.metric("배포 가능 여부", "가능" if precheck_report.get("status") == "PASS" else "차단")
+    p2.metric("오류", f"{precheck_report.get("error_count", 0)}개")
+    p3.metric("경고", f"{precheck_report.get("warning_count", 0)}개")
+    failed_checks = [row for row in precheck_report.get("checks", []) if not row.get("ok")]
+    if failed_checks:
+        st.dataframe(failed_checks, hide_index=True, use_container_width=True)
+    else:
+        st.success("문법·Import·필수함수·Streamlit 옵션 검사 결과 배포 가능합니다.")
+    if st.button("사전점검 다시 실행", key="system_run_precheck_v743", use_container_width=True):
+        st.rerun()
+
     st.markdown("#### 프로젝트 상태")
     st.dataframe(health, hide_index=True, use_container_width=True)
 
@@ -338,7 +353,7 @@ def render_system_management_page(
     st.markdown("#### Git 반영 안내")
     st.code(
         'git add .\n'
-        'git commit -m "v3.5.0 기업마당 자동 동기화"\n'
+        'git commit -m "v7.4.3 시스템 사전점검 자동롤백 배포안정화"\n'
         'git push',
         language="powershell",
     )
