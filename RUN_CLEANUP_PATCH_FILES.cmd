@@ -2,17 +2,12 @@
 setlocal
 cd /d "%~dp0"
 echo ================================================
-echo OASIS v7.4.5 HOTFIX
+echo OASIS LEGACY PATCH CLEANUP
 echo ================================================
 where py >nul 2>nul
 if %errorlevel%==0 (
-  py -3 update_v7.4.5.py
+  py -3 cleanup_legacy_patches.py
 ) else (
-  python update_v7.4.5.py
-)
-if not %errorlevel%==0 (
-  echo UPDATE FAILED
-  pause
-  exit /b 1
+  python cleanup_legacy_patches.py
 )
 endlocal

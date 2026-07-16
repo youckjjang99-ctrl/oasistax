@@ -9,3 +9,21 @@ user_data/
 _oasis_backups/
 backup_before_v*/
 *.tmp
+
+# OASIS runtime and generated files
+data/system_precheck_report.json
+_applied_update_packages/
+_legacy_patch_archive/
+update_package/
+
+# Legacy patch installers are kept outside GitHub
+update_v*.py
+RUN_V*_UPDATE.cmd
+RUN_V*_UPDATE.bat
+README_v*_적용방법.md
+CHANGELOG_v*.md
+
+# Keep the common v8 updater files
+!update_engine.py
+!RUN_UPDATE.cmd
+!RUN_PRECHECK.cmd

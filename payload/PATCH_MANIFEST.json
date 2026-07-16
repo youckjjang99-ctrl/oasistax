@@ -1,9 +1,0 @@
-{
-  "version": "v7.4.5",
-  "base_version": "v7.4.4",
-  "modified_files": [
-    "maintenance.py",
-    "VERSION.txt"
-  ],
-  "sql_required": false
-}
