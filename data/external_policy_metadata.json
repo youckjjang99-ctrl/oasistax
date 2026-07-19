@@ -1,6 +1,19 @@
 {
-  "status": "not_run",
-  "message": "새벽 동기화 실행 전",
+  "generated_at": "2026-07-20T04:02:10+09:00",
+  "status": "preserved",
   "record_count": 0,
-  "sources": []
+  "sources": [
+    {
+      "source": "K-Startup",
+      "status": "미설정",
+      "message": "KSTARTUP_API_URL 미설정",
+      "count": 0
+    },
+    {
+      "source": "중진공 OpenAPI",
+      "status": "미설정",
+      "message": "KOSMES_API_URL 미설정",
+      "count": 0
+    }
+  ]
 }
