@@ -888,6 +888,43 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
             "발행주식총수, 1주의 금액 등을 자동 추출합니다."
         )
 
+        current_business_no = _normalize_business_no(
+            st.session_state.get("stock_business_no", "")
+        )
+        if not current_business_no and selected_row is not None:
+            current_business_no = _normalize_business_no(
+                selected_row.get("사업자등록번호", "")
+            )
+
+        if st.button(
+            "등록된 등기정보 불러오기",
+            key="stock_load_saved_registry",
+            use_container_width=True,
+            disabled=not bool(current_business_no),
+        ):
+            registry_data = load_registry_snapshot(
+                user_id,
+                current_business_no,
+            )
+            if registry_data:
+                preserved_financial_inputs = _capture_stock_financial_inputs()
+                _apply_registry_data(registry_data)
+                _restore_stock_financial_inputs(preserved_financial_inputs)
+                st.session_state["stock_last_registry_data"] = registry_data
+                st.session_state["stock_registry_restored_key"] = (
+                    current_business_no
+                )
+                st.success(
+                    "등록된 등기정보를 불러왔습니다. "
+                    "기존 재무·당기순이익 입력값은 유지됩니다."
+                )
+                st.rerun()
+            else:
+                st.warning(
+                    "해당 사업자등록번호로 저장된 등기정보를 찾지 못했습니다. "
+                    f"조회번호: {current_business_no or '-'}"
+                )
+
         if registry_pdf is not None and st.button(
             "등기자료 분석",
             key="stock_analyze_registry",

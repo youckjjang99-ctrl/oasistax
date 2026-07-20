@@ -531,6 +531,40 @@ def load_company_consultation_context(
     return matched
 
 
+def load_company_consultation_context(
+    user_id: str,
+    business_no: str,
+    company_name: str = "",
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    # AI copilot: load saved consultation journals for one company.
+    normalized_no = normalize_business_no(business_no)
+    normalized_name = str(company_name or "").strip()
+
+    matched: list[dict[str, Any]] = []
+    for record in _load_journals(user_id):
+        if not isinstance(record, dict):
+            continue
+
+        record_no = normalize_business_no(record.get("business_no", ""))
+        record_name = str(record.get("company_name", "") or "").strip()
+
+        number_match = bool(
+            normalized_no and record_no and normalized_no == record_no
+        )
+        name_match = bool(
+            normalized_name and record_name and normalized_name == record_name
+        )
+        if not number_match and not name_match:
+            continue
+
+        matched.append(dict(record))
+        if len(matched) >= max(1, int(limit)):
+            break
+
+    return matched
+
+
 def _save_cloud_journal(user_id: str, record: dict[str, Any]) -> None:
     if not cloud_is_configured():
         return

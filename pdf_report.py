@@ -66,6 +66,13 @@ def _register_fonts() -> None:
         try:
             pdfmetrics.registerFont(TTFont("OasisKR", regular))
             pdfmetrics.registerFont(TTFont("OasisKR-Bold", bold))
+            pdfmetrics.registerFontFamily(
+                "OasisKR",
+                normal="OasisKR",
+                bold="OasisKR-Bold",
+                italic="OasisKR",
+                boldItalic="OasisKR-Bold",
+            )
             return
         except Exception:
             # TTC files and minimal Railway images can still reject TTFont.
@@ -76,6 +83,13 @@ def _register_fonts() -> None:
     # Alias the CID font under the names already used throughout this report.
     pdfmetrics._fonts["OasisKR"] = pdfmetrics.getFont("HYSMyeongJo-Medium")
     pdfmetrics._fonts["OasisKR-Bold"] = pdfmetrics.getFont("HYSMyeongJo-Medium")
+    pdfmetrics.registerFontFamily(
+        "OasisKR",
+        normal="OasisKR",
+        bold="OasisKR-Bold",
+        italic="OasisKR",
+        boldItalic="OasisKR-Bold",
+    )
 
 
 def _clean(value: Any) -> str:

@@ -17,6 +17,12 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from matching_preferences import get_matching_preferences
+from cloud_sync import (
+    load_financial_snapshot,
+    load_registry_snapshot,
+    load_stock_valuations,
+)
+from consultation_journal import load_company_consultation_context
 from registered_policy_match import (
     build_customer_labels,
     load_registered_customers,
@@ -116,29 +122,57 @@ def _load_json(path: Path, default: Any) -> Any:
 def _latest_stock_record(
     user_id: str,
     business_no: str,
+    company_name: str = "",
 ) -> dict[str, Any]:
     dirs = get_user_dirs(user_id)
-    records = _load_json(
+    local_records = _load_json(
         dirs["base"] / "stock_valuations.json",
         [],
     )
-    if not isinstance(records, list):
-        return {}
+    if not isinstance(local_records, list):
+        local_records = []
+
+    try:
+        cloud_records = load_stock_valuations(user_id, limit=500)
+    except Exception:
+        cloud_records = []
 
     normalized = _normalize_business_no(business_no)
-    matches = [
-        record
-        for record in records
-        if isinstance(record, dict)
-        and _normalize_business_no(record.get("business_no", ""))
-        == normalized
-    ]
+    clean_company = _clean(company_name)
+    merged: dict[str, dict[str, Any]] = {}
+
+    for record in [*cloud_records, *local_records]:
+        if not isinstance(record, dict):
+            continue
+
+        record_no = _normalize_business_no(record.get("business_no", ""))
+        record_company = _clean(record.get("company_name", ""))
+        number_match = bool(normalized and record_no and normalized == record_no)
+        name_match = bool(
+            clean_company and record_company and clean_company == record_company
+        )
+        if not number_match and not name_match:
+            continue
+
+        record_id = _clean(record.get("record_id", ""))
+        if not record_id:
+            record_id = "|".join([
+                record_no,
+                _clean(record.get("valuation_date", "")),
+                _clean(record.get("saved_at", "")),
+            ])
+        merged[record_id] = dict(record)
+
+    matches = list(merged.values())
     if not matches:
         return {}
 
     return sorted(
         matches,
-        key=lambda record: str(record.get("saved_at", "")),
+        key=lambda record: str(
+            record.get("saved_at", "")
+            or record.get("valuation_date", "")
+        ),
         reverse=True,
     )[0]
 
@@ -153,8 +187,18 @@ def _financial_snapshot(
         {},
     )
     if not isinstance(cache, dict):
-        return {}
-    return cache.get(_normalize_business_no(business_no), {}) or {}
+        cache = {}
+
+    normalized = _normalize_business_no(business_no)
+    local = cache.get(normalized, {}) or {}
+    if local:
+        return local
+
+    try:
+        cloud = load_financial_snapshot(user_id, normalized)
+    except Exception:
+        cloud = {}
+    return cloud if isinstance(cloud, dict) else {}
 
 
 def _registry_snapshot(
@@ -167,9 +211,115 @@ def _registry_snapshot(
         {},
     )
     if not isinstance(cache, dict):
-        return {}
+        cache = {}
+
     normalized = _normalize_business_no(business_no)
-    return cache.get(normalized, {}) or {}
+    local = cache.get(normalized, {}) or {}
+    if local:
+        return local
+
+    try:
+        cloud = load_registry_snapshot(user_id, normalized)
+    except Exception:
+        cloud = {}
+    return cloud if isinstance(cloud, dict) else {}
+
+
+def _as_list(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple, set)):
+        return [
+            _clean(item)
+            for item in value
+            if _clean(item)
+        ]
+    text = _clean(value)
+    return [text] if text else []
+
+
+def _build_consultation_context(
+    user_id: str,
+    business_no: str,
+    company_name: str,
+) -> dict[str, Any]:
+    try:
+        journals = load_company_consultation_context(
+            user_id,
+            business_no,
+            company_name=company_name,
+            limit=50,
+        )
+    except Exception:
+        journals = []
+
+    if not journals:
+        return {
+            "count": 0,
+            "latest_saved_at": "",
+            "latest_summary": "",
+            "matching_keywords": [],
+            "interest_fields": [],
+            "client_needs": [],
+            "next_actions": [],
+            "transcript_count": 0,
+            "records": [],
+        }
+
+    matching_keywords: list[str] = []
+    interest_fields: list[str] = []
+    client_needs: list[str] = []
+    next_actions: list[str] = []
+    transcript_count = 0
+
+    for journal in journals:
+        if not isinstance(journal, dict):
+            continue
+        matching_keywords.extend(
+            _as_list(
+                journal.get("matching_keywords")
+                or journal.get("매칭키워드")
+            )
+        )
+        interest_fields.extend(
+            _as_list(
+                journal.get("interest_fields")
+                or journal.get("관심지원분야")
+            )
+        )
+        client_needs.extend(
+            _as_list(
+                journal.get("client_needs")
+                or journal.get("대표자니즈")
+                or journal.get("key_needs")
+            )
+        )
+        next_actions.extend(
+            _as_list(
+                journal.get("next_actions")
+                or journal.get("후속조치")
+                or journal.get("next_action")
+            )
+        )
+        if _clean(journal.get("transcript", "")):
+            transcript_count += 1
+
+    latest = journals[0] if journals else {}
+    latest_summary = _clean(
+        latest.get("summary", "")
+        or latest.get("consultation_summary", "")
+        or latest.get("상담요약", "")
+    )
+
+    return {
+        "count": len(journals),
+        "latest_saved_at": _clean(latest.get("saved_at", "")),
+        "latest_summary": latest_summary,
+        "matching_keywords": list(dict.fromkeys(matching_keywords)),
+        "interest_fields": list(dict.fromkeys(interest_fields)),
+        "client_needs": list(dict.fromkeys(client_needs)),
+        "next_actions": list(dict.fromkeys(next_actions)),
+        "transcript_count": transcript_count,
+        "records": journals,
+    }
 
 
 def _value_from_sources(
@@ -746,12 +896,22 @@ def render_ai_consulting_report_page(
         customer.get("사업자등록번호", "")
     )
 
+    company_name = _clean(customer.get("업체명", ""))
     financial = _financial_snapshot(user_id, business_no)
     registry = _registry_snapshot(user_id, business_no)
-    stock_record = _latest_stock_record(user_id, business_no)
+    stock_record = _latest_stock_record(
+        user_id,
+        business_no,
+        company_name=company_name,
+    )
     preferences = get_matching_preferences(
         user_id,
         business_no,
+    )
+    consultation_context = _build_consultation_context(
+        user_id,
+        business_no,
+        company_name,
     )
 
     analysis = build_consulting_analysis(
@@ -760,6 +920,7 @@ def render_ai_consulting_report_page(
         registry,
         stock_record,
         preferences,
+        consultation_context=consultation_context,
     )
 
     st.markdown(
@@ -802,6 +963,43 @@ def render_ai_consulting_report_page(
         st.info(
             "자료 충족도에 반영되지 않은 항목: " + ", ".join(missing_sources)
             + " · 해당 자료를 등록하면 진단 범위와 정확도가 높아집니다."
+        )
+
+    source_columns = st.columns(4, gap="medium")
+    source_columns[0].metric(
+        "등록 등기정보",
+        "1건" if registry else "0건",
+    )
+    source_columns[1].metric(
+        "저장 주가평가",
+        "1건" if stock_record else "0건",
+    )
+    source_columns[2].metric(
+        "상담일지",
+        f"{consultation_context.get('count', 0)}건",
+    )
+    source_columns[3].metric(
+        "녹취 반영",
+        f"{consultation_context.get('transcript_count', 0)}건",
+    )
+
+    with st.expander("자료 연결 진단", expanded=False):
+        st.write(f"조회 회사명: {company_name or '-'}")
+        st.write(f"조회 사업자등록번호: {business_no or '-'}")
+        st.write(
+            "등기정보 연결: "
+            + ("성공" if registry else "실패 — 동일 사업자번호의 저장 등기정보 없음")
+        )
+        st.write(
+            "주가평가 연결: "
+            + ("성공" if stock_record else "실패 — 사업자번호·회사명이 일치하는 평가자료 없음")
+        )
+        st.write(
+            f"상담일지 연결: {consultation_context.get('count', 0)}건"
+        )
+        st.write(
+            f"녹취 전문 포함 상담일지: "
+            f"{consultation_context.get('transcript_count', 0)}건"
         )
 
     st.markdown("### 기업 기본정보")
