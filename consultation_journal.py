@@ -494,6 +494,43 @@ def _load_journals(user_id: str) -> list[dict[str, Any]]:
     )
 
 
+def load_company_consultation_context(
+    user_id: str,
+    business_no: str,
+    company_name: str = "",
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    # AI 코파일럿용 회사별 상담일지·녹취 컨텍스트를 반환합니다.
+    normalized_no = normalize_business_no(business_no)
+    normalized_name = str(company_name or "").strip()
+
+    records = _load_journals(user_id)
+    matched: list[dict[str, Any]] = []
+
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+
+        record_no = normalize_business_no(record.get("business_no", ""))
+        record_name = str(record.get("company_name", "") or "").strip()
+
+        number_matches = bool(
+            normalized_no and record_no and normalized_no == record_no
+        )
+        name_matches = bool(
+            normalized_name and record_name and normalized_name == record_name
+        )
+
+        if not number_matches and not name_matches:
+            continue
+
+        matched.append(dict(record))
+        if len(matched) >= max(int(limit), 1):
+            break
+
+    return matched
+
+
 def _save_cloud_journal(user_id: str, record: dict[str, Any]) -> None:
     if not cloud_is_configured():
         return

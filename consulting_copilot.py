@@ -12,6 +12,8 @@ import streamlit as st
 
 from consulting_report import render_ai_consulting_report_page
 from tax_diagnosis import render_tax_diagnosis_page
+from consultation_journal import load_company_consultation_context
+from cloud_sync import load_stock_valuations
 from matching_preferences import get_matching_preferences
 from registered_policy_match import (
     build_customer_labels,
@@ -283,10 +285,130 @@ def save_success_case(
     _save_json(_success_path(user_id), cases[:1000])
 
 
+def _normalize_business_no(value: Any) -> str:
+    digits = re.sub(r"[^0-9]", "", str(value or ""))
+    if len(digits) == 10:
+        return f"{digits[:3]}-{digits[3:5]}-{digits[5:]}"
+    return str(value or "").strip()
+
+
+def _safe_number(value: Any) -> float | None:
+    if value is None:
+        return None
+    text = str(value).replace(",", "").strip()
+    if text.lower() in {"", "none", "nan", "nat", "-"}:
+        return None
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_money(value: Any) -> str:
+    number = _safe_number(value)
+    if number is None:
+        return "-"
+    return f"{number:,.0f}원"
+
+
+@st.cache_data(ttl=45, show_spinner=False)
+def _load_integrated_company_context(
+    user_id: str,
+    company_name: str,
+    business_no: str,
+) -> dict[str, Any]:
+    normalized_no = _normalize_business_no(business_no)
+
+    stock_records = []
+    for record in load_stock_valuations(user_id, limit=300):
+        if not isinstance(record, dict):
+            continue
+        record_no = _normalize_business_no(record.get("business_no", ""))
+        record_name = _clean(record.get("company_name", ""))
+        if (
+            normalized_no and record_no and normalized_no == record_no
+        ) or (
+            company_name and record_name and company_name == record_name
+        ):
+            stock_records.append(dict(record))
+
+    stock_records.sort(
+        key=lambda item: str(
+            item.get("saved_at", "") or item.get("valuation_date", "")
+        ),
+        reverse=True,
+    )
+
+    journals = load_company_consultation_context(
+        user_id,
+        business_no,
+        company_name=company_name,
+        limit=20,
+    )
+
+    journal_text_parts: list[str] = []
+    transcript_count = 0
+    for journal in journals:
+        if not isinstance(journal, dict):
+            continue
+        for field in (
+            "consultation_title",
+            "summary",
+            "key_needs",
+            "consultation_summary",
+            "consultant_notes",
+            "next_action",
+            "follow_up",
+            "representative_needs",
+        ):
+            value = _clean(journal.get(field, ""))
+            if value:
+                journal_text_parts.append(value)
+
+        transcript = _clean(journal.get("transcript", ""))
+        if transcript:
+            transcript_count += 1
+            journal_text_parts.append(transcript[:8000])
+
+    stock_text_parts: list[str] = []
+    latest_stock = stock_records[0] if stock_records else {}
+    if latest_stock:
+        result = latest_stock.get("result", {})
+        inputs = latest_stock.get("inputs", {})
+        if not isinstance(result, dict):
+            result = {}
+        if not isinstance(inputs, dict):
+            inputs = {}
+
+        stock_text_parts.extend([
+            _clean(latest_stock.get("company_name", "")),
+            _clean(latest_stock.get("valuation_date", "")),
+            _clean(latest_stock.get("saved_at", "")),
+            _clean(result.get("final_value_per_share", "")),
+            _clean(result.get("total_equity_value", "")),
+            _clean(result.get("adjusted_net_asset_value", "")),
+            _clean(result.get("net_asset_value", "")),
+            _clean(inputs.get("valuation_type", "")),
+        ])
+
+    combined_text = " ".join(
+        part for part in [*stock_text_parts, *journal_text_parts] if part
+    )
+
+    return {
+        "stock_records": stock_records,
+        "latest_stock": latest_stock,
+        "journals": journals,
+        "transcript_count": transcript_count,
+        "combined_text": combined_text,
+    }
+
+
 def _customer_text(
     customer: pd.Series,
     preferences: dict[str, Any],
     memory: dict[str, Any],
+    integrated_context: dict[str, Any] | None = None,
 ) -> str:
     fields = [
         _clean(customer.get("업체명", "")),
@@ -301,6 +423,7 @@ def _customer_text(
         _clean(memory.get("key_needs", "")),
         _clean(memory.get("consultant_notes", "")),
         _clean(memory.get("next_focus", "")),
+        _clean((integrated_context or {}).get("combined_text", "")),
     ]
     return " ".join(field for field in fields if field)
 
@@ -365,11 +488,13 @@ def build_topic_recommendations(
     customer: pd.Series,
     preferences: dict[str, Any],
     memory: dict[str, Any],
+    integrated_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     text = _customer_text(
         customer,
         preferences,
         memory,
+        integrated_context,
     )
     text_tokens = _tokens(text)
     results = []
@@ -513,16 +638,24 @@ def render_copilot_page(
         business_no,
     )
 
+    integrated_context = _load_integrated_company_context(
+        user_id,
+        company_name,
+        business_no,
+    )
+
     recommendations = build_topic_recommendations(
         customer,
         preferences,
         memory,
+        integrated_context,
     )
 
     current_text = _customer_text(
         customer,
         preferences,
         memory,
+        integrated_context,
     )
     similar_cases = find_similar_success_cases(
         user_id,
@@ -548,6 +681,65 @@ def render_copilot_page(
         """,
         unsafe_allow_html=True,
     )
+
+    stock_records = integrated_context.get("stock_records", [])
+    journals = integrated_context.get("journals", [])
+    transcript_count = int(
+        integrated_context.get("transcript_count", 0) or 0
+    )
+    latest_stock = integrated_context.get("latest_stock", {})
+    if not isinstance(latest_stock, dict):
+        latest_stock = {}
+
+    st.markdown("### AI 분석 반영자료")
+    source_columns = st.columns(4, gap="medium")
+    source_columns[0].metric("고객 기본정보", "반영")
+    source_columns[1].metric("주가평가", f"{len(stock_records)}건")
+    source_columns[2].metric("상담일지", f"{len(journals)}건")
+    source_columns[3].metric("녹취내용", f"{transcript_count}건")
+
+    if not stock_records and not journals:
+        st.warning(
+            "이 기업의 사업자등록번호 또는 법인명이 저장자료와 연결되지 않았습니다. "
+            "기업컨설팅에서 동일 기업을 선택해 주가평가·상담일지를 저장했는지 확인해주세요."
+        )
+    else:
+        with st.expander("AI에 반영된 기업컨설팅 자료 확인", expanded=False):
+            if latest_stock:
+                result = latest_stock.get("result", {})
+                if not isinstance(result, dict):
+                    result = {}
+                st.markdown("#### 최근 주가평가")
+                s1, s2, s3 = st.columns(3)
+                s1.metric(
+                    "평가기준일",
+                    str(latest_stock.get("valuation_date", "") or "-"),
+                )
+                s2.metric(
+                    "1주당 평가액",
+                    _format_money(result.get("final_value_per_share")),
+                )
+                s3.metric(
+                    "전체 주식가치",
+                    _format_money(result.get("total_equity_value")),
+                )
+
+            if journals:
+                st.markdown("#### 최근 상담일지")
+                for journal in journals[:5]:
+                    title = _clean(
+                        journal.get("consultation_title", "")
+                    ) or "녹음 상담일지"
+                    saved_at = _clean(journal.get("saved_at", ""))
+                    summary = _clean(
+                        journal.get("summary", "")
+                        or journal.get("consultation_summary", "")
+                    )
+                    st.markdown(
+                        f"**{title}** · {saved_at or '일자 미확인'}"
+                    )
+                    if summary:
+                        st.caption(summary[:1000])
 
     top = recommendations[:5]
     st.markdown("### 이번 상담 우선순위")
