@@ -1157,32 +1157,69 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
             )
 
         with l2:
-            premium_exempt = st.checkbox(
-                "최대주주 할증평가 제외 적용",
-                value=bool(
-                    st.session_state.get(
-                        "stock_premium_exempt",
-                        True,
-                    )
-                ),
-                key="stock_premium_exempt",
-                help="중소기업 해당 여부 등 법령상 제외요건을 확인한 뒤 선택합니다.",
+            saved_premium_exempt = bool(
+                st.session_state.get("stock_premium_exempt", True)
             )
-            premium_pct = st.number_input(
-                "최대주주 할증률(%)",
-                min_value=0.0,
-                max_value=100.0,
-                value=float(
-                    st.session_state.get(
-                        "stock_premium_rate",
-                        MAX_SHAREHOLDER_PREMIUM_DEFAULT,
-                    )
-                    * 100
-                ),
-                step=1.0,
-                disabled=premium_exempt,
-                key="stock_premium_pct",
+            saved_premium_pct = float(
+                st.session_state.get(
+                    "stock_premium_rate",
+                    MAX_SHAREHOLDER_PREMIUM_DEFAULT,
+                )
+                * 100
             )
+
+            if saved_premium_exempt or saved_premium_pct == 0:
+                premium_default_label = "미적용"
+            elif saved_premium_pct in (10.0, 15.0, 20.0):
+                premium_default_label = f"{int(saved_premium_pct)}% 적용"
+            else:
+                premium_default_label = "직접입력"
+
+            premium_options = [
+                "미적용",
+                "10% 적용",
+                "15% 적용",
+                "20% 적용",
+                "직접입력",
+            ]
+            premium_default_index = premium_options.index(
+                premium_default_label
+            )
+
+            premium_selection = st.selectbox(
+                "최대주주 할증평가",
+                premium_options,
+                index=premium_default_index,
+                key="stock_premium_selection",
+                help=(
+                    "중소기업 해당 여부, 평가기준일 및 최대주주 요건을 "
+                    "확인한 뒤 선택합니다."
+                ),
+            )
+
+            if premium_selection == "직접입력":
+                premium_pct = st.number_input(
+                    "직접 입력 할증률(%)",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=saved_premium_pct,
+                    step=1.0,
+                    key="stock_premium_custom_pct",
+                )
+            elif premium_selection == "미적용":
+                premium_pct = 0.0
+            else:
+                premium_pct = float(
+                    premium_selection.replace("% 적용", "")
+                )
+
+            premium_exempt = premium_selection == "미적용"
+            if premium_exempt:
+                st.caption("최종 평가액에는 최대주주 할증을 적용하지 않습니다.")
+            else:
+                st.caption(
+                    f"할증 전 평가액에 {premium_pct:.0f}%를 적용합니다."
+                )
 
         inputs = {
             "company_name": company_name,
@@ -1238,13 +1275,38 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
 
     result = None
     if calculate_clicked:
-        with st.spinner("주가평가를 계산하고 있습니다..."):
-            try:
-                result = calculate_stock_valuation(inputs)
-                st.session_state["stock_last_result"] = result
-                st.session_state["stock_last_inputs"] = inputs
-            except ValueError as exc:
-                st.error(str(exc))
+        calculation_status = st.status(
+            "주가평가 중입니다...",
+            expanded=True,
+            state="running",
+        )
+        try:
+            calculation_status.write("입력값과 발행주식수를 확인하고 있습니다.")
+            calculation_status.write(
+                "순손익가치와 순자산가치를 계산하고 있습니다."
+            )
+            result = calculate_stock_valuation(inputs)
+            st.session_state["stock_last_result"] = result
+            st.session_state["stock_last_inputs"] = inputs
+            calculation_status.update(
+                label="주가평가가 완료되었습니다.",
+                state="complete",
+                expanded=False,
+            )
+        except ValueError as exc:
+            calculation_status.update(
+                label="주가평가를 완료하지 못했습니다.",
+                state="error",
+                expanded=True,
+            )
+            st.error(str(exc))
+        except Exception as exc:
+            calculation_status.update(
+                label="주가평가 중 오류가 발생했습니다.",
+                state="error",
+                expanded=True,
+            )
+            st.error(f"주가평가 오류: {exc}")
 
     if result is None:
         result = st.session_state.get("stock_last_result")
