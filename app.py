@@ -1534,7 +1534,10 @@ elif active_tab == "통합 정책자금 매칭":
     )
 
     cumulative_db_path = get_user_cumulative_db_path(CURRENT_USER_ID)
-    registered_customers = load_registered_customers(cumulative_db_path)
+    registered_customers = load_registered_customers(
+        cumulative_db_path,
+        owner_user_id=CURRENT_USER_ID,
+    )
 
     if registered_customers.empty:
         st.info(

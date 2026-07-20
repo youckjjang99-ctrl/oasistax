@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import shutil
 from datetime import datetime
@@ -21,59 +22,163 @@ def normalize_text(value: Any) -> str:
     return re.sub(r"\s+", "", str(value or "").strip()).lower()
 
 
-def load_registered_customers(cumulative_path: Path) -> pd.DataFrame:
-    """회원별 Supabase 고객을 우선 조회하고, 연결 실패 시에만 엑셀을 사용한다."""
-    user_id = str(cumulative_path.parent.name or "").strip().lower()
+def _owner_user_id_from_cumulative_path(cumulative_path: Path) -> str:
+    """회원별 누적DB 경로에서 로그인 회원 ID를 복원한다."""
+    try:
+        return str(Path(cumulative_path).parent.name or "").strip()
+    except Exception:
+        return ""
+
+
+def _parse_customer_data(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
+    return {}
+
+
+def _load_registered_customers_from_cloud(
+    owner_user_id: str,
+) -> pd.DataFrame | None:
+    """Supabase에서 로그인 회원 소유 고객을 조회한다."""
+    owner_user_id = str(owner_user_id or "").strip().lower()
+    if not owner_user_id:
+        print("[OASIS_CUSTOMERS_ERROR] owner_user_id is empty", flush=True)
+        return None
 
     try:
-        from cloud_db import CloudDatabase, TABLE_CUSTOMERS, cloud_is_configured
+        from cloud_db import (
+            CloudDatabase,
+            TABLE_CUSTOMERS,
+            cloud_is_configured,
+        )
 
-        if user_id and cloud_is_configured():
-            rows = CloudDatabase().select(
+        configured = cloud_is_configured()
+        print(
+            f"[OASIS_CUSTOMERS] configured={configured} "
+            f"table={TABLE_CUSTOMERS} owner={owner_user_id}",
+            flush=True,
+        )
+        if not configured:
+            return None
+
+        database = CloudDatabase()
+        rows = database.select(
+            TABLE_CUSTOMERS,
+            filters={"owner_user_id": owner_user_id},
+            order="company_name.asc",
+        )
+
+        # 과거 데이터에 대소문자 또는 앞뒤 공백이 섞인 경우도 복구한다.
+        if not rows:
+            all_rows = database.select(
                 TABLE_CUSTOMERS,
-                filters={"owner_user_id": user_id},
-                order="updated_at.desc",
-                limit=5000,
+                order="company_name.asc",
             )
-            records = []
-            for row in rows:
-                detail = row.get("customer_data")
-                if isinstance(detail, str):
-                    try:
-                        import json
-                        detail = json.loads(detail)
-                    except Exception:
-                        detail = {}
-                if not isinstance(detail, dict):
-                    detail = {}
-                record = dict(detail)
-                record.setdefault("업체명", row.get("company_name", ""))
-                record.setdefault("대표자명", row.get("representative_name", ""))
-                record.setdefault("사업자등록번호", row.get("business_no", ""))
-                record.setdefault("업종명", row.get("industry_name", ""))
-                record.setdefault("사업장 소재지", row.get("address", ""))
-                record.setdefault("담당자", row.get("manager_name", ""))
-                records.append(record)
-            print(f"[OASIS_CUSTOMERS] owner={user_id} table={TABLE_CUSTOMERS} count={len(records)}", flush=True)
-            if records:
-                df = pd.DataFrame(records).dropna(how="all")
-                df.columns = [str(column).strip() for column in df.columns]
-                return df
-            return pd.DataFrame()
+            rows = [
+                row for row in all_rows
+                if str(row.get("owner_user_id", "")).strip().lower()
+                == owner_user_id
+            ]
+            print(
+                f"[OASIS_CUSTOMERS] exact_count=0 "
+                f"all_count={len(all_rows)} recovered_count={len(rows)}",
+                flush=True,
+            )
     except Exception as exc:
-        print(f"[OASIS_CUSTOMERS_ERROR] owner={user_id} error={exc}", flush=True)
+        print(
+            f"[OASIS_CUSTOMERS_ERROR] owner={owner_user_id} "
+            f"type={type(exc).__name__} error={exc}",
+            flush=True,
+        )
+        return None
 
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        record = _parse_customer_data(row.get("customer_data"))
+        canonical_fields = {
+            "업체명": row.get("company_name"),
+            "대표자명": row.get("representative_name"),
+            "사업자등록번호": row.get("business_no"),
+            "업종명": row.get("industry_name"),
+            "사업장 소재지": row.get("address"),
+            "담당자": row.get("manager_name"),
+        }
+        for field, value in canonical_fields.items():
+            if value is not None and str(value).strip():
+                record[field] = value
+
+        if record:
+            records.append(record)
+
+    df = pd.DataFrame(records)
+    print(
+        f"[OASIS_CUSTOMERS] owner={owner_user_id} "
+        f"row_count={len(rows)} dataframe_count={len(df)}",
+        flush=True,
+    )
+    if df.empty:
+        return df
+
+    df = df.dropna(how="all").copy()
+    df.columns = [str(column).strip() for column in df.columns]
+    if "사업자등록번호" in df.columns:
+        df["사업자등록번호"] = df["사업자등록번호"].map(
+            normalize_business_no
+        )
+    return df.reset_index(drop=True)
+
+def _load_registered_customers_from_excel(
+    cumulative_path: Path,
+) -> pd.DataFrame:
     if not cumulative_path.exists():
         return pd.DataFrame()
+
     try:
         df = pd.read_excel(cumulative_path, sheet_name="고객DB")
     except Exception:
         return pd.DataFrame()
+
     if df.empty:
         return df
+
     df = df.dropna(how="all").copy()
     df.columns = [str(column).strip() for column in df.columns]
-    return df
+    return df.reset_index(drop=True)
+
+
+def load_registered_customers(
+    cumulative_path: Path,
+    owner_user_id: str | None = None,
+) -> pd.DataFrame:
+    explicit_owner = str(owner_user_id or "").strip().lower()
+    resolved_owner = (
+        explicit_owner
+        or _owner_user_id_from_cumulative_path(cumulative_path).lower()
+    )
+    cloud_df = _load_registered_customers_from_cloud(resolved_owner)
+
+    if cloud_df is not None:
+        return cloud_df
+
+    excel_df = _load_registered_customers_from_excel(cumulative_path)
+    print(
+        f"[OASIS_CUSTOMERS] source=excel owner={resolved_owner} "
+        f"count={len(excel_df)} path={cumulative_path}",
+        flush=True,
+    )
+    return excel_df
 
 
 def build_customer_labels(df: pd.DataFrame) -> tuple[list[str], dict[str, int]]:

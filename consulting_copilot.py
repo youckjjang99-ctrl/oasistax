@@ -446,7 +446,8 @@ def render_copilot_page(
     )
 
     customers = load_registered_customers(
-        get_user_cumulative_db_path(user_id)
+        get_user_cumulative_db_path(user_id),
+        owner_user_id=user_id,
     )
     if customers.empty:
         st.info(

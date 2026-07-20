@@ -372,7 +372,8 @@ def render_enterprise_management_center(
     )
 
     all_customers = load_registered_customers(
-        get_user_cumulative_db_path(user_id)
+        get_user_cumulative_db_path(user_id),
+        owner_user_id=user_id,
     )
     if all_customers.empty:
         st.info(
