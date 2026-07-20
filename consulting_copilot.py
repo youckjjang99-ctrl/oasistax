@@ -11,6 +11,7 @@ import pandas as pd
 import streamlit as st
 
 from consulting_report import render_ai_consulting_report_page
+from tax_diagnosis import render_tax_diagnosis_page
 from matching_preferences import get_matching_preferences
 from registered_policy_match import (
     build_customer_labels,
@@ -584,6 +585,7 @@ def render_copilot_page(
 
     (
         tab_report,
+        tab_tax,
         tab_playbook,
         tab_memory,
         tab_success,
@@ -591,6 +593,7 @@ def render_copilot_page(
     ) = st.tabs(
         [
             "AI 상담보고서",
+            "AI 절세진단",
             "상담 플레이북",
             "기업 메모리",
             "성공사례",
@@ -609,6 +612,13 @@ def render_copilot_page(
             customer=customer,
             embedded=True,
             key_prefix=f"copilot_report_{business_key}",
+        )
+
+    with tab_tax:
+        render_tax_diagnosis_page(
+            user_id,
+            customer,
+            key_prefix=f"copilot_tax_{business_key}",
         )
 
     with tab_playbook:
