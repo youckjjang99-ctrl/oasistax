@@ -10,6 +10,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+from consulting_report import render_ai_consulting_report_page
 from matching_preferences import get_matching_preferences
 from registered_policy_match import (
     build_customer_labels,
@@ -446,8 +447,7 @@ def render_copilot_page(
     )
 
     customers = load_registered_customers(
-        get_user_cumulative_db_path(user_id),
-        owner_user_id=user_id,
+        get_user_cumulative_db_path(user_id)
     )
     if customers.empty:
         st.info(
@@ -566,14 +566,34 @@ def render_copilot_page(
             else:
                 st.caption("기본 확인 필요")
 
-    tab_playbook, tab_memory, tab_success, tab_review = st.tabs(
+    (
+        tab_report,
+        tab_playbook,
+        tab_memory,
+        tab_success,
+        tab_review,
+    ) = st.tabs(
         [
+            "AI 상담보고서",
             "상담 플레이북",
             "기업 메모리",
             "성공사례",
             "미팅 종료점검",
         ]
     )
+
+    with tab_report:
+        st.caption(
+            "선택한 기업의 고객DB·재무·등기·주가평가·매칭설정을 "
+            "한 번에 결합한 상담 사전진단입니다."
+        )
+        render_ai_consulting_report_page(
+            user_id,
+            user_name,
+            customer=customer,
+            embedded=True,
+            key_prefix=f"copilot_report_{business_key}",
+        )
 
     with tab_playbook:
         checklist = _load_checklist(

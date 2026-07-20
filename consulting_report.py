@@ -637,30 +637,34 @@ def build_consulting_excel_report(analysis: dict[str, Any]) -> bytes:
 def render_ai_consulting_report_page(
     user_id: str,
     user_name: str = "",
+    customer: pd.Series | None = None,
+    embedded: bool = False,
+    key_prefix: str = "ai_report",
 ) -> None:
-    st.markdown("## AI 컨설팅 리포트")
-    st.caption(
-        "기존 고객DB·크레탑 재무정보·등기정보·주가평가·매칭설정을 "
-        "읽기 전용으로 결합해 상담용 리포트를 만듭니다."
-    )
-
-    customers = load_registered_customers(
-        get_user_cumulative_db_path(user_id),
-        owner_user_id=user_id,
-    )
-    if customers.empty:
-        st.info(
-            "등록된 고객이 없습니다. 먼저 크레탑 자동등록으로 고객을 등록해주세요."
+    if not embedded:
+        st.markdown("## AI 컨설팅 리포트")
+        st.caption(
+            "기존 고객DB·크레탑 재무정보·등기정보·주가평가·매칭설정을 "
+            "읽기 전용으로 결합해 상담용 리포트를 만듭니다."
         )
-        return
 
-    labels, row_map = build_customer_labels(customers)
-    selected_label = st.selectbox(
-        "컨설팅 리포트 대상 고객",
-        labels,
-        key="ai_report_customer_selector",
-    )
-    customer = customers.loc[row_map[selected_label]]
+    if customer is None:
+        customers = load_registered_customers(
+            get_user_cumulative_db_path(user_id)
+        )
+        if customers.empty:
+            st.info(
+                "등록된 고객이 없습니다. 먼저 크레탑 자동등록으로 고객을 등록해주세요."
+            )
+            return
+
+        labels, row_map = build_customer_labels(customers)
+        selected_label = st.selectbox(
+            "컨설팅 리포트 대상 고객",
+            labels,
+            key=f"{key_prefix}_customer_selector",
+        )
+        customer = customers.loc[row_map[selected_label]]
     business_no = _normalize_business_no(
         customer.get("사업자등록번호", "")
     )
