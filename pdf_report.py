@@ -13,6 +13,7 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.platypus import (
     SimpleDocTemplate,
     Image,
@@ -34,29 +35,47 @@ MUTED = colors.HexColor("#667085")
 RED = colors.HexColor("#C43D3D")
 
 
-def _font_paths() -> tuple[str, str]:
+def _font_paths() -> tuple[str, str] | None:
+    """Return an installed Korean TrueType font pair when available.
+
+    Railway images do not always include the old unfonts-core package.  Never
+    return a path that does not exist; the caller can safely use ReportLab's
+    built-in Korean CID font instead.
+    """
+    project_dir = Path(__file__).resolve().parent
     candidates = [
-        (
-            "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
-            "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
-        ),
-        (
-            "/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf",
-            "/usr/share/fonts/truetype/nanum/NanumBarunGothicBold.ttf",
-        ),
+        (project_dir / "assets" / "NanumGothic.ttf", project_dir / "assets" / "NanumGothicBold.ttf"),
+        (Path("/usr/share/fonts/truetype/nanum/NanumGothic.ttf"), Path("/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf")),
+        (Path("/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf"), Path("/usr/share/fonts/truetype/nanum/NanumBarunGothicBold.ttf")),
+        (Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"), Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc")),
+        (Path("/usr/share/fonts/truetype/unfonts-core/UnDotum.ttf"), Path("/usr/share/fonts/truetype/unfonts-core/UnDotumBold.ttf")),
     ]
     for regular, bold in candidates:
-        if Path(regular).exists() and Path(bold).exists():
-            return regular, bold
-    return "/usr/share/fonts/truetype/unfonts-core/UnDotum.ttf", "/usr/share/fonts/truetype/unfonts-core/UnDotumBold.ttf"
+        if regular.is_file() and bold.is_file():
+            return str(regular), str(bold)
+    return None
 
 
 def _register_fonts() -> None:
     if "OasisKR" in pdfmetrics.getRegisteredFontNames():
         return
-    regular, bold = _font_paths()
-    pdfmetrics.registerFont(TTFont("OasisKR", regular))
-    pdfmetrics.registerFont(TTFont("OasisKR-Bold", bold))
+
+    paths = _font_paths()
+    if paths:
+        regular, bold = paths
+        try:
+            pdfmetrics.registerFont(TTFont("OasisKR", regular))
+            pdfmetrics.registerFont(TTFont("OasisKR-Bold", bold))
+            return
+        except Exception:
+            # TTC files and minimal Railway images can still reject TTFont.
+            # Fall through to ReportLab's built-in Korean CID font.
+            pass
+
+    pdfmetrics.registerFont(UnicodeCIDFont("HYSMyeongJo-Medium"))
+    # Alias the CID font under the names already used throughout this report.
+    pdfmetrics._fonts["OasisKR"] = pdfmetrics.getFont("HYSMyeongJo-Medium")
+    pdfmetrics._fonts["OasisKR-Bold"] = pdfmetrics.getFont("HYSMyeongJo-Medium")
 
 
 def _clean(value: Any) -> str:
@@ -169,7 +188,8 @@ def build_representative_pdf(
         ["02", "재무 현황 및 진단"],
         ["03", "기업 강점과 주요 점검사항"],
         ["04", "정책자금·고용지원·세무 검토 방향"],
-        ["05", "오아시스 실행 로드맵"],
+        ["05", "AI 절세기회 분석"],
+        ["06", "오아시스 실행 로드맵"],
     ]
     toc = Table(contents, colWidths=[18 * mm, 145 * mm], rowHeights=15 * mm)
     toc.setStyle(TableStyle([
@@ -268,7 +288,44 @@ def build_representative_pdf(
         ]))
         story += [block, Spacer(1, 3 * mm)]
 
-    story += [Spacer(1, 4 * mm), Paragraph("05. 오아시스 실행 로드맵", title)]
+    tax_result = analysis.get("tax_diagnosis") or {}
+    tax_items = tax_result.get("items") or []
+    if tax_items:
+        story += [PageBreak(), Paragraph("05. AI 절세기회 분석", title)]
+        story += [Paragraph(
+            f"적용 기준일: {_clean(tax_result.get('tax_rule_basis_date'))} · "
+            "현재 확보된 자료를 기준으로 한 사전검토용 예상 범위입니다.", small
+        ), Spacer(1, 4 * mm)]
+        tax_rows = [["검토 항목", "상태", "예상 공제·감면", "신뢰도"]]
+        for item in tax_items[:6]:
+            tax_rows.append([
+                _clean(item.get("name")), _clean(item.get("status")),
+                _clean(item.get("rate_range")), f"{item.get('confidence', 0)}%",
+            ])
+        tt = Table(tax_rows, colWidths=[60 * mm, 28 * mm, 52 * mm, 28 * mm], repeatRows=1)
+        tt.setStyle(TableStyle([
+            ("FONTNAME", (0, 0), (-1, -1), "OasisKR"),
+            ("FONTNAME", (0, 0), (-1, 0), "OasisKR-Bold"),
+            ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), 0.4, MID),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 7),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ]))
+        story += [tt, Spacer(1, 5 * mm)]
+        for item in tax_items[:3]:
+            reasons = ", ".join((item.get("reasons") or [])[:3]) or "추가 자료 확인 필요"
+            story += [Paragraph(
+                f"<b>{_clean(item.get('name'))}</b> · {_clean(item.get('rate_label'))} "
+                f"{_clean(item.get('rate_range'))}<br/>{reasons}", body
+            ), Spacer(1, 2 * mm)]
+        story += [Paragraph(
+            "※ 예상 공제율과 공제액은 확정 세액이 아니며, 사업연도·기업규모·업종·소재지·증빙·중복공제 제한을 반영한 세무사 최종 검토가 필요합니다.", small
+        )]
+
+    story += [Spacer(1, 4 * mm), Paragraph("06. 오아시스 실행 로드맵", title)]
     roadmap = [
         ["단계", "실행 내용", "목표"],
         ["1단계", "필요자료와 사업계획 확인", "지원 가능성 및 우선순위 확정"],

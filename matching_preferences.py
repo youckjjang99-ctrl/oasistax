@@ -59,17 +59,31 @@ def _save_all(user_id: str, data: dict[str, Any]) -> None:
     )
 
 
+def _safe_text(value: Any, max_length: int = 300) -> str:
+    """Normalize user text before local JSON/Supabase persistence."""
+    text = str(value or "")
+    # Remove control characters that can break JSON, Excel, logs or reruns.
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", text)
+    text = re.sub(r"[ \t]+", " ", text).strip()
+    return text[:max_length]
+
+
 def split_keywords(value: Any) -> list[str]:
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple, set)):
         source = value
     else:
-        source = re.split(r"[,/\n;|]+", str(value or ""))
+        source = re.split(r"[,/\n\r;|]+", str(value or ""))
 
-    result = []
+    result: list[str] = []
+    seen: set[str] = set()
     for item in source:
-        keyword = str(item or "").strip()
-        if keyword and keyword not in result:
+        keyword = _safe_text(item, max_length=80)
+        normalized = keyword.casefold()
+        if keyword and normalized not in seen:
             result.append(keyword)
+            seen.add(normalized)
+        if len(result) >= 30:
+            break
     return result
 
 
@@ -123,18 +137,25 @@ def save_matching_preferences(
     data = _load_all(user_id)
     record = {
         "사업자등록번호": key,
-        "업체명": str(company_name or "").strip(),
+        "업체명": _safe_text(company_name, 120),
         "매칭키워드": split_keywords(matching_keywords),
         "관심지원분야": split_keywords(interest_fields),
         "제외키워드": split_keywords(exclusion_keywords),
-        "자금사용목적": str(fund_purpose or "").strip(),
-        "투자예정금액": str(planned_amount or "").strip(),
-        "투자예정시기": str(planned_timing or "").strip(),
+        "자금사용목적": _safe_text(fund_purpose, 200),
+        "투자예정금액": _safe_text(planned_amount, 80),
+        "투자예정시기": _safe_text(planned_timing, 80),
         "수정일시": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     data[key] = record
     _save_all(user_id, data)
-    sync_matching_preferences(user_id, key, record)
+
+    # Local persistence is the primary success condition. A temporary cloud
+    # failure must not cancel customer registration or keyword saving.
+    try:
+        sync_matching_preferences(user_id, key, record)
+    except Exception as sync_error:
+        record["_cloud_sync_warning"] = str(sync_error)
+
     return record
 
 

@@ -6,6 +6,7 @@ import glob
 import shutil
 import pandas as pd
 from pathlib import Path
+from runtime_error_log import write_runtime_error
 
 from ui import apply_oasis_ui
 from maintenance import render_system_management_page
@@ -2454,21 +2455,40 @@ elif active_tab == "크레탑 자동등록":
             )
 
             if add_customer_clicked:
-                with st.spinner("누적 고객DB에 저장 중입니다..."):
-                    cumulative_path, saved_count, message, _, saved_preview = (
-                        append_cretop_to_user_customer_db(
-                            pdf_save_path,
-                            CURRENT_USER_ID,
-                            manager_name=(
-                                cretop_manager_name.strip()
-                                or CURRENT_USER_NAME
-                            ),
-                            duplicate_action="skip",
-                            extracted_data=extracted_data,
+                # v8.5.3: 고객 기본등록, 매칭설정, 클라우드 동기화를
+                # 독립 단계로 처리한다. 부가 설정 오류가 고객등록을 취소하거나
+                # Streamlit 화면 전체를 중단시키지 않도록 한다.
+                saved_count = 0
+                message = ""
+                registration_error = None
+                try:
+                    with st.spinner("누적 고객DB에 저장 중입니다..."):
+                        cumulative_path, saved_count, message, _, saved_preview = (
+                            append_cretop_to_user_customer_db(
+                                pdf_save_path,
+                                CURRENT_USER_ID,
+                                manager_name=(
+                                    cretop_manager_name.strip()
+                                    or CURRENT_USER_NAME
+                                ),
+                                duplicate_action="skip",
+                                extracted_data=extracted_data,
+                            )
                         )
+                except Exception as exc:
+                    registration_error = exc
+                    log_path = write_runtime_error(
+                        "cretop_customer_registration", exc,
+                        {"business_no": cretop_business_no},
+                    )
+                    st.error(
+                        "고객 기본정보 저장 중 오류가 발생했습니다. "
+                        "입력한 정책자금 키워드와는 별개로 처리됩니다: "
+                        f"{exc}"
                     )
 
-                if saved_count > 0:
+                if registration_error is None:
+                    preference_saved = False
                     try:
                         save_matching_preferences(
                             CURRENT_USER_ID,
@@ -2483,26 +2503,55 @@ elif active_tab == "크레탑 자동등록":
                             planned_amount=cretop_planned_amount,
                             planned_timing=cretop_planned_timing,
                         )
+                        preference_saved = True
                     except Exception as preference_error:
+                        log_path = write_runtime_error(
+                            "cretop_matching_preferences", preference_error,
+                            {"business_no": cretop_business_no},
+                        )
                         st.warning(
-                            "고객은 등록됐지만 매칭설정 저장에 실패했습니다: "
-                            f"{preference_error}"
+                            "고객 기본정보는 처리됐지만 정책자금 매칭설정 저장에 "
+                            f"실패했습니다: {preference_error}"
                         )
 
-                    sync_customer_snapshot(
-                        CURRENT_USER_ID,
-                        extracted_data,
-                        source="cretop_registration",
-                        manager_name=CURRENT_USER_NAME,
-                    )
+                    if saved_count > 0:
+                        try:
+                            sync_customer_snapshot(
+                                CURRENT_USER_ID,
+                                extracted_data,
+                                source="cretop_registration",
+                                manager_name=CURRENT_USER_NAME,
+                            )
+                        except Exception as sync_error:
+                            log_path = write_runtime_error(
+                                "cretop_cloud_sync", sync_error,
+                                {"business_no": cretop_business_no},
+                            )
+                            st.warning(
+                                "고객은 등록됐지만 클라우드 동기화가 지연됐습니다: "
+                                f"{sync_error}"
+                            )
 
-                    total_count = count_user_cumulative_rows(CURRENT_USER_ID)
-                    st.success(f"{message} 현재 누적 고객 수: {total_count}건")
-                    st.session_state["cretop_last_message"] = message
-                    st.session_state["cretop_last_saved_count"] = saved_count
-                    st.session_state["cretop_last_total_count"] = total_count
-                else:
-                    st.info(message)
+                        try:
+                            total_count = count_user_cumulative_rows(CURRENT_USER_ID)
+                        except Exception:
+                            total_count = 0
+                        suffix = (
+                            f" 현재 누적 고객 수: {total_count}건"
+                            if total_count else ""
+                        )
+                        st.success(f"{message}{suffix}")
+                        if preference_saved:
+                            st.caption("정책자금 매칭설정도 함께 저장했습니다.")
+                        st.session_state["cretop_last_message"] = message
+                        st.session_state["cretop_last_saved_count"] = saved_count
+                        st.session_state["cretop_last_total_count"] = total_count
+                    else:
+                        st.info(message)
+                        if preference_saved:
+                            st.success(
+                                "기존 고객의 정책자금 매칭설정은 정상 저장했습니다."
+                            )
 
 elif active_tab == "실행이력":
     st.markdown("### 📚 실행이력")

@@ -7,6 +7,7 @@ import re
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+from runtime_error_log import write_runtime_error
 from typing import Any
 
 import pandas as pd
@@ -22,6 +23,7 @@ from registered_policy_match import (
 )
 from utils import get_user_cumulative_db_path, get_user_dirs
 from pdf_report import build_representative_pdf
+from tax_diagnosis import build_tax_diagnosis
 
 
 
@@ -888,6 +890,12 @@ def render_ai_consulting_report_page(
                 "저장된 고객별 매칭키워드가 없습니다."
             )
 
+    # 대표님 PDF에 AI 절세진단 요약을 함께 전달한다.
+    try:
+        analysis["tax_diagnosis"] = build_tax_diagnosis(user_id, customer)
+    except Exception:
+        analysis["tax_diagnosis"] = {}
+
     logo_path = Path(__file__).resolve().parent / "assets" / "oasis_logo.png"
     try:
         pdf_bytes = build_representative_pdf(
@@ -897,7 +905,12 @@ def render_ai_consulting_report_page(
         )
     except Exception as exc:
         pdf_bytes = b""
-        st.warning(f"PDF 생성 중 오류가 발생했습니다: {exc}")
+        log_path = write_runtime_error(
+            "representative_pdf_generation", exc,
+            {"company_name": analysis.get("company_name", "")},
+        )
+        suffix = f" (오류로그: {log_path})" if log_path else ""
+        st.warning(f"PDF 생성 중 오류가 발생했습니다: {exc}{suffix}")
 
     excel_bytes = build_consulting_excel_report(analysis)
     safe_company = re.sub(
