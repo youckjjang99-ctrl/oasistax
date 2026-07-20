@@ -255,6 +255,38 @@ def create_user(user_id, password, name):
     return True, "회원가입 신청이 완료되었습니다. 관리자 승인 후 로그인할 수 있습니다."
 
 
+def _load_authoritative_user_for_login(user_id: str):
+    # 로그인 검증은 Supabase의 최신 계정정보를 우선 사용합니다.
+    safe_id = _safe_user_id(user_id)
+    if not safe_id:
+        return None, "아이디 또는 비밀번호가 올바르지 않습니다."
+
+    if cloud_is_configured():
+        try:
+            rows = CloudDatabase().select(
+                TABLE_USERS,
+                filters={"user_id": safe_id},
+                columns=(
+                    "user_id,name,salt,password_hash,role,status,created_at,"
+                    "approved_at,approved_by,password_changed_at"
+                ),
+                limit=1,
+            )
+        except Exception:
+            return None, "로그인 서버에 연결하지 못했습니다. 잠시 후 다시 시도해주세요."
+
+        if not rows:
+            return None, "아이디 또는 비밀번호가 올바르지 않습니다."
+
+        user = _cloud_row_to_user(rows[0])
+        local_users = _load_local_users()
+        local_users[safe_id] = user
+        _save_local_users(local_users)
+        return user, ""
+
+    return _load_local_users().get(safe_id), ""
+
+
 def authenticate_user(user_id, password):
     ok, user, _msg = authenticate_user_with_message(user_id, password)
     return user if ok else None
@@ -263,11 +295,20 @@ def authenticate_user(user_id, password):
 def authenticate_user_with_message(user_id, password):
     ensure_default_admin()
     user_id = _safe_user_id(user_id)
-    users = load_users()
-    user = users.get(user_id)
+    if not user_id or not str(password):
+        return False, None, "아이디 또는 비밀번호가 올바르지 않습니다."
+
+    user, load_error = _load_authoritative_user_for_login(user_id)
+    if load_error:
+        return False, None, load_error
     if not user:
         return False, None, "아이디 또는 비밀번호가 올바르지 않습니다."
-    if not _verify_password(password, user.get("salt", ""), user.get("password_hash", "")):
+
+    salt = str(user.get("salt", "") or "")
+    password_hash = str(user.get("password_hash", "") or "")
+    if not salt or not password_hash:
+        return False, None, "계정의 비밀번호 정보가 올바르지 않습니다. 관리자에게 문의해주세요."
+    if not _verify_password(str(password), salt, password_hash):
         return False, None, "아이디 또는 비밀번호가 올바르지 않습니다."
 
     status = user.get("status", "approved")

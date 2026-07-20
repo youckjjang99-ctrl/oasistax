@@ -16,6 +16,8 @@ from cloud_sync import (
     sync_financial_snapshot,
     sync_registry_snapshot,
     sync_stock_valuation,
+    load_financial_snapshot,
+    load_registry_snapshot,
 )
 from utils import get_user_cumulative_db_path, get_user_dirs
 
@@ -67,6 +69,46 @@ def _normalize_business_no(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _first_value(data: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = data.get(key)
+        if value is not None and str(value).strip().lower() not in {
+            "", "none", "nan", "nat", "-"
+        }:
+            return value
+    return None
+
+
+def _normalize_financial_snapshot(data: dict[str, Any]) -> dict[str, Any]:
+    # 크레탑 추출기의 컬럼명 차이를 주가평가 표준키로 정규화합니다.
+    source = dict(data or {})
+    source["자산총계"] = _first_value(
+        source, "자산총계", "총자산", "자산합계", "장부상총자산"
+    )
+    source["부채총계"] = _first_value(
+        source, "부채총계", "총부채", "부채합계", "장부상총부채"
+    )
+    source["당기순이익"] = _first_value(
+        source, "당기순이익", "순이익", "법인세차감후순이익", "당기순손익"
+    )
+    history = source.get("재무연도별", [])
+    if not isinstance(history, list):
+        history = []
+    normalized_history = []
+    for row in history:
+        if not isinstance(row, dict):
+            continue
+        item = dict(row)
+        item["당기순이익"] = _first_value(
+            item, "당기순이익", "순이익", "법인세차감후순이익", "당기순손익"
+        )
+        item["자산총계"] = _first_value(item, "자산총계", "총자산", "자산합계")
+        item["부채총계"] = _first_value(item, "부채총계", "총부채", "부채합계")
+        normalized_history.append(item)
+    source["재무연도별"] = normalized_history
+    return source
+
+
 def _financial_cache_path(user_id: str) -> Path:
     dirs = get_user_dirs(user_id)
     return dirs["base"] / "stock_financial_cache.json"
@@ -100,7 +142,7 @@ def save_cretop_financial_snapshot(
     Cretop analysis result is saved separately for stock valuation.
     Existing customer DB is never modified.
     """
-    data = dict(extracted_data or {})
+    data = _normalize_financial_snapshot(extracted_data or {})
     business_no = _normalize_business_no(
         data.get("사업자등록번호", data.get("사업자번호", ""))
     )
@@ -175,6 +217,12 @@ def _apply_customer_financial_data(
     business_no = _normalize_business_no(defaults.get("사업자등록번호", ""))
     cache = _load_financial_cache(user_id)
     snapshot = cache.get(business_no, {}) if business_no else {}
+    if not snapshot and business_no:
+        snapshot = load_financial_snapshot(user_id, business_no)
+        if snapshot:
+            snapshot = _normalize_financial_snapshot(snapshot)
+            cache[business_no] = snapshot
+            _save_financial_cache(user_id, cache)
 
     if snapshot:
         st.session_state["stock_company_name"] = str(
@@ -205,6 +253,11 @@ def _apply_customer_financial_data(
             key=lambda item: item.get("연도", 0),
             reverse=True,
         )[:3]
+        if not history and snapshot.get("당기순이익") not in (None, ""):
+            history = [{
+                "연도": datetime.now().year - 1,
+                "당기순이익": snapshot.get("당기순이익"),
+            }]
 
         for index in range(1, 4):
             st.session_state[f"stock_year_{index}"] = ""
@@ -513,6 +566,43 @@ def _apply_registry_data(data: dict[str, Any]) -> None:
     st.session_state["stock_share_classes"] = data.get("주식종류", [])
 
 
+def _restore_registry_for_business(
+    user_id: str,
+    business_no: Any,
+) -> dict[str, Any]:
+    # 재접속 시 로컬 또는 Supabase에서 등기 업로드 내역을 복원합니다.
+    key = _normalize_business_no(business_no)
+    if not key:
+        return {}
+
+    cache = _load_registry_cache(user_id)
+    data = cache.get(key, {})
+    if not data:
+        data = load_registry_snapshot(user_id, key)
+        if data:
+            cache[key] = {
+                **dict(data),
+                "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            path = _registry_cache_path(user_id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(cache, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+
+    if data:
+        _apply_registry_data(data)
+        st.session_state["stock_last_registry_data"] = data
+        issued = _format_number(data.get("발행주식총수"))
+        if issued:
+            for index in range(1, 4):
+                key_name = f"stock_shares_{index}"
+                if not st.session_state.get(key_name):
+                    st.session_state[key_name] = issued
+    return data
+
+
 def _compare_values(label: str, left: Any, right: Any) -> dict[str, Any]:
     left_text = str(left or "").strip()
     right_text = str(right or "").strip()
@@ -635,6 +725,10 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
                     selected_row,
                 )
                 if loaded:
+                    _restore_registry_for_business(
+                        user_id,
+                        st.session_state.get("stock_business_no", ""),
+                    )
                     st.success(message)
                     st.rerun()
                 else:
@@ -670,6 +764,8 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
             if error:
                 st.error(error)
             else:
+                data = _normalize_financial_snapshot(data)
+                save_cretop_financial_snapshot(user_id, data)
                 st.session_state["stock_company_name"] = data.get("업체명", "")
                 st.session_state["stock_business_no"] = data.get(
                     "사업자등록번호", ""
@@ -683,11 +779,18 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
                 st.session_state["stock_establishment"] = data.get(
                     "설립일", ""
                 )
+                history = data.get("재무연도별", [])
+                history = sorted(
+                    [row for row in history if isinstance(row, dict)],
+                    key=lambda row: row.get("연도", 0),
+                    reverse=True,
+                )
+                latest_financial = history[0] if history else {}
                 st.session_state["stock_total_assets"] = _format_number(
-                    data.get("자산총계")
+                    data.get("자산총계") or latest_financial.get("자산총계")
                 )
                 st.session_state["stock_total_liabilities"] = _format_number(
-                    data.get("부채총계")
+                    data.get("부채총계") or latest_financial.get("부채총계")
                 )
 
                 history = data.get("재무연도별", [])
@@ -748,10 +851,21 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
                     registry_data,
                 )
                 st.session_state["stock_last_registry_data"] = registry_data
-                st.success("등기자료를 불러왔습니다. 자동 추출값을 확인·수정해주세요.")
+                issued = _format_number(registry_data.get("발행주식총수"))
+                if issued:
+                    for index in range(1, 4):
+                        st.session_state[f"stock_shares_{index}"] = issued
+                st.success("등기자료를 저장하고 발행주식총수를 최근 3개 연도에 반영했습니다.")
                 st.rerun()
 
         registry_data = st.session_state.get("stock_last_registry_data", {})
+        current_business_no = st.session_state.get("stock_business_no", "")
+        restore_key = _normalize_business_no(current_business_no)
+        if restore_key and st.session_state.get("stock_registry_restored_key") != restore_key:
+            restored = _restore_registry_for_business(user_id, restore_key)
+            st.session_state["stock_registry_restored_key"] = restore_key
+            if restored:
+                registry_data = restored
         if registry_data:
             st.markdown("#### 등기자료 추출값")
             registry_preview = pd.DataFrame([

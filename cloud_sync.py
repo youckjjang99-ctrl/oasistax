@@ -217,6 +217,52 @@ def sync_registry_snapshot(
     )
 
 
+def load_financial_snapshot(
+    user_id: str,
+    business_no: Any,
+) -> dict[str, Any]:
+    # Supabase에 저장된 최신 크레탑 재무 스냅샷을 읽습니다.
+    business_no = normalize_business_no(business_no)
+    if not business_no or not cloud_is_configured():
+        return {}
+    try:
+        rows = CloudDatabase().select(
+            TABLE_FINANCIALS,
+            filters={"owner_user_id": user_id, "business_no": business_no},
+            columns="financial_data",
+            limit=1,
+        )
+        if not rows:
+            return {}
+        data = rows[0].get("financial_data", {})
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def load_registry_snapshot(
+    user_id: str,
+    business_no: Any,
+) -> dict[str, Any]:
+    # Supabase에 저장된 최신 법인 등기 스냅샷을 읽습니다.
+    business_no = normalize_business_no(business_no)
+    if not business_no or not cloud_is_configured():
+        return {}
+    try:
+        rows = CloudDatabase().select(
+            TABLE_REGISTRY,
+            filters={"owner_user_id": user_id, "business_no": business_no},
+            columns="registry_data",
+            limit=1,
+        )
+        if not rows:
+            return {}
+        data = rows[0].get("registry_data", {})
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 def sync_stock_valuation(
     user_id: str,
     record: dict[str, Any],
