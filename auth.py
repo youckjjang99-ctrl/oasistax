@@ -62,7 +62,7 @@ def _safe_user_id(user_id):
     return user_id[:50]
 
 
-def load_users():
+def _load_local_users():
     _ensure_data_dir()
     if USERS_FILE.exists():
         try:
@@ -75,10 +75,100 @@ def load_users():
     return {}
 
 
-def save_users(users):
+def _save_local_users(users):
     _ensure_data_dir()
     with open(USERS_FILE, "w", encoding="utf-8") as f:
         json.dump(users, f, ensure_ascii=False, indent=2)
+
+
+def _user_to_cloud_row(user_id, user):
+    return {
+        "user_id": _safe_user_id(user_id),
+        "name": str(user.get("name", "")),
+        "salt": str(user.get("salt", "")),
+        "password_hash": str(user.get("password_hash", "")),
+        "role": str(user.get("role", "member")),
+        "status": str(user.get("status", "approved")),
+        "created_at": str(user.get("created_at", "")),
+        "approved_at": str(user.get("approved_at", "")),
+        "approved_by": str(user.get("approved_by", "")),
+        "password_changed_at": str(user.get("password_changed_at", "")),
+    }
+
+
+def _cloud_row_to_user(row):
+    return {
+        "user_id": _safe_user_id(row.get("user_id", "")),
+        "name": str(row.get("name", "")),
+        "salt": str(row.get("salt", "")),
+        "password_hash": str(row.get("password_hash", "")),
+        "role": str(row.get("role", "member")),
+        "status": str(row.get("status", "approved")),
+        "created_at": str(row.get("created_at", "")),
+        "approved_at": str(row.get("approved_at", "")),
+        "approved_by": str(row.get("approved_by", "")),
+        "password_changed_at": str(row.get("password_changed_at", "")),
+    }
+
+
+def load_users():
+    local_users = _load_local_users()
+    if not cloud_is_configured():
+        return local_users
+
+    try:
+        db = CloudDatabase()
+        rows = db.select(
+            TABLE_USERS,
+            columns=(
+                "user_id,name,salt,password_hash,role,status,created_at,"
+                "approved_at,approved_by,password_changed_at"
+            ),
+            order="created_at.asc",
+        )
+        cloud_users = {}
+        for row in rows:
+            user = _cloud_row_to_user(row)
+            user_id = user.get("user_id", "")
+            if user_id:
+                cloud_users[user_id] = user
+
+        # 기존 users.json 계정은 Supabase에 없는 계정만 최초 자동 이전한다.
+        missing_rows = []
+        for user_id, user in local_users.items():
+            safe_id = _safe_user_id(user_id)
+            if safe_id and safe_id not in cloud_users and isinstance(user, dict):
+                migrated = dict(user)
+                migrated["user_id"] = safe_id
+                cloud_users[safe_id] = migrated
+                missing_rows.append(_user_to_cloud_row(safe_id, migrated))
+
+        if missing_rows:
+            db.upsert(TABLE_USERS, missing_rows, "user_id")
+
+        _save_local_users(cloud_users)
+        return cloud_users
+    except Exception:
+        # Supabase 장애 시 기존 계정 로그인까지 중단되지 않도록 로컬 백업을 읽는다.
+        return local_users
+
+
+def save_users(users):
+    normalized = {}
+    for user_id, user in (users or {}).items():
+        safe_id = _safe_user_id(user_id)
+        if safe_id and isinstance(user, dict):
+            normalized[safe_id] = dict(user)
+            normalized[safe_id]["user_id"] = safe_id
+
+    if cloud_is_configured():
+        rows = [
+            _user_to_cloud_row(user_id, user)
+            for user_id, user in normalized.items()
+        ]
+        CloudDatabase().upsert(TABLE_USERS, rows, "user_id")
+
+    _save_local_users(normalized)
 
 
 def ensure_default_admin():
@@ -121,7 +211,10 @@ def ensure_default_admin():
             changed = True
 
     if changed:
-        save_users(users)
+        try:
+            save_users(users)
+        except Exception:
+            _save_local_users(users)
 
 
 def create_user(user_id, password, name):
@@ -151,7 +244,14 @@ def create_user(user_id, password, name):
         "approved_at": "",
         "approved_by": "",
     }
-    save_users(users)
+    try:
+        save_users(users)
+    except Exception as exc:
+        return False, (
+            "회원정보를 Supabase에 저장하지 못했습니다. "
+            "oasis_users 테이블과 Railway 환경변수를 확인해주세요. "
+            f"({type(exc).__name__})"
+        )
     return True, "회원가입 신청이 완료되었습니다. 관리자 승인 후 로그인할 수 있습니다."
 
 
@@ -230,7 +330,13 @@ def approve_user(user_id, approved_by=""):
     users[user_id]["status"] = "approved"
     users[user_id]["approved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     users[user_id]["approved_by"] = approved_by or "admin"
-    save_users(users)
+    try:
+        save_users(users)
+    except Exception as exc:
+        return False, (
+            "회원 승인정보를 Supabase에 저장하지 못했습니다. "
+            f"({type(exc).__name__})"
+        )
     return True, f"{user_id} 회원을 승인했습니다."
 
 
@@ -245,10 +351,17 @@ def reject_user(user_id, approved_by=""):
     users[user_id]["status"] = "rejected"
     users[user_id]["approved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     users[user_id]["approved_by"] = approved_by or "admin"
-    save_users(users)
+    try:
+        save_users(users)
+    except Exception as exc:
+        return False, (
+            "회원 거절정보를 Supabase에 저장하지 못했습니다. "
+            f"({type(exc).__name__})"
+        )
     return True, f"{user_id} 회원을 거절 처리했습니다."
 
 
+TABLE_USERS = "oasis_users"
 TABLE_LOGIN_SESSIONS = "oasis_login_sessions"
 
 
@@ -328,7 +441,13 @@ def change_password(
         "%Y-%m-%d %H:%M:%S"
     )
     users[user_id] = user
-    save_users(users)
+    try:
+        save_users(users)
+    except Exception as exc:
+        return False, (
+            "변경된 비밀번호를 Supabase에 저장하지 못했습니다. "
+            f"({type(exc).__name__})"
+        )
 
     # 비밀번호 변경 즉시 새 토큰을 발급해 다른 기기의 기존 세션을 만료
     new_token = _register_login_session(user_id)
