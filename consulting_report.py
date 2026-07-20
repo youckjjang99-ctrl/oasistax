@@ -1111,12 +1111,90 @@ def render_ai_consulting_report_page(
             )
 
     with st.expander("정책자금 매칭설정", expanded=False):
-        if preferences:
-            st.json(preferences)
-        else:
+        if not preferences:
             st.info(
                 "저장된 고객별 매칭키워드가 없습니다."
             )
+        else:
+            setting_rows = [
+                {
+                    "항목": "매칭키워드",
+                    "내용": ", ".join(
+                        preferences.get("매칭키워드", []) or []
+                    ) or "-",
+                },
+                {
+                    "항목": "관심지원분야",
+                    "내용": ", ".join(
+                        preferences.get("관심지원분야", []) or []
+                    ) or "-",
+                },
+                {
+                    "항목": "제외키워드",
+                    "내용": ", ".join(
+                        preferences.get("제외키워드", []) or []
+                    ) or "-",
+                },
+                {
+                    "항목": "자금사용목적",
+                    "내용": _clean(
+                        preferences.get("자금사용목적", "")
+                    ) or "-",
+                },
+                {
+                    "항목": "투자예정금액",
+                    "내용": _clean(
+                        preferences.get("투자예정금액", "")
+                    ) or "-",
+                },
+                {
+                    "항목": "투자예정시기",
+                    "내용": _clean(
+                        preferences.get("투자예정시기", "")
+                    ) or "-",
+                },
+            ]
+            st.dataframe(
+                pd.DataFrame(setting_rows),
+                hide_index=True,
+                use_container_width=True,
+            )
+
+            saved_policies = [
+                item
+                for item in (
+                    preferences.get("저장정책자금", []) or []
+                )
+                if isinstance(item, dict)
+            ]
+            if saved_policies:
+                st.markdown("#### AI 코파일럿 반영 정책자금")
+                st.caption(
+                    f"{len(saved_policies)}건 · 최소점수 "
+                    f"{preferences.get('저장정책자금_최소점수', '-')}점 · "
+                    f"저장일시 "
+                    f"{preferences.get('저장정책자금_저장일시', '-')}"
+                )
+                policy_rows = []
+                for item in saved_policies[:30]:
+                    policy_rows.append(
+                        {
+                            "점수": item.get("score", ""),
+                            "분류": item.get("category", ""),
+                            "공고명": item.get("title", ""),
+                            "기관": item.get("agency", ""),
+                            "신청종료": item.get("end_date", ""),
+                        }
+                    )
+                st.dataframe(
+                    pd.DataFrame(policy_rows),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+            else:
+                st.info(
+                    "AI 코파일럿에 반영하도록 저장한 정책자금 추천이 없습니다."
+                )
 
     # 대표님 PDF에 AI 절세진단 요약을 함께 전달한다.
     try:

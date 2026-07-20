@@ -843,6 +843,26 @@ def save_results(
     )
 
 
+def load_recent_results(
+    user_id: str,
+    business_no: str,
+    company_name: str,
+) -> dict[str, Any]:
+    path = _cache_path(user_id)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+
+    key = re.sub(r"[^0-9]", "", business_no) or company_name
+    value = data.get(key, {})
+    return value if isinstance(value, dict) else {}
+
+
 def collect_all_sources() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     records, status = load_local_sources()
     return _deduplicate(records), [status]
@@ -1078,14 +1098,40 @@ def render_multi_source_match(
 
     company_name = _customer_value(customer, "업체명")
     business_no = _customer_value(customer, "사업자등록번호")
-    stored = st.session_state.get(
+    session_key = (
         f"multi_source_results_{business_no or company_name}"
     )
+    stored = st.session_state.get(session_key)
     if not stored:
+        recent = load_recent_results(
+            user_id,
+            business_no,
+            company_name,
+        )
+        if recent:
+            stored = {
+                "results": recent.get("results", []) or [],
+                "source_status": recent.get("source_status", []) or [],
+                "saved_at": recent.get("saved_at", ""),
+                "loaded_from_history": True,
+            }
+            st.session_state[session_key] = stored
+
+    if not stored:
+        st.info(
+            "최근 정책자금 매칭 이력이 없습니다. "
+            "다중소스 AI 매칭을 실행하면 이 화면에 저장됩니다."
+        )
         return
 
-    source_status = stored["source_status"]
-    results = stored["results"]
+    source_status = stored.get("source_status", []) or []
+    results = stored.get("results", []) or []
+    saved_at = stored.get("saved_at", "")
+    if stored.get("loaded_from_history"):
+        st.success(
+            "최근 저장된 정책자금 매칭 결과를 불러왔습니다"
+            + (f" · {saved_at}" if saved_at else "")
+        )
 
     st.markdown("##### 공고소스 상태")
     st.dataframe(
@@ -1116,7 +1162,7 @@ def render_multi_source_match(
         "AI 코파일럿용 확정 추천자료로 저장할 수 있습니다."
     )
     if st.button(
-        "현재 최소점수 이상 추천을 AI 코파일럿에 저장",
+        "최근 매칭 결과 중 현재 점수 이상을 AI 코파일럿에 반영",
         type="primary",
         use_container_width=True,
         key=f"save_policy_recommendations_{business_no or company_name}",
@@ -1136,7 +1182,8 @@ def render_multi_source_match(
         )
         st.success(
             f"{saved.get('저장정책자금_건수', 0)}건을 "
-            "AI 코파일럿 반영자료로 저장했습니다."
+            "AI 코파일럿 반영자료로 저장했습니다. "
+            "AI 코파일럿에서 같은 기업을 열면 표 형태로 확인할 수 있습니다."
         )
 
     categorized = {
