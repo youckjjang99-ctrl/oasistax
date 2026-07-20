@@ -603,6 +603,35 @@ def _restore_registry_for_business(
     return data
 
 
+def _capture_stock_financial_inputs() -> dict[str, Any]:
+    keys = [
+        "stock_total_assets",
+        "stock_total_liabilities",
+        "stock_asset_additions",
+        "stock_asset_deductions",
+        "stock_liability_additions",
+        "stock_liability_deductions",
+        "stock_goodwill",
+        "stock_other_adjustments",
+    ]
+    for index in range(1, 4):
+        keys.extend([
+            f"stock_year_{index}",
+            f"stock_net_income_{index}",
+        ])
+    return {
+        key: st.session_state.get(key)
+        for key in keys
+        if key in st.session_state
+    }
+
+
+def _restore_stock_financial_inputs(values: dict[str, Any]) -> None:
+    for key, value in (values or {}).items():
+        if value is not None:
+            st.session_state[key] = value
+
+
 def _compare_values(label: str, left: Any, right: Any) -> dict[str, Any]:
     left_text = str(left or "").strip()
     right_text = str(right or "").strip()
@@ -844,7 +873,9 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
             if registry_error:
                 st.error(registry_error)
             else:
+                preserved_financial_inputs = _capture_stock_financial_inputs()
                 _apply_registry_data(registry_data)
+                _restore_stock_financial_inputs(preserved_financial_inputs)
                 _save_registry_cache(
                     user_id,
                     st.session_state.get("stock_business_no", ""),
@@ -854,8 +885,12 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
                 issued = _format_number(registry_data.get("발행주식총수"))
                 if issued:
                     for index in range(1, 4):
-                        st.session_state[f"stock_shares_{index}"] = issued
-                st.success("등기자료를 저장하고 발행주식총수를 최근 3개 연도에 반영했습니다.")
+                        share_key = f"stock_shares_{index}"
+                        if not st.session_state.get(share_key):
+                            st.session_state[share_key] = issued
+                st.success(
+                    "등기자료를 저장했습니다. 기존 당기순이익과 재무 입력값은 유지됩니다."
+                )
                 st.rerun()
 
         registry_data = st.session_state.get("stock_last_registry_data", {})
@@ -933,279 +968,283 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
                     st.success("저장된 평가자료를 불러왔습니다.")
                     st.rerun()
 
-    st.markdown("### 1. 기본정보")
-    b1, b2 = st.columns(2)
+    with st.form(
+        "stock_valuation_input_form_v855",
+        clear_on_submit=False,
+    ):
+        st.markdown("### 1. 기본정보")
+        b1, b2 = st.columns(2)
 
-    with b1:
-        company_name = st.text_input(
-            "법인명",
-            key="stock_company_name",
-        )
-        business_no = st.text_input(
-            "사업자등록번호",
-            key="stock_business_no",
-        )
-        corporate_no = st.text_input(
-            "법인등록번호",
-            key="stock_corporate_no",
-        )
-        address = st.text_area(
-            "본점소재지",
-            key="stock_address",
-            height=90,
-        )
-        establishment = st.text_input(
-            "법인설립일",
-            key="stock_establishment",
-            placeholder="YYYY-MM-DD",
-        )
-
-    with b2:
-        valuation_date = st.text_input(
-            "평가기준일",
-            value=st.session_state.get(
-                "stock_valuation_date",
-                date.today().isoformat(),
-            ),
-            key="stock_valuation_date",
-        )
-        current_shares_text = st.text_input(
-            "현재 발행주식총수(주)",
-            key="stock_current_shares",
-            placeholder="크레탑에 없으면 법인등기·주주명부를 확인",
-        )
-        par_value_text = st.text_input(
-            "1주당 액면가액(원)",
-            key="stock_par_value",
-        )
-        capital_text = st.text_input(
-            "등기상 자본금(원)",
-            key="stock_capital",
-            placeholder="등기자료 업로드 시 자동 입력",
-        )
-        authorized_shares_text = st.text_input(
-            "발행할 주식의 총수(주)",
-            key="stock_authorized_shares",
-            placeholder="등기자료 업로드 시 자동 입력",
-        )
-        valuation_type = st.selectbox(
-            "평가유형",
-            [
-                "일반법인(3:2)",
-                "부동산과다보유법인(2:3)",
-                "순자산가치만 적용",
-            ],
-            key="stock_valuation_type",
-        )
-
-    st.markdown("### 2. 최근 3개년 순손익액")
-    st.warning(
-        "자동 입력값은 회계상 당기순이익입니다. "
-        "상증세법상 가산·차감 조정을 반영한 순손익액으로 직접 수정해주세요."
-    )
-
-    current_year = datetime.now().year - 1
-    annual_rows = []
-    annual_columns = st.columns(3)
-
-    for index, column in enumerate(annual_columns, start=1):
-        with column:
-            year_key = f"stock_year_{index}"
-            _ensure_text_state(
-                year_key,
-                str(current_year - index + 1),
+        with b1:
+            company_name = st.text_input(
+                "법인명",
+                key="stock_company_name",
             )
-            year = st.text_input(
-                f"{index}번째 연도",
-                key=year_key,
+            business_no = st.text_input(
+                "사업자등록번호",
+                key="stock_business_no",
             )
-            net_income_key = f"stock_net_income_{index}"
-            shares_key = f"stock_shares_{index}"
-            _ensure_text_state(net_income_key, "")
-            _ensure_text_state(shares_key, "")
-
-            adjusted_net_income = st.text_input(
-                "세법상 조정 후 순손익액(원)",
-                key=net_income_key,
-                placeholder="공란이면 직접 입력",
+            corporate_no = st.text_input(
+                "법인등록번호",
+                key="stock_corporate_no",
             )
-            shares = st.text_input(
-                "해당 연도 발행주식총수(주)",
-                key=shares_key,
-                placeholder="공란이면 현재 주식수 적용",
+            address = st.text_area(
+                "본점소재지",
+                key="stock_address",
+                height=90,
             )
-            annual_rows.append({
-                "year": year,
-                "adjusted_net_income": _safe_number(adjusted_net_income),
-                "shares": _safe_number(shares),
-            })
+            establishment = st.text_input(
+                "법인설립일",
+                key="stock_establishment",
+                placeholder="YYYY-MM-DD",
+            )
 
-    st.markdown("### 3. 순자산가액 및 세법상 조정")
-    n1, n2 = st.columns(2)
+        with b2:
+            valuation_date = st.text_input(
+                "평가기준일",
+                value=st.session_state.get(
+                    "stock_valuation_date",
+                    date.today().isoformat(),
+                ),
+                key="stock_valuation_date",
+            )
+            current_shares_text = st.text_input(
+                "현재 발행주식총수(주)",
+                key="stock_current_shares",
+                placeholder="크레탑에 없으면 법인등기·주주명부를 확인",
+            )
+            par_value_text = st.text_input(
+                "1주당 액면가액(원)",
+                key="stock_par_value",
+            )
+            capital_text = st.text_input(
+                "등기상 자본금(원)",
+                key="stock_capital",
+                placeholder="등기자료 업로드 시 자동 입력",
+            )
+            authorized_shares_text = st.text_input(
+                "발행할 주식의 총수(주)",
+                key="stock_authorized_shares",
+                placeholder="등기자료 업로드 시 자동 입력",
+            )
+            valuation_type = st.selectbox(
+                "평가유형",
+                [
+                    "일반법인(3:2)",
+                    "부동산과다보유법인(2:3)",
+                    "순자산가치만 적용",
+                ],
+                key="stock_valuation_type",
+            )
 
-    with n1:
-        total_assets_text = st.text_input(
-            "장부상 총자산(원)",
-            key="stock_total_assets",
-        )
-        asset_additions_text = st.text_input(
-            "자산 가산조정(원)",
-            key="stock_asset_additions",
-            placeholder="시가평가 증액, 누락자산 등",
-        )
-        asset_deductions_text = st.text_input(
-            "자산 차감조정(원)",
-            key="stock_asset_deductions",
-            placeholder="회수불능자산, 평가차감 등",
-        )
-        goodwill_text = st.text_input(
-            "영업권 평가액(원)",
-            key="stock_goodwill",
-            placeholder="해당하는 경우 입력",
+        st.markdown("### 2. 최근 3개년 순손익액")
+        st.warning(
+            "자동 입력값은 회계상 당기순이익입니다. "
+            "상증세법상 가산·차감 조정을 반영한 순손익액으로 직접 수정해주세요."
         )
 
-    with n2:
-        total_liabilities_text = st.text_input(
-            "장부상 총부채(원)",
-            key="stock_total_liabilities",
-        )
-        liability_additions_text = st.text_input(
-            "부채 가산조정(원)",
-            key="stock_liability_additions",
-            placeholder="미계상 채무, 퇴직급여 등",
-        )
-        liability_deductions_text = st.text_input(
-            "부채 차감조정(원)",
-            key="stock_liability_deductions",
-        )
-        other_adjustments_text = st.text_input(
-            "기타 순자산 조정(원)",
-            key="stock_other_adjustments",
-            placeholder="가산은 양수, 차감은 음수",
-        )
+        current_year = datetime.now().year - 1
+        annual_rows = []
+        annual_columns = st.columns(3)
 
-    st.markdown("### 4. 법령 적용 설정")
-    l1, l2 = st.columns(2)
-
-    with l1:
-        cap_rate_pct = st.number_input(
-            "순손익가치 환원율(%)",
-            min_value=0.1,
-            max_value=100.0,
-            value=float(
-                st.session_state.get(
-                    "stock_cap_rate",
-                    CAPITALIZATION_RATE_DEFAULT,
+        for index, column in enumerate(annual_columns, start=1):
+            with column:
+                year_key = f"stock_year_{index}"
+                _ensure_text_state(
+                    year_key,
+                    str(current_year - index + 1),
                 )
-                * 100
-            ),
-            step=0.1,
-            key="stock_cap_rate_pct",
-        )
-        nav_floor_pct = st.number_input(
-            "순자산가치 하한 비율(%)",
-            min_value=0.0,
-            max_value=100.0,
-            value=float(
-                st.session_state.get(
-                    "stock_nav_floor",
-                    NAV_FLOOR_RATE_DEFAULT,
+                year = st.text_input(
+                    f"{index}번째 연도",
+                    key=year_key,
                 )
-                * 100
-            ),
-            step=1.0,
-            key="stock_nav_floor_pct",
-        )
+                net_income_key = f"stock_net_income_{index}"
+                shares_key = f"stock_shares_{index}"
+                _ensure_text_state(net_income_key, "")
+                _ensure_text_state(shares_key, "")
 
-    with l2:
-        premium_exempt = st.checkbox(
-            "최대주주 할증평가 제외 적용",
-            value=bool(
-                st.session_state.get(
-                    "stock_premium_exempt",
-                    True,
+                adjusted_net_income = st.text_input(
+                    "세법상 조정 후 순손익액(원)",
+                    key=net_income_key,
+                    placeholder="공란이면 직접 입력",
                 )
-            ),
-            key="stock_premium_exempt",
-            help="중소기업 해당 여부 등 법령상 제외요건을 확인한 뒤 선택합니다.",
-        )
-        premium_pct = st.number_input(
-            "최대주주 할증률(%)",
-            min_value=0.0,
-            max_value=100.0,
-            value=float(
-                st.session_state.get(
-                    "stock_premium_rate",
-                    MAX_SHAREHOLDER_PREMIUM_DEFAULT,
+                shares = st.text_input(
+                    "해당 연도 발행주식총수(주)",
+                    key=shares_key,
+                    placeholder="공란이면 현재 주식수 적용",
                 )
-                * 100
-            ),
-            step=1.0,
-            disabled=premium_exempt,
-            key="stock_premium_pct",
-        )
+                annual_rows.append({
+                    "year": year,
+                    "adjusted_net_income": _safe_number(adjusted_net_income),
+                    "shares": _safe_number(shares),
+                })
 
-    inputs = {
-        "company_name": company_name,
-        "business_no": business_no,
-        "corporate_no": corporate_no,
-        "address": address,
-        "establishment": establishment,
-        "valuation_date": valuation_date,
-        "current_shares": _safe_number(current_shares_text),
-        "par_value": _safe_number(par_value_text),
-        "capital": _safe_number(capital_text),
-        "authorized_shares": _safe_number(authorized_shares_text),
-        "share_classes": st.session_state.get("stock_share_classes", []),
-        "valuation_type": valuation_type,
-        "annual_rows": annual_rows,
-        "total_assets": _safe_number(total_assets_text),
-        "total_liabilities": _safe_number(total_liabilities_text),
-        "asset_additions": _safe_number(asset_additions_text),
-        "asset_deductions": _safe_number(asset_deductions_text),
-        "liability_additions": _safe_number(liability_additions_text),
-        "liability_deductions": _safe_number(liability_deductions_text),
-        "goodwill": _safe_number(goodwill_text),
-        "other_adjustments": _safe_number(other_adjustments_text),
-        "capitalization_rate": cap_rate_pct / 100,
-        "nav_floor_rate": nav_floor_pct / 100,
-        "premium_exempt": premium_exempt,
-        "premium_rate": premium_pct / 100,
-    }
+        st.markdown("### 3. 순자산가액 및 세법상 조정")
+        n1, n2 = st.columns(2)
 
-    capital_number = _safe_number(capital_text)
-    issued_shares_number = _safe_number(current_shares_text)
-    par_value_number = _safe_number(par_value_text)
-
-    if capital_number and issued_shares_number and par_value_number:
-        calculated_capital = issued_shares_number * par_value_number
-        difference = abs(calculated_capital - capital_number)
-        tolerance = max(1, capital_number * 0.01)
-        if difference > tolerance:
-            st.warning(
-                "등기상 자본금과 `발행주식총수 × 1주당 액면가액`이 일치하지 않습니다. "
-                "변경등기 이력이나 종류주식 여부를 확인해주세요."
+        with n1:
+            total_assets_text = st.text_input(
+                "장부상 총자산(원)",
+                key="stock_total_assets",
             )
-        else:
-            st.success(
-                "등기상 자본금과 발행주식수·액면가액 계산값이 일치합니다."
+            asset_additions_text = st.text_input(
+                "자산 가산조정(원)",
+                key="stock_asset_additions",
+                placeholder="시가평가 증액, 누락자산 등",
+            )
+            asset_deductions_text = st.text_input(
+                "자산 차감조정(원)",
+                key="stock_asset_deductions",
+                placeholder="회수불능자산, 평가차감 등",
+            )
+            goodwill_text = st.text_input(
+                "영업권 평가액(원)",
+                key="stock_goodwill",
+                placeholder="해당하는 경우 입력",
             )
 
-    calculate_clicked = st.button(
-        "주가평가 계산",
-        type="primary",
-        key="stock_calculate",
-        use_container_width=True,
-    )
+        with n2:
+            total_liabilities_text = st.text_input(
+                "장부상 총부채(원)",
+                key="stock_total_liabilities",
+            )
+            liability_additions_text = st.text_input(
+                "부채 가산조정(원)",
+                key="stock_liability_additions",
+                placeholder="미계상 채무, 퇴직급여 등",
+            )
+            liability_deductions_text = st.text_input(
+                "부채 차감조정(원)",
+                key="stock_liability_deductions",
+            )
+            other_adjustments_text = st.text_input(
+                "기타 순자산 조정(원)",
+                key="stock_other_adjustments",
+                placeholder="가산은 양수, 차감은 음수",
+            )
+
+        st.markdown("### 4. 법령 적용 설정")
+        l1, l2 = st.columns(2)
+
+        with l1:
+            cap_rate_pct = st.number_input(
+                "순손익가치 환원율(%)",
+                min_value=0.1,
+                max_value=100.0,
+                value=float(
+                    st.session_state.get(
+                        "stock_cap_rate",
+                        CAPITALIZATION_RATE_DEFAULT,
+                    )
+                    * 100
+                ),
+                step=0.1,
+                key="stock_cap_rate_pct",
+            )
+            nav_floor_pct = st.number_input(
+                "순자산가치 하한 비율(%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(
+                    st.session_state.get(
+                        "stock_nav_floor",
+                        NAV_FLOOR_RATE_DEFAULT,
+                    )
+                    * 100
+                ),
+                step=1.0,
+                key="stock_nav_floor_pct",
+            )
+
+        with l2:
+            premium_exempt = st.checkbox(
+                "최대주주 할증평가 제외 적용",
+                value=bool(
+                    st.session_state.get(
+                        "stock_premium_exempt",
+                        True,
+                    )
+                ),
+                key="stock_premium_exempt",
+                help="중소기업 해당 여부 등 법령상 제외요건을 확인한 뒤 선택합니다.",
+            )
+            premium_pct = st.number_input(
+                "최대주주 할증률(%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(
+                    st.session_state.get(
+                        "stock_premium_rate",
+                        MAX_SHAREHOLDER_PREMIUM_DEFAULT,
+                    )
+                    * 100
+                ),
+                step=1.0,
+                disabled=premium_exempt,
+                key="stock_premium_pct",
+            )
+
+        inputs = {
+            "company_name": company_name,
+            "business_no": business_no,
+            "corporate_no": corporate_no,
+            "address": address,
+            "establishment": establishment,
+            "valuation_date": valuation_date,
+            "current_shares": _safe_number(current_shares_text),
+            "par_value": _safe_number(par_value_text),
+            "capital": _safe_number(capital_text),
+            "authorized_shares": _safe_number(authorized_shares_text),
+            "share_classes": st.session_state.get("stock_share_classes", []),
+            "valuation_type": valuation_type,
+            "annual_rows": annual_rows,
+            "total_assets": _safe_number(total_assets_text),
+            "total_liabilities": _safe_number(total_liabilities_text),
+            "asset_additions": _safe_number(asset_additions_text),
+            "asset_deductions": _safe_number(asset_deductions_text),
+            "liability_additions": _safe_number(liability_additions_text),
+            "liability_deductions": _safe_number(liability_deductions_text),
+            "goodwill": _safe_number(goodwill_text),
+            "other_adjustments": _safe_number(other_adjustments_text),
+            "capitalization_rate": cap_rate_pct / 100,
+            "nav_floor_rate": nav_floor_pct / 100,
+            "premium_exempt": premium_exempt,
+            "premium_rate": premium_pct / 100,
+        }
+
+        capital_number = _safe_number(capital_text)
+        issued_shares_number = _safe_number(current_shares_text)
+        par_value_number = _safe_number(par_value_text)
+
+        if capital_number and issued_shares_number and par_value_number:
+            calculated_capital = issued_shares_number * par_value_number
+            difference = abs(calculated_capital - capital_number)
+            tolerance = max(1, capital_number * 0.01)
+            if difference > tolerance:
+                st.warning(
+                    "등기상 자본금과 `발행주식총수 × 1주당 액면가액`이 일치하지 않습니다. "
+                    "변경등기 이력이나 종류주식 여부를 확인해주세요."
+                )
+            else:
+                st.success(
+                    "등기상 자본금과 발행주식수·액면가액 계산값이 일치합니다."
+                )
+
+        calculate_clicked = st.form_submit_button(
+            "주가평가 계산",
+            type="primary",
+            use_container_width=True,
+        )
 
     result = None
     if calculate_clicked:
-        try:
-            result = calculate_stock_valuation(inputs)
-            st.session_state["stock_last_result"] = result
-            st.session_state["stock_last_inputs"] = inputs
-        except ValueError as exc:
-            st.error(str(exc))
+        with st.spinner("주가평가를 계산하고 있습니다..."):
+            try:
+                result = calculate_stock_valuation(inputs)
+                st.session_state["stock_last_result"] = result
+                st.session_state["stock_last_inputs"] = inputs
+            except ValueError as exc:
+                st.error(str(exc))
 
     if result is None:
         result = st.session_state.get("stock_last_result")
