@@ -32,6 +32,10 @@ LIGHT = colors.HexColor("#F3F7FC")
 MID = colors.HexColor("#D7E2F0")
 TEXT = colors.HexColor("#172033")
 MUTED = colors.HexColor("#667085")
+FONT_NORMAL = "Helvetica"
+FONT_BOLD = "Helvetica-Bold"
+
+
 RED = colors.HexColor("#C43D3D")
 
 
@@ -56,40 +60,32 @@ def _font_paths() -> tuple[str, str] | None:
     return None
 
 
-def _register_fonts() -> None:
-    if "OasisKR" in pdfmetrics.getRegisteredFontNames():
-        return
+def _register_fonts() -> tuple[str, str]:
+    registered = set(pdfmetrics.getRegisteredFontNames())
+    if {FONT_NORMAL, "OasisKR-Bold"}.issubset(registered):
+        return FONT_NORMAL, "OasisKR-Bold"
 
     paths = _font_paths()
     if paths:
         regular, bold = paths
         try:
-            pdfmetrics.registerFont(TTFont("OasisKR", regular))
-            pdfmetrics.registerFont(TTFont("OasisKR-Bold", bold))
+            pdfmetrics.registerFont(TTFont(FONT_NORMAL, regular))
+            pdfmetrics.registerFont(TTFont(FONT_BOLD, bold))
             pdfmetrics.registerFontFamily(
-                "OasisKR",
-                normal="OasisKR",
-                bold="OasisKR-Bold",
-                italic="OasisKR",
-                boldItalic="OasisKR-Bold",
+                FONT_NORMAL,
+                normal=FONT_NORMAL,
+                bold=FONT_BOLD,
+                italic=FONT_NORMAL,
+                boldItalic=FONT_BOLD,
             )
-            return
+            return FONT_NORMAL, "OasisKR-Bold"
         except Exception:
-            # TTC files and minimal Railway images can still reject TTFont.
-            # Fall through to ReportLab's built-in Korean CID font.
             pass
 
-    pdfmetrics.registerFont(UnicodeCIDFont("HYSMyeongJo-Medium"))
-    # Alias the CID font under the names already used throughout this report.
-    pdfmetrics._fonts["OasisKR"] = pdfmetrics.getFont("HYSMyeongJo-Medium")
-    pdfmetrics._fonts["OasisKR-Bold"] = pdfmetrics.getFont("HYSMyeongJo-Medium")
-    pdfmetrics.registerFontFamily(
-        "OasisKR",
-        normal="OasisKR",
-        bold="OasisKR-Bold",
-        italic="OasisKR",
-        boldItalic="OasisKR-Bold",
-    )
+    cid_name = "HYSMyeongJo-Medium"
+    if cid_name not in pdfmetrics.getRegisteredFontNames():
+        pdfmetrics.registerFont(UnicodeCIDFont(cid_name))
+    return cid_name, cid_name
 
 
 def _clean(value: Any) -> str:
@@ -126,7 +122,7 @@ def _header_footer(canvas, doc) -> None:
     width, height = A4
     canvas.setStrokeColor(MID)
     canvas.line(18 * mm, 14 * mm, width - 18 * mm, 14 * mm)
-    canvas.setFont("OasisKR", 7.5)
+    canvas.setFont(FONT_NORMAL, 7.5)
     canvas.setFillColor(MUTED)
     canvas.drawString(18 * mm, 9 * mm, "OASIS AI CONSULTING REPORT")
     canvas.drawRightString(width - 18 * mm, 9 * mm, f"{doc.page}")
@@ -150,20 +146,20 @@ def _cover(canvas, doc, analysis: dict[str, Any], logo_path: str | None, consult
             pass
 
     canvas.setFillColor(colors.white)
-    canvas.setFont("OasisKR", 12)
+    canvas.setFont(FONT_NORMAL, 12)
     canvas.drawString(22 * mm, height - 92 * mm, "AI CONSULTING REPORT")
-    canvas.setFont("OasisKR-Bold", 27)
+    canvas.setFont(FONT_BOLD, 27)
     company = _clean(analysis.get("company_name"))
     canvas.drawString(22 * mm, height - 115 * mm, company[:26])
-    canvas.setFont("OasisKR", 11)
+    canvas.setFont(FONT_NORMAL, 11)
     canvas.drawString(22 * mm, height - 134 * mm, datetime.now().strftime("%Y년 %m월 %d일"))
 
     canvas.setFillColor(colors.HexColor("#E9F0FB"))
     canvas.roundRect(22 * mm, 42 * mm, 165 * mm, 42 * mm, 4 * mm, fill=1, stroke=0)
     canvas.setFillColor(NAVY)
-    canvas.setFont("OasisKR-Bold", 11)
+    canvas.setFont(FONT_BOLD, 11)
     canvas.drawString(28 * mm, 70 * mm, "오아시스 기업컨설팅")
-    canvas.setFont("OasisKR", 9)
+    canvas.setFont(FONT_NORMAL, 9)
     canvas.drawString(28 * mm, 59 * mm, f"담당 컨설턴트  {consultant_name or '-'}")
     canvas.drawString(28 * mm, 49 * mm, "기업의 현재를 진단하고 실행 가능한 개선 방향을 제안합니다.")
     canvas.restoreState()
@@ -175,7 +171,8 @@ def build_representative_pdf(
     logo_path: str | None = None,
 ) -> bytes:
     """대표님 제출용 PDF. CRM 내부 메모/상담 질문/계약확률은 포함하지 않는다."""
-    _register_fonts()
+    global FONT_NORMAL, FONT_BOLD
+    FONT_NORMAL, FONT_BOLD = _register_fonts()
     output = BytesIO()
     doc = SimpleDocTemplate(
         output,
@@ -188,12 +185,12 @@ def build_representative_pdf(
         author="OASIS",
     )
     styles = getSampleStyleSheet()
-    title = ParagraphStyle("title", parent=styles["Heading1"], fontName="OasisKR-Bold", fontSize=20, leading=27, textColor=NAVY, spaceAfter=10)
-    h2 = ParagraphStyle("h2", parent=styles["Heading2"], fontName="OasisKR-Bold", fontSize=14, leading=20, textColor=NAVY, spaceBefore=8, spaceAfter=8)
-    body = ParagraphStyle("body", parent=styles["BodyText"], fontName="OasisKR", fontSize=9.5, leading=15, textColor=TEXT)
+    title = ParagraphStyle("title", parent=styles["Heading1"], fontName=FONT_BOLD, fontSize=20, leading=27, textColor=NAVY, spaceAfter=10)
+    h2 = ParagraphStyle("h2", parent=styles["Heading2"], fontName=FONT_BOLD, fontSize=14, leading=20, textColor=NAVY, spaceBefore=8, spaceAfter=8)
+    body = ParagraphStyle("body", parent=styles["BodyText"], fontName=FONT_NORMAL, fontSize=9.5, leading=15, textColor=TEXT)
     small = ParagraphStyle("small", parent=body, fontSize=8, leading=12, textColor=MUTED)
     center = ParagraphStyle("center", parent=body, alignment=TA_CENTER)
-    score_style = ParagraphStyle("score", parent=center, fontName="OasisKR-Bold", fontSize=18, leading=22, textColor=NAVY)
+    score_style = ParagraphStyle("score", parent=center, fontName=FONT_BOLD, fontSize=18, leading=22, textColor=NAVY)
 
     story = [PageBreak()]
     story += [Paragraph("목차", title), Spacer(1, 5 * mm)]
@@ -207,8 +204,8 @@ def build_representative_pdf(
     ]
     toc = Table(contents, colWidths=[18 * mm, 145 * mm], rowHeights=15 * mm)
     toc.setStyle(TableStyle([
-        ("FONTNAME", (0, 0), (-1, -1), "OasisKR"),
-        ("FONTNAME", (0, 0), (0, -1), "OasisKR-Bold"),
+        ("FONTNAME", (0, 0), (-1, -1), FONT_NORMAL),
+        ("FONTNAME", (0, 0), (0, -1), FONT_BOLD),
         ("FONTSIZE", (0, 0), (-1, -1), 11),
         ("TEXTCOLOR", (0, 0), (0, -1), BLUE),
         ("LINEBELOW", (0, 0), (-1, -1), 0.4, MID),
@@ -224,9 +221,9 @@ def build_representative_pdf(
     ]
     table = Table(overview, colWidths=[28 * mm, 57 * mm, 30 * mm, 55 * mm])
     table.setStyle(TableStyle([
-        ("FONTNAME", (0, 0), (-1, -1), "OasisKR"),
-        ("FONTNAME", (0, 0), (0, -1), "OasisKR-Bold"),
-        ("FONTNAME", (2, 0), (2, -1), "OasisKR-Bold"),
+        ("FONTNAME", (0, 0), (-1, -1), FONT_NORMAL),
+        ("FONTNAME", (0, 0), (0, -1), FONT_BOLD),
+        ("FONTNAME", (2, 0), (2, -1), FONT_BOLD),
         ("BACKGROUND", (0, 0), (0, -1), LIGHT),
         ("BACKGROUND", (2, 0), (2, -1), LIGHT),
         ("GRID", (0, 0), (-1, -1), 0.4, MID),
@@ -262,8 +259,8 @@ def build_representative_pdf(
     ]
     ft = Table(finance, colWidths=[35 * mm, 43 * mm, 92 * mm], repeatRows=1)
     ft.setStyle(TableStyle([
-        ("FONTNAME", (0, 0), (-1, -1), "OasisKR"),
-        ("FONTNAME", (0, 0), (-1, 0), "OasisKR-Bold"),
+        ("FONTNAME", (0, 0), (-1, -1), FONT_NORMAL),
+        ("FONTNAME", (0, 0), (-1, 0), FONT_BOLD),
         ("BACKGROUND", (0, 0), (-1, 0), NAVY),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
         ("GRID", (0, 0), (-1, -1), 0.4, MID),
@@ -318,8 +315,8 @@ def build_representative_pdf(
             ])
         tt = Table(tax_rows, colWidths=[60 * mm, 28 * mm, 52 * mm, 28 * mm], repeatRows=1)
         tt.setStyle(TableStyle([
-            ("FONTNAME", (0, 0), (-1, -1), "OasisKR"),
-            ("FONTNAME", (0, 0), (-1, 0), "OasisKR-Bold"),
+            ("FONTNAME", (0, 0), (-1, -1), FONT_NORMAL),
+            ("FONTNAME", (0, 0), (-1, 0), FONT_BOLD),
             ("BACKGROUND", (0, 0), (-1, 0), NAVY),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
             ("GRID", (0, 0), (-1, -1), 0.4, MID),
@@ -349,7 +346,7 @@ def build_representative_pdf(
     ]
     rt = Table(roadmap, colWidths=[25 * mm, 83 * mm, 62 * mm], repeatRows=1)
     rt.setStyle(TableStyle([
-        ("FONTNAME", (0, 0), (-1, -1), "OasisKR"), ("FONTNAME", (0, 0), (-1, 0), "OasisKR-Bold"), ("BACKGROUND", (0, 0), (-1, 0), NAVY), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("GRID", (0, 0), (-1, -1), 0.4, MID), ("FONTSIZE", (0, 0), (-1, -1), 8.5), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("TOPPADDING", (0, 0), (-1, -1), 8), ("BOTTOMPADDING", (0, 0), (-1, -1), 8)
+        ("FONTNAME", (0, 0), (-1, -1), FONT_NORMAL), ("FONTNAME", (0, 0), (-1, 0), FONT_BOLD), ("BACKGROUND", (0, 0), (-1, 0), NAVY), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("GRID", (0, 0), (-1, -1), 0.4, MID), ("FONTSIZE", (0, 0), (-1, -1), 8.5), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("TOPPADDING", (0, 0), (-1, -1), 8), ("BOTTOMPADDING", (0, 0), (-1, -1), 8)
     ]))
     story += [rt, Spacer(1, 10 * mm)]
     disclaimer = (

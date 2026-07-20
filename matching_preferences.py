@@ -159,6 +159,95 @@ def save_matching_preferences(
     return record
 
 
+def save_policy_recommendations(
+    user_id: str,
+    business_no: Any,
+    company_name: str,
+    minimum_score: int,
+    recommendations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    key = normalize_business_no(business_no)
+    if len(re.sub(r"[^0-9]", "", key)) != 10:
+        raise ValueError(
+            "사업자등록번호가 확인되어야 정책자금 추천을 저장할 수 있습니다."
+        )
+
+    data = _load_all(user_id)
+    current = data.get(key, {})
+    if not isinstance(current, dict):
+        current = {}
+
+    saved_items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in recommendations:
+        if not isinstance(item, dict):
+            continue
+        title = _safe_text(item.get("title", ""), 200)
+        if not title:
+            continue
+        record_id = _safe_text(item.get("id", ""), 80) or title.casefold()
+        if record_id in seen:
+            continue
+        seen.add(record_id)
+        saved_items.append(
+            {
+                "id": record_id,
+                "title": title,
+                "score": int(item.get("score", 0) or 0),
+                "grade": _safe_text(item.get("grade", ""), 40),
+                "category": _safe_text(
+                    item.get("category")
+                    or item.get("classification")
+                    or item.get("분류"),
+                    80,
+                ),
+                "agency": _safe_text(item.get("agency", ""), 120),
+                "summary": _safe_text(item.get("summary", ""), 500),
+                "target": _safe_text(item.get("target", ""), 300),
+                "end_date": _safe_text(item.get("end_date", ""), 40),
+                "url": _safe_text(item.get("url", ""), 500),
+                "evidence": [
+                    _safe_text(value, 200)
+                    for value in (item.get("evidence", []) or [])[:5]
+                    if _safe_text(value, 200)
+                ],
+            }
+        )
+        if len(saved_items) >= 50:
+            break
+
+    record = dict(current)
+    record.update(
+        {
+            "사업자등록번호": key,
+            "업체명": _safe_text(
+                company_name or current.get("업체명", ""),
+                120,
+            ),
+            "저장정책자금_최소점수": max(
+                0,
+                min(int(minimum_score), 100),
+            ),
+            "저장정책자금": saved_items,
+            "저장정책자금_건수": len(saved_items),
+            "저장정책자금_저장일시": datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+            "수정일시": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
+
+    data[key] = record
+    _save_all(user_id, data)
+
+    try:
+        sync_matching_preferences(user_id, key, record)
+    except Exception as sync_error:
+        record["_cloud_sync_warning"] = str(sync_error)
+
+    return record
+
+
 def preference_summary(preferences: dict[str, Any]) -> str:
     parts = []
 

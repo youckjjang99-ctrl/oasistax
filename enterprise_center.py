@@ -452,6 +452,11 @@ def render_enterprise_management_center(
     business_no = _normalize_business_no(
         selected_row.get("사업자등록번호", "")
     )
+    # Keep the currently viewed enterprise available when the user
+    # moves to AI Copilot through the sidebar instead of the dedicated button.
+    st.session_state["_oasis_active_company_business_no"] = business_no
+    st.session_state["_oasis_active_company_name"] = company_name
+
     customer_key = make_customer_key(company_name, business_no)
 
     integration = reconcile_enterprise_consulting_context(

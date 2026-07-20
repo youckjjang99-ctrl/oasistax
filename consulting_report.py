@@ -525,6 +525,36 @@ def build_consulting_analysis(
         strategy.append(
             "연구개발 조직과 지식재산 보유현황을 확인해 R&D·인증 지원사업을 검토합니다."
         )
+    saved_policy_items = preferences.get("저장정책자금", []) or []
+    saved_policy_items = [
+        item for item in saved_policy_items if isinstance(item, dict)
+    ]
+    if saved_policy_items:
+        strengths.append(
+            f"기업컨설팅에서 확정 저장한 정책자금 추천 "
+            f"{len(saved_policy_items)}건이 반영되었습니다."
+        )
+        for item in saved_policy_items[:8]:
+            title = _clean(item.get("title", ""))
+            score = item.get("score", "")
+            category = _clean(item.get("category", ""))
+            agency = _clean(item.get("agency", ""))
+            if not title:
+                continue
+            note_parts = [
+                f"{score}점" if str(score).strip() else "",
+                category,
+                agency,
+            ]
+            note = " · ".join(
+                part for part in note_parts if part
+            )
+            strategy.append(
+                "저장 정책자금 추천: "
+                + title
+                + (f" ({note})" if note else "")
+            )
+
     if fund_purpose:
         strategy.append(
             f"대표가 입력한 자금사용목적은 '{fund_purpose}'입니다."

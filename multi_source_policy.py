@@ -16,6 +16,7 @@ import xml.etree.ElementTree as ET
 
 from utils import ROOT_DIR, get_user_dirs
 from employee_status import employee_matching_context
+from matching_preferences import save_policy_recommendations
 from integrated_policy_repository import (
     load_repository_records,
     refresh_repository,
@@ -1109,6 +1110,34 @@ def render_multi_source_match(
     if not visible:
         st.info("설정한 점수 이상인 공고가 없습니다.")
         return
+
+    st.caption(
+        f"현재 최소점수 {minimum_score}점 이상 추천 {len(visible)}건을 "
+        "AI 코파일럿용 확정 추천자료로 저장할 수 있습니다."
+    )
+    if st.button(
+        "현재 최소점수 이상 추천을 AI 코파일럿에 저장",
+        type="primary",
+        use_container_width=True,
+        key=f"save_policy_recommendations_{business_no or company_name}",
+    ):
+        save_payload = []
+        for result in visible:
+            item = dict(result)
+            item["category"] = classify_support_result(result)
+            save_payload.append(item)
+
+        saved = save_policy_recommendations(
+            user_id=user_id,
+            business_no=business_no,
+            company_name=company_name,
+            minimum_score=minimum_score,
+            recommendations=save_payload,
+        )
+        st.success(
+            f"{saved.get('저장정책자금_건수', 0)}건을 "
+            "AI 코파일럿 반영자료로 저장했습니다."
+        )
 
     categorized = {
         "정책자금·보증": [],

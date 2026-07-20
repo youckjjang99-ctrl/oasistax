@@ -420,6 +420,15 @@ def _customer_text(
         ", ".join(preferences.get("매칭키워드", []) or []),
         ", ".join(preferences.get("관심지원분야", []) or []),
         _clean(preferences.get("자금사용목적", "")),
+        " ".join(
+            _clean(item.get("title", ""))
+            + " "
+            + _clean(item.get("summary", ""))
+            + " "
+            + " ".join(item.get("evidence", []) or [])
+            for item in (preferences.get("저장정책자금", []) or [])
+            if isinstance(item, dict)
+        ),
         _clean(memory.get("key_needs", "")),
         _clean(memory.get("consultant_notes", "")),
         _clean(memory.get("next_focus", "")),
@@ -584,10 +593,20 @@ def render_copilot_page(
     labels, row_map = build_customer_labels(customers)
 
     prefill_business_no = str(
-        st.session_state.pop("_oasis_copilot_business_no", "") or ""
+        st.session_state.pop("_oasis_copilot_business_no", "")
+        or st.session_state.get(
+            "_oasis_active_company_business_no",
+            "",
+        )
+        or ""
     )
     prefill_company_name = str(
-        st.session_state.pop("_oasis_copilot_company_name", "") or ""
+        st.session_state.pop("_oasis_copilot_company_name", "")
+        or st.session_state.get(
+            "_oasis_active_company_name",
+            "",
+        )
+        or ""
     )
     if prefill_business_no or prefill_company_name:
         normalized_prefill = re.sub(r"[^0-9]", "", prefill_business_no)
@@ -740,6 +759,33 @@ def render_copilot_page(
                     )
                     if summary:
                         st.caption(summary[:1000])
+
+    saved_policy_items = preferences.get("저장정책자금", []) or []
+    saved_policy_items = [
+        item for item in saved_policy_items if isinstance(item, dict)
+    ]
+    if saved_policy_items:
+        st.markdown("### 저장된 정책자금 추천")
+        st.caption(
+            f"기업컨설팅에서 확정 저장한 추천 {len(saved_policy_items)}건 · "
+            f"최소점수 {preferences.get('저장정책자금_최소점수', '-')}점"
+        )
+        policy_rows = []
+        for item in saved_policy_items[:20]:
+            policy_rows.append(
+                {
+                    "점수": item.get("score", ""),
+                    "분류": item.get("category", ""),
+                    "공고명": item.get("title", ""),
+                    "기관": item.get("agency", ""),
+                    "신청종료": item.get("end_date", ""),
+                }
+            )
+        st.dataframe(
+            pd.DataFrame(policy_rows),
+            hide_index=True,
+            use_container_width=True,
+        )
 
     top = recommendations[:5]
     st.markdown("### 이번 상담 우선순위")
