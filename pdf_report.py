@@ -207,7 +207,7 @@ def build_representative_pdf(
         ("매출액", _money(analysis.get("sales"))),
         ("영업이익", _money(analysis.get("operating_profit"))),
         ("당기순이익", _money(analysis.get("net_income"))),
-        ("정보완성도", f"{analysis.get('completeness', 0)}%"),
+        ("종업원수", (_clean(analysis.get("employees")) or "-") + ("명" if _clean(analysis.get("employees")) else "")),
     ]
     cells = []
     for label, value in kpis:

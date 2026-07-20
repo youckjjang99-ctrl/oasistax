@@ -464,25 +464,50 @@ def build_consulting_analysis(
         "기업전체주식가치": stock_result.get("total_equity_value"),
     }
 
-    completeness_values = [
-        company_name,
-        business_no,
-        industry,
-        address,
-        establishment,
-        employees,
-        sales,
-        operating_profit,
-        net_income,
-        assets,
-        liabilities,
-        equity,
+    # 자료 충족도는 단순 필드 개수가 아니라 실제 컨설팅에 필요한 자료군을
+    # 가중 평가합니다. 모든 자료가 갖춰져도 100% 대신 최대 95%로 제한해
+    # 추가 확인 가능성이 항상 남아 있음을 표현합니다.
+    profile_fields = [business_no, industry, address, establishment, employees]
+    finance_fields = [sales, operating_profit, net_income, assets, liabilities, equity]
+
+    profile_ratio = sum(1 for value in profile_fields if _clean(value)) / len(profile_fields)
+    finance_ratio = sum(1 for value in finance_fields if _clean(value)) / len(finance_fields)
+
+    preference_values = []
+    for key in ("관심지원분야", "매칭키워드", "제외키워드", "자금사용목적"):
+        value = preferences.get(key) if isinstance(preferences, dict) else None
+        if isinstance(value, (list, tuple, set)):
+            preference_values.extend([item for item in value if _clean(item)])
+        elif _clean(value):
+            preference_values.append(value)
+    has_preferences = bool(preference_values)
+
+    completeness_components = [
+        ("기업 기본정보", 15.0 * profile_ratio, profile_ratio >= 0.8),
+        ("재무자료", 30.0 * finance_ratio, finance_ratio >= 0.8),
+        ("등기정보", 12.0 if registry else 0.0, bool(registry)),
+        ("주가평가", 12.0 if stock_record else 0.0, bool(stock_record)),
+        ("정관검토", 10.0 if articles_review else 0.0, bool(articles_review)),
+        ("상담일지", 10.0 if consultation_count else 0.0, bool(consultation_count)),
+        ("매칭설정", 6.0 if has_preferences else 0.0, has_preferences),
     ]
-    completeness = round(
-        sum(1 for value in completeness_values if _clean(value))
-        / len(completeness_values)
-        * 100
-    )
+    raw_completeness = sum(score for _, score, _ in completeness_components)
+    completeness = min(95, round(raw_completeness / 95.0 * 100))
+
+    if completeness >= 85:
+        completeness_status = "매우 충분"
+    elif completeness >= 70:
+        completeness_status = "충분"
+    elif completeness >= 50:
+        completeness_status = "보통"
+    elif completeness >= 30:
+        completeness_status = "보완 필요"
+    else:
+        completeness_status = "자료 부족"
+
+    missing_sources = [
+        name for name, _, is_ready in completeness_components if not is_ready
+    ]
 
     return {
         "company_name": company_name,
@@ -515,9 +540,12 @@ def build_consulting_analysis(
             "stock": bool(stock_record),
             "consultation": bool(consultation_count),
             "articles_review": bool(articles_review),
-            "matching_preferences": bool(preferences),
+            "matching_preferences": has_preferences,
         },
         "completeness": completeness,
+        "completeness_status": completeness_status,
+        "completeness_components": completeness_components,
+        "missing_sources": missing_sources,
     }
 
 
@@ -758,7 +786,7 @@ def render_ai_consulting_report_page(
     _inject_report_css()
     kpi_columns = st.columns(4, gap="medium")
     kpi_items = [
-        ("정보 완성도", f"{analysis['completeness']}%", "분석자료 충족도", "blue"),
+        ("자료 충족도", f"{analysis['completeness']}%", analysis.get("completeness_status", "보완 필요"), "blue"),
         ("매출액", _format_money(analysis["sales"]), "최근 결산 기준", "green"),
         ("영업이익", _format_money(analysis["operating_profit"]), "본업 수익성", "purple"),
         ("당기순이익", _format_money(analysis["net_income"]), "세후 최종손익", "orange"),
@@ -766,6 +794,13 @@ def render_ai_consulting_report_page(
     for column, (label, value, note, tone) in zip(kpi_columns, kpi_items):
         with column:
             st.markdown(_metric_card(label, value, note, tone), unsafe_allow_html=True)
+
+    missing_sources = analysis.get("missing_sources", []) or []
+    if missing_sources:
+        st.info(
+            "자료 충족도에 반영되지 않은 항목: " + ", ".join(missing_sources)
+            + " · 해당 자료를 등록하면 진단 범위와 정확도가 높아집니다."
+        )
 
     st.markdown("### 기업 기본정보")
     base_df = pd.DataFrame(
