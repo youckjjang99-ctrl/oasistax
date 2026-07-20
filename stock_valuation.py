@@ -10,14 +10,13 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from cretop_runner import run_cretop_worker
-from registry_runner import run_registry_worker
 from cloud_sync import (
     sync_financial_snapshot,
     sync_registry_snapshot,
     sync_stock_valuation,
     load_financial_snapshot,
     load_registry_snapshot,
+    load_stock_valuations,
 )
 from utils import get_user_cumulative_db_path, get_user_dirs
 
@@ -294,10 +293,10 @@ def _storage_path(user_id: str) -> Path:
     return dirs["base"] / "stock_valuations.json"
 
 
-def _load_records(user_id: str) -> list[dict[str, Any]]:
-    path = _storage_path(user_id)
-    if not path.exists():
-        return []
+@st.cache_data(ttl=60, show_spinner=False)
+def _read_json_records_cached(path_text: str, modified_time: float) -> list[dict[str, Any]]:
+    del modified_time
+    path = Path(path_text)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, list) else []
@@ -305,13 +304,53 @@ def _load_records(user_id: str) -> list[dict[str, Any]]:
         return []
 
 
+@st.cache_data(ttl=45, show_spinner=False)
+def _load_cloud_records_cached(user_id: str) -> list[dict[str, Any]]:
+    return load_stock_valuations(user_id)
+
+
+def _merge_records(local_records: list[dict[str, Any]], cloud_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for record in [*cloud_records, *local_records]:
+        if not isinstance(record, dict):
+            continue
+        record_id = str(record.get("record_id", "") or "").strip()
+        if not record_id:
+            record_id = "|".join([str(record.get("business_no", "") or ""), str(record.get("valuation_date", "") or ""), str(record.get("saved_at", "") or "")])
+        if not record_id:
+            continue
+        existing = merged.get(record_id)
+        if existing is None or str(record.get("saved_at", "") or "") >= str(existing.get("saved_at", "") or ""):
+            merged[record_id] = dict(record)
+    return sorted(merged.values(), key=lambda item: str(item.get("saved_at", "") or ""), reverse=True)
+
+
+def _load_records(user_id: str) -> list[dict[str, Any]]:
+    path = _storage_path(user_id)
+    local_records: list[dict[str, Any]] = []
+    if path.exists():
+        try:
+            local_records = _read_json_records_cached(str(path), path.stat().st_mtime)
+        except OSError:
+            local_records = []
+    cloud_records = _load_cloud_records_cached(user_id)
+    return _merge_records(local_records, cloud_records)
+
+
 def _save_records(user_id: str, records: list[dict[str, Any]]) -> None:
     path = _storage_path(user_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(records, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
-    )
+    path.write_text(json.dumps(records, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    _read_json_records_cached.clear()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _read_customer_excel_cached(path_text: str, modified_time: float) -> pd.DataFrame:
+    del modified_time
+    try:
+        return pd.read_excel(path_text, sheet_name="고객DB")
+    except Exception:
+        return pd.DataFrame()
 
 
 def _read_customers(user_id: str) -> pd.DataFrame:
@@ -319,15 +358,12 @@ def _read_customers(user_id: str) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
     try:
-        df = pd.read_excel(path, sheet_name="고객DB")
-    except Exception:
+        df = _read_customer_excel_cached(str(path), path.stat().st_mtime)
+    except OSError:
         return pd.DataFrame()
-
     if df.empty:
         return df
-
-    df = df.dropna(how="all").copy()
-    return df
+    return df.dropna(how="all").copy()
 
 
 def _customer_defaults(row: pd.Series | None) -> dict[str, Any]:
@@ -783,6 +819,8 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
             with open(pdf_path, "wb") as output:
                 output.write(uploaded_pdf.read())
 
+            from cretop_runner import run_cretop_worker
+
             with st.spinner("크레탑 보고서에서 최근 3개년 재무정보를 찾고 있습니다..."):
                 data, error, logs = run_cretop_worker(
                     pdf_path,
@@ -863,6 +901,8 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
             registry_pdf.seek(0)
             with open(registry_path, "wb") as output:
                 output.write(registry_pdf.read())
+
+            from registry_runner import run_registry_worker
 
             with st.spinner("등기자료에서 자본금과 주식정보를 찾고 있습니다..."):
                 registry_data, registry_error = run_registry_worker(
@@ -949,21 +989,24 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
             )
 
     records = _load_records(user_id)
-    if records:
-        with st.expander("저장된 주가평가 불러오기·수정", expanded=False):
+    with st.expander("저장된 주가평가 불러오기·수정", expanded=False):
+        if not records:
+            st.info("저장된 주가평가 자료가 없습니다. 평가자료를 저장하면 이 메뉴에서 다시 불러올 수 있습니다.")
+        else:
+            st.caption(f"저장된 평가자료 {len(records)}건 · 로컬 및 Supabase 통합 조회")
             options = ["선택 안 함"] + [_record_label(record) for record in records]
-            selected_record_label = st.selectbox(
-                "저장 기록",
-                options,
-                key="stock_saved_record_selector",
-            )
+            selected_record_label = st.selectbox("저장 기록", options, key="stock_saved_record_selector")
             if selected_record_label != "선택 안 함":
                 record = records[options.index(selected_record_label) - 1]
-                if st.button(
-                    "선택 평가 불러오기",
-                    key="stock_load_record",
-                    use_container_width=True,
-                ):
+                preview_result = record.get("result", {})
+                if isinstance(preview_result, dict):
+                    final_value = _safe_number(preview_result.get("final_value_per_share"))
+                    total_value = _safe_number(preview_result.get("total_equity_value"))
+                    if final_value is not None or total_value is not None:
+                        p1, p2 = st.columns(2)
+                        p1.metric("저장된 1주당 평가액", f"{final_value:,.0f}원" if final_value is not None else "-")
+                        p2.metric("저장된 전체 주식가치", f"{total_value:,.0f}원" if total_value is not None else "-")
+                if st.button("선택 평가 불러오기", key="stock_load_record", use_container_width=True):
                     _apply_loaded_record(record)
                     st.success("저장된 평가자료를 불러왔습니다.")
                     st.rerun()
@@ -1426,6 +1469,7 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
 
             _save_records(user_id, records)
             sync_stock_valuation(user_id, record)
+            _load_cloud_records_cached.clear()
             st.session_state["stock_loaded_record_id"] = record["record_id"]
             st.success(
                 "주가평가 자료를 로컬 파일과 Supabase에 동시 저장했습니다."

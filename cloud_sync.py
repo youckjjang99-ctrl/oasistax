@@ -290,6 +290,38 @@ def sync_stock_valuation(
     )
 
 
+def load_stock_valuations(
+    user_id: str,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """Supabase에 저장된 사용자의 주가평가 기록을 최신순으로 읽습니다."""
+    if not user_id or not cloud_is_configured():
+        return []
+
+    try:
+        rows = CloudDatabase().select(
+            TABLE_STOCK,
+            filters={"owner_user_id": user_id},
+            columns="record_id,valuation_data",
+            order="created_at.desc",
+            limit=limit,
+        )
+    except Exception:
+        return []
+
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        data = row.get("valuation_data", {})
+        if not isinstance(data, dict):
+            continue
+        record = dict(data)
+        if not record.get("record_id"):
+            record["record_id"] = str(row.get("record_id", "") or "")
+        if record.get("record_id"):
+            records.append(record)
+    return records
+
+
 def sync_matching_preferences(
     user_id: str,
     business_no: Any,
