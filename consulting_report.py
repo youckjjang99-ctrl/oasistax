@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import json
 import math
 import re
@@ -20,6 +21,52 @@ from registered_policy_match import (
     load_registered_customers,
 )
 from utils import get_user_cumulative_db_path, get_user_dirs
+from pdf_report import build_representative_pdf
+
+
+
+
+def _metric_card(label: str, value: str, note: str = "", tone: str = "blue") -> str:
+    palette = {
+        "blue": ("#EAF2FF", "#1E5BD7"),
+        "green": ("#EAF8F2", "#16835F"),
+        "purple": ("#F3EDFF", "#7048C8"),
+        "orange": ("#FFF4E7", "#B56716"),
+        "red": ("#FFF0F0", "#C43D3D"),
+    }
+    background, accent = palette.get(tone, palette["blue"])
+    return f"""
+    <div class="oasis-kpi-card" style="--card-bg:{background};--card-accent:{accent};">
+      <div class="oasis-kpi-label">{html.escape(label)}</div>
+      <div class="oasis-kpi-value">{html.escape(value)}</div>
+      <div class="oasis-kpi-note">{html.escape(note or '현재 저장자료 기준')}</div>
+    </div>
+    """
+
+
+def _inject_report_css() -> None:
+    st.markdown(
+        """
+        <style>
+        .oasis-kpi-card {
+          min-height:132px; padding:18px 18px 15px; border-radius:16px;
+          border:1px solid color-mix(in srgb, var(--card-accent) 24%, white);
+          background:linear-gradient(145deg,#fff,var(--card-bg));
+          box-shadow:0 7px 20px rgba(15,42,80,.08); margin-bottom:8px;
+          position:relative; overflow:hidden;
+        }
+        .oasis-kpi-card:before {content:"";position:absolute;left:0;top:0;bottom:0;width:5px;background:var(--card-accent);}
+        .oasis-kpi-label {font-size:.87rem;font-weight:750;color:#475467;margin-bottom:13px;}
+        .oasis-kpi-value {font-size:1.78rem;line-height:1.1;font-weight:850;color:#172033;letter-spacing:-.04em;word-break:keep-all;}
+        .oasis-kpi-note {font-size:.76rem;color:var(--card-accent);font-weight:700;margin-top:12px;}
+        .oasis-section-card {border:1px solid #dbe4ef;border-radius:16px;background:#fff;padding:18px 20px;box-shadow:0 5px 16px rgba(15,42,80,.055);height:100%;}
+        .oasis-section-card h4 {margin:0 0 12px;color:#0b2b5b;}
+        .oasis-section-card ul {padding-left:20px;margin:0;}
+        .oasis-section-card li {margin-bottom:7px;color:#344054;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _clean(value: Any) -> str:
@@ -708,11 +755,17 @@ def render_ai_consulting_report_page(
         unsafe_allow_html=True,
     )
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("정보 완성도", f"{analysis['completeness']}%")
-    m2.metric("매출액", _format_money(analysis["sales"]))
-    m3.metric("영업이익", _format_money(analysis["operating_profit"]))
-    m4.metric("당기순이익", _format_money(analysis["net_income"]))
+    _inject_report_css()
+    kpi_columns = st.columns(4, gap="medium")
+    kpi_items = [
+        ("정보 완성도", f"{analysis['completeness']}%", "분석자료 충족도", "blue"),
+        ("매출액", _format_money(analysis["sales"]), "최근 결산 기준", "green"),
+        ("영업이익", _format_money(analysis["operating_profit"]), "본업 수익성", "purple"),
+        ("당기순이익", _format_money(analysis["net_income"]), "세후 최종손익", "orange"),
+    ]
+    for column, (label, value, note, tone) in zip(kpi_columns, kpi_items):
+        with column:
+            st.markdown(_metric_card(label, value, note, tone), unsafe_allow_html=True)
 
     st.markdown("### 기업 기본정보")
     base_df = pd.DataFrame(
@@ -731,31 +784,15 @@ def render_ai_consulting_report_page(
     )
 
     st.markdown("### 재무 진단")
-    f1, f2, f3 = st.columns(3)
-    f1.metric(
-        "영업이익률",
-        (
-            f"{analysis['operating_margin']:.1f}%"
-            if analysis["operating_margin"] is not None
-            else "-"
-        ),
-    )
-    f2.metric(
-        "순이익률",
-        (
-            f"{analysis['net_margin']:.1f}%"
-            if analysis["net_margin"] is not None
-            else "-"
-        ),
-    )
-    f3.metric(
-        "부채비율",
-        (
-            f"{analysis['debt_ratio']:.1f}%"
-            if analysis["debt_ratio"] is not None
-            else "-"
-        ),
-    )
+    ratio_items = [
+        ("영업이익률", f"{analysis['operating_margin']:.1f}%" if analysis["operating_margin"] is not None else "-", "매출 대비 영업이익", "green"),
+        ("순이익률", f"{analysis['net_margin']:.1f}%" if analysis["net_margin"] is not None else "-", "매출 대비 당기순이익", "blue"),
+        ("부채비율", f"{analysis['debt_ratio']:.1f}%" if analysis["debt_ratio"] is not None else "-", "자본 대비 부채", "red" if (analysis["debt_ratio"] or 0) >= 200 else "purple"),
+    ]
+    ratio_columns = st.columns(3, gap="medium")
+    for column, (label, value, note, tone) in zip(ratio_columns, ratio_items):
+        with column:
+            st.markdown(_metric_card(label, value, note, tone), unsafe_allow_html=True)
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -816,6 +853,17 @@ def render_ai_consulting_report_page(
                 "저장된 고객별 매칭키워드가 없습니다."
             )
 
+    logo_path = Path(__file__).resolve().parent / "assets" / "oasis_logo.png"
+    try:
+        pdf_bytes = build_representative_pdf(
+            analysis,
+            consultant_name=user_name,
+            logo_path=str(logo_path) if logo_path.exists() else None,
+        )
+    except Exception as exc:
+        pdf_bytes = b""
+        st.warning(f"PDF 생성 중 오류가 발생했습니다: {exc}")
+
     excel_bytes = build_consulting_excel_report(analysis)
     safe_company = re.sub(
         r'[\\/:*?"<>|]',
@@ -827,19 +875,36 @@ def render_ai_consulting_report_page(
         f"{datetime.now().strftime('%Y%m%d')}.xlsx"
     )
 
-    st.download_button(
-        "AI 컨설팅 리포트 엑셀 다운로드",
-        data=excel_bytes,
-        file_name=filename,
-        mime=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
-        type="primary",
-        use_container_width=True,
+    pdf_filename = (
+        f"오아시스_AI기업컨설팅보고서_{safe_company}_"
+        f"{datetime.now().strftime('%Y%m%d')}.pdf"
     )
+    download_columns = st.columns(2, gap="medium")
+    with download_columns[0]:
+        st.download_button(
+            "대표님용 PDF 보고서 다운로드",
+            data=pdf_bytes,
+            file_name=pdf_filename,
+            mime="application/pdf",
+            type="primary",
+            use_container_width=True,
+            disabled=not bool(pdf_bytes),
+            key=f"{key_prefix}_pdf_download",
+        )
+    with download_columns[1]:
+        st.download_button(
+            "내부 검토용 엑셀 다운로드",
+            data=excel_bytes,
+            file_name=filename,
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+            use_container_width=True,
+            key=f"{key_prefix}_excel_download",
+        )
 
     st.caption(
-        "본 리포트는 현재 저장된 기업정보를 바탕으로 만든 상담용 사전진단입니다. "
-        "정책자금 신청요건과 세무·주가평가는 기준일 자료를 추가 확인해야 합니다."
+        "화면은 영업사원의 상담 준비용이며, PDF는 대표님 제출용으로 내부 메모·상담질문을 제외해 구성됩니다. "
+        "최종 지원 가능 여부는 최신 공고와 증빙자료를 추가 확인해야 합니다."
     )

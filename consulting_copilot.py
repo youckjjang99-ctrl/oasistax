@@ -551,20 +551,36 @@ def render_copilot_page(
     top = recommendations[:5]
     st.markdown("### 이번 상담 우선순위")
 
-    columns = st.columns(min(len(top), 5))
+    st.markdown(
+        """
+        <style>
+        .copilot-priority-card {min-height:150px;padding:17px;border:1px solid #d9e3f0;border-radius:16px;background:linear-gradient(145deg,#ffffff,#f6f9fd);box-shadow:0 7px 20px rgba(15,42,80,.07);position:relative;overflow:hidden;margin-bottom:7px;}
+        .copilot-priority-card:before {content:"";position:absolute;left:0;top:0;right:0;height:4px;background:#1e5bd7;}
+        .copilot-priority-topic {font-weight:800;color:#344054;font-size:.88rem;margin-top:4px;min-height:42px;}
+        .copilot-priority-score {font-size:2rem;font-weight:900;color:#0b2b5b;letter-spacing:-.04em;margin:5px 0;}
+        .copilot-priority-note {font-size:.74rem;color:#667085;line-height:1.35;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    columns = st.columns(min(len(top), 5), gap="medium")
     for index, item in enumerate(top):
+        evidence = (
+            "근거: " + ", ".join(item["matched"][:3])
+            if item["matched"]
+            else "기본 확인 필요"
+        )
         with columns[index]:
-            st.metric(
-                item["topic"],
-                f"{item['score']}점",
+            st.markdown(
+                f"""
+                <div class="copilot-priority-card">
+                  <div class="copilot-priority-topic">{item['topic']}</div>
+                  <div class="copilot-priority-score">{item['score']}점</div>
+                  <div class="copilot-priority-note">{evidence}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
-            if item["matched"]:
-                st.caption(
-                    "근거: "
-                    + ", ".join(item["matched"][:3])
-                )
-            else:
-                st.caption("기본 확인 필요")
 
     (
         tab_report,
