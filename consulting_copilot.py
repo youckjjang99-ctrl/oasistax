@@ -592,24 +592,62 @@ def render_copilot_page(
 
     labels, row_map = build_customer_labels(customers)
 
-    prefill_business_no = str(
-        st.session_state.pop("_oasis_copilot_business_no", "")
-        or st.session_state.get(
+    explicit_business_no = str(
+        st.session_state.pop("_oasis_copilot_business_no", "") or ""
+    )
+    explicit_company_name = str(
+        st.session_state.pop("_oasis_copilot_company_name", "") or ""
+    )
+
+    active_business_no = str(
+        st.session_state.get(
             "_oasis_active_company_business_no",
             "",
         )
         or ""
     )
-    prefill_company_name = str(
-        st.session_state.pop("_oasis_copilot_company_name", "")
-        or st.session_state.get(
+    active_company_name = str(
+        st.session_state.get(
             "_oasis_active_company_name",
             "",
         )
         or ""
     )
-    if prefill_business_no or prefill_company_name:
-        normalized_prefill = re.sub(r"[^0-9]", "", prefill_business_no)
+
+    active_key = (
+        re.sub(r"[^0-9]", "", active_business_no)
+        or active_company_name.strip()
+    )
+    consumed_active_key = str(
+        st.session_state.get(
+            "_oasis_copilot_consumed_active_key",
+            "",
+        )
+        or ""
+    )
+
+    # Apply the enterprise-center selection only once.
+    # After the first handoff, the user can freely select another company
+    # inside AI Copilot without the value being overwritten on every rerun.
+    should_apply_handoff = bool(
+        explicit_business_no
+        or explicit_company_name
+        or (active_key and active_key != consumed_active_key)
+    )
+
+    if should_apply_handoff:
+        prefill_business_no = (
+            explicit_business_no or active_business_no
+        )
+        prefill_company_name = (
+            explicit_company_name or active_company_name
+        )
+        normalized_prefill = re.sub(
+            r"[^0-9]",
+            "",
+            prefill_business_no,
+        )
+
         for candidate_label, candidate_index in row_map.items():
             candidate = customers.loc[candidate_index]
             candidate_business = re.sub(
@@ -627,6 +665,11 @@ def render_copilot_page(
             ):
                 st.session_state["copilot_customer"] = candidate_label
                 break
+
+        if active_key:
+            st.session_state[
+                "_oasis_copilot_consumed_active_key"
+            ] = active_key
 
     if st.session_state.get("copilot_customer") not in labels:
         st.session_state.pop("copilot_customer", None)
