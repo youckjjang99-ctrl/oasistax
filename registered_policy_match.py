@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import shutil
 from datetime import datetime
@@ -21,7 +22,96 @@ def normalize_text(value: Any) -> str:
     return re.sub(r"\s+", "", str(value or "").strip()).lower()
 
 
-def load_registered_customers(cumulative_path: Path) -> pd.DataFrame:
+def _owner_user_id_from_cumulative_path(cumulative_path: Path) -> str:
+    """회원별 누적DB 경로에서 로그인 회원 ID를 복원한다."""
+    try:
+        return str(Path(cumulative_path).parent.name or "").strip()
+    except Exception:
+        return ""
+
+
+def _parse_customer_data(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
+    return {}
+
+
+def _load_registered_customers_from_cloud(
+    owner_user_id: str,
+) -> pd.DataFrame | None:
+    """
+    Supabase 연결 성공 시 해당 회원의 고객만 반환한다.
+
+    반환값이 None이면 Supabase 미설정 또는 조회 실패이므로 기존 엑셀을
+    예비 수단으로 사용한다. 빈 DataFrame은 조회는 성공했지만 해당 회원의
+    고객이 실제로 0명이라는 의미다.
+    """
+    if not owner_user_id:
+        return None
+
+    try:
+        from cloud_db import (
+            CloudDatabase,
+            TABLE_CUSTOMERS,
+            cloud_is_configured,
+        )
+
+        if not cloud_is_configured():
+            return None
+
+        rows = CloudDatabase().select(
+            TABLE_CUSTOMERS,
+            filters={"owner_user_id": owner_user_id},
+            order="company_name.asc",
+        )
+    except Exception:
+        return None
+
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        record = _parse_customer_data(row.get("customer_data"))
+        canonical_fields = {
+            "업체명": row.get("company_name"),
+            "대표자명": row.get("representative_name"),
+            "사업자등록번호": row.get("business_no"),
+            "업종명": row.get("industry_name"),
+            "사업장 소재지": row.get("address"),
+            "담당자": row.get("manager_name"),
+        }
+        for field, value in canonical_fields.items():
+            if value is not None and str(value).strip():
+                record[field] = value
+
+        records.append(record)
+
+    df = pd.DataFrame(records)
+    if df.empty:
+        return df
+
+    df = df.dropna(how="all").copy()
+    df.columns = [str(column).strip() for column in df.columns]
+    if "사업자등록번호" in df.columns:
+        df["사업자등록번호"] = df["사업자등록번호"].map(
+            normalize_business_no
+        )
+    return df.reset_index(drop=True)
+
+
+def _load_registered_customers_from_excel(
+    cumulative_path: Path,
+) -> pd.DataFrame:
     if not cumulative_path.exists():
         return pd.DataFrame()
 
@@ -35,7 +125,17 @@ def load_registered_customers(cumulative_path: Path) -> pd.DataFrame:
 
     df = df.dropna(how="all").copy()
     df.columns = [str(column).strip() for column in df.columns]
-    return df
+    return df.reset_index(drop=True)
+
+
+def load_registered_customers(cumulative_path: Path) -> pd.DataFrame:
+    owner_user_id = _owner_user_id_from_cumulative_path(cumulative_path)
+    cloud_df = _load_registered_customers_from_cloud(owner_user_id)
+
+    if cloud_df is not None:
+        return cloud_df
+
+    return _load_registered_customers_from_excel(cumulative_path)
 
 
 def build_customer_labels(df: pd.DataFrame) -> tuple[list[str], dict[str, int]]:
