@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import re
 from datetime import date, datetime
 from pathlib import Path
@@ -89,16 +88,14 @@ EMPLOYMENT_SUPPORT_CATALOG: list[dict[str, Any]] = [
         "id": "senior_continued",
         "category": "고령자",
         "name": "고령자 계속고용장려금",
-        "support": "정년연장·정년폐지·재고용으로 정년 도달자를 계속고용하면 수도권 월 30만원, 비수도권 월 40만원, 최대 3년",
+        "support": "정년연장·정년폐지·재고용으로 정년 도달자를 계속고용하면 1명당 분기 90만원, 비수도권 120만원, 최대 3년",
         "confirm": [
-            "계속고용제도 시행 전 정년제도를 1년 이상 운영했는지",
-            "취업규칙·단체협약에 정년연장·정년폐지·재고용 중 하나를 명시하고 신고했는지",
-            "60세 이상 피보험자 비율이 직전연도 기준 30%를 넘지 않는지",
-            "대상 근로자가 제도 시행일부터 5년 이내 종전 정년에 도달하는지",
-            "정년 도달일까지 해당 사업장 피보험기간이 계속 2년 이상인지",
-            "배우자·직계존비속, 일부 외국인, 월평균보수 124만원 미만 근로자 제외 여부",
+            "정년제도를 1년 이상 운영했는지",
+            "취업규칙·단체협약에 계속고용제도를 명시했는지",
+            "정년 도달자와 정년 전 피보험기간 요건",
+            "배우자·직계존비속·일부 외국인·저임금자 제외",
         ],
-        "source": "2026 고령자 계속고용장려금 가이드북·고용노동부 고시 제2025-115호",
+        "source": "2026 고용장려금 지원제도 Ⅴ",
     },
     {
         "id": "worklife_45",
@@ -329,234 +326,6 @@ def _score(item: dict[str, Any], metrics: dict[str, Any], settings: dict[str, An
     return {**item, "score": score, "grade": grade, "evidence": evidence}
 
 
-
-def _parse_date_value(value: Any) -> date | None:
-    if isinstance(value, date):
-        return value
-    text = str(value or "").strip()
-    if not text:
-        return None
-    try:
-        return datetime.strptime(text[:10], "%Y-%m-%d").date()
-    except Exception:
-        return None
-
-
-def _continued_employment_diagnosis(
-    metrics: dict[str, Any],
-    settings: dict[str, Any],
-) -> dict[str, Any]:
-    region = settings.get("region_type", "확인필요")
-    system_type = settings.get("continued_system_type", "미확인")
-    retirement_start = _parse_date_value(settings.get("retirement_system_start_date"))
-    continued_start = _parse_date_value(settings.get("continued_system_effective_date"))
-    today = date.today()
-
-    checks: list[dict[str, str]] = []
-
-    def add_check(title: str, status: str, detail: str, action: str) -> None:
-        checks.append({
-            "요건": title,
-            "판정": status,
-            "현재상태": detail,
-            "실행조치": action,
-        })
-
-    if retirement_start and continued_start:
-        days = (continued_start - retirement_start).days
-        if days >= 365:
-            add_check("정년제도 1년 이상 운영", "충족", f"약 {days // 30}개월 운영", "기존 취업규칙·인사규정과 신고 접수증을 보관합니다.")
-        else:
-            add_check("정년제도 1년 이상 운영", "미충족", f"약 {max(days, 0) // 30}개월 운영", "1년 운영기간을 채운 뒤 계속고용제도를 시행하도록 일정 재설계가 필요합니다.")
-    elif retirement_start:
-        operated_days = (today - retirement_start).days
-        status = "충족" if operated_days >= 365 else "미충족"
-        add_check("정년제도 1년 이상 운영", status, f"현재까지 약 {max(operated_days, 0) // 30}개월 운영", "계속고용제도 시행 예정일을 입력해 정확한 선후관계를 확인합니다.")
-    else:
-        add_check("정년제도 1년 이상 운영", "확인필요", "정년 규정 시행일 미입력", "취업규칙·단체협약·인사규정에서 기존 정년 시행일을 확인합니다.")
-
-    if system_type in {"정년 연장", "정년 폐지", "재고용"}:
-        add_check("계속고용제도 유형", "충족", system_type, "선택한 유형에 맞춰 취업규칙 문구와 근로계약을 일치시킵니다.")
-    else:
-        add_check("계속고용제도 유형", "확인필요", "유형 미선택", "정년 연장·정년 폐지·퇴직 후 6개월 이내 재고용 중 하나를 결정합니다.")
-
-    rules_reported = settings.get("continued_work_rules_reported")
-    if rules_reported is True:
-        add_check("취업규칙 명시·신고", "충족", "명시 및 신고 완료", "변경 전후 취업규칙과 신고 접수증을 신청서류에 첨부합니다.")
-    elif rules_reported is False:
-        add_check("취업규칙 명시·신고", "미충족", "미완료", "노사 의견청취 후 취업규칙을 변경하고 관할 지방노동관서에 신고합니다.")
-    else:
-        add_check("취업규칙 명시·신고", "확인필요", "확인되지 않음", "변경 취업규칙, 근로자 의견서, 신고 접수증 존재 여부를 확인합니다.")
-
-    ratio_under = settings.get("senior_insured_ratio_under_30")
-    if ratio_under is True:
-        add_check("60세 이상 피보험자 비율 30% 이하", "충족", "30% 이하 확인", "직전연도 매월 말 피보험자 명부와 산정표를 보관합니다.")
-    elif ratio_under is False:
-        add_check("60세 이상 피보험자 비율 30% 이하", "미충족", "30% 초과", "계속고용장려금 대상 제외 가능성이 높으므로 고령자 고용지원금 등 대안을 검토합니다.")
-    else:
-        add_check("60세 이상 피보험자 비율 30% 이하", "확인필요", "비율 미산정", "직전연도 매월 말 전체 피보험자와 60세 이상 피보험자 수를 산정합니다.")
-
-    employee_tenure = settings.get("continued_target_tenure_2y")
-    add_check(
-        "대상자 정년 전 피보험기간 2년 이상",
-        "충족" if employee_tenure is True else "미충족" if employee_tenure is False else "확인필요",
-        "확인 완료" if employee_tenure is True else "2년 미만" if employee_tenure is False else "대상자별 미확인",
-        "고용보험 자격이력과 근로자별 입사일을 확인합니다.",
-    )
-
-    exclusions_ok = settings.get("continued_exclusions_clear")
-    add_check(
-        "지원 제외 근로자 해당 없음",
-        "충족" if exclusions_ok is True else "미충족" if exclusions_ok is False else "확인필요",
-        "제외사유 없음" if exclusions_ok is True else "제외사유 존재" if exclusions_ok is False else "미확인",
-        "대표자 가족관계, 국적·체류자격, 월평균보수 124만원 이상 여부를 대상자별로 점검합니다.",
-    )
-
-    eligible_count = max(0, int(settings.get("continued_target_count", 0) or 0))
-    active_count = max(0, int(metrics.get("active_count", 0) or 0))
-    if active_count < 10:
-        headcount_cap = 3
-    else:
-        headcount_cap = min(30, math.floor(active_count * 0.3))
-    estimated_supported_count = min(eligible_count, headcount_cap) if eligible_count else 0
-    monthly_rate = 400_000 if region == "비수도권" else 300_000
-    months = max(1, min(36, int(settings.get("continued_support_months", 36) or 36)))
-    estimated_total = estimated_supported_count * monthly_rate * months
-    estimated_quarter = estimated_supported_count * monthly_rate * 3
-
-    failed = [row for row in checks if row["판정"] == "미충족"]
-    unknown = [row for row in checks if row["판정"] == "확인필요"]
-    readiness = max(0, round((len(checks) - len(failed) - len(unknown) * 0.5) / len(checks) * 100))
-    overall = "진행 가능" if not failed and not unknown else "조건 보완 후 진행" if not failed else "현재 신청 곤란"
-
-    action_plan = [
-        {
-            "단계": "1. 기초요건 진단",
-            "시점": "즉시",
-            "담당": "영업사원 + 인사담당자",
-            "실행내용": "기존 정년 시행일, 60세 이상 피보험자 비율, 대상자의 근속·가족관계·보수 요건을 확정합니다.",
-            "필요자료": "기존 취업규칙, 고용보험 사업장 명부, 대상자 자격이력, 임금대장",
-        },
-        {
-            "단계": "2. 계속고용 방식 결정",
-            "시점": "제도 시행 전",
-            "담당": "대표자 + 인사·노무 담당",
-            "실행내용": "정년 연장, 정년 폐지, 재고용 중 인력운영에 적합한 유형을 선택하고 시행일을 정합니다.",
-            "필요자료": "대상자별 정년 예정일, 인력계획, 임금·직무 설계안",
-        },
-        {
-            "단계": "3. 취업규칙 변경·신고",
-            "시점": "계속고용 시행 전",
-            "담당": "인사담당자 또는 노무사",
-            "실행내용": "계속고용 유형과 시행일을 취업규칙 또는 단체협약에 명시하고 근로자 의견청취 후 신고합니다.",
-            "필요자료": "변경 전후 취업규칙, 근로자 의견서, 신고서 및 접수증",
-        },
-        {
-            "단계": "4. 대상자 계속고용 실행",
-            "시점": "정년 도달 시",
-            "담당": "인사담당자",
-            "실행내용": "재고용형은 퇴직 후 6개월 이내 1년 이상 근로계약을 체결하고, 연장형은 변경된 정년까지 고용을 유지합니다.",
-            "필요자료": "근로계약서, 급여대장, 출근부, 고용보험 자격취득·상실 자료",
-        },
-        {
-            "단계": "5. 분기별 장려금 신청",
-            "시점": "지원대상 근로자 발생 후 분기별",
-            "담당": "사업주 또는 위임받은 담당자",
-            "실행내용": "고용24 또는 관할 고용센터를 통해 신청하고 대상자 명부와 증빙을 제출합니다.",
-            "필요자료": "신청서, 계속고용 명부, 취업규칙, 근로계약서, 임금대장, 사업주 명의 통장",
-        },
-        {
-            "단계": "6. 사후관리",
-            "시점": "지급기간 최대 3년",
-            "담당": "인사담당자",
-            "실행내용": "퇴사·임금변경·근로시간 변경과 다른 지원금 중복 여부를 분기마다 점검합니다.",
-            "필요자료": "분기별 피보험자 현황, 임금대장, 다른 장려금 수급내역",
-        },
-    ]
-
-    return {
-        "checks": checks,
-        "readiness": readiness,
-        "overall": overall,
-        "failed_count": len(failed),
-        "unknown_count": len(unknown),
-        "headcount_cap": headcount_cap,
-        "eligible_count": eligible_count,
-        "supported_count": estimated_supported_count,
-        "monthly_rate": monthly_rate,
-        "months": months,
-        "estimated_quarter": estimated_quarter,
-        "estimated_total": estimated_total,
-        "action_plan": action_plan,
-    }
-
-
-def _render_continued_employment_execution_plan(
-    business_no: str,
-    metrics: dict[str, Any],
-    settings: dict[str, Any],
-) -> None:
-    diagnosis = _continued_employment_diagnosis(metrics, settings)
-    st.markdown("##### 고령자 계속고용장려금 실행계획")
-    st.caption("2026년 가이드북 기준으로 지원 가능성과 실제 실행 순서를 함께 보여줍니다.")
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("신청 준비도", f"{diagnosis['readiness']}%")
-    m2.metric("종합판정", diagnosis["overall"])
-    m3.metric("예상 지원인원", f"{diagnosis['supported_count']}명", help=f"현재 피보험자 수 기준 추정 한도 {diagnosis['headcount_cap']}명")
-    m4.metric("예상 총지원", f"{diagnosis['estimated_total']:,}원", help=f"월 {diagnosis['monthly_rate']:,}원 × {diagnosis['months']}개월 기준")
-
-    if diagnosis["failed_count"]:
-        st.error(f"미충족 요건 {diagnosis['failed_count']}개가 있어 현재 상태로는 신청이 어렵습니다. 아래 실행조치를 먼저 처리하세요.")
-    elif diagnosis["unknown_count"]:
-        st.warning(f"확인이 필요한 요건 {diagnosis['unknown_count']}개가 있습니다. 서류 확인 후 최종 판정해야 합니다.")
-    else:
-        st.success("입력된 정보 기준으로 핵심요건을 충족합니다. 대상자별 증빙과 신청기한을 최종 확인하세요.")
-
-    st.dataframe(pd.DataFrame(diagnosis["checks"]), hide_index=True, use_container_width=True)
-
-    if diagnosis["supported_count"]:
-        st.info(
-            f"예상 분기 지원액은 약 {diagnosis['estimated_quarter']:,}원이며, "
-            f"최대 {diagnosis['months']}개월 기준 총 {diagnosis['estimated_total']:,}원입니다. "
-            "실제 금액은 월 중 입·퇴사, 분기별 피보험자 수와 지원한도에 따라 달라질 수 있습니다."
-        )
-
-    with st.expander("구체적인 6단계 실행 로드맵", expanded=True):
-        for row in diagnosis["action_plan"]:
-            st.markdown(f"**{row['단계']} · {row['시점']}**")
-            st.write(f"- 담당: {row['담당']}")
-            st.write(f"- 실행: {row['실행내용']}")
-            st.write(f"- 준비자료: {row['필요자료']}")
-
-    with st.expander("대표님·인사담당자에게 확인할 질문", expanded=False):
-        questions = [
-            "현재 취업규칙에 정년이 몇 세로 규정되어 있고, 그 규정은 언제부터 시행됐나요?",
-            "향후 1~3년 안에 정년에 도달하는 직원은 몇 명인가요?",
-            "정년 연장, 정년 폐지, 퇴직 후 재고용 중 어떤 방식이 회사 운영에 적합한가요?",
-            "대상자는 현재 회사에서 고용보험 피보험기간이 계속 2년 이상인가요?",
-            "직전연도 기준 60세 이상 피보험자 비율이 30% 이하인가요?",
-            "대상자 중 대표자의 배우자·직계존비속 또는 지원 제외 외국인이 있나요?",
-            "재고용형이라면 퇴직 후 6개월 이내, 1년 이상 계약이 가능한가요?",
-        ]
-        for q in questions:
-            st.write(f"- {q}")
-
-    with st.expander("신청 전 최종 서류 체크리스트", expanded=False):
-        docs = [
-            "변경 전·후 취업규칙 또는 단체협약",
-            "취업규칙 변경 신고서와 접수증",
-            "근로자 의견청취서 또는 노사합의 자료",
-            "대상자별 고용보험 자격이력과 정년 도달일 자료",
-            "재고용 근로계약서 또는 정년 연장 적용 자료",
-            "최근 임금대장·급여이체내역·근태자료",
-            "직전연도 월별 전체·60세 이상 피보험자 산정표",
-            "사업주 또는 법인 명의 통장 사본",
-            "다른 고용장려금 수급내역 및 중복지원 검토표",
-        ]
-        for doc in docs:
-            st.write(f"- □ {doc}")
-
 def render_employment_support_analysis(
     user_id: str,
     business_no: str,
@@ -606,87 +375,6 @@ def render_employment_support_analysis(
             workplace_nursery = st.checkbox("직장어린이집 설치·운영", value=bool(current.get("workplace_nursery")), key=f"emp_nursery_{business_no}")
             regional_move_invest = st.checkbox("고용위기지역 이전·신설·증설", value=bool(current.get("regional_move_invest")), key=f"emp_regionmove_{business_no}")
 
-
-        st.markdown("##### 고령자 계속고용장려금 상세 진단")
-        st.caption("정년제도·취업규칙·대상자 요건을 입력하면 예상 지원금과 실행계획을 자동 생성합니다.")
-        d1, d2 = st.columns(2)
-        with d1:
-            system_options = ["미확인", "정년 연장", "정년 폐지", "재고용"]
-            saved_type = current.get("continued_system_type", "미확인")
-            continued_system_type = st.selectbox(
-                "계속고용제도 유형",
-                system_options,
-                index=system_options.index(saved_type) if saved_type in system_options else 0,
-                key=f"emp_cont_type_{business_no}",
-            )
-            retirement_default = _parse_date_value(current.get("retirement_system_start_date")) or date.today()
-            retirement_system_start_date = st.date_input(
-                "기존 정년제도 시행일",
-                value=retirement_default,
-                key=f"emp_retirement_start_{business_no}",
-            )
-            continued_default = _parse_date_value(current.get("continued_system_effective_date")) or date.today()
-            continued_system_effective_date = st.date_input(
-                "계속고용제도 시행일 또는 예정일",
-                value=continued_default,
-                key=f"emp_cont_start_{business_no}",
-            )
-            report_options = ["확인필요", "완료", "미완료"]
-            saved_report = current.get("continued_work_rules_reported")
-            report_label = "완료" if saved_report is True else "미완료" if saved_report is False else "확인필요"
-            report_choice = st.radio(
-                "취업규칙 명시·신고",
-                report_options,
-                index=report_options.index(report_label),
-                horizontal=True,
-                key=f"emp_rules_report_{business_no}",
-            )
-            continued_work_rules_reported = True if report_choice == "완료" else False if report_choice == "미완료" else None
-        with d2:
-            ratio_options = ["확인필요", "30% 이하", "30% 초과"]
-            saved_ratio = current.get("senior_insured_ratio_under_30")
-            ratio_label = "30% 이하" if saved_ratio is True else "30% 초과" if saved_ratio is False else "확인필요"
-            ratio_choice = st.radio(
-                "직전연도 60세 이상 피보험자 비율",
-                ratio_options,
-                index=ratio_options.index(ratio_label),
-                horizontal=True,
-                key=f"emp_senior_ratio_{business_no}",
-            )
-            senior_insured_ratio_under_30 = True if ratio_choice == "30% 이하" else False if ratio_choice == "30% 초과" else None
-            continued_target_count = st.number_input(
-                "예상 지원대상 근로자 수",
-                min_value=0,
-                max_value=100,
-                value=int(current.get("continued_target_count", 0) or 0),
-                step=1,
-                key=f"emp_cont_count_{business_no}",
-            )
-            continued_support_months = st.number_input(
-                "예상 지원개월",
-                min_value=1,
-                max_value=36,
-                value=int(current.get("continued_support_months", 36) or 36),
-                step=1,
-                key=f"emp_cont_months_{business_no}",
-            )
-            tenure_choice = st.radio(
-                "대상자 정년 전 피보험기간 2년 이상",
-                ["확인필요", "예", "아니오"],
-                index=1 if current.get("continued_target_tenure_2y") is True else 2 if current.get("continued_target_tenure_2y") is False else 0,
-                horizontal=True,
-                key=f"emp_cont_tenure_{business_no}",
-            )
-            continued_target_tenure_2y = True if tenure_choice == "예" else False if tenure_choice == "아니오" else None
-            exclusion_choice = st.radio(
-                "가족·국적·저임금 등 제외사유 없음",
-                ["확인필요", "예", "아니오"],
-                index=1 if current.get("continued_exclusions_clear") is True else 2 if current.get("continued_exclusions_clear") is False else 0,
-                horizontal=True,
-                key=f"emp_cont_exclusion_{business_no}",
-            )
-            continued_exclusions_clear = True if exclusion_choice == "예" else False if exclusion_choice == "아니오" else None
-
         settings = {
             "region_type": region_type,
             "planned_youth_hire": planned_youth_hire,
@@ -702,15 +390,6 @@ def render_employment_support_analysis(
             "unpaid_leave": unpaid_leave,
             "workplace_nursery": workplace_nursery,
             "regional_move_invest": regional_move_invest,
-            "continued_system_type": continued_system_type,
-            "retirement_system_start_date": retirement_system_start_date.isoformat(),
-            "continued_system_effective_date": continued_system_effective_date.isoformat(),
-            "continued_work_rules_reported": continued_work_rules_reported,
-            "senior_insured_ratio_under_30": senior_insured_ratio_under_30,
-            "continued_target_count": int(continued_target_count),
-            "continued_support_months": int(continued_support_months),
-            "continued_target_tenure_2y": continued_target_tenure_2y,
-            "continued_exclusions_clear": continued_exclusions_clear,
         }
         if st.button("추가조건 저장 후 다시 분석", type="primary", use_container_width=True, key=f"emp_save_{business_no}"):
             _save_settings(user_id, business_no, company_name, settings)
@@ -718,9 +397,6 @@ def render_employment_support_analysis(
             st.rerun()
 
     settings = _load_settings(user_id, business_no, company_name)
-    if settings.get("continued_employment_system") or settings.get("continued_system_type") not in {None, "", "미확인"}:
-        _render_continued_employment_execution_plan(business_no, metrics, settings)
-
     results = sorted(
         [_score(item, metrics, settings) for item in EMPLOYMENT_SUPPORT_CATALOG],
         key=lambda item: item["score"],
