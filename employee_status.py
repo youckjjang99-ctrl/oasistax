@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
+import os
 import re
 from datetime import date, datetime
 from pathlib import Path
@@ -13,6 +15,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import pytesseract
+import requests
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 from cloud_db import CloudDatabase, cloud_is_configured
@@ -21,6 +24,361 @@ from document_preprocessor import preprocess_document
 from utils import get_user_dirs
 
 TABLE_EMPLOYEE_ROSTERS = "oasis_employee_rosters"
+
+DEFAULT_ROSTER_VISION_MODEL = "gpt-5-mini"
+VISION_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
+
+
+def _read_secret(name: str, default: str = "") -> str:
+    value = os.environ.get(name, "")
+    if value:
+        return value.strip()
+    try:
+        if name in st.secrets:
+            return str(st.secrets[name]).strip()
+    except Exception:
+        pass
+    return default
+
+
+def _extract_response_text(response_data: dict[str, Any]) -> str:
+    direct = response_data.get("output_text")
+    if isinstance(direct, str):
+        return direct.strip()
+
+    values: list[str] = []
+    for output in response_data.get("output", []) or []:
+        if not isinstance(output, dict):
+            continue
+        for content in output.get("content", []) or []:
+            if not isinstance(content, dict):
+                continue
+            value = content.get("text")
+            if isinstance(value, str):
+                values.append(value)
+    return "\n".join(values).strip()
+
+
+def _vision_image_data_url(filename: str, data: bytes) -> str:
+    image = Image.open(io.BytesIO(data))
+    image = ImageOps.exif_transpose(image).convert("RGB")
+
+    maximum = max(image.size)
+    if maximum > 2400:
+        ratio = 2400 / maximum
+        image = image.resize(
+            (
+                max(1, int(image.width * ratio)),
+                max(1, int(image.height * ratio)),
+            ),
+            Image.Resampling.LANCZOS,
+        )
+
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=92, optimize=True)
+    encoded = base64.b64encode(output.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def _roster_vision_schema() -> dict[str, Any]:
+    employee_properties = {
+        "sequence": {"type": "integer"},
+        "name": {"type": "string"},
+        "birth_six": {"type": "string"},
+        "national_pension_date": {"type": "string"},
+        "health_insurance_date": {"type": "string"},
+        "industrial_accident_date": {"type": "string"},
+        "employment_insurance_date": {"type": "string"},
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "document_type": {
+                "type": "string",
+                "enum": [
+                    "four_insurance_roster",
+                    "non_roster",
+                    "mixed",
+                ],
+            },
+            "expected_employee_count": {"type": "integer"},
+            "employees": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": employee_properties,
+                    "required": list(employee_properties),
+                },
+            },
+            "ignored_pages": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "notes": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": [
+            "document_type",
+            "expected_employee_count",
+            "employees",
+            "ignored_pages",
+            "notes",
+        ],
+    }
+
+
+def _extract_roster_with_ai_vision(
+    image_files: list[tuple[str, bytes]],
+) -> dict[str, Any]:
+    api_key = _read_secret("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY가 설정되지 않아 AI 비전 분석을 사용할 수 없습니다."
+        )
+
+    content: list[dict[str, Any]] = [
+        {
+            "type": "input_text",
+            "text": (
+                "첨부 이미지는 한국의 '4대 사회보험 사업장 가입자 명부'입니다. "
+                "표의 각 직원 행을 정확히 읽으세요. 문서가 90도 또는 180도 "
+                "회전되어 있어도 올바르게 해석하세요. 안내문이나 도장만 있는 "
+                "페이지, '이하 여백' 페이지는 직원 행으로 만들지 마세요. "
+                "연번이 있는 실제 가입내역 표에서만 직원을 추출하세요. "
+                "성명은 반드시 '성명' 열의 한글 이름만 사용하세요. "
+                "주민등록번호는 앞 6자리만 birth_six에 기록하고 뒷자리는 "
+                "절대 출력하지 마세요. 날짜가 '-'이면 빈 문자열로 기록하세요. "
+                "날짜는 YYYY-MM-DD 형식으로 통일하세요. expected_employee_count는 "
+                "가입내역 표의 연번 범위와 실제 행 수를 근거로 정하세요. "
+                "같은 명부의 여러 페이지가 포함되면 중복 직원은 한 번만 출력하세요."
+            ),
+        }
+    ]
+
+    for index, (filename, data) in enumerate(image_files, start=1):
+        content.append(
+            {
+                "type": "input_text",
+                "text": f"이미지 {index}: {filename}",
+            }
+        )
+        content.append(
+            {
+                "type": "input_image",
+                "image_url": _vision_image_data_url(filename, data),
+                "detail": "high",
+            }
+        )
+
+    payload = {
+        "model": _read_secret(
+            "OPENAI_ROSTER_VISION_MODEL",
+            DEFAULT_ROSTER_VISION_MODEL,
+        ),
+        "input": [
+            {
+                "role": "user",
+                "content": content,
+            }
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "four_insurance_roster",
+                "description": (
+                    "4대 사회보험 사업장 가입자 명부의 직원 행 추출 결과"
+                ),
+                "strict": True,
+                "schema": _roster_vision_schema(),
+            }
+        },
+        "max_output_tokens": 8000,
+    }
+
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=240,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"AI 비전 연결 실패: {exc}") from exc
+
+    if not response.ok:
+        raise RuntimeError(
+            f"AI 비전 분석 실패(HTTP {response.status_code}): "
+            f"{response.text[:1000]}"
+        )
+
+    response_data = response.json()
+    result_text = _extract_response_text(response_data)
+    if not result_text:
+        raise RuntimeError("AI 비전 분석 결과가 비어 있습니다.")
+
+    try:
+        result = json.loads(result_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "AI 비전 분석 결과 JSON을 해석하지 못했습니다."
+        ) from exc
+
+    if not isinstance(result, dict):
+        raise RuntimeError("AI 비전 분석 결과 형식이 올바르지 않습니다.")
+    return result
+
+
+def _clean_review_name(value: Any) -> str:
+    return re.sub(r"[^가-힣]", "", str(value or "").strip())
+
+
+def _clean_birth_six(value: Any) -> str:
+    digits = re.sub(r"[^0-9]", "", str(value or ""))
+    return digits[:6] if len(digits) >= 6 else ""
+
+
+def _review_date(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or text in {"-", "없음", "해당없음"}:
+        return ""
+    return _parse_date(text)
+
+
+def _vision_result_to_review_rows(
+    result: dict[str, Any],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for index, item in enumerate(result.get("employees", []) or [], start=1):
+        if not isinstance(item, dict):
+            continue
+        name = _clean_review_name(item.get("name", ""))
+        birth_six = _clean_birth_six(item.get("birth_six", ""))
+        identity = f"{name}|{birth_six}"
+        if not name or identity in seen:
+            continue
+        seen.add(identity)
+
+        sequence = item.get("sequence", index)
+        try:
+            sequence = int(sequence)
+        except (TypeError, ValueError):
+            sequence = index
+
+        rows.append(
+            {
+                "포함": True,
+                "연번": sequence,
+                "성명": name,
+                "생년월일6자리": birth_six,
+                "국민연금": _review_date(
+                    item.get("national_pension_date", "")
+                ),
+                "건강보험": _review_date(
+                    item.get("health_insurance_date", "")
+                ),
+                "산재보험": _review_date(
+                    item.get("industrial_accident_date", "")
+                ),
+                "고용보험": _review_date(
+                    item.get("employment_insurance_date", "")
+                ),
+            }
+        )
+
+    rows.sort(key=lambda row: int(row.get("연번", 0) or 0))
+    return rows
+
+
+def _employees_to_review_rows(
+    employees: list[dict[str, Any]],
+    start_sequence: int = 1,
+) -> list[dict[str, Any]]:
+    rows = []
+    for offset, employee in enumerate(employees):
+        rows.append(
+            {
+                "포함": True,
+                "연번": start_sequence + offset,
+                "성명": employee.get("name_masked", ""),
+                "생년월일6자리": (
+                    str(employee.get("birth_year", "")) + "0101"
+                    if employee.get("birth_year")
+                    else ""
+                ),
+                "국민연금": "",
+                "건강보험": employee.get("acquisition_date", ""),
+                "산재보험": "",
+                "고용보험": "",
+            }
+        )
+    return rows
+
+
+def _review_rows_to_employees(
+    review_df: pd.DataFrame,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    employees: list[dict[str, Any]] = []
+    errors: list[str] = []
+    seen: set[str] = set()
+
+    if review_df is None or review_df.empty:
+        return [], ["검수표에 직원이 없습니다."]
+
+    for row_index, row in review_df.iterrows():
+        if not bool(row.get("포함", True)):
+            continue
+
+        sequence = row.get("연번", row_index + 1)
+        name = _clean_review_name(row.get("성명", ""))
+        birth_six = _clean_birth_six(row.get("생년월일6자리", ""))
+        dates = [
+            _review_date(row.get(column, ""))
+            for column in ["국민연금", "건강보험", "산재보험", "고용보험"]
+        ]
+        dates = [value for value in dates if value]
+
+        if not (2 <= len(name) <= 5):
+            errors.append(f"{sequence}번: 성명을 확인해주세요.")
+            continue
+        if len(birth_six) != 6:
+            errors.append(f"{sequence}번 {name}: 생년월일 6자리를 확인해주세요.")
+            continue
+        if not dates:
+            errors.append(f"{sequence}번 {name}: 자격취득일을 하나 이상 입력해주세요.")
+            continue
+
+        identity = f"{name}|{birth_six}"
+        if identity in seen:
+            continue
+        seen.add(identity)
+
+        employee = _normalize_employee(
+            name,
+            birth_six,
+            min(dates),
+            "",
+            "가입중",
+            ", ".join(
+                column
+                for column in ["국민연금", "건강보험", "산재보험", "고용보험"]
+                if _review_date(row.get(column, ""))
+            ),
+        )
+        if employee:
+            employee["source_dates"] = sorted(dates)
+            employees.append(employee)
+
+    return employees, errors
+
 
 COLUMN_ALIASES = {
     "name": [
@@ -1379,10 +1737,18 @@ def render_employee_status(
 ) -> None:
     st.markdown("#### 직원현황")
     st.caption(
-        "XLSX·CSV·PDF·JPG·JPEG·PNG 파일을 여러 개 동시에 업로드할 수 있습니다. "
-        "여러 페이지·파일에서 확인된 직원은 하나의 명부로 합치고 중복을 제거합니다. "
-        "4대보험 가입자명부의 주민등록번호는 저장하지 않으며, "
-        "직원명은 마스킹하고 생년·자격취득일·근속기간만 고용지원금 매칭에 활용합니다."
+        "가입자명부 이미지는 AI 비전으로 표 전체를 분석한 뒤, "
+        "편집 가능한 검수표에서 확인한 내용만 저장합니다. "
+        "주민등록번호 뒷자리는 AI에 출력하도록 요청하지 않으며 저장하지 않습니다."
+    )
+    st.info(
+        "JPG·JPEG·PNG 이미지는 OpenAI API로 전송되어 분석됩니다. "
+        "검수 완료 버튼을 누르기 전에는 직원현황과 Supabase에 저장되지 않습니다."
+    )
+
+    state_key = (
+        f"employee_roster_review_"
+        f"{_company_key(business_no, company_name)}"
     )
 
     uploaded_files = st.file_uploader(
@@ -1391,183 +1757,282 @@ def render_employee_status(
         accept_multiple_files=True,
         key=f"employee_roster_upload_{business_no or company_name}",
         help=(
-            "가입자명부가 여러 장이면 모든 이미지 또는 파일을 함께 선택하세요. "
-            "분석 후 직원정보를 하나로 합칩니다."
+            "가입내역 페이지와 안내 페이지를 함께 올려도 됩니다. "
+            "AI가 직원 행이 없는 안내 페이지는 제외합니다."
         ),
     )
 
     if uploaded_files and st.button(
-        "선택한 파일 전체 분석·저장",
+        "AI 비전 분석 후 검수표 만들기",
         type="primary",
         use_container_width=True,
         key=f"employee_roster_analyze_{business_no or company_name}",
     ):
-        total_files = len(uploaded_files)
-        progress = st.progress(
-            0,
-            text=f"가입자명부 {total_files}개 파일을 확인하고 있습니다.",
-        )
-
-        merged_employees: dict[str, dict[str, Any]] = {}
+        progress = st.progress(0, text="가입자명부 분석을 준비하고 있습니다.")
+        image_files: list[tuple[str, bytes]] = []
+        conventional_rows: list[dict[str, Any]] = []
         parse_files: list[dict[str, Any]] = []
-        failed_files: list[dict[str, str]] = []
+        failures: list[dict[str, str]] = []
 
-        for file_index, uploaded in enumerate(uploaded_files):
-            file_base = file_index / max(total_files, 1)
-            file_share = 1 / max(total_files, 1)
-
-            def update_progress(
-                current: int,
-                total: int,
-                message: str = "",
-                *,
-                _base: float = file_base,
-                _share: float = file_share,
-                _name: str = uploaded.name,
-                _index: int = file_index,
-            ) -> None:
-                inner_ratio = min(
-                    max(current / max(total, 1), 0.0),
-                    1.0,
-                )
-                overall = min(_base + inner_ratio * _share, 1.0)
-                progress.progress(
-                    overall,
-                    text=(
-                        f"{_index + 1}/{total_files} {_name} · "
-                        f"{message or '직원명부 분석 중'}"
-                    ),
-                )
-
+        for uploaded in uploaded_files:
+            suffix = Path(uploaded.name).suffix.lower()
+            data = uploaded.getvalue()
+            if suffix in VISION_IMAGE_SUFFIXES:
+                image_files.append((uploaded.name, data))
+                continue
             try:
                 employees, parse_info = parse_roster(
                     uploaded.name,
-                    uploaded.getvalue(),
-                    progress_callback=update_progress,
+                    data,
                 )
-                if not employees:
-                    raise ValueError(
-                        "성명·자격취득일이 표시된 직원 행을 찾지 못했습니다."
+                conventional_rows.extend(
+                    _employees_to_review_rows(
+                        employees,
+                        start_sequence=len(conventional_rows) + 1,
                     )
-
-                for employee in employees:
-                    employee_id = str(
-                        employee.get("employee_id", "")
-                    ).strip()
-                    if not employee_id:
-                        continue
-                    merged_employees[employee_id] = employee
-
+                )
                 parse_files.append(
                     {
                         "filename": uploaded.name,
+                        "method": parse_info.get("method", ""),
                         "employee_count": len(employees),
                         "status": "success",
-                        "parse_info": parse_info,
                     }
-                )
-                progress.progress(
-                    min((file_index + 1) / total_files, 1.0),
-                    text=(
-                        f"{file_index + 1}/{total_files} "
-                        f"{uploaded.name} 분석 완료"
-                    ),
                 )
             except Exception as exc:
-                failed_files.append(
+                failures.append(
                     {
                         "filename": uploaded.name,
                         "error": str(exc),
                     }
-                )
-                parse_files.append(
-                    {
-                        "filename": uploaded.name,
-                        "employee_count": 0,
-                        "status": "failed",
-                        "error": str(exc),
-                    }
-                )
-                progress.progress(
-                    min((file_index + 1) / total_files, 1.0),
-                    text=(
-                        f"{file_index + 1}/{total_files} "
-                        f"{uploaded.name} 분석 실패 · 다음 파일 계속"
-                    ),
                 )
 
-        employees = list(merged_employees.values())
-        if not employees:
-            st.error(
-                "선택한 파일에서 직원정보를 찾지 못했습니다. "
-                "Railway에 Tesseract 한국어 OCR이 설치된 새 배포인지 확인하고, "
-                "문서가 선명하고 표 전체가 보이는지 확인해주세요."
+        vision_result: dict[str, Any] = {}
+        vision_rows: list[dict[str, Any]] = []
+        if image_files:
+            progress.progress(
+                0.25,
+                text=f"이미지 {len(image_files)}장을 AI 비전으로 분석하고 있습니다.",
             )
-            for failure in failed_files:
+            try:
+                vision_result = _extract_roster_with_ai_vision(image_files)
+                vision_rows = _vision_result_to_review_rows(vision_result)
+                parse_files.extend(
+                    {
+                        "filename": filename,
+                        "method": "openai_vision_structured",
+                        "status": "success",
+                    }
+                    for filename, _ in image_files
+                )
+            except Exception as vision_exc:
+                st.warning(
+                    f"AI 비전 분석에 실패해 기존 OCR로 보조 분석합니다: "
+                    f"{vision_exc}"
+                )
+                for filename, data in image_files:
+                    try:
+                        employees, parse_info = parse_roster(filename, data)
+                        vision_rows.extend(
+                            _employees_to_review_rows(
+                                employees,
+                                start_sequence=len(vision_rows) + 1,
+                            )
+                        )
+                        parse_files.append(
+                            {
+                                "filename": filename,
+                                "method": "ocr_fallback",
+                                "employee_count": len(employees),
+                                "status": "fallback",
+                                "parse_info": parse_info,
+                            }
+                        )
+                    except Exception as exc:
+                        failures.append(
+                            {
+                                "filename": filename,
+                                "error": str(exc),
+                            }
+                        )
+
+        all_rows = [*vision_rows, *conventional_rows]
+        deduped_rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in all_rows:
+            identity = (
+                f"{_clean_review_name(row.get('성명', ''))}|"
+                f"{_clean_birth_six(row.get('생년월일6자리', ''))}"
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            deduped_rows.append(row)
+
+        if not deduped_rows:
+            progress.empty()
+            st.error("직원행을 만들지 못했습니다.")
+            for failure in failures:
                 st.caption(
-                    f"실패: {failure['filename']} · {failure['error']}"
+                    f"{failure['filename']}: {failure['error']}"
                 )
         else:
-            combined_filename = (
-                uploaded_files[0].name
-                if total_files == 1
-                else f"다중업로드_{total_files}개파일"
+            expected_count = int(
+                vision_result.get("expected_employee_count", 0) or 0
             )
-            parse_info = {
-                "method": "multi_file_merge",
-                "file_count": total_files,
-                "success_count": len(parse_files) - len(failed_files),
-                "failed_count": len(failed_files),
-                "files": parse_files,
-                "deduplicated_employee_count": len(employees),
+            st.session_state[state_key] = {
+                "rows": deduped_rows,
+                "expected_count": expected_count,
+                "vision_result": vision_result,
+                "parse_files": parse_files,
+                "failures": failures,
+                "filename": (
+                    uploaded_files[0].name
+                    if len(uploaded_files) == 1
+                    else f"AI검수_다중업로드_{len(uploaded_files)}개파일"
+                ),
+                "created_at": datetime.now().isoformat(timespec="seconds"),
             }
-
-            _, message = save_employee_roster(
-                user_id,
-                business_no,
-                company_name,
-                combined_filename,
-                employees,
-                parse_info,
-            )
-            progress.progress(1.0, text="통합 직원현황 저장 완료")
+            progress.progress(1.0, text="AI 분석 완료 · 검수표를 확인해주세요.")
             st.success(
-                f"{total_files}개 파일에서 중복을 제거한 직원 "
-                f"{len(employees)}명을 분석해 {message}했습니다."
+                f"검수 대상 직원 {len(deduped_rows)}명을 추출했습니다. "
+                "아래 표를 확인·수정한 뒤 저장하세요."
             )
 
-            preview_df = _display_employee_rows(employees)
-            if not preview_df.empty:
-                with st.expander(
-                    f"이번 업로드 인식 결과 {len(employees)}명 확인",
-                    expanded=True,
-                ):
-                    st.dataframe(
-                        preview_df,
-                        hide_index=True,
-                        use_container_width=True,
+    pending = st.session_state.get(state_key)
+    if isinstance(pending, dict) and pending.get("rows"):
+        st.markdown("##### AI 분석 결과 검수")
+        expected_count = int(pending.get("expected_count", 0) or 0)
+        current_count = len(pending.get("rows", []))
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric(
+            "문서 예상 인원",
+            f"{expected_count}명" if expected_count else "확인필요",
+        )
+        c2.metric("AI 추출 인원", f"{current_count}명")
+        c3.metric(
+            "인원 검증",
+            (
+                "일치"
+                if expected_count and expected_count == current_count
+                else "검수필요"
+            ),
+        )
+
+        review_df = pd.DataFrame(pending["rows"])
+        edited_df = st.data_editor(
+            review_df,
+            hide_index=True,
+            use_container_width=True,
+            num_rows="dynamic",
+            key=f"{state_key}_editor",
+            column_config={
+                "포함": st.column_config.CheckboxColumn(
+                    "포함",
+                    help="저장하지 않을 행은 체크를 해제하세요.",
+                    default=True,
+                ),
+                "연번": st.column_config.NumberColumn(
+                    "연번",
+                    min_value=1,
+                    step=1,
+                ),
+                "성명": st.column_config.TextColumn(
+                    "성명",
+                    help="원본 명부의 성명 열과 비교하세요.",
+                ),
+                "생년월일6자리": st.column_config.TextColumn(
+                    "생년월일6자리",
+                    help="주민등록번호 앞 6자리만 입력합니다.",
+                ),
+            },
+        )
+
+        included_count = int(
+            edited_df["포함"].fillna(False).astype(bool).sum()
+            if "포함" in edited_df.columns
+            else len(edited_df)
+        )
+        mismatch = bool(
+            expected_count and included_count != expected_count
+        )
+        if mismatch:
+            st.warning(
+                f"문서 예상 인원은 {expected_count}명인데, "
+                f"현재 저장 대상은 {included_count}명입니다."
+            )
+            mismatch_confirmed = st.checkbox(
+                "인원 차이를 확인했으며 현재 검수표대로 저장합니다.",
+                key=f"{state_key}_mismatch_confirm",
+            )
+        else:
+            mismatch_confirmed = True
+
+        failures = pending.get("failures", []) or []
+        if failures:
+            with st.expander("읽지 못한 파일·페이지 확인", expanded=False):
+                for failure in failures:
+                    st.write(
+                        f"- {failure.get('filename', '')}: "
+                        f"{failure.get('error', '')}"
                     )
 
-            if len(employees) < 5:
-                st.warning(
-                    "인식된 직원 수가 적습니다. 문서의 실제 인원과 "
-                    "아래 인식 결과를 반드시 비교해주세요."
-                )
+        col_save, col_cancel = st.columns([3, 1])
+        with col_save:
+            save_clicked = st.button(
+                "검수 완료 후 직원현황 저장",
+                type="primary",
+                use_container_width=True,
+                disabled=not mismatch_confirmed,
+                key=f"{state_key}_save",
+            )
+        with col_cancel:
+            cancel_clicked = st.button(
+                "검수 취소",
+                use_container_width=True,
+                key=f"{state_key}_cancel",
+            )
 
-            if failed_files:
-                st.warning(
-                    f"{len(failed_files)}개 파일은 읽지 못했지만 "
-                    "나머지 파일의 직원현황은 정상 저장했습니다."
+        if cancel_clicked:
+            st.session_state.pop(state_key, None)
+            st.rerun()
+
+        if save_clicked:
+            employees, errors = _review_rows_to_employees(edited_df)
+            if errors:
+                st.error("검수표를 저장할 수 없습니다.")
+                for error in errors[:20]:
+                    st.write(f"- {error}")
+            elif not employees:
+                st.error("저장할 직원이 없습니다.")
+            else:
+                parse_info = {
+                    "method": "ai_vision_human_review",
+                    "reviewed": True,
+                    "expected_employee_count": expected_count,
+                    "saved_employee_count": len(employees),
+                    "vision_result": pending.get("vision_result", {}),
+                    "files": pending.get("parse_files", []),
+                    "failed_files": failures,
+                    "reviewed_at": datetime.now().isoformat(
+                        timespec="seconds"
+                    ),
+                }
+                _, message = save_employee_roster(
+                    user_id,
+                    business_no,
+                    company_name,
+                    pending.get("filename", "AI비전_가입자명부"),
+                    employees,
+                    parse_info,
                 )
-                with st.expander(
-                    "읽지 못한 파일과 오류 확인",
-                    expanded=True,
-                ):
-                    for failure in failed_files:
-                        st.write(
-                            f"- {failure['filename']}: "
-                            f"{failure['error']}"
-                        )
+                st.session_state.pop(state_key, None)
+                st.success(
+                    f"검수 완료한 직원 {len(employees)}명을 "
+                    f"{message}했습니다."
+                )
+                st.rerun()
 
     latest = get_latest_employee_status(
         user_id,
@@ -1646,3 +2111,4 @@ def render_employee_status(
                 hide_index=True,
                 use_container_width=True,
             )
+
