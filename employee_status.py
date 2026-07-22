@@ -90,6 +90,24 @@ def _roster_vision_schema() -> dict[str, Any]:
         "industrial_accident_date": {"type": "string"},
         "employment_insurance_date": {"type": "string"},
     }
+    workplace_properties = {
+        "workplace_management_no": {"type": "string"},
+        "workplace_name": {"type": "string"},
+        "source_images": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "expected_employee_count": {"type": "integer"},
+        "employees": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": employee_properties,
+                "required": list(employee_properties),
+            },
+        },
+    }
     return {
         "type": "object",
         "additionalProperties": False,
@@ -102,14 +120,14 @@ def _roster_vision_schema() -> dict[str, Any]:
                     "mixed",
                 ],
             },
-            "expected_employee_count": {"type": "integer"},
-            "employees": {
+            "total_expected_employee_count": {"type": "integer"},
+            "workplaces": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "properties": employee_properties,
-                    "required": list(employee_properties),
+                    "properties": workplace_properties,
+                    "required": list(workplace_properties),
                 },
             },
             "ignored_pages": {
@@ -123,8 +141,8 @@ def _roster_vision_schema() -> dict[str, Any]:
         },
         "required": [
             "document_type",
-            "expected_employee_count",
-            "employees",
+            "total_expected_employee_count",
+            "workplaces",
             "ignored_pages",
             "notes",
         ],
@@ -154,7 +172,12 @@ def _extract_roster_with_ai_vision(
                 "절대 출력하지 마세요. 날짜가 '-'이면 빈 문자열로 기록하세요. "
                 "날짜는 YYYY-MM-DD 형식으로 통일하세요. expected_employee_count는 "
                 "가입내역 표의 연번 범위와 실제 행 수를 근거로 정하세요. "
-                "같은 명부의 여러 페이지가 포함되면 중복 직원은 한 번만 출력하세요."
+                "중요: 첨부 이미지에 사업장 관리번호나 사업장 명칭이 서로 다른 "
+                "여러 사업장 명부가 포함될 수 있습니다. 서로 다른 사업장을 하나로 "
+                "간주하거나 제외하지 말고 workplaces 배열에 각각 별도로 만드세요. "
+                "각 사업장의 관리번호, 명칭, 예상 인원과 직원 목록을 모두 추출하세요. "
+                "같은 사업장의 여러 페이지에서만 중복 직원을 한 번으로 합치세요. "
+                "total_expected_employee_count는 모든 유효 사업장 예상 인원의 합계입니다."
             ),
         }
     ]
@@ -257,45 +280,110 @@ def _vision_result_to_review_rows(
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
 
-    for index, item in enumerate(result.get("employees", []) or [], start=1):
-        if not isinstance(item, dict):
+    workplaces = result.get("workplaces", []) or []
+    for workplace_index, workplace in enumerate(workplaces, start=1):
+        if not isinstance(workplace, dict):
             continue
-        name = _clean_review_name(item.get("name", ""))
-        birth_six = _clean_birth_six(item.get("birth_six", ""))
-        identity = f"{name}|{birth_six}"
-        if not name or identity in seen:
-            continue
-        seen.add(identity)
 
-        sequence = item.get("sequence", index)
-        try:
-            sequence = int(sequence)
-        except (TypeError, ValueError):
-            sequence = index
-
-        rows.append(
-            {
-                "포함": True,
-                "연번": sequence,
-                "성명": name,
-                "생년월일6자리": birth_six,
-                "국민연금": _review_date(
-                    item.get("national_pension_date", "")
-                ),
-                "건강보험": _review_date(
-                    item.get("health_insurance_date", "")
-                ),
-                "산재보험": _review_date(
-                    item.get("industrial_accident_date", "")
-                ),
-                "고용보험": _review_date(
-                    item.get("employment_insurance_date", "")
-                ),
-            }
+        workplace_no = re.sub(
+            r"[^0-9]",
+            "",
+            str(workplace.get("workplace_management_no", "") or ""),
+        )
+        workplace_name = str(
+            workplace.get("workplace_name", "") or ""
+        ).strip()
+        workplace_label = workplace_name or (
+            f"사업장 {workplace_index}"
         )
 
-    rows.sort(key=lambda row: int(row.get("연번", 0) or 0))
+        for index, item in enumerate(
+            workplace.get("employees", []) or [],
+            start=1,
+        ):
+            if not isinstance(item, dict):
+                continue
+            name = _clean_review_name(item.get("name", ""))
+            birth_six = _clean_birth_six(item.get("birth_six", ""))
+            identity = f"{workplace_no}|{workplace_label}|{name}|{birth_six}"
+            if not name or identity in seen:
+                continue
+            seen.add(identity)
+
+            sequence = item.get("sequence", index)
+            try:
+                sequence = int(sequence)
+            except (TypeError, ValueError):
+                sequence = index
+
+            rows.append(
+                {
+                    "포함": True,
+                    "사업장명": workplace_label,
+                    "사업장관리번호": workplace_no,
+                    "연번": sequence,
+                    "성명": name,
+                    "생년월일6자리": birth_six,
+                    "국민연금": _review_date(
+                        item.get("national_pension_date", "")
+                    ),
+                    "건강보험": _review_date(
+                        item.get("health_insurance_date", "")
+                    ),
+                    "산재보험": _review_date(
+                        item.get("industrial_accident_date", "")
+                    ),
+                    "고용보험": _review_date(
+                        item.get("employment_insurance_date", "")
+                    ),
+                }
+            )
+
+    rows.sort(
+        key=lambda row: (
+            str(row.get("사업장명", "")),
+            int(row.get("연번", 0) or 0),
+        )
+    )
     return rows
+
+
+def _vision_workplace_summary(
+    result: dict[str, Any],
+) -> list[dict[str, Any]]:
+    summaries = []
+    for workplace in result.get("workplaces", []) or []:
+        if not isinstance(workplace, dict):
+            continue
+        employees = [
+            item
+            for item in (workplace.get("employees", []) or [])
+            if isinstance(item, dict)
+        ]
+        summaries.append(
+            {
+                "사업장명": str(
+                    workplace.get("workplace_name", "") or ""
+                ),
+                "사업장관리번호": re.sub(
+                    r"[^0-9]",
+                    "",
+                    str(
+                        workplace.get(
+                            "workplace_management_no",
+                            "",
+                        )
+                        or ""
+                    ),
+                ),
+                "예상인원": int(
+                    workplace.get("expected_employee_count", 0)
+                    or 0
+                ),
+                "AI추출인원": len(employees),
+            }
+        )
+    return summaries
 
 
 def _employees_to_review_rows(
@@ -307,6 +395,8 @@ def _employees_to_review_rows(
         rows.append(
             {
                 "포함": True,
+                "사업장명": "",
+                "사업장관리번호": "",
                 "연번": start_sequence + offset,
                 "성명": employee.get("name_masked", ""),
                 "생년월일6자리": (
@@ -356,7 +446,17 @@ def _review_rows_to_employees(
             errors.append(f"{sequence}번 {name}: 자격취득일을 하나 이상 입력해주세요.")
             continue
 
-        identity = f"{name}|{birth_six}"
+        workplace_name = str(
+            row.get("사업장명", "") or ""
+        ).strip()
+        workplace_no = re.sub(
+            r"[^0-9]",
+            "",
+            str(row.get("사업장관리번호", "") or ""),
+        )
+        identity = (
+            f"{workplace_no}|{workplace_name}|{name}|{birth_six}"
+        )
         if identity in seen:
             continue
         seen.add(identity)
@@ -375,6 +475,8 @@ def _review_rows_to_employees(
         )
         if employee:
             employee["source_dates"] = sorted(dates)
+            employee["workplace_name"] = workplace_name
+            employee["workplace_management_no"] = workplace_no
             employees.append(employee)
 
     return employees, errors
@@ -1719,6 +1821,10 @@ def _display_employee_rows(
         )
         rows.append(
             {
+                "사업장": (
+                    employee.get("workplace_name", "")
+                    or employee.get("workplace_management_no", "")
+                ),
                 "직원": employee.get("name_masked", ""),
                 "출생연도": employee.get("birth_year", ""),
                 "연령구간": employee.get("age_group", ""),
@@ -1861,6 +1967,8 @@ def render_employee_status(
         seen: set[str] = set()
         for row in all_rows:
             identity = (
+                f"{re.sub('[^0-9]', '', str(row.get('사업장관리번호', '') or ''))}|"
+                f"{str(row.get('사업장명', '') or '').strip()}|"
                 f"{_clean_review_name(row.get('성명', ''))}|"
                 f"{_clean_birth_six(row.get('생년월일6자리', ''))}"
             )
@@ -1878,7 +1986,23 @@ def render_employee_status(
                 )
         else:
             expected_count = int(
-                vision_result.get("expected_employee_count", 0) or 0
+                vision_result.get(
+                    "total_expected_employee_count",
+                    0,
+                )
+                or sum(
+                    int(
+                        workplace.get(
+                            "expected_employee_count",
+                            0,
+                        )
+                        or 0
+                    )
+                    for workplace in (
+                        vision_result.get("workplaces", []) or []
+                    )
+                    if isinstance(workplace, dict)
+                )
             )
             st.session_state[state_key] = {
                 "rows": deduped_rows,
@@ -1920,7 +2044,43 @@ def render_employee_status(
             ),
         )
 
+        workplace_summary = _vision_workplace_summary(
+            pending.get("vision_result", {}) or {}
+        )
+        if workplace_summary:
+            st.markdown("###### 사업장별 인원 확인")
+            st.dataframe(
+                pd.DataFrame(workplace_summary),
+                hide_index=True,
+                use_container_width=True,
+            )
+
         review_df = pd.DataFrame(pending["rows"])
+
+        duplicate_people: dict[str, set[str]] = {}
+        for _, duplicate_row in review_df.iterrows():
+            person_key = (
+                f"{_clean_review_name(duplicate_row.get('성명', ''))}|"
+                f"{_clean_birth_six(duplicate_row.get('생년월일6자리', ''))}"
+            )
+            workplace_key = (
+                str(duplicate_row.get("사업장관리번호", "") or "")
+                or str(duplicate_row.get("사업장명", "") or "")
+            )
+            duplicate_people.setdefault(person_key, set()).add(
+                workplace_key
+            )
+        cross_workplace_duplicates = [
+            key
+            for key, workplaces in duplicate_people.items()
+            if key != "|" and len(workplaces) > 1
+        ]
+        if cross_workplace_duplicates:
+            st.warning(
+                f"동일 성명·생년월일 직원 {len(cross_workplace_duplicates)}명이 "
+                "여러 사업장에 중복되어 있습니다. 실제 중복 재직인지 확인하세요."
+            )
+
         edited_df = st.data_editor(
             review_df,
             hide_index=True,
@@ -1932,6 +2092,14 @@ def render_employee_status(
                     "포함",
                     help="저장하지 않을 행은 체크를 해제하세요.",
                     default=True,
+                ),
+                "사업장명": st.column_config.TextColumn(
+                    "사업장명",
+                    help="본점·지점·공장 등 명부에 적힌 사업장명입니다.",
+                ),
+                "사업장관리번호": st.column_config.TextColumn(
+                    "사업장관리번호",
+                    help="명부 상단의 사업장 관리번호입니다.",
                 ),
                 "연번": st.column_config.NumberColumn(
                     "연번",
