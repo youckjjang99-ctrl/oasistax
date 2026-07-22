@@ -378,7 +378,7 @@ def parse_roster(
                 continue
         raise ValueError("CSV 파일 인코딩을 확인할 수 없습니다.")
 
-    if suffix == ".pdf":
+    if suffix in {".pdf", ".jpg", ".jpeg", ".png"}:
         text, extraction = preprocess_document(
             filename,
             data,
@@ -386,12 +386,18 @@ def parse_roster(
         )
         employees = _parse_pdf_text(text)
         return employees, {
-            "method": "pdf_ocr",
+            "method": (
+                "pdf_ocr"
+                if suffix == ".pdf"
+                else "image_ocr"
+            ),
             "filename": filename,
             "extraction": extraction,
         }
 
-    raise ValueError("지원 형식은 XLSX, XLS, CSV, PDF입니다.")
+    raise ValueError(
+        "지원 형식은 XLSX, XLS, CSV, PDF, JPG, JPEG, PNG입니다."
+    )
 
 
 def build_summary(employees: list[dict[str, Any]]) -> dict[str, Any]:
@@ -602,13 +608,14 @@ def render_employee_status(
 ) -> None:
     st.markdown("#### 직원현황")
     st.caption(
-        "4대보험 가입자명부의 주민등록번호는 저장하지 않습니다. "
+        "XLSX·CSV·PDF·JPG·JPEG·PNG 형식을 지원합니다. "
+        "4대보험 가입자명부의 주민등록번호는 저장하지 않으며, "
         "직원명은 마스킹하고 생년·자격취득일·근속기간만 고용지원금 매칭에 활용합니다."
     )
 
     uploaded = st.file_uploader(
         "4대보험 가입자명부 업로드",
-        type=["xlsx", "xls", "csv", "pdf"],
+        type=["xlsx", "xls", "csv", "pdf", "jpg", "jpeg", "png"],
         key=f"employee_roster_upload_{business_no or company_name}",
     )
 

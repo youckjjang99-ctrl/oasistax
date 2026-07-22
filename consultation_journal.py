@@ -767,7 +767,10 @@ def _split_audio_if_needed(
         if path.stat().st_size <= MAX_API_FILE_BYTES:
             return [path]
         raise RuntimeError(
-            "장시간 또는 24MB 초과 녹음을 처리하려면 ffmpeg가 필요합니다."
+            "Railway 실행환경에서 ffmpeg/ffprobe를 찾지 못했습니다. "
+            "24MB 초과 녹음은 서버에서 자동 압축·분할해야 하므로 "
+            "railpack.json에 ffmpeg가 포함된 상태로 Railway를 "
+            "새로 빌드·배포해야 합니다."
         )
 
     duration = _audio_duration_seconds(path)
