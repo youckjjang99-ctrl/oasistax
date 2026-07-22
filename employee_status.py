@@ -1766,15 +1766,137 @@ def save_employee_roster(
     return record, cloud_message
 
 
+def _cloud_employee_record(
+    row: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "version_id": row.get("version_id", ""),
+        "owner_user_id": row.get("owner_user_id", ""),
+        "business_no": row.get("business_no", ""),
+        "company_name": row.get("company_name", ""),
+        "filename": row.get("filename", ""),
+        "uploaded_at": row.get("uploaded_at", ""),
+        "summary": (
+            row.get("summary_data", {})
+            if isinstance(row.get("summary_data"), dict)
+            else {}
+        ),
+        "employees": (
+            row.get("employee_data", [])
+            if isinstance(row.get("employee_data"), list)
+            else []
+        ),
+        "parse_info": (
+            row.get("parse_info", {})
+            if isinstance(row.get("parse_info"), dict)
+            else {}
+        ),
+        "storage_source": "supabase",
+    }
+
+
+def _load_cloud_employee_versions(
+    user_id: str,
+    business_no: str,
+    company_name: str,
+) -> list[dict[str, Any]]:
+    if not cloud_is_configured():
+        return []
+
+    normalized_business = _normalize_business_no(business_no)
+    normalized_company = _clean(company_name)
+
+    rows = CloudDatabase().select(
+        TABLE_EMPLOYEE_ROSTERS,
+        filters={"owner_user_id": user_id},
+        columns=(
+            "version_id,owner_user_id,business_no,company_name,"
+            "filename,uploaded_at,summary_data,employee_data,parse_info"
+        ),
+        order="uploaded_at.desc",
+        limit=100,
+    )
+
+    matched: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        row_business = _normalize_business_no(
+            row.get("business_no", "")
+        )
+        row_company = _clean(row.get("company_name", ""))
+
+        business_match = bool(
+            normalized_business
+            and row_business == normalized_business
+        )
+        company_match = bool(
+            not normalized_business
+            and normalized_company
+            and row_company == normalized_company
+        )
+        fallback_company_match = bool(
+            normalized_business
+            and not row_business
+            and normalized_company
+            and row_company == normalized_company
+        )
+
+        if business_match or company_match or fallback_company_match:
+            matched.append(_cloud_employee_record(row))
+
+    matched.sort(
+        key=lambda item: str(item.get("uploaded_at", "")),
+        reverse=True,
+    )
+    return matched[:20]
+
+
+def _load_local_employee_versions(
+    user_id: str,
+    business_no: str,
+    company_name: str,
+) -> list[dict[str, Any]]:
+    data = _load_json(_storage_path(user_id), {})
+    key = _company_key(business_no, company_name)
+    versions = data.get(key, []) if isinstance(data, dict) else []
+    if not isinstance(versions, list):
+        return []
+    return [
+        {
+            **version,
+            "storage_source": version.get(
+                "storage_source",
+                "local",
+            ),
+        }
+        for version in versions
+        if isinstance(version, dict)
+    ][:20]
+
+
 def load_employee_versions(
     user_id: str,
     business_no: str,
     company_name: str = "",
 ) -> list[dict[str, Any]]:
-    data = _load_json(_storage_path(user_id), {})
-    key = _company_key(business_no, company_name)
-    versions = data.get(key, []) if isinstance(data, dict) else []
-    return versions if isinstance(versions, list) else []
+    try:
+        cloud_versions = _load_cloud_employee_versions(
+            user_id,
+            business_no,
+            company_name,
+        )
+        if cloud_versions:
+            return cloud_versions
+    except Exception:
+        pass
+
+    return _load_local_employee_versions(
+        user_id,
+        business_no,
+        company_name,
+    )
 
 
 def get_latest_employee_status(
@@ -2222,9 +2344,16 @@ def render_employee_status(
     c3.metric("청년 추정", f"{summary.get('youth_count', 0)}명")
     c4.metric("고령자 추정", f"{summary.get('senior_count', 0)}명")
 
+    storage_source = latest.get("storage_source", "")
+    source_label = (
+        "Supabase"
+        if storage_source == "supabase"
+        else "로컬 보조자료"
+    )
     st.caption(
         f"최근 업로드: {str(latest.get('uploaded_at', ''))[:19]} · "
-        f"파일: {latest.get('filename', '-')}"
+        f"파일: {latest.get('filename', '-')} · "
+        f"불러온 위치: {source_label}"
     )
 
     employee_df = _display_employee_rows(
