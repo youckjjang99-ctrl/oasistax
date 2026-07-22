@@ -1,4 +1,4 @@
 git status
 git add .
-git commit -m "v9.3.2 고용지원금 가입자명부 자동분석"
+git commit -m "v9.3.3 employment support unified diagnosis"
 git push origin main
