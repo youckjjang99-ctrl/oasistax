@@ -259,7 +259,33 @@ def build_tax_diagnosis(user_id: str, customer: pd.Series) -> dict[str, Any]:
         "절세 기회와 별도로 가산세·상여처분 등 잠재 리스크를 점검하는 항목입니다.",
     ))
 
-    items.sort(key=lambda x: (-x["priority"], x["name"]))
+    # v9.1.0a: 항목별 점수·확신도·실행항목을 보수적으로 산정한다.
+    status_base = {"검토 우선": 68, "자료 확인": 46, "가능성 낮음": 24}
+    for item in items:
+        evidence_count = len([x for x in item.get("reasons", []) if x])
+        missing_count = len([x for x in item.get("missing", []) if x])
+        score = status_base.get(item.get("status", ""), 35)
+        score += min(18, evidence_count * 6)
+        score -= min(12, max(0, missing_count - 3) * 2)
+        score = max(10, min(95, int(score)))
+
+        confidence = 34 + min(36, evidence_count * 12)
+        if financial_source:
+            confidence += 10
+        if reference_year:
+            confidence += 6
+        confidence -= min(18, missing_count * 2)
+        confidence = max(20, min(92, int(confidence)))
+
+        item["score"] = score
+        item["confidence"] = confidence
+        item["action_items"] = [
+            f"{document} 확보" for document in item.get("documents", [])[:2]
+        ] + [
+            f"대표 확인: {question}" for question in item.get("questions", [])[:1]
+        ]
+
+    items.sort(key=lambda x: (-x.get("score", 0), -x["priority"], x["name"]))
     immediate = sum(1 for x in items if x["status"] == "검토 우선")
     verify = sum(1 for x in items if x["status"] == "자료 확인")
     low = sum(1 for x in items if x["status"] == "가능성 낮음")
@@ -268,6 +294,20 @@ def build_tax_diagnosis(user_id: str, customer: pd.Series) -> dict[str, Any]:
     signals = [bool(industry), bool(address), bool(establishment), sales is not None, employees is not None, tangible is not None, rnd is not None, tax is not None]
     filled = sum(signals)
     stars = min(5, max(1, round(filled / len(signals) * 5)))
+    opportunity_items = [x for x in items if x.get("category") != "세무리스크"]
+    overall_score = int(round(sum(x["score"] for x in opportunity_items) / max(1, len(opportunity_items))))
+    overall_confidence = int(round(sum(x["confidence"] for x in items) / max(1, len(items))))
+    priority_items = [
+        {
+            "rank": rank,
+            "name": item["name"],
+            "score": item["score"],
+            "confidence": item["confidence"],
+            "status": item["status"],
+            "action_items": item.get("action_items", []),
+        }
+        for rank, item in enumerate(items[:5], start=1)
+    ]
 
     return {
         "company_name": company_name,
@@ -276,6 +316,10 @@ def build_tax_diagnosis(user_id: str, customer: pd.Series) -> dict[str, Any]:
         "verify": verify,
         "low": low,
         "stars": stars,
+        "overall_score": overall_score,
+        "overall_confidence": overall_confidence,
+        "priority_items": priority_items,
+        "disclaimer": "AI 점수는 현재 등록자료에 따른 검토 우선순위이며 세액공제 적용 여부나 절세금액을 확정하지 않습니다.",
         "basis": (
             f"고객DB·{financial_source} 기준" if financial_source
             else "현재 저장된 고객DB 기준"
@@ -300,8 +344,8 @@ def render_tax_diagnosis_page(user_id: str, customer: pd.Series, key_prefix: str
 
     c1, c2, c3, c4 = st.columns(4, gap="medium")
     metrics = [
-        ("절세자료 준비", "★" * result["stars"] + "☆" * (5 - result["stars"]), result["basis"]),
-        ("발견 항목", f"{len(result['items'])}건", "세액공제·감면·리스크"),
+        ("절세 가능성", f"{result['overall_score']}점", "현재 자료 기준 검토 우선도"),
+        ("AI 신뢰도", f"{result['overall_confidence']}%", result["basis"]),
         ("검토 우선", f"{result['immediate']}건", "증빙 확인을 먼저 권장"),
         ("자료 확인", f"{result['verify']}건", "질문 및 서류 보완 필요"),
     ]
@@ -326,11 +370,12 @@ def render_tax_diagnosis_page(user_id: str, customer: pd.Series, key_prefix: str
 
     for index, item in enumerate(visible):
         bg, color = _status_style(item["status"])
-        with st.expander(f"{item['status']} · {item['name']}", expanded=index < 2):
+        with st.expander(f"{item.get('score', 0)}점 · {item['status']} · {item['name']}", expanded=index < 2):
             st.markdown(
                 f"<span style='display:inline-block;padding:5px 10px;border-radius:999px;background:{bg};color:{color};font-weight:800;font-size:.78rem'>{item['status']}</span>",
                 unsafe_allow_html=True,
             )
+            st.caption(f"AI 확신도 {item.get('confidence', 0)}% · 현재 자료에 따른 검토 우선순위")
             left, right = st.columns([1, 1], gap="large")
             with left:
                 st.markdown("**현재 확인된 근거**")
@@ -346,5 +391,8 @@ def render_tax_diagnosis_page(user_id: str, customer: pd.Series, key_prefix: str
                 st.markdown("**요청할 자료**")
                 for document in item["documents"]:
                     st.write(f"• {document}")
+                st.markdown("**다음 실행항목**")
+                for action in item.get("action_items", []):
+                    st.write(f"→ {action}")
             if item.get("caution"):
                 st.warning(item["caution"])

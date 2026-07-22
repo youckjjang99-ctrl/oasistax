@@ -1216,6 +1216,37 @@ def render_ai_consulting_report_page(
         st.warning("크레탑은 요약재무로만 평가합니다. 계정별원장·법인세 신고자료 등 독립 증빙이 없으면 점수가 높게 올라가지 않습니다.")
         st.caption(health.get("disclaimer", ""))
 
+    # v9.1.0a AI 절세진단 Core
+    try:
+        tax_core = build_tax_diagnosis(user_id, customer)
+    except Exception:
+        tax_core = {}
+    if tax_core:
+        st.markdown("### AI 절세진단 Core")
+        tc1, tc2 = st.columns(2, gap="medium")
+        tc1.metric("절세 가능성", f"{tax_core.get('overall_score', 0)}점", "현재 자료 기준 검토 우선도")
+        tc2.metric("AI 신뢰도", f"{tax_core.get('overall_confidence', 0)}%", tax_core.get("basis", ""))
+        priority_rows = []
+        for item in tax_core.get("priority_items", [])[:5]:
+            priority_rows.append({
+                "순위": item.get("rank"),
+                "절세 검토항목": item.get("name", ""),
+                "점수": item.get("score", 0),
+                "AI 신뢰도": f"{item.get('confidence', 0)}%",
+                "상태": item.get("status", ""),
+                "다음 조치": " / ".join(item.get("action_items", [])[:2]),
+            })
+        if priority_rows:
+            st.dataframe(pd.DataFrame(priority_rows), hide_index=True, use_container_width=True)
+        with st.expander("AI 판단 근거·부족 증빙 보기", expanded=False):
+            for item in tax_core.get("items", [])[:5]:
+                st.markdown(f"**{item.get('name')} · {item.get('score', 0)}점 · 확신도 {item.get('confidence', 0)}%**")
+                for reason in item.get("reasons", [])[:3]:
+                    st.write(f"✓ {reason}")
+                if item.get("missing"):
+                    st.caption("부족 증빙: " + ", ".join(item.get("missing", [])[:4]))
+        st.caption(tax_core.get("disclaimer", ""))
+
     source_columns = st.columns(5, gap="medium")
     source_columns[0].metric(
         "등록 등기정보",
@@ -1564,10 +1595,7 @@ def render_ai_consulting_report_page(
                 )
 
     # 대표님 PDF에 AI 절세진단 요약을 함께 전달한다.
-    try:
-        analysis["tax_diagnosis"] = build_tax_diagnosis(user_id, customer)
-    except Exception:
-        analysis["tax_diagnosis"] = {}
+    analysis["tax_diagnosis"] = tax_core if isinstance(tax_core, dict) else {}
 
     logo_path = Path(__file__).resolve().parent / "assets" / "oasis_logo.png"
     try:
