@@ -31,6 +31,7 @@ from registered_policy_match import (
 from utils import get_user_cumulative_db_path, get_user_dirs
 from pdf_report import build_representative_pdf
 from tax_diagnosis import build_tax_diagnosis
+from financial_anomaly import build_financial_anomaly
 from comprehensive_financial_diagnosis import (
     build_comprehensive_financial_diagnosis,
 )
@@ -1246,6 +1247,45 @@ def render_ai_consulting_report_page(
                 if item.get("missing"):
                     st.caption("부족 증빙: " + ", ".join(item.get("missing", [])[:4]))
         st.caption(tax_core.get("disclaimer", ""))
+
+    # v9.1.0b 재무 이상징후 분석
+    try:
+        anomaly_result = build_financial_anomaly(user_id, customer)
+    except Exception:
+        anomaly_result = {}
+    if anomaly_result:
+        st.markdown("### 재무 이상징후")
+        ac1, ac2, ac3, ac4 = st.columns(4, gap="medium")
+        ac1.metric("종합 위험도", f"{anomaly_result.get('overall_score', 0)}점", anomaly_result.get("overall_level", ""))
+        ac2.metric("AI 신뢰도", f"{anomaly_result.get('confidence', 0)}%", anomaly_result.get("source", ""))
+        ac3.metric("높음", f"{anomaly_result.get('high_count', 0)}건", "우선 원장 확인")
+        ac4.metric("보통", f"{anomaly_result.get('medium_count', 0)}건", "증빙 보완 검토")
+        anomaly_rows = []
+        for anomaly in anomaly_result.get("items", []):
+            ratio = anomaly.get("ratio")
+            anomaly_rows.append({
+                "이상징후": anomaly.get("name", ""),
+                "분류": anomaly.get("category", ""),
+                "위험도": anomaly.get("severity", ""),
+                "점수": anomaly.get("score", 0),
+                "매출·자산 대비": f"{ratio:.1f}%" if isinstance(ratio, (int, float)) else "자료 부족",
+                "우선 확인자료": " / ".join(anomaly.get("documents", [])[:2]),
+            })
+        if anomaly_rows:
+            st.dataframe(pd.DataFrame(anomaly_rows), hide_index=True, use_container_width=True)
+        with st.expander("이상징후 판단 근거·확인자료", expanded=False):
+            for anomaly in anomaly_result.get("items", []):
+                st.markdown(f"**{anomaly.get('name')} · {anomaly.get('severity')} · {anomaly.get('score', 0)}점**")
+                for reason in anomaly.get("reasons", [])[:4]:
+                    st.write(f"✓ {reason}")
+                if anomaly.get("account_paths"):
+                    st.caption("탐지 계정: " + ", ".join(anomaly.get("account_paths", [])[:5]))
+                st.caption("확인자료: " + ", ".join(anomaly.get("documents", [])[:4]))
+                for question in anomaly.get("questions", [])[:2]:
+                    st.write(f"• {question}")
+                if anomaly.get("caution"):
+                    st.warning(anomaly.get("caution"))
+        st.caption(anomaly_result.get("disclaimer", ""))
 
     source_columns = st.columns(5, gap="medium")
     source_columns[0].metric(
