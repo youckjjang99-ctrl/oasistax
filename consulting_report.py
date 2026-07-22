@@ -34,6 +34,8 @@ from tax_diagnosis import build_tax_diagnosis
 from comprehensive_financial_diagnosis import (
     build_comprehensive_financial_diagnosis,
 )
+from data_completeness_engine import build_data_completeness
+from company_health_engine import build_company_health
 
 
 
@@ -817,51 +819,27 @@ def build_consulting_analysis(
         "기업전체주식가치": stock_result.get("total_equity_value"),
     }
 
-    # 자료 충족도는 단순 필드 개수가 아니라 실제 컨설팅에 필요한 자료군을
-    # 가중 평가합니다. 모든 자료가 갖춰져도 100% 대신 최대 95%로 제한해
-    # 추가 확인 가능성이 항상 남아 있음을 표현합니다.
-    profile_fields = [business_no, industry, address, establishment, employees]
-    finance_fields = [sales, operating_profit, net_income, assets, liabilities, equity]
-
-    profile_ratio = sum(1 for value in profile_fields if _clean(value)) / len(profile_fields)
-    finance_ratio = sum(1 for value in finance_fields if _clean(value)) / len(finance_fields)
-
-    preference_values = []
-    for key in ("관심지원분야", "매칭키워드", "제외키워드", "자금사용목적"):
-        value = preferences.get(key) if isinstance(preferences, dict) else None
-        if isinstance(value, (list, tuple, set)):
-            preference_values.extend([item for item in value if _clean(item)])
-        elif _clean(value):
-            preference_values.append(value)
-    has_preferences = bool(preference_values)
-
-    completeness_components = [
-        ("기업 기본정보", 15.0 * profile_ratio, profile_ratio >= 0.8),
-        ("재무자료", 30.0 * finance_ratio, finance_ratio >= 0.8),
-        ("등기정보", 12.0 if registry else 0.0, bool(registry)),
-        ("주가평가", 12.0 if stock_record else 0.0, bool(stock_record)),
-        ("정관검토", 10.0 if articles_review else 0.0, bool(articles_review)),
-        ("상담일지", 8.0 if consultation_count else 0.0, bool(consultation_count)),
-        ("직원현황", 8.0 if employee_source_available else 0.0, employee_source_available),
-        ("매칭설정", 6.0 if has_preferences else 0.0, has_preferences),
-    ]
-    raw_completeness = sum(score for _, score, _ in completeness_components)
-    completeness = min(95, round(raw_completeness / 95.0 * 100))
-
-    if completeness >= 85:
-        completeness_status = "매우 충분"
-    elif completeness >= 70:
-        completeness_status = "충분"
-    elif completeness >= 50:
-        completeness_status = "보통"
-    elif completeness >= 30:
-        completeness_status = "보완 필요"
-    else:
-        completeness_status = "자료 부족"
-
-    missing_sources = [
-        name for name, _, is_ready in completeness_components if not is_ready
-    ]
+    completeness_result = build_data_completeness(
+        business_no=business_no, industry=industry, address=address,
+        establishment=establishment, financial=financial, registry=registry,
+        stock_record=stock_record, consultation_context=consultation_context,
+        employee_context=employee_context, articles_review=articles_review,
+        preferences=preferences,
+    )
+    completeness = completeness_result["score"]
+    completeness_status = completeness_result["status"]
+    completeness_components = completeness_result["components"]
+    missing_sources = completeness_result["missing_sources"]
+    company_health = build_company_health(
+        sales=sales, operating_profit=operating_profit, net_income=net_income,
+        assets=assets, liabilities=liabilities, equity=equity, employees=employees,
+        completeness=completeness, confidence=completeness_result["confidence"],
+        comprehensive_diagnosis=comprehensive_diagnosis,
+        consultation_context=consultation_context, stock_record=stock_record,
+    )
+    has_preferences = bool(preferences and any(preferences.get(k) for k in (
+        "관심지원분야", "매칭키워드", "자금사용목적", "저장정책자금"
+    )))
 
     return {
         "company_name": company_name,
@@ -908,6 +886,10 @@ def build_consulting_analysis(
         "completeness_status": completeness_status,
         "completeness_components": completeness_components,
         "missing_sources": missing_sources,
+        "completeness_detail": completeness_result,
+        "ai_confidence": completeness_result["confidence"],
+        "ai_confidence_status": completeness_result["confidence_status"],
+        "company_health": company_health,
     }
 
 
@@ -1204,23 +1186,35 @@ def render_ai_consulting_report_page(
     )
 
     _inject_report_css()
-    kpi_columns = st.columns(4, gap="medium")
+    health = analysis.get("company_health", {}) or {}
+    kpi_columns = st.columns(5, gap="medium")
     kpi_items = [
-        ("자료 충족도", f"{analysis['completeness']}%", analysis.get("completeness_status", "보완 필요"), "blue"),
-        ("매출액", _format_money(analysis["sales"]), "최근 결산 기준", "green"),
-        ("영업이익", _format_money(analysis["operating_profit"]), "본업 수익성", "purple"),
-        ("당기순이익", _format_money(analysis["net_income"]), "세후 최종손익", "orange"),
+        ("자료 충족도", f"{analysis['completeness']}%", analysis.get("completeness_status", "자료 부족"), "blue"),
+        ("AI 신뢰도", f"{analysis.get('ai_confidence', 0)}%", analysis.get("ai_confidence_status", "낮음"), "purple"),
+        ("기업 건강점수", f"{health.get('health_score', 0)}점", health.get("stage", "판단보류"), "green"),
+        ("절세 가능성", f"{health.get('tax_opportunity_score', 0)}점", health.get("tax_opportunity_level", "자료 부족"), "orange"),
+        ("세무 리스크", f"{health.get('tax_risk_score', 0)}점", "높을수록 추가 확인 필요", "red"),
     ]
     for column, (label, value, note, tone) in zip(kpi_columns, kpi_items):
         with column:
             st.markdown(_metric_card(label, value, note, tone), unsafe_allow_html=True)
-
-    missing_sources = analysis.get("missing_sources", []) or []
-    if missing_sources:
-        st.info(
-            "자료 충족도에 반영되지 않은 항목: " + ", ".join(missing_sources)
-            + " · 해당 자료를 등록하면 진단 범위와 정확도가 높아집니다."
-        )
+    st.caption(f"기업 성장단계: {health.get('stage','판단보류')} · {health.get('stage_reason','')}")
+    detail = analysis.get("completeness_detail", {}) or {}
+    actions = detail.get("next_actions", []) or []
+    if actions:
+        st.info("현재 분석은 보수적으로 산정되었습니다. " + " / ".join(
+            f"{x.get('name')} 등록 시 최대 +{x.get('gain',0)}%p" for x in actions[:4]))
+    with st.expander("자료 충족도·AI 신뢰도 산정근거", expanded=False):
+        rows = [{
+            "자료군": x.get("name", ""), "배점": x.get("weight", 0),
+            "반영점수": x.get("earned", 0),
+            "등록상태": "반영" if x.get("ready") else "미등록",
+            "다음 조치": x.get("next_action", ""),
+        } for x in detail.get("components", []) or []]
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        st.warning("크레탑은 요약재무로만 평가합니다. 계정별원장·법인세 신고자료 등 독립 증빙이 없으면 점수가 높게 올라가지 않습니다.")
+        st.caption(health.get("disclaimer", ""))
 
     source_columns = st.columns(5, gap="medium")
     source_columns[0].metric(
