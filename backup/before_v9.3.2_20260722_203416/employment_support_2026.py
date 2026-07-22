@@ -237,36 +237,13 @@ def _metrics(latest: dict[str, Any]) -> dict[str, Any]:
         if employee.get("age_group") == "고령자" and isinstance(tenure, int) and tenure >= 12:
             senior_long.append(employee)
     summary = latest.get("summary", {}) or {}
-    senior_rows = []
-    for idx, employee in enumerate(active, start=1):
-        if employee.get("age_group") != "고령자":
-            continue
-        tenure = employee.get("tenure_months")
-        tenure_ok = isinstance(tenure, int) and tenure >= 24
-        name = str(employee.get("name") or employee.get("employee_name") or employee.get("성명") or f"직원 {idx}")
-        senior_rows.append({
-            "성명": name,
-            "근속개월": tenure if isinstance(tenure, int) else "",
-            "근속 2년": "충족" if tenure_ok else "미충족" if isinstance(tenure, int) else "확인필요",
-            "자동판정": "가능" if tenure_ok else "제외" if isinstance(tenure, int) else "확인필요",
-            "판정근거": "4대보험 가입자명부 근속기간 기준" if tenure_ok else "피보험기간 2년 미만" if isinstance(tenure, int) else "취득일 또는 근속기간 확인 필요",
-        })
-    senior_count = len(senior_rows)
-    active_count = len(active)
-    senior_ratio = (senior_count / active_count * 100) if active_count else None
     return {
-        "active_count": active_count,
+        "active_count": len(active),
         "recent_count": len(recent),
         "recent_youth_count": len(recent_youth),
         "youth_count": int(summary.get("youth_count", 0) or 0),
-        "senior_count": senior_count,
+        "senior_count": int(summary.get("senior_count", 0) or 0),
         "senior_long_count": len(senior_long),
-        "senior_ratio": senior_ratio,
-        "senior_ratio_under_30": senior_ratio <= 30 if senior_ratio is not None else None,
-        "continued_candidate_rows": senior_rows,
-        "continued_auto_eligible_count": sum(1 for row in senior_rows if row["자동판정"] == "가능"),
-        "continued_auto_review_count": sum(1 for row in senior_rows if row["자동판정"] == "확인필요"),
-        "has_employee_roster": bool(active),
     }
 
 
@@ -411,7 +388,7 @@ def _continued_employment_diagnosis(
     else:
         add_check("취업규칙 명시·신고", "확인필요", "확인되지 않음", "변경 취업규칙, 근로자 의견서, 신고 접수증 존재 여부를 확인합니다.")
 
-    ratio_under = metrics.get("senior_ratio_under_30")
+    ratio_under = settings.get("senior_insured_ratio_under_30")
     if ratio_under is True:
         add_check("60세 이상 피보험자 비율 30% 이하", "충족", "30% 이하 확인", "직전연도 매월 말 피보험자 명부와 산정표를 보관합니다.")
     elif ratio_under is False:
@@ -419,7 +396,7 @@ def _continued_employment_diagnosis(
     else:
         add_check("60세 이상 피보험자 비율 30% 이하", "확인필요", "비율 미산정", "직전연도 매월 말 전체 피보험자와 60세 이상 피보험자 수를 산정합니다.")
 
-    employee_tenure = True if metrics.get("continued_auto_eligible_count", 0) > 0 and metrics.get("continued_auto_review_count", 0) == 0 else None
+    employee_tenure = settings.get("continued_target_tenure_2y")
     add_check(
         "대상자 정년 전 피보험기간 2년 이상",
         "충족" if employee_tenure is True else "미충족" if employee_tenure is False else "확인필요",
@@ -427,7 +404,7 @@ def _continued_employment_diagnosis(
         "고용보험 자격이력과 근로자별 입사일을 확인합니다.",
     )
 
-    exclusions_ok = None
+    exclusions_ok = settings.get("continued_exclusions_clear")
     add_check(
         "지원 제외 근로자 해당 없음",
         "충족" if exclusions_ok is True else "미충족" if exclusions_ok is False else "확인필요",
@@ -435,7 +412,7 @@ def _continued_employment_diagnosis(
         "대표자 가족관계, 국적·체류자격, 월평균보수 124만원 이상 여부를 대상자별로 점검합니다.",
     )
 
-    eligible_count = max(0, int(metrics.get("continued_auto_eligible_count", 0) or 0))
+    eligible_count = max(0, int(settings.get("continued_target_count", 0) or 0))
     active_count = max(0, int(metrics.get("active_count", 0) or 0))
     if active_count < 10:
         headcount_cap = 3
@@ -557,8 +534,8 @@ def _render_continued_employment_execution_plan(
             "현재 취업규칙에 정년이 몇 세로 규정되어 있고, 그 규정은 언제부터 시행됐나요?",
             "향후 1~3년 안에 정년에 도달하는 직원은 몇 명인가요?",
             "정년 연장, 정년 폐지, 퇴직 후 재고용 중 어떤 방식이 회사 운영에 적합한가요?",
-            "가입자명부 자동분석 결과에서 근속기간 확인필요로 표시된 직원이 있나요?",
-            "직전연도 월별 명부와 현재 업로드 명부의 60세 이상 비율이 동일한지 최종 확인했나요?",
+            "대상자는 현재 회사에서 고용보험 피보험기간이 계속 2년 이상인가요?",
+            "직전연도 기준 60세 이상 피보험자 비율이 30% 이하인가요?",
             "대상자 중 대표자의 배우자·직계존비속 또는 지원 제외 외국인이 있나요?",
             "재고용형이라면 퇴직 후 6개월 이내, 1년 이상 계약이 가능한가요?",
         ]
@@ -631,7 +608,7 @@ def render_employment_support_analysis(
 
 
         st.markdown("##### 고령자 계속고용장려금 상세 진단")
-        st.caption("정년제도와 취업규칙만 입력하면, 대상자·근속기간·60세 이상 비율은 4대보험 가입자명부에서 자동 분석합니다.")
+        st.caption("정년제도·취업규칙·대상자 요건을 입력하면 예상 지원금과 실행계획을 자동 생성합니다.")
         d1, d2 = st.columns(2)
         with d1:
             system_options = ["미확인", "정년 연장", "정년 폐지", "재고용"]
@@ -666,26 +643,49 @@ def render_employment_support_analysis(
             )
             continued_work_rules_reported = True if report_choice == "완료" else False if report_choice == "미완료" else None
         with d2:
-            ratio = metrics.get("senior_ratio")
-            st.markdown("**4대보험 가입자명부 자동분석**")
-            if ratio is None:
-                st.warning("등록된 가입자명부가 없어 60세 이상 비율을 계산할 수 없습니다.")
-            else:
-                st.metric("60세 이상 피보험자 비율", f"{ratio:.1f}%", delta="30% 이하" if ratio <= 30 else "30% 초과")
-            st.metric("자동 산출 예상 대상자", f"{metrics.get('continued_auto_eligible_count', 0)}명")
-            if metrics.get("continued_auto_review_count", 0):
-                st.warning(f"근속기간 확인이 필요한 고령자 {metrics['continued_auto_review_count']}명이 있습니다.")
-            rows = metrics.get("continued_candidate_rows", [])
-            if rows:
-                st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-            else:
-                st.info("가입자명부에서 60세 이상 근로자가 확인되지 않았습니다.")
-            st.caption("가족관계·국적·체류자격·월평균보수는 가입자명부에 없는 경우 신청 전 별도 확인합니다.")
+            ratio_options = ["확인필요", "30% 이하", "30% 초과"]
+            saved_ratio = current.get("senior_insured_ratio_under_30")
+            ratio_label = "30% 이하" if saved_ratio is True else "30% 초과" if saved_ratio is False else "확인필요"
+            ratio_choice = st.radio(
+                "직전연도 60세 이상 피보험자 비율",
+                ratio_options,
+                index=ratio_options.index(ratio_label),
+                horizontal=True,
+                key=f"emp_senior_ratio_{business_no}",
+            )
+            senior_insured_ratio_under_30 = True if ratio_choice == "30% 이하" else False if ratio_choice == "30% 초과" else None
+            continued_target_count = st.number_input(
+                "예상 지원대상 근로자 수",
+                min_value=0,
+                max_value=100,
+                value=int(current.get("continued_target_count", 0) or 0),
+                step=1,
+                key=f"emp_cont_count_{business_no}",
+            )
             continued_support_months = st.number_input(
-                "예상 지원개월", min_value=1, max_value=36,
-                value=int(current.get("continued_support_months", 36) or 36), step=1,
+                "예상 지원개월",
+                min_value=1,
+                max_value=36,
+                value=int(current.get("continued_support_months", 36) or 36),
+                step=1,
                 key=f"emp_cont_months_{business_no}",
             )
+            tenure_choice = st.radio(
+                "대상자 정년 전 피보험기간 2년 이상",
+                ["확인필요", "예", "아니오"],
+                index=1 if current.get("continued_target_tenure_2y") is True else 2 if current.get("continued_target_tenure_2y") is False else 0,
+                horizontal=True,
+                key=f"emp_cont_tenure_{business_no}",
+            )
+            continued_target_tenure_2y = True if tenure_choice == "예" else False if tenure_choice == "아니오" else None
+            exclusion_choice = st.radio(
+                "가족·국적·저임금 등 제외사유 없음",
+                ["확인필요", "예", "아니오"],
+                index=1 if current.get("continued_exclusions_clear") is True else 2 if current.get("continued_exclusions_clear") is False else 0,
+                horizontal=True,
+                key=f"emp_cont_exclusion_{business_no}",
+            )
+            continued_exclusions_clear = True if exclusion_choice == "예" else False if exclusion_choice == "아니오" else None
 
         settings = {
             "region_type": region_type,
@@ -706,9 +706,11 @@ def render_employment_support_analysis(
             "retirement_system_start_date": retirement_system_start_date.isoformat(),
             "continued_system_effective_date": continued_system_effective_date.isoformat(),
             "continued_work_rules_reported": continued_work_rules_reported,
+            "senior_insured_ratio_under_30": senior_insured_ratio_under_30,
+            "continued_target_count": int(continued_target_count),
             "continued_support_months": int(continued_support_months),
-            "continued_target_count": int(metrics.get("continued_auto_eligible_count", 0) or 0),
-            "senior_insured_ratio_under_30": metrics.get("senior_ratio_under_30"),
+            "continued_target_tenure_2y": continued_target_tenure_2y,
+            "continued_exclusions_clear": continued_exclusions_clear,
         }
         if st.button("추가조건 저장 후 다시 분석", type="primary", use_container_width=True, key=f"emp_save_{business_no}"):
             _save_settings(user_id, business_no, company_name, settings)
