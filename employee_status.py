@@ -10,6 +10,8 @@ from typing import Any
 
 import pandas as pd
 import streamlit as st
+import pytesseract
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 from cloud_db import CloudDatabase, cloud_is_configured
 from customer_history import save_customer_event
@@ -307,6 +309,210 @@ def _parse_excel(data: bytes) -> list[dict[str, Any]]:
     return best
 
 
+ROSTER_MASKED_RRN_PATTERN = re.compile(
+    r"(?<!\d)(\d{6})\s*[-–—]?\s*[1-8]?\s*[*xX•·]{4,7}(?!\d)"
+)
+ROSTER_DATE_PATTERN = re.compile(
+    r"(19\d{2}|20\d{2})\s*[.\-/년]\s*(\d{1,2})"
+    r"\s*[.\-/월]\s*(\d{1,2})"
+)
+ROSTER_NAME_PATTERN = re.compile(r"^[가-힣]{2,5}$")
+ROSTER_EXCLUDED_NAMES = {
+    "국민연금", "건강보험", "산재보험", "고용보험",
+    "사업장", "가입자", "명부", "성명", "연번",
+    "자격취득일", "취득일", "주민등록번호", "등록번호",
+    "출력일시", "발급일시", "발급번호", "확인용",
+    "구분", "보험", "이하여백", "주식회사",
+}
+
+
+def _prepare_roster_image(image: Image.Image) -> Image.Image:
+    image = ImageOps.exif_transpose(image).convert("RGB")
+    maximum = max(image.size)
+    if maximum < 2400:
+        ratio = 2400 / max(maximum, 1)
+        image = image.resize(
+            (
+                max(1, int(image.width * ratio)),
+                max(1, int(image.height * ratio)),
+            )
+        )
+    image = ImageOps.grayscale(image)
+    image = ImageOps.autocontrast(image, cutoff=1)
+    image = ImageEnhance.Contrast(image).enhance(1.55)
+    image = ImageEnhance.Sharpness(image).enhance(1.7)
+    return image.filter(ImageFilter.MedianFilter(size=3))
+
+
+def _normalize_roster_date(value: str) -> str:
+    match = ROSTER_DATE_PATTERN.search(str(value or ""))
+    if not match:
+        return ""
+    try:
+        return datetime(
+            int(match.group(1)),
+            int(match.group(2)),
+            int(match.group(3)),
+        ).strftime("%Y-%m-%d")
+    except ValueError:
+        return ""
+
+
+def _valid_roster_name(value: str) -> bool:
+    value = re.sub(r"\s+", "", str(value or ""))
+    return bool(
+        ROSTER_NAME_PATTERN.fullmatch(value)
+        and value not in ROSTER_EXCLUDED_NAMES
+    )
+
+
+def _parse_roster_text_blocks(text: str) -> list[dict[str, Any]]:
+    lines = [
+        re.sub(r"\s+", " ", line).strip()
+        for line in str(text or "").splitlines()
+        if re.sub(r"\s+", " ", line).strip()
+    ]
+    employees: list[dict[str, Any]] = []
+
+    for index, line in enumerate(lines):
+        compact = re.sub(r"\s+", "", line)
+        rrn_match = ROSTER_MASKED_RRN_PATTERN.search(compact)
+        if not rrn_match:
+            continue
+
+        start = max(0, index - 1)
+        end = min(len(lines), index + 4)
+        block_lines = lines[start:end]
+        block = " ".join(block_lines)
+
+        name_candidates: list[str] = []
+        for token in re.findall(r"[가-힣]{2,5}", block):
+            if _valid_roster_name(token):
+                name_candidates.append(token)
+
+        if not name_candidates:
+            continue
+
+        # 주민번호가 있는 줄에서 주민번호 뒤쪽 이름을 우선한다.
+        same_line_after_rrn = compact[rrn_match.end():]
+        same_line_names = [
+            token
+            for token in re.findall(r"[가-힣]{2,5}", same_line_after_rrn)
+            if _valid_roster_name(token)
+        ]
+        name = (
+            same_line_names[0]
+            if same_line_names
+            else name_candidates[0]
+        )
+
+        dates: list[str] = []
+        for match in ROSTER_DATE_PATTERN.finditer(block):
+            normalized = _normalize_roster_date(match.group(0))
+            if normalized and normalized not in dates:
+                dates.append(normalized)
+
+        if not dates:
+            continue
+
+        acquisition = min(dates)
+        employee = _normalize_employee(
+            name,
+            rrn_match.group(1),
+            acquisition,
+            "",
+            "가입중",
+            "",
+        )
+        if employee:
+            employee["source_dates"] = sorted(dates)
+            employees.append(employee)
+
+    deduped: dict[str, dict[str, Any]] = {}
+    for employee in employees:
+        identity = "|".join(
+            [
+                str(employee.get("name_masked", "")),
+                str(employee.get("birth_year", "")),
+            ]
+        )
+        current = deduped.get(identity)
+        if current is None:
+            deduped[identity] = employee
+            continue
+        current_date = str(current.get("acquisition_date", ""))
+        new_date = str(employee.get("acquisition_date", ""))
+        if new_date and (not current_date or new_date < current_date):
+            deduped[identity] = employee
+    return list(deduped.values())
+
+
+def _parse_roster_image(
+    data: bytes,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    image = Image.open(io.BytesIO(data))
+    prepared = _prepare_roster_image(image)
+    candidates: list[dict[str, Any]] = []
+
+    for rotation in (0, 90, 180, 270):
+        rotated = prepared.rotate(
+            rotation,
+            expand=True,
+            fillcolor="white",
+        )
+        text = pytesseract.image_to_string(
+            rotated,
+            lang="kor+eng",
+            config="--oem 1 --psm 6",
+        )
+        employees = _parse_roster_text_blocks(text)
+        rrn_count = len(
+            ROSTER_MASKED_RRN_PATTERN.findall(
+                re.sub(r"\s+", "", text)
+            )
+        )
+        date_count = len(ROSTER_DATE_PATTERN.findall(text))
+        candidates.append(
+            {
+                "rotation": rotation,
+                "employees": employees,
+                "rrn_count": rrn_count,
+                "date_count": date_count,
+                "score": (
+                    len(employees) * 100
+                    + rrn_count * 20
+                    + date_count
+                ),
+            }
+        )
+
+    best = max(
+        candidates,
+        key=lambda item: (
+            item["score"],
+            len(item["employees"]),
+            item["rrn_count"],
+        ),
+    )
+    return best["employees"], {
+        "method": "four_insurance_roster_ocr_v2",
+        "selected_rotation": best["rotation"],
+        "recognized_employee_count": len(best["employees"]),
+        "rrn_row_count": best["rrn_count"],
+        "date_token_count": best["date_count"],
+        "rotation_candidates": [
+            {
+                "rotation": item["rotation"],
+                "employee_count": len(item["employees"]),
+                "rrn_count": item["rrn_count"],
+                "date_count": item["date_count"],
+                "score": item["score"],
+            }
+            for item in candidates
+        ],
+    }
+
+
 def _parse_pdf_text(text: str) -> list[dict[str, Any]]:
     employees = []
     date_pattern = re.compile(
@@ -378,7 +584,27 @@ def parse_roster(
                 continue
         raise ValueError("CSV 파일 인코딩을 확인할 수 없습니다.")
 
-    if suffix in {".pdf", ".jpg", ".jpeg", ".png"}:
+    if suffix in {".jpg", ".jpeg", ".png"}:
+        if progress_callback:
+            progress_callback(
+                0,
+                4,
+                "가입자명부 표와 문서 방향을 분석하고 있습니다.",
+            )
+        employees, extraction = _parse_roster_image(data)
+        if progress_callback:
+            progress_callback(
+                4,
+                4,
+                f"가입자명부 직원 {len(employees)}명 인식 완료",
+            )
+        return employees, {
+            "method": "image_roster_table_ocr",
+            "filename": filename,
+            "extraction": extraction,
+        }
+
+    if suffix == ".pdf":
         text, extraction = preprocess_document(
             filename,
             data,
@@ -386,11 +612,7 @@ def parse_roster(
         )
         employees = _parse_pdf_text(text)
         return employees, {
-            "method": (
-                "pdf_ocr"
-                if suffix == ".pdf"
-                else "image_ocr"
-            ),
+            "method": "pdf_ocr",
             "filename": filename,
             "extraction": extraction,
         }
@@ -764,6 +986,24 @@ def render_employee_status(
                 f"{total_files}개 파일에서 중복을 제거한 직원 "
                 f"{len(employees)}명을 분석해 {message}했습니다."
             )
+
+            preview_df = _display_employee_rows(employees)
+            if not preview_df.empty:
+                with st.expander(
+                    f"이번 업로드 인식 결과 {len(employees)}명 확인",
+                    expanded=True,
+                ):
+                    st.dataframe(
+                        preview_df,
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+
+            if len(employees) < 5:
+                st.warning(
+                    "인식된 직원 수가 적습니다. 문서의 실제 인원과 "
+                    "아래 인식 결과를 반드시 비교해주세요."
+                )
 
             if failed_files:
                 st.warning(
