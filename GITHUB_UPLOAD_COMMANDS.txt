@@ -1,4 +1,4 @@
 git status
 git add .
-git commit -m "feat: update OASIS to v9.2.0 enterprise health dashboard"
+git commit -m "Update OASIS to v9.3.0 AI consulting scenario engine"
 git push origin main

@@ -10,7 +10,16 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+from consulting_report import render_ai_consulting_report_page
+from tax_diagnosis import render_tax_diagnosis_page
+from consultation_journal import load_company_consultation_context
+from cloud_sync import load_financial_snapshot, load_stock_valuations
 from matching_preferences import get_matching_preferences
+from consulting_priority_engine import build_priority_recommendations
+from consultation_scenario_engine import (
+    analyze_representative_answer,
+    build_scenario_brief,
+)
 from registered_policy_match import (
     build_customer_labels,
     load_registered_customers,
@@ -281,10 +290,138 @@ def save_success_case(
     _save_json(_success_path(user_id), cases[:1000])
 
 
+def _normalize_business_no(value: Any) -> str:
+    digits = re.sub(r"[^0-9]", "", str(value or ""))
+    if len(digits) == 10:
+        return f"{digits[:3]}-{digits[3:5]}-{digits[5:]}"
+    return str(value or "").strip()
+
+
+def _safe_number(value: Any) -> float | None:
+    if value is None:
+        return None
+    text = str(value).replace(",", "").strip()
+    if text.lower() in {"", "none", "nan", "nat", "-"}:
+        return None
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_money(value: Any) -> str:
+    number = _safe_number(value)
+    if number is None:
+        return "-"
+    return f"{number:,.0f}원"
+
+
+@st.cache_data(ttl=45, show_spinner=False)
+def _load_integrated_company_context(
+    user_id: str,
+    company_name: str,
+    business_no: str,
+) -> dict[str, Any]:
+    normalized_no = _normalize_business_no(business_no)
+
+    stock_records = []
+    for record in load_stock_valuations(user_id, limit=300):
+        if not isinstance(record, dict):
+            continue
+        record_no = _normalize_business_no(record.get("business_no", ""))
+        record_name = _clean(record.get("company_name", ""))
+        if (
+            normalized_no and record_no and normalized_no == record_no
+        ) or (
+            company_name and record_name and company_name == record_name
+        ):
+            stock_records.append(dict(record))
+
+    stock_records.sort(
+        key=lambda item: str(
+            item.get("saved_at", "") or item.get("valuation_date", "")
+        ),
+        reverse=True,
+    )
+
+    journals = load_company_consultation_context(
+        user_id,
+        business_no,
+        company_name=company_name,
+        limit=20,
+    )
+
+    try:
+        financial = load_financial_snapshot(user_id, normalized_no)
+    except Exception:
+        financial = {}
+    if not isinstance(financial, dict):
+        financial = {}
+
+    journal_text_parts: list[str] = []
+    transcript_count = 0
+    for journal in journals:
+        if not isinstance(journal, dict):
+            continue
+        for field in (
+            "consultation_title",
+            "summary",
+            "key_needs",
+            "consultation_summary",
+            "consultant_notes",
+            "next_action",
+            "follow_up",
+            "representative_needs",
+        ):
+            value = _clean(journal.get(field, ""))
+            if value:
+                journal_text_parts.append(value)
+
+        transcript = _clean(journal.get("transcript", ""))
+        if transcript:
+            transcript_count += 1
+            journal_text_parts.append(transcript[:8000])
+
+    stock_text_parts: list[str] = []
+    latest_stock = stock_records[0] if stock_records else {}
+    if latest_stock:
+        result = latest_stock.get("result", {})
+        inputs = latest_stock.get("inputs", {})
+        if not isinstance(result, dict):
+            result = {}
+        if not isinstance(inputs, dict):
+            inputs = {}
+
+        stock_text_parts.extend([
+            _clean(latest_stock.get("company_name", "")),
+            _clean(latest_stock.get("valuation_date", "")),
+            _clean(latest_stock.get("saved_at", "")),
+            _clean(result.get("final_value_per_share", "")),
+            _clean(result.get("total_equity_value", "")),
+            _clean(result.get("adjusted_net_asset_value", "")),
+            _clean(result.get("net_asset_value", "")),
+            _clean(inputs.get("valuation_type", "")),
+        ])
+
+    combined_text = " ".join(
+        part for part in [*stock_text_parts, *journal_text_parts] if part
+    )
+
+    return {
+        "stock_records": stock_records,
+        "latest_stock": latest_stock,
+        "financial": financial,
+        "journals": journals,
+        "transcript_count": transcript_count,
+        "combined_text": combined_text,
+    }
+
+
 def _customer_text(
     customer: pd.Series,
     preferences: dict[str, Any],
     memory: dict[str, Any],
+    integrated_context: dict[str, Any] | None = None,
 ) -> str:
     fields = [
         _clean(customer.get("업체명", "")),
@@ -296,9 +433,19 @@ def _customer_text(
         ", ".join(preferences.get("매칭키워드", []) or []),
         ", ".join(preferences.get("관심지원분야", []) or []),
         _clean(preferences.get("자금사용목적", "")),
+        " ".join(
+            _clean(item.get("title", ""))
+            + " "
+            + _clean(item.get("summary", ""))
+            + " "
+            + " ".join(item.get("evidence", []) or [])
+            for item in (preferences.get("저장정책자금", []) or [])
+            if isinstance(item, dict)
+        ),
         _clean(memory.get("key_needs", "")),
         _clean(memory.get("consultant_notes", "")),
         _clean(memory.get("next_focus", "")),
+        _clean((integrated_context or {}).get("combined_text", "")),
     ]
     return " ".join(field for field in fields if field)
 
@@ -363,53 +510,16 @@ def build_topic_recommendations(
     customer: pd.Series,
     preferences: dict[str, Any],
     memory: dict[str, Any],
+    integrated_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    text = _customer_text(
+    result = build_priority_recommendations(
         customer,
         preferences,
         memory,
+        integrated_context,
+        TOPIC_RULES,
     )
-    text_tokens = _tokens(text)
-    results = []
-
-    for rule in TOPIC_RULES:
-        matched = []
-        for keyword in rule["keywords"]:
-            keyword_tokens = _tokens(keyword)
-            if keyword_tokens and keyword_tokens & text_tokens:
-                matched.append(keyword)
-
-        score = 25
-        score += min(len(matched) * 13, 55)
-
-        if rule["topic"] in (
-            preferences.get("관심지원분야", [])
-            or []
-        ):
-            score += 15
-
-        if rule["topic"] in _clean(
-            memory.get("next_focus", "")
-        ):
-            score += 15
-
-        score = min(score, 100)
-
-        results.append(
-            {
-                "topic": rule["topic"],
-                "score": score,
-                "matched": list(dict.fromkeys(matched)),
-                "questions": rule["questions"],
-                "documents": rule["documents"],
-            }
-        )
-
-    results.sort(
-        key=lambda item: item["score"],
-        reverse=True,
-    )
-    return results
+    return result.get("recommendations", [])
 
 
 def _load_checklist(
@@ -446,8 +556,7 @@ def render_copilot_page(
     )
 
     customers = load_registered_customers(
-        get_user_cumulative_db_path(user_id),
-        owner_user_id=user_id,
+        get_user_cumulative_db_path(user_id)
     )
     if customers.empty:
         st.info(
@@ -457,14 +566,62 @@ def render_copilot_page(
 
     labels, row_map = build_customer_labels(customers)
 
-    prefill_business_no = str(
+    explicit_business_no = str(
         st.session_state.pop("_oasis_copilot_business_no", "") or ""
     )
-    prefill_company_name = str(
+    explicit_company_name = str(
         st.session_state.pop("_oasis_copilot_company_name", "") or ""
     )
-    if prefill_business_no or prefill_company_name:
-        normalized_prefill = re.sub(r"[^0-9]", "", prefill_business_no)
+
+    active_business_no = str(
+        st.session_state.get(
+            "_oasis_active_company_business_no",
+            "",
+        )
+        or ""
+    )
+    active_company_name = str(
+        st.session_state.get(
+            "_oasis_active_company_name",
+            "",
+        )
+        or ""
+    )
+
+    active_key = (
+        re.sub(r"[^0-9]", "", active_business_no)
+        or active_company_name.strip()
+    )
+    consumed_active_key = str(
+        st.session_state.get(
+            "_oasis_copilot_consumed_active_key",
+            "",
+        )
+        or ""
+    )
+
+    # Apply the enterprise-center selection only once.
+    # After the first handoff, the user can freely select another company
+    # inside AI Copilot without the value being overwritten on every rerun.
+    should_apply_handoff = bool(
+        explicit_business_no
+        or explicit_company_name
+        or (active_key and active_key != consumed_active_key)
+    )
+
+    if should_apply_handoff:
+        prefill_business_no = (
+            explicit_business_no or active_business_no
+        )
+        prefill_company_name = (
+            explicit_company_name or active_company_name
+        )
+        normalized_prefill = re.sub(
+            r"[^0-9]",
+            "",
+            prefill_business_no,
+        )
+
         for candidate_label, candidate_index in row_map.items():
             candidate = customers.loc[candidate_index]
             candidate_business = re.sub(
@@ -482,6 +639,11 @@ def render_copilot_page(
             ):
                 st.session_state["copilot_customer"] = candidate_label
                 break
+
+        if active_key:
+            st.session_state[
+                "_oasis_copilot_consumed_active_key"
+            ] = active_key
 
     if st.session_state.get("copilot_customer") not in labels:
         st.session_state.pop("copilot_customer", None)
@@ -512,16 +674,26 @@ def render_copilot_page(
         business_no,
     )
 
-    recommendations = build_topic_recommendations(
+    integrated_context = _load_integrated_company_context(
+        user_id,
+        company_name,
+        business_no,
+    )
+
+    priority_analysis = build_priority_recommendations(
         customer,
         preferences,
         memory,
+        integrated_context,
+        TOPIC_RULES,
     )
+    recommendations = priority_analysis.get("recommendations", [])
 
     current_text = _customer_text(
         customer,
         preferences,
         memory,
+        integrated_context,
     )
     similar_cases = find_similar_success_cases(
         user_id,
@@ -548,26 +720,183 @@ def render_copilot_page(
         unsafe_allow_html=True,
     )
 
+    stock_records = integrated_context.get("stock_records", [])
+    journals = integrated_context.get("journals", [])
+    transcript_count = int(
+        integrated_context.get("transcript_count", 0) or 0
+    )
+    latest_stock = integrated_context.get("latest_stock", {})
+    if not isinstance(latest_stock, dict):
+        latest_stock = {}
+
+    st.markdown("### AI 분석 반영자료")
+    source_columns = st.columns(4, gap="medium")
+    source_columns[0].metric("고객 기본정보", "반영")
+    source_columns[1].metric("주가평가", f"{len(stock_records)}건")
+    source_columns[2].metric("상담일지", f"{len(journals)}건")
+    source_columns[3].metric("녹취내용", f"{transcript_count}건")
+
+    if not stock_records and not journals:
+        st.warning(
+            "이 기업의 사업자등록번호 또는 법인명이 저장자료와 연결되지 않았습니다. "
+            "기업컨설팅에서 동일 기업을 선택해 주가평가·상담일지를 저장했는지 확인해주세요."
+        )
+    else:
+        with st.expander("AI에 반영된 기업컨설팅 자료 확인", expanded=False):
+            if latest_stock:
+                result = latest_stock.get("result", {})
+                if not isinstance(result, dict):
+                    result = {}
+                st.markdown("#### 최근 주가평가")
+                s1, s2, s3 = st.columns(3)
+                s1.metric(
+                    "평가기준일",
+                    str(latest_stock.get("valuation_date", "") or "-"),
+                )
+                s2.metric(
+                    "1주당 평가액",
+                    _format_money(result.get("final_value_per_share")),
+                )
+                s3.metric(
+                    "전체 주식가치",
+                    _format_money(result.get("total_equity_value")),
+                )
+
+            if journals:
+                st.markdown("#### 최근 상담일지")
+                for journal in journals[:5]:
+                    title = _clean(
+                        journal.get("consultation_title", "")
+                    ) or "녹음 상담일지"
+                    saved_at = _clean(journal.get("saved_at", ""))
+                    summary = _clean(
+                        journal.get("summary", "")
+                        or journal.get("consultation_summary", "")
+                    )
+                    st.markdown(
+                        f"**{title}** · {saved_at or '일자 미확인'}"
+                    )
+                    if summary:
+                        st.caption(summary[:1000])
+
+    saved_policy_items = preferences.get("저장정책자금", []) or []
+    saved_policy_items = [
+        item for item in saved_policy_items if isinstance(item, dict)
+    ]
+    if saved_policy_items:
+        st.markdown("### 저장된 정책자금 추천")
+        st.caption(
+            f"기업컨설팅에서 확정 저장한 추천 {len(saved_policy_items)}건 · "
+            f"최소점수 {preferences.get('저장정책자금_최소점수', '-')}점"
+        )
+        policy_rows = []
+        for item in saved_policy_items[:20]:
+            policy_rows.append(
+                {
+                    "점수": item.get("score", ""),
+                    "분류": item.get("category", ""),
+                    "공고명": item.get("title", ""),
+                    "기관": item.get("agency", ""),
+                    "신청종료": item.get("end_date", ""),
+                }
+            )
+        st.dataframe(
+            pd.DataFrame(policy_rows),
+            hide_index=True,
+            use_container_width=True,
+        )
+
     top = recommendations[:5]
     st.markdown("### 이번 상담 우선순위")
+    stage_columns = st.columns([1, 1, 2], gap="medium")
+    stage_columns[0].metric(
+        "기업 성장단계",
+        priority_analysis.get("stage", "판단보류"),
+    )
+    stage_columns[1].metric(
+        "기업규모 점수",
+        f"{priority_analysis.get('scale_score', 0)}점",
+    )
+    stage_columns[2].caption(
+        priority_analysis.get("stage_reason", "")
+        + "\n\n점수기준: "
+        + priority_analysis.get("method", "")
+    )
 
-    columns = st.columns(min(len(top), 5))
+    st.markdown(
+        """
+        <style>
+        .copilot-priority-card {min-height:150px;padding:17px;border:1px solid #d9e3f0;border-radius:16px;background:linear-gradient(145deg,#ffffff,#f6f9fd);box-shadow:0 7px 20px rgba(15,42,80,.07);position:relative;overflow:hidden;margin-bottom:7px;}
+        .copilot-priority-card:before {content:"";position:absolute;left:0;top:0;right:0;height:4px;background:#1e5bd7;}
+        .copilot-priority-topic {font-weight:800;color:#344054;font-size:.88rem;margin-top:4px;min-height:42px;}
+        .copilot-priority-score {font-size:2rem;font-weight:900;color:#0b2b5b;letter-spacing:-.04em;margin:5px 0;}
+        .copilot-priority-note {font-size:.74rem;color:#667085;line-height:1.35;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    columns = st.columns(min(len(top), 5), gap="medium")
     for index, item in enumerate(top):
+        evidence_items = item.get("evidence", []) or []
+        penalty_items = item.get("penalties", []) or []
+        evidence = (
+            "근거: " + " / ".join(evidence_items[:2])
+            if evidence_items
+            else "확인된 직접 근거가 부족합니다."
+        )
+        penalty = (
+            "감점: " + " / ".join(penalty_items[:1])
+            if penalty_items
+            else ""
+        )
+        card_html = (
+            '<div class="copilot-priority-card">'
+            f'<div class="copilot-priority-topic">{item["topic"]}</div>'
+            f'<div class="copilot-priority-score">{item["score"]}점</div>'
+            '<div class="copilot-priority-note">'
+            f'{item.get("status", "")} · 확신도 {item.get("confidence", 0)}점<br>'
+            f'{evidence}<br>{penalty}'
+            '</div></div>'
+        )
         with columns[index]:
-            st.metric(
-                item["topic"],
-                f"{item['score']}점",
-            )
-            if item["matched"]:
-                st.caption(
-                    "근거: "
-                    + ", ".join(item["matched"][:3])
-                )
-            else:
-                st.caption("기본 확인 필요")
+            st.markdown(card_html, unsafe_allow_html=True)
 
-    tab_playbook, tab_memory, tab_success, tab_review = st.tabs(
+    with st.expander("우선순위 점수 산정근거", expanded=False):
+        st.caption(
+            "단순 키워드 개수가 아니라 기업규모·실제 금액·재무비율·성장단계·"
+            "대표 의도·자료충족도·실행가능성을 함께 반영합니다."
+        )
+        for rank, item in enumerate(recommendations, start=1):
+            st.markdown(
+                f"**{rank}. {item.get('topic', '')} — "
+                f"{item.get('score', 0)}점 / 확신도 "
+                f"{item.get('confidence', 0)}점**"
+            )
+            for value in item.get("evidence", []) or []:
+                st.write(f"- 가점근거: {value}")
+            for value in item.get("penalties", []) or []:
+                st.write(f"- 감점근거: {value}")
+            components = item.get("components", {}) or {}
+            if components:
+                st.caption(
+                    "점수 구성: "
+                    + ", ".join(
+                        f"{name} {score:+d}"
+                        for name, score in components.items()
+                    )
+                )
+
+    (
+        tab_report,
+        tab_tax,
+        tab_playbook,
+        tab_memory,
+        tab_success,
+        tab_review,
+    ) = st.tabs(
         [
+            "AI 상담보고서",
+            "AI 절세진단",
             "상담 플레이북",
             "기업 메모리",
             "성공사례",
@@ -575,7 +904,165 @@ def render_copilot_page(
         ]
     )
 
+    with tab_report:
+        st.caption(
+            "선택한 기업의 고객DB·재무·등기·주가평가·매칭설정을 "
+            "한 번에 결합한 상담 사전진단입니다."
+        )
+        render_ai_consulting_report_page(
+            user_id,
+            user_name,
+            customer=customer,
+            embedded=True,
+            key_prefix=f"copilot_report_{business_key}",
+        )
+
+    with tab_tax:
+        render_tax_diagnosis_page(
+            user_id,
+            customer,
+            key_prefix=f"copilot_tax_{business_key}",
+        )
+
     with tab_playbook:
+        scenario_brief = build_scenario_brief(
+            recommendations,
+            memory,
+        )
+
+        st.markdown("#### AI 실시간 상담 시나리오")
+        st.caption(
+            "대표 답변을 입력하면 감지된 니즈를 바탕으로 "
+            "다음 질문과 연결 가능한 컨설팅 주제를 추천합니다."
+        )
+
+        opening_questions = scenario_brief.get(
+            "opening_questions",
+            [],
+        )
+        if opening_questions:
+            st.markdown("##### 추천 시작 질문")
+            for rank, item in enumerate(opening_questions, start=1):
+                st.markdown(
+                    f"**{rank}. [{item.get('topic', '기타')}] "
+                    f"{item.get('question', '')}**"
+                )
+                st.caption(item.get("reason", ""))
+
+        default_question_options = [
+            item.get("question", "")
+            for item in opening_questions
+            if item.get("question")
+        ]
+        if not default_question_options:
+            default_question_options = [
+                "올해 가장 해결하고 싶은 경영상 문제는 무엇입니까?"
+            ]
+
+        scenario_question = st.selectbox(
+            "현재 질문",
+            default_question_options,
+            key=f"scenario_question_{business_key}",
+        )
+        representative_answer = st.text_area(
+            "대표 답변",
+            placeholder=(
+                "예: 올해 하반기에 직원 3명을 채용하고 "
+                "기계설비도 약 2억원 정도 도입할 예정입니다."
+            ),
+            height=120,
+            key=f"scenario_answer_{business_key}",
+        )
+
+        scenario_result_key = f"scenario_result_{business_key}"
+        if st.button(
+            "답변 분석하고 다음 질문 추천",
+            type="primary",
+            use_container_width=True,
+            key=f"analyze_scenario_{business_key}",
+        ):
+            st.session_state[scenario_result_key] = (
+                analyze_representative_answer(
+                    representative_answer,
+                    current_topic=scenario_question,
+                    recommendations=recommendations,
+                )
+            )
+
+        scenario_result = st.session_state.get(
+            scenario_result_key,
+            {},
+        )
+        if scenario_result:
+            sr1, sr2, sr3 = st.columns(3, gap="medium")
+            sr1.metric(
+                "대표 반응",
+                scenario_result.get("intent", "-"),
+            )
+            sr2.metric(
+                "분석 확신도",
+                f"{scenario_result.get('confidence', 0)}점",
+            )
+            sr3.metric(
+                "연결 제안",
+                f"{len(scenario_result.get('services', []))}개",
+            )
+            st.info(scenario_result.get("summary", ""))
+
+            detected = scenario_result.get("signals", []) or []
+            if detected:
+                st.markdown("##### 감지된 대표 니즈")
+                signal_rows = [
+                    {
+                        "니즈": item.get("name", ""),
+                        "확신도": item.get("score", 0),
+                        "감지어": ", ".join(
+                            item.get("matched", []) or []
+                        ),
+                    }
+                    for item in detected
+                ]
+                st.dataframe(
+                    pd.DataFrame(signal_rows),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+            q_col, p_col = st.columns(2, gap="large")
+            with q_col:
+                st.markdown("##### 다음 추천 질문")
+                for index, question in enumerate(
+                    scenario_result.get("next_questions", []) or [],
+                    start=1,
+                ):
+                    st.write(f"{index}. {question}")
+            with p_col:
+                st.markdown("##### 연결 가능한 제안")
+                for service in (
+                    scenario_result.get("services", []) or []
+                ):
+                    st.write(f"- {service}")
+
+            points = scenario_result.get("talking_points", []) or []
+            if points:
+                st.markdown("##### 영업사원 설명 포인트")
+                for point in points:
+                    st.success(point)
+
+            if st.button(
+                "시나리오 분석 초기화",
+                use_container_width=True,
+                key=f"clear_scenario_{business_key}",
+            ):
+                st.session_state.pop(scenario_result_key, None)
+                st.session_state.pop(
+                    f"scenario_answer_{business_key}",
+                    None,
+                )
+                st.rerun()
+
+        st.divider()
+
         checklist = _load_checklist(
             user_id,
             business_key,
