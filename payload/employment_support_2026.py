@@ -218,21 +218,37 @@ def _save_settings(user_id: str, business_no: str, company_name: str, settings: 
 
 
 def _real_employee_name(employee: dict[str, Any]) -> str:
-    """Return a usable employee name. Synthetic placeholder rows are rejected."""
+    """Return a usable employee name while rejecting synthetic placeholder rows."""
     raw = str(
         employee.get("name")
         or employee.get("employee_name")
         or employee.get("성명")
+        or employee.get("가입자명")
+        or employee.get("피보험자명")
+        or employee.get("근로자명")
+        or employee.get("직원명")
+        or employee.get("name_masked")
         or ""
     ).strip()
     if not raw:
         return ""
-    if re.fullmatch(r"직원\s*\d+", raw):
-        return ""
-    if raw.lower() in {"unknown", "none", "nan", "미확인"}:
-        return ""
-    return raw
 
+    compact = re.sub(r"\s+", "", raw)
+    if re.fullmatch(r"(직원|employee|staff)[-_ ]*\d+", raw, flags=re.IGNORECASE):
+        return ""
+    if compact.lower() in {
+        "unknown", "none", "nan", "미확인",
+        "성명", "가입자명", "피보험자명",
+    }:
+        return ""
+
+    # employee_status.py stores privacy-safe names such as 홍*동 in name_masked.
+    # Masked Korean names are valid roster identities and must be accepted.
+    if re.fullmatch(r"[가-힣][가-힣*○ㆍ·]{1,10}", compact):
+        return compact
+    if re.fullmatch(r"[A-Za-z][A-Za-z .'-]{1,50}", raw):
+        return raw
+    return raw
 
 def _metrics(latest: dict[str, Any]) -> dict[str, Any]:
     employees = latest.get("employees", []) or []
@@ -247,6 +263,12 @@ def _metrics(latest: dict[str, Any]) -> dict[str, Any]:
             continue
         copied = dict(employee)
         copied["_verified_name"] = name
+        copied["_name_source"] = (
+            "name_masked" if employee.get("name_masked") else
+            "name" if employee.get("name") else
+            "employee_name" if employee.get("employee_name") else
+            "legacy_alias"
+        )
         active.append(copied)
 
     today = date.today()
@@ -308,6 +330,10 @@ def _metrics(latest: dict[str, Any]) -> dict[str, Any]:
         "continued_auto_eligible_count": sum(1 for row in senior_rows if row["자동판정"] == "가능"),
         "continued_auto_review_count": sum(1 for row in senior_rows if row["자동판정"] == "확인필요"),
         "has_employee_roster": bool(active),
+        "masked_name_count": sum(
+            1 for employee in active
+            if employee.get("_name_source") == "name_masked"
+        ),
     }
 
 def _score(item: dict[str, Any], metrics: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
@@ -766,6 +792,11 @@ def render_employment_support_analysis(
         c2.metric("최근 6개월 취득", f"{metrics['recent_count']}명")
         c3.metric("확인된 청년", f"{metrics['youth_count']}명")
         c4.metric("60세 이상·근속 1년 초과", f"{metrics['senior_long_count']}명")
+        if metrics.get("masked_name_count"):
+            st.caption(
+                f"직원현황의 개인정보 보호형 마스킹 성명 "
+                f"{metrics['masked_name_count']}명을 정상 인식했습니다."
+            )
 
     with st.expander("기업·채용계획 추가정보", expanded=not bool(current)):
         st.caption("가입자명부만으로 확인되지 않는 기업계획과 제도 운영 여부만 입력합니다.")
