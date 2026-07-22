@@ -31,6 +31,9 @@ from registered_policy_match import (
 from utils import get_user_cumulative_db_path, get_user_dirs
 from pdf_report import build_representative_pdf
 from tax_diagnosis import build_tax_diagnosis
+from comprehensive_financial_diagnosis import (
+    build_comprehensive_financial_diagnosis,
+)
 
 
 
@@ -466,6 +469,36 @@ def build_consulting_analysis(
     strategy: list[str] = []
     questions: list[str] = []
 
+    comprehensive_diagnosis = build_comprehensive_financial_diagnosis(
+        customer,
+        financial,
+    )
+    diagnosis_findings = (
+        comprehensive_diagnosis.get("findings", [])
+        if isinstance(comprehensive_diagnosis, dict)
+        else []
+    )
+
+    for finding in diagnosis_findings[:5]:
+        cautions.append(
+            f"[{finding.get('status', '확인 필요')}] "
+            f"{finding.get('title', '')} — "
+            f"중요도 {finding.get('importance', 0)}점, "
+            f"확신도 {finding.get('confidence', 0)}점"
+        )
+        facts = finding.get("facts", []) or []
+        if facts:
+            strategy.append(
+                f"{finding.get('title', '재무진단')}: "
+                + " ".join(str(item) for item in facts[:2])
+            )
+
+    questions.extend(
+        comprehensive_diagnosis.get("questions", [])[:15]
+        if isinstance(comprehensive_diagnosis, dict)
+        else []
+    )
+
     consultation_context = (
         consultation_context if isinstance(consultation_context, dict) else {}
     )
@@ -842,6 +875,7 @@ def build_consulting_analysis(
         "employee_context": employee_context,
         "employee_summary": employee_summary,
         "workplace_counts": workplace_counts,
+        "comprehensive_diagnosis": comprehensive_diagnosis,
         "sales": sales,
         "operating_profit": operating_profit,
         "net_income": net_income,
@@ -862,6 +896,7 @@ def build_consulting_analysis(
         "data_sources": {
             "cretop": bool(len(customer.index)),
             "financial": bool(financial),
+            "comprehensive_financial_diagnosis": bool(diagnosis_findings),
             "registry": bool(registry),
             "stock": bool(stock_record),
             "consultation": bool(consultation_count),
@@ -929,6 +964,44 @@ def build_consulting_excel_report(analysis: dict[str, Any]) -> bytes:
     for row in summary_rows:
         summary.append(row)
     _style_sheet(summary)
+
+    diagnosis_engine = workbook.create_sheet("종합재무진단")
+    diagnosis_engine.append(
+        [
+            "우선순위",
+            "진단주제",
+            "분류",
+            "중요도",
+            "확신도",
+            "판정",
+            "관찰사실",
+            "대표질문",
+            "요청자료",
+            "확인 후 방향",
+        ]
+    )
+    for index, finding in enumerate(
+        analysis.get("comprehensive_diagnosis", {}).get(
+            "findings",
+            [],
+        ),
+        start=1,
+    ):
+        diagnosis_engine.append(
+            [
+                index,
+                finding.get("title", ""),
+                finding.get("category", ""),
+                finding.get("importance", 0),
+                finding.get("confidence", 0),
+                finding.get("status", ""),
+                "\n".join(finding.get("facts", []) or []),
+                "\n".join(finding.get("questions", []) or []),
+                "\n".join(finding.get("documents", []) or []),
+                "\n".join(finding.get("directions", []) or []),
+            ]
+        )
+    _style_sheet(diagnosis_engine)
 
     financial = workbook.create_sheet("재무분석")
     financial.append(["항목", "금액 또는 비율"])
@@ -1269,6 +1342,84 @@ def render_ai_consulting_report_page(
                 hide_index=True,
                 use_container_width=True,
             )
+
+    st.markdown("### 종합 재무진단 우선순위")
+    comprehensive = analysis.get("comprehensive_diagnosis", {}) or {}
+    findings = comprehensive.get("findings", []) or []
+
+    if not findings:
+        st.info(
+            "현재 크레탑·재무자료에서 진단 가능한 세부 계정과목을 충분히 찾지 못했습니다. "
+            "상세 재무제표나 계정별원장을 추가하면 진단 범위가 넓어집니다."
+        )
+    else:
+        priority_df = pd.DataFrame(
+            [
+                {
+                    "순위": index,
+                    "진단 주제": finding.get("title", ""),
+                    "분류": finding.get("category", ""),
+                    "중요도": finding.get("importance", 0),
+                    "확신도": finding.get("confidence", 0),
+                    "종합우선도": finding.get("priority", 0),
+                    "판정": finding.get("status", ""),
+                }
+                for index, finding in enumerate(findings, start=1)
+            ]
+        )
+        st.dataframe(
+            priority_df,
+            hide_index=True,
+            use_container_width=True,
+        )
+
+        for index, finding in enumerate(findings, start=1):
+            with st.expander(
+                f"{index}. {finding.get('title', '')} · "
+                f"중요도 {finding.get('importance', 0)} · "
+                f"확신도 {finding.get('confidence', 0)}",
+                expanded=index <= 3,
+            ):
+                st.markdown("**관찰된 사실**")
+                for fact in finding.get("facts", []) or []:
+                    st.write(f"- {fact}")
+
+                st.markdown("**대표 확인 질문**")
+                for question in finding.get("questions", []) or []:
+                    st.write(f"- {question}")
+
+                st.markdown("**추가 요청자료**")
+                for document in finding.get("documents", []) or []:
+                    st.write(f"- {document}")
+
+                st.markdown("**확인 후 컨설팅 방향**")
+                for direction in finding.get("directions", []) or []:
+                    st.write(f"- {direction}")
+
+                account_hits = finding.get("account_hits", []) or []
+                if account_hits:
+                    with st.container(border=True):
+                        st.caption("탐지된 계정과목 근거")
+                        hit_df = pd.DataFrame(
+                            [
+                                {
+                                    "계정 경로": hit.get("account", ""),
+                                    "연도": hit.get("year") or "-",
+                                    "금액": _format_money(hit.get("value")),
+                                }
+                                for hit in account_hits[:20]
+                            ]
+                        )
+                        st.dataframe(
+                            hit_df,
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+
+        st.warning(
+            "이 결과는 계정과목 이상징후를 찾는 사전진단입니다. "
+            "특히 가지급금 가능성은 계정별원장과 거래증빙 확인 전에는 확정할 수 없습니다."
+        )
 
     st.markdown("### 재무 진단")
     ratio_items = [
