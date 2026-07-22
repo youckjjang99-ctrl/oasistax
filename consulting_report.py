@@ -23,6 +23,7 @@ from cloud_sync import (
     load_stock_valuations,
 )
 from consultation_journal import load_company_consultation_context
+from employee_status import get_latest_employee_status
 from registered_policy_match import (
     build_customer_labels,
     load_registered_customers,
@@ -354,6 +355,7 @@ def build_consulting_analysis(
     preferences: dict[str, Any],
     consultation_context: dict[str, Any] | None = None,
     articles_review: dict[str, Any] | None = None,
+    employee_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     company_name = _clean(customer.get("업체명", "")) or _clean(
         financial.get("업체명", "")
@@ -377,11 +379,49 @@ def build_consulting_analysis(
             "설립년도",
         )
     )
-    employees = _value_from_sources(
+    cretop_employees = _value_from_sources(
         customer,
         financial,
         "종업원수",
         "상시근로자수",
+    )
+
+    employee_context = (
+        employee_context if isinstance(employee_context, dict) else {}
+    )
+    employee_summary = (
+        employee_context.get("summary", {})
+        if isinstance(employee_context.get("summary"), dict)
+        else {}
+    )
+    employee_records = (
+        employee_context.get("employees", [])
+        if isinstance(employee_context.get("employees"), list)
+        else []
+    )
+    employee_active_count = int(
+        employee_summary.get("active_count", 0) or 0
+    )
+    employee_total_count = int(
+        employee_summary.get("total_count", 0) or len(employee_records)
+    )
+    employee_source_available = bool(
+        employee_context
+        and (
+            employee_active_count
+            or employee_total_count
+            or employee_records
+        )
+    )
+    employees = (
+        employee_active_count
+        if employee_source_available
+        else cretop_employees
+    )
+    employees_source = (
+        "직원현황"
+        if employee_source_available
+        else "크레탑·고객DB"
     )
 
     sales = _value_from_sources(
@@ -451,6 +491,35 @@ def build_consulting_analysis(
     net_number = _number(net_income)
     employees_number = _number(employees)
 
+    cretop_employees_number = _number(cretop_employees)
+    youth_count = int(employee_summary.get("youth_count", 0) or 0)
+    middle_aged_count = int(
+        employee_summary.get("middle_aged_count", 0) or 0
+    )
+    senior_count = int(employee_summary.get("senior_count", 0) or 0)
+    recent_3m_count = int(
+        employee_summary.get("recent_3m_count", 0) or 0
+    )
+    recent_6m_count = int(
+        employee_summary.get("recent_6m_count", 0) or 0
+    )
+    long_tenure_count = int(
+        employee_summary.get("long_tenure_count", 0) or 0
+    )
+
+    workplace_counts: dict[str, int] = {}
+    for employee in employee_records:
+        if not isinstance(employee, dict):
+            continue
+        if not bool(employee.get("active", True)):
+            continue
+        workplace = _clean(
+            employee.get("workplace_name", "")
+            or employee.get("workplace_management_no", "")
+            or "소속 미확인"
+        )
+        workplace_counts[workplace] = workplace_counts.get(workplace, 0) + 1
+
     if sales_number:
         strengths.append(
             f"최근 확인 매출액은 {_format_money(sales)}입니다."
@@ -471,7 +540,42 @@ def build_consulting_analysis(
         )
     if employees_number:
         strengths.append(
-            f"확인된 종업원수는 {int(employees_number):,}명입니다."
+            f"확인된 종업원수는 {int(employees_number):,}명이며 "
+            f"{employees_source} 자료를 기준으로 반영했습니다."
+        )
+
+    if employee_source_available:
+        if youth_count:
+            strengths.append(
+                f"직원현황 기준 청년 연령구간 직원은 {youth_count}명입니다."
+            )
+        if senior_count:
+            strengths.append(
+                f"직원현황 기준 60세 이상 고령자 추정 직원은 "
+                f"{senior_count}명입니다."
+            )
+        if recent_6m_count:
+            strengths.append(
+                f"최근 6개월 자격취득 직원이 {recent_6m_count}명 확인됩니다."
+            )
+        if long_tenure_count:
+            strengths.append(
+                f"2년 이상 장기근속 직원은 {long_tenure_count}명입니다."
+            )
+
+        if (
+            cretop_employees_number is not None
+            and int(cretop_employees_number) != employee_active_count
+        ):
+            cautions.append(
+                f"크레탑 종업원수 {int(cretop_employees_number):,}명과 "
+                f"최신 직원현황 가입중 {employee_active_count:,}명이 다릅니다. "
+                "컨설팅과 고용지원금 검토에는 최신 직원현황을 우선 적용했습니다."
+            )
+    else:
+        cautions.append(
+            "저장된 직원현황이 없어 종업원수와 고용분석은 "
+            "크레탑·고객DB 자료만 반영했습니다."
         )
 
     if not address:
@@ -519,8 +623,34 @@ def build_consulting_analysis(
         )
     if "신규채용" in interests or "고용유지" in interests:
         strategy.append(
-            "채용계획과 고용보험 인원을 확인해 고용지원금 및 세액공제를 함께 검토합니다."
+            "직원현황의 연령·자격취득일·근속기간을 기준으로 "
+            "고용지원금과 고용증대 세액공제를 함께 검토합니다."
         )
+
+    if employee_source_available:
+        if recent_6m_count:
+            strategy.append(
+                f"최근 6개월 취득 직원 {recent_6m_count}명에 대해 "
+                "채용일 전 구직등록, 정규직 여부, 근로시간과 임금요건을 확인합니다."
+            )
+        if youth_count:
+            strategy.append(
+                f"청년 추정 직원 {youth_count}명의 실제 나이와 입사 당시 "
+                "취업애로청년 요건을 확인해 청년일자리도약장려금을 검토합니다."
+            )
+        if senior_count:
+            strategy.append(
+                f"고령자 추정 직원 {senior_count}명에 대해 고령자 고용지원금과 "
+                "계속고용장려금 적용 가능성을 구분해 검토합니다."
+            )
+        if workplace_counts:
+            strategy.append(
+                "사업장별 가입인원: "
+                + ", ".join(
+                    f"{name} {count}명"
+                    for name, count in sorted(workplace_counts.items())
+                )
+            )
     if "연구개발" in interests or "특허·인증" in interests:
         strategy.append(
             "연구개발 조직과 지식재산 보유현황을 확인해 R&D·인증 지원사업을 검토합니다."
@@ -625,6 +755,14 @@ def build_consulting_analysis(
             "운전자금·시설투자·채용계획을 확인한 뒤 지원사업 우선순위를 정하는 것이 좋습니다."
         )
 
+    if employee_source_available:
+        questions.extend([
+            "최근 자격취득 직원들의 정규직 여부, 주당 근로시간과 월 급여는 어떻게 됩니까?",
+            "청년 직원 중 채용 전 4개월 이상 실업, 고졸 이하, 자립준비청년 등 취업애로 요건에 해당하는 직원이 있습니까?",
+            "60세 이상 직원 수가 과거 기준기간보다 증가했거나 정년연장·재고용 제도를 운영하고 있습니까?",
+            "육아휴직·근로시간 단축·대체인력 또는 유연근무를 사용하는 직원이 있습니까?",
+        ])
+
     questions.extend([
         "최근 1년 이내 기계·시설·차량 투자계획이 있습니까?",
         "향후 6개월 이내 신규채용 또는 고용유지 계획이 있습니까?",
@@ -670,7 +808,8 @@ def build_consulting_analysis(
         ("등기정보", 12.0 if registry else 0.0, bool(registry)),
         ("주가평가", 12.0 if stock_record else 0.0, bool(stock_record)),
         ("정관검토", 10.0 if articles_review else 0.0, bool(articles_review)),
-        ("상담일지", 10.0 if consultation_count else 0.0, bool(consultation_count)),
+        ("상담일지", 8.0 if consultation_count else 0.0, bool(consultation_count)),
+        ("직원현황", 8.0 if employee_source_available else 0.0, employee_source_available),
         ("매칭설정", 6.0 if has_preferences else 0.0, has_preferences),
     ]
     raw_completeness = sum(score for _, score, _ in completeness_components)
@@ -698,6 +837,11 @@ def build_consulting_analysis(
         "address": address,
         "establishment": establishment,
         "employees": employees,
+        "employees_source": employees_source,
+        "cretop_employees": cretop_employees,
+        "employee_context": employee_context,
+        "employee_summary": employee_summary,
+        "workplace_counts": workplace_counts,
         "sales": sales,
         "operating_profit": operating_profit,
         "net_income": net_income,
@@ -721,6 +865,7 @@ def build_consulting_analysis(
             "registry": bool(registry),
             "stock": bool(stock_record),
             "consultation": bool(consultation_count),
+            "employee_status": employee_source_available,
             "articles_review": bool(articles_review),
             "matching_preferences": has_preferences,
         },
@@ -943,6 +1088,14 @@ def render_ai_consulting_report_page(
         business_no,
         company_name,
     )
+    try:
+        employee_context = get_latest_employee_status(
+            user_id,
+            business_no,
+            company_name,
+        )
+    except Exception:
+        employee_context = {}
 
     analysis = build_consulting_analysis(
         customer,
@@ -951,6 +1104,7 @@ def render_ai_consulting_report_page(
         stock_record,
         preferences,
         consultation_context=consultation_context,
+        employee_context=employee_context,
     )
 
     st.markdown(
@@ -995,7 +1149,7 @@ def render_ai_consulting_report_page(
             + " · 해당 자료를 등록하면 진단 범위와 정확도가 높아집니다."
         )
 
-    source_columns = st.columns(4, gap="medium")
+    source_columns = st.columns(5, gap="medium")
     source_columns[0].metric(
         "등록 등기정보",
         "1건" if registry else "0건",
@@ -1005,10 +1159,18 @@ def render_ai_consulting_report_page(
         "1건" if stock_record else "0건",
     )
     source_columns[2].metric(
+        "직원현황",
+        (
+            f"{analysis.get('employee_summary', {}).get('active_count', 0)}명"
+            if analysis.get("data_sources", {}).get("employee_status")
+            else "0명"
+        ),
+    )
+    source_columns[3].metric(
         "상담일지",
         f"{consultation_context.get('count', 0)}건",
     )
-    source_columns[3].metric(
+    source_columns[4].metric(
         "녹취 반영",
         f"{consultation_context.get('transcript_count', 0)}건",
     )
@@ -1031,6 +1193,18 @@ def render_ai_consulting_report_page(
             f"녹취 전문 포함 상담일지: "
             f"{consultation_context.get('transcript_count', 0)}건"
         )
+        st.write(
+            "직원현황 연결: "
+            + (
+                f"성공 — 가입중 "
+                f"{analysis.get('employee_summary', {}).get('active_count', 0)}명"
+                if analysis.get("data_sources", {}).get("employee_status")
+                else "실패 — 동일 사업자번호의 저장 직원현황 없음"
+            )
+        )
+        st.write(
+            f"종업원수 적용 기준: {analysis.get('employees_source', '-')}"
+        )
 
     st.markdown("### 기업 기본정보")
     base_df = pd.DataFrame(
@@ -1038,7 +1212,21 @@ def render_ai_consulting_report_page(
             ["업종", analysis["industry"] or "-"],
             ["사업장 소재지", analysis["address"] or "-"],
             ["설립일", analysis["establishment"] or "-"],
-            ["종업원수", _clean(analysis["employees"]) or "-"],
+            [
+                "종업원수",
+                (
+                    f"{_clean(analysis['employees']) or '-'}명 "
+                    f"({analysis.get('employees_source', '-')})"
+                ),
+            ],
+            [
+                "크레탑 종업원수",
+                (
+                    f"{_clean(analysis.get('cretop_employees'))}명"
+                    if _clean(analysis.get("cretop_employees"))
+                    else "-"
+                ),
+            ],
         ],
         columns=["항목", "내용"],
     )
@@ -1047,6 +1235,40 @@ def render_ai_consulting_report_page(
         hide_index=True,
         use_container_width=True,
     )
+
+    if analysis.get("data_sources", {}).get("employee_status"):
+        st.markdown("### 직원·고용 현황")
+        employee_summary = analysis.get("employee_summary", {}) or {}
+        e1, e2, e3, e4 = st.columns(4)
+        e1.metric(
+            "가입중",
+            f"{employee_summary.get('active_count', 0)}명",
+        )
+        e2.metric(
+            "최근 6개월 취득",
+            f"{employee_summary.get('recent_6m_count', 0)}명",
+        )
+        e3.metric(
+            "청년 추정",
+            f"{employee_summary.get('youth_count', 0)}명",
+        )
+        e4.metric(
+            "고령자 추정",
+            f"{employee_summary.get('senior_count', 0)}명",
+        )
+
+        workplace_counts = analysis.get("workplace_counts", {}) or {}
+        if workplace_counts:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {"사업장": name, "가입중 인원": count}
+                        for name, count in sorted(workplace_counts.items())
+                    ]
+                ),
+                hide_index=True,
+                use_container_width=True,
+            )
 
     st.markdown("### 재무 진단")
     ratio_items = [
