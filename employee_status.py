@@ -557,9 +557,9 @@ def _read_roster_name(cell: np.ndarray) -> str:
         cell,
         language="kor",
         configs=[
-            "--oem 1 --psm 7",
+            "--oem 1 --psm 7 -c preserve_interword_spaces=1",
             "--oem 1 --psm 8",
-            "--oem 1 --psm 6",
+            "--oem 1 --psm 13",
         ],
     )
     candidates: list[str] = []
@@ -614,6 +614,50 @@ def _read_roster_dates(cell: np.ndarray) -> list[str]:
     return dates
 
 
+def _best_regular_line_band(
+    positions: list[int],
+    *,
+    minimum_lines: int = 8,
+    minimum_gap: int = 10,
+    maximum_gap: int = 65,
+) -> list[int]:
+    positions = sorted(set(int(value) for value in positions))
+    best: list[int] = []
+    best_score = float("-inf")
+
+    for start_index in range(len(positions)):
+        current = [positions[start_index]]
+        for next_index in range(start_index + 1, len(positions)):
+            gap = positions[next_index] - current[-1]
+            if gap < minimum_gap:
+                continue
+            if gap > maximum_gap:
+                break
+            current.append(positions[next_index])
+
+            if len(current) < minimum_lines:
+                continue
+
+            gaps = np.diff(current).astype(float)
+            median_gap = float(np.median(gaps))
+            if median_gap <= 0:
+                continue
+            deviation = float(
+                np.mean(np.abs(gaps - median_gap)) / median_gap
+            )
+            span = current[-1] - current[0]
+            score = (
+                len(current) * 120
+                + span * 0.25
+                - deviation * 500
+            )
+            if score > best_score:
+                best = list(current)
+                best_score = score
+
+    return best
+
+
 def _detect_roster_grid(
     image: np.ndarray,
 ) -> tuple[tuple[int, int, int, int] | None, list[int], list[int]]:
@@ -627,17 +671,13 @@ def _detect_roster_grid(
         255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
-        41,
-        13,
+        31,
+        12,
     )
 
     horizontal_kernel = cv2.getStructuringElement(
         cv2.MORPH_RECT,
-        (max(gray.shape[1] // 18, 35), 1),
-    )
-    vertical_kernel = cv2.getStructuringElement(
-        cv2.MORPH_RECT,
-        (1, max(gray.shape[0] // 35, 25)),
+        (max(gray.shape[1] // 18, 28), 1),
     )
     horizontal = cv2.morphologyEx(
         binary,
@@ -645,100 +685,145 @@ def _detect_roster_grid(
         horizontal_kernel,
         iterations=1,
     )
+
+    horizontal_strength = np.sum(horizontal > 0, axis=1)
+    raw_y = np.where(
+        horizontal_strength >= max(gray.shape[1] * 0.30, 100)
+    )[0].tolist()
+    all_y_lines = _cluster_line_positions(raw_y, tolerance=5)
+
+    # The employee table contains a long sequence of near-evenly spaced
+    # horizontal lines. Select that band instead of the document border.
+    y_lines = _best_regular_line_band(
+        all_y_lines,
+        minimum_lines=8,
+        minimum_gap=max(10, gray.shape[0] // 90),
+        maximum_gap=max(55, gray.shape[0] // 12),
+    )
+    if len(y_lines) < 8:
+        return None, [], []
+
+    top = max(y_lines[0] - 4, 0)
+    bottom = min(y_lines[-1] + 5, gray.shape[0])
+    band_height = bottom - top
+    if band_height <= 0:
+        return None, [], []
+
+    vertical_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (1, max(band_height // 4, 24)),
+    )
     vertical = cv2.morphologyEx(
-        binary,
+        binary[top:bottom, :],
         cv2.MORPH_OPEN,
         vertical_kernel,
         iterations=1,
     )
-    grid = cv2.bitwise_or(horizontal, vertical)
+    vertical_strength = np.sum(vertical > 0, axis=0)
+    raw_x = np.where(
+        vertical_strength >= max(band_height * 0.28, 25)
+    )[0].tolist()
 
-    contours, _ = cv2.findContours(
-        grid,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE,
-    )
-    candidates = []
-    image_area = gray.shape[0] * gray.shape[1]
-    for contour in contours:
-        x, y, width, height = cv2.boundingRect(contour)
-        area = width * height
-        if (
-            width >= gray.shape[1] * 0.55
-            and height >= gray.shape[0] * 0.12
-            and area >= image_area * 0.08
-        ):
-            candidates.append((area, x, y, width, height))
-
-    if not candidates:
+    # Merge doubled lines caused by shadows, thick printing or markup.
+    x_lines = _cluster_line_positions(raw_x, tolerance=12)
+    if len(x_lines) < 6:
         return None, [], []
 
-    _, x, y, width, height = max(candidates)
-    crop_horizontal = horizontal[y:y + height, x:x + width]
-    crop_vertical = vertical[y:y + height, x:x + width]
+    left = max(min(x_lines) - 3, 0)
+    right = min(max(x_lines) + 4, gray.shape[1])
+    width = right - left
+    if width < gray.shape[1] * 0.50:
+        return None, [], []
 
-    horizontal_strength = np.sum(crop_horizontal > 0, axis=1)
-    vertical_strength = np.sum(crop_vertical > 0, axis=0)
-
-    y_values = np.where(
-        horizontal_strength >= max(width * 0.35, 30)
-    )[0].tolist()
-    x_values = np.where(
-        vertical_strength >= max(height * 0.25, 25)
-    )[0].tolist()
-
-    y_lines = _cluster_line_positions(y_values, tolerance=7)
-    x_lines = _cluster_line_positions(x_values, tolerance=7)
-
-    y_lines = [
-        value for value in y_lines
-        if 0 <= value < height
+    local_x = [
+        value - left
+        for value in x_lines
+        if left <= value <= right
     ]
-    x_lines = [
-        value for value in x_lines
-        if 0 <= value < width
+    local_y = [
+        value - top
+        for value in y_lines
+        if top <= value <= bottom
     ]
-    return (x, y, width, height), x_lines, y_lines
+    return (
+        left,
+        top,
+        width,
+        band_height,
+    ), local_x, local_y
 
 
 def _select_roster_columns(
     x_lines: list[int],
     width: int,
 ) -> list[int]:
-    usable = sorted(
+    values = sorted(
         value
         for value in x_lines
         if 0 <= value <= width
     )
-    if len(usable) >= 8:
-        # The roster table normally has 8 vertical boundaries:
-        # serial, RRN, name and four insurance-date columns.
-        best: list[int] | None = None
-        best_score = float("inf")
-        expected = [0.0, 0.10, 0.31, 0.46, 0.595, 0.73, 0.865, 1.0]
-        for start in range(0, len(usable) - 7):
-            candidate = usable[start:start + 8]
-            span = candidate[-1] - candidate[0]
-            if span < width * 0.65:
+    expected = [
+        0.0,
+        0.10,
+        0.31,
+        0.45,
+        0.585,
+        0.72,
+        0.855,
+        1.0,
+    ]
+
+    best: list[int] | None = None
+    best_score = float("inf")
+
+    if len(values) >= 8:
+        from itertools import combinations
+
+        # Limit candidate count while retaining the document edges.
+        candidates = values
+        if len(candidates) > 13:
+            candidates = sorted(
+                set(
+                    [candidates[0], candidates[-1]]
+                    + candidates[1:-1:2]
+                    + candidates[2:-1:2]
+                )
+            )
+
+        for selected in combinations(candidates, 8):
+            span = selected[-1] - selected[0]
+            if span < width * 0.70:
                 continue
             ratios = [
-                (value - candidate[0]) / max(span, 1)
-                for value in candidate
+                (value - selected[0]) / max(span, 1)
+                for value in selected
             ]
-            score = sum(
+            ratio_error = sum(
                 abs(actual - target)
                 for actual, target in zip(ratios, expected)
             )
+            edge_error = (
+                abs(selected[0]) / max(width, 1)
+                + abs(width - selected[-1]) / max(width, 1)
+            )
+            score = ratio_error + edge_error * 2
             if score < best_score:
-                best = candidate
+                best = list(selected)
                 best_score = score
-        if best is not None:
-            return best
 
-    # Safe proportional fallback for the standardized 4-insurance form.
+    if best is None:
+        best = [
+            int(round(width * ratio))
+            for ratio in expected
+        ]
+
+    # Normalize the selected boundaries to the table crop.
+    left = best[0]
+    right = best[-1]
+    span = max(right - left, 1)
     return [
-        int(width * ratio)
-        for ratio in (0.0, 0.10, 0.31, 0.46, 0.595, 0.73, 0.865, 1.0)
+        int(round((value - left) * width / span))
+        for value in best
     ]
 
 
@@ -824,9 +909,36 @@ def _parse_roster_grid_image(
         )
         deduped[identity] = employee
 
+    detected_employee_rows = sum(
+        1
+        for row in row_debug
+        if row.get("birth_detected")
+    )
+    recognized_count = len(deduped)
+    minimum_acceptable = (
+        max(3, int(detected_employee_rows * 0.70))
+        if detected_employee_rows
+        else 0
+    )
+    if (
+        detected_employee_rows >= 5
+        and recognized_count < minimum_acceptable
+    ):
+        return [], {
+            "method": "cell_grid_ocr",
+            "grid_found": True,
+            "validation_failed": True,
+            "reason": "recognized_below_rrn_row_threshold",
+            "detected_employee_rows": detected_employee_rows,
+            "recognized_employee_count": recognized_count,
+            "minimum_acceptable": minimum_acceptable,
+            "rows": row_debug,
+        }
+
     return list(deduped.values()), {
         "method": "cell_grid_ocr",
         "grid_found": True,
+        "detected_employee_rows": detected_employee_rows,
         "grid_box": {
             "x": x,
             "y": y,
