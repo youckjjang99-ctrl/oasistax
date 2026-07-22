@@ -13,8 +13,9 @@ import streamlit as st
 from consulting_report import render_ai_consulting_report_page
 from tax_diagnosis import render_tax_diagnosis_page
 from consultation_journal import load_company_consultation_context
-from cloud_sync import load_stock_valuations
+from cloud_sync import load_financial_snapshot, load_stock_valuations
 from matching_preferences import get_matching_preferences
+from consulting_priority_engine import build_priority_recommendations
 from registered_policy_match import (
     build_customer_labels,
     load_registered_customers,
@@ -346,6 +347,13 @@ def _load_integrated_company_context(
         limit=20,
     )
 
+    try:
+        financial = load_financial_snapshot(user_id, normalized_no)
+    except Exception:
+        financial = {}
+    if not isinstance(financial, dict):
+        financial = {}
+
     journal_text_parts: list[str] = []
     transcript_count = 0
     for journal in journals:
@@ -398,6 +406,7 @@ def _load_integrated_company_context(
     return {
         "stock_records": stock_records,
         "latest_stock": latest_stock,
+        "financial": financial,
         "journals": journals,
         "transcript_count": transcript_count,
         "combined_text": combined_text,
@@ -499,53 +508,14 @@ def build_topic_recommendations(
     memory: dict[str, Any],
     integrated_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    text = _customer_text(
+    result = build_priority_recommendations(
         customer,
         preferences,
         memory,
         integrated_context,
+        TOPIC_RULES,
     )
-    text_tokens = _tokens(text)
-    results = []
-
-    for rule in TOPIC_RULES:
-        matched = []
-        for keyword in rule["keywords"]:
-            keyword_tokens = _tokens(keyword)
-            if keyword_tokens and keyword_tokens & text_tokens:
-                matched.append(keyword)
-
-        score = 25
-        score += min(len(matched) * 13, 55)
-
-        if rule["topic"] in (
-            preferences.get("관심지원분야", [])
-            or []
-        ):
-            score += 15
-
-        if rule["topic"] in _clean(
-            memory.get("next_focus", "")
-        ):
-            score += 15
-
-        score = min(score, 100)
-
-        results.append(
-            {
-                "topic": rule["topic"],
-                "score": score,
-                "matched": list(dict.fromkeys(matched)),
-                "questions": rule["questions"],
-                "documents": rule["documents"],
-            }
-        )
-
-    results.sort(
-        key=lambda item: item["score"],
-        reverse=True,
-    )
-    return results
+    return result.get("recommendations", [])
 
 
 def _load_checklist(
@@ -706,12 +676,14 @@ def render_copilot_page(
         business_no,
     )
 
-    recommendations = build_topic_recommendations(
+    priority_analysis = build_priority_recommendations(
         customer,
         preferences,
         memory,
         integrated_context,
+        TOPIC_RULES,
     )
+    recommendations = priority_analysis.get("recommendations", [])
 
     current_text = _customer_text(
         customer,
@@ -832,6 +804,20 @@ def render_copilot_page(
 
     top = recommendations[:5]
     st.markdown("### 이번 상담 우선순위")
+    stage_columns = st.columns([1, 1, 2], gap="medium")
+    stage_columns[0].metric(
+        "기업 성장단계",
+        priority_analysis.get("stage", "판단보류"),
+    )
+    stage_columns[1].metric(
+        "기업규모 점수",
+        f"{priority_analysis.get('scale_score', 0)}점",
+    )
+    stage_columns[2].caption(
+        priority_analysis.get("stage_reason", "")
+        + "\n\n점수기준: "
+        + priority_analysis.get("method", "")
+    )
 
     st.markdown(
         """
@@ -847,22 +833,54 @@ def render_copilot_page(
     )
     columns = st.columns(min(len(top), 5), gap="medium")
     for index, item in enumerate(top):
+        evidence_items = item.get("evidence", []) or []
+        penalty_items = item.get("penalties", []) or []
         evidence = (
-            "근거: " + ", ".join(item["matched"][:3])
-            if item["matched"]
-            else "기본 확인 필요"
+            "근거: " + " / ".join(evidence_items[:2])
+            if evidence_items
+            else "확인된 직접 근거가 부족합니다."
+        )
+        penalty = (
+            "감점: " + " / ".join(penalty_items[:1])
+            if penalty_items
+            else ""
+        )
+        card_html = (
+            '<div class="copilot-priority-card">'
+            f'<div class="copilot-priority-topic">{item["topic"]}</div>'
+            f'<div class="copilot-priority-score">{item["score"]}점</div>'
+            '<div class="copilot-priority-note">'
+            f'{item.get("status", "")} · 확신도 {item.get("confidence", 0)}점<br>'
+            f'{evidence}<br>{penalty}'
+            '</div></div>'
         )
         with columns[index]:
+            st.markdown(card_html, unsafe_allow_html=True)
+
+    with st.expander("우선순위 점수 산정근거", expanded=False):
+        st.caption(
+            "단순 키워드 개수가 아니라 기업규모·실제 금액·재무비율·성장단계·"
+            "대표 의도·자료충족도·실행가능성을 함께 반영합니다."
+        )
+        for rank, item in enumerate(recommendations, start=1):
             st.markdown(
-                f"""
-                <div class="copilot-priority-card">
-                  <div class="copilot-priority-topic">{item['topic']}</div>
-                  <div class="copilot-priority-score">{item['score']}점</div>
-                  <div class="copilot-priority-note">{evidence}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
+                f"**{rank}. {item.get('topic', '')} — "
+                f"{item.get('score', 0)}점 / 확신도 "
+                f"{item.get('confidence', 0)}점**"
             )
+            for value in item.get("evidence", []) or []:
+                st.write(f"- 가점근거: {value}")
+            for value in item.get("penalties", []) or []:
+                st.write(f"- 감점근거: {value}")
+            components = item.get("components", {}) or {}
+            if components:
+                st.caption(
+                    "점수 구성: "
+                    + ", ".join(
+                        f"{name} {score:+d}"
+                        for name, score in components.items()
+                    )
+                )
 
     (
         tab_report,
