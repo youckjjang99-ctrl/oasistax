@@ -446,7 +446,8 @@ def render_copilot_page(
     )
 
     customers = load_registered_customers(
-        get_user_cumulative_db_path(user_id)
+        get_user_cumulative_db_path(user_id),
+        owner_user_id=user_id,
     )
     if customers.empty:
         st.info(
@@ -455,6 +456,36 @@ def render_copilot_page(
         return
 
     labels, row_map = build_customer_labels(customers)
+
+    prefill_business_no = str(
+        st.session_state.pop("_oasis_copilot_business_no", "") or ""
+    )
+    prefill_company_name = str(
+        st.session_state.pop("_oasis_copilot_company_name", "") or ""
+    )
+    if prefill_business_no or prefill_company_name:
+        normalized_prefill = re.sub(r"[^0-9]", "", prefill_business_no)
+        for candidate_label, candidate_index in row_map.items():
+            candidate = customers.loc[candidate_index]
+            candidate_business = re.sub(
+                r"[^0-9]",
+                "",
+                str(candidate.get("사업자등록번호", "") or ""),
+            )
+            candidate_name = _clean(candidate.get("업체명", ""))
+            if (
+                normalized_prefill
+                and candidate_business == normalized_prefill
+            ) or (
+                prefill_company_name
+                and candidate_name == prefill_company_name
+            ):
+                st.session_state["copilot_customer"] = candidate_label
+                break
+
+    if st.session_state.get("copilot_customer") not in labels:
+        st.session_state.pop("copilot_customer", None)
+
     selected_label = st.selectbox(
         "상담할 기업",
         labels,

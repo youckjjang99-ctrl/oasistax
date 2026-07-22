@@ -1,18 +1,8 @@
 # 적용방법
 
-1. 압축 안의 모든 파일을 기존 `정책자금자동화` 폴더에 풉니다.
-2. `RUN_V371_FIX.bat`를 더블클릭합니다.
-3. `[SUCCESS]`가 나오면 완료입니다.
-4. 다시 실행합니다.
+1. ZIP 안의 파일을 현재 OASIS 프로젝트 최상위 폴더에 모두 덮어씁니다.
+2. `RUN_UPDATE_v9.2.0.bat`를 실행합니다.
+3. `UPDATE_OK`, `VERSION=v9.2.0`을 확인합니다.
+4. 오류가 발생하면 업데이트가 자동 롤백되며 `backup/before_v9.2.0_...`에 백업이 남습니다.
 
-```powershell
-streamlit run app.py
-```
-
-정상 확인 후 GitHub 반영:
-
-```powershell
-git add .
-git commit -m "v3.7.1 CRM 오류 수정"
-git push
-```
+적용 전 기준 버전은 `v9.1.0b`입니다.

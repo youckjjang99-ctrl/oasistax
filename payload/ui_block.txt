@@ -1,0 +1,31 @@
+    # v9.2.0 AI 기업 건강진단 통합 대시보드
+    try:
+        enterprise_health = build_enterprise_health(analysis, tax_core, anomaly_result)
+    except Exception:
+        enterprise_health = {}
+    if enterprise_health:
+        st.markdown("### AI 기업 건강진단")
+        eh1, eh2, eh3, eh4 = st.columns(4, gap="medium")
+        eh1.metric("기업 건강점수", f"{enterprise_health.get('overall_score', 0)}점", enterprise_health.get("grade", "-"))
+        eh2.metric("종합상태", enterprise_health.get("level", "-"), enterprise_health.get("stage", ""))
+        eh3.metric("AI 신뢰도", f"{enterprise_health.get('confidence', 0)}%", "현재 등록자료 기준")
+        eh4.metric("우선 실행과제", f"{len(enterprise_health.get('actions', []))}건", "점수순 정렬")
+        category_rows = [{"진단영역": item.get("name", ""), "점수": item.get("score", 0),
+                          "상태": item.get("status", ""), "가중치": f"{item.get('weight', 0)}%",
+                          "산정기준": item.get("reason", "")} for item in enterprise_health.get("categories", [])]
+        if category_rows:
+            st.dataframe(pd.DataFrame(category_rows), hide_index=True, use_container_width=True)
+        action_rows = [{"우선순위": action.get("priority", ""), "실행과제": action.get("title", ""),
+                        "영역": action.get("area", ""), "근거": action.get("reason", ""),
+                        "다음 조치": action.get("next_step", "")} for action in enterprise_health.get("actions", [])]
+        if action_rows:
+            st.markdown("#### 대표 우선 실행과제")
+            st.dataframe(pd.DataFrame(action_rows), hide_index=True, use_container_width=True)
+        with st.expander("건강점수 해석", expanded=False):
+            strengths = " / ".join(f"{x.get('name')} {x.get('score')}점" for x in enterprise_health.get("strengths", []))
+            weaknesses = " / ".join(f"{x.get('name')} {x.get('score')}점" for x in enterprise_health.get("weaknesses", []))
+            st.write("강점: " + (strengths or "자료 부족"))
+            st.write("우선 개선영역: " + (weaknesses or "자료 부족"))
+            st.caption(enterprise_health.get("stage_reason", ""))
+        st.caption(enterprise_health.get("disclaimer", ""))
+
