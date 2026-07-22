@@ -8,6 +8,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+import cv2
+import numpy as np
 import pandas as pd
 import streamlit as st
 import pytesseract
@@ -447,42 +449,428 @@ def _parse_roster_text_blocks(text: str) -> list[dict[str, Any]]:
     return list(deduped.values())
 
 
+def _cluster_line_positions(
+    values: list[int],
+    tolerance: int = 8,
+) -> list[int]:
+    if not values:
+        return []
+    values = sorted(int(value) for value in values)
+    groups: list[list[int]] = [[values[0]]]
+    for value in values[1:]:
+        if value - groups[-1][-1] <= tolerance:
+            groups[-1].append(value)
+        else:
+            groups.append([value])
+    return [
+        int(round(sum(group) / len(group)))
+        for group in groups
+    ]
+
+
+def _ocr_cell_variants(
+    image: np.ndarray,
+    *,
+    language: str,
+    configs: list[str],
+) -> list[str]:
+    if image.size == 0:
+        return []
+
+    height, width = image.shape[:2]
+    scale = max(2.0, min(4.0, 1200 / max(width, height, 1)))
+    resized = cv2.resize(
+        image,
+        None,
+        fx=scale,
+        fy=scale,
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+    if len(resized.shape) == 3:
+        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = resized
+
+    variants = [
+        gray,
+        cv2.threshold(
+            gray,
+            0,
+            255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        )[1],
+        cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            31,
+            11,
+        ),
+    ]
+
+    results: list[str] = []
+    for variant in variants:
+        bordered = cv2.copyMakeBorder(
+            variant,
+            24,
+            24,
+            24,
+            24,
+            cv2.BORDER_CONSTANT,
+            value=255,
+        )
+        for config in configs:
+            try:
+                value = pytesseract.image_to_string(
+                    bordered,
+                    lang=language,
+                    config=config,
+                )
+            except Exception:
+                continue
+            value = re.sub(r"\s+", "", str(value or ""))
+            if value and value not in results:
+                results.append(value)
+    return results
+
+
+def _read_roster_rrn(cell: np.ndarray) -> str:
+    values = _ocr_cell_variants(
+        cell,
+        language="eng",
+        configs=[
+            "--oem 1 --psm 7 -c tessedit_char_whitelist=0123456789-*xX",
+            "--oem 1 --psm 8 -c tessedit_char_whitelist=0123456789-*xX",
+        ],
+    )
+    for value in values:
+        digits = re.sub(r"[^0-9]", "", value)
+        if len(digits) >= 6:
+            return digits[:6]
+    return ""
+
+
+def _read_roster_name(cell: np.ndarray) -> str:
+    values = _ocr_cell_variants(
+        cell,
+        language="kor",
+        configs=[
+            "--oem 1 --psm 7",
+            "--oem 1 --psm 8",
+            "--oem 1 --psm 6",
+        ],
+    )
+    candidates: list[str] = []
+    for value in values:
+        for token in re.findall(r"[가-힣]{2,5}", value):
+            if _valid_roster_name(token):
+                candidates.append(token)
+
+    if not candidates:
+        return ""
+
+    # Prefer a consistently repeated result; ties favor a common 3-char name.
+    counts: dict[str, int] = {}
+    for candidate in candidates:
+        counts[candidate] = counts.get(candidate, 0) + 1
+    return max(
+        counts,
+        key=lambda value: (
+            counts[value],
+            int(len(value) == 3),
+            -abs(len(value) - 3),
+        ),
+    )
+
+
+def _read_roster_dates(cell: np.ndarray) -> list[str]:
+    values = _ocr_cell_variants(
+        cell,
+        language="eng",
+        configs=[
+            "--oem 1 --psm 7 -c tessedit_char_whitelist=0123456789.-/",
+            "--oem 1 --psm 6 -c tessedit_char_whitelist=0123456789.-/",
+        ],
+    )
+    dates: list[str] = []
+    for value in values:
+        normalized_value = value.replace("/", ".").replace("-", ".")
+        for match in re.finditer(
+            r"(19\d{2}|20\d{2})[.]?(\d{1,2})[.]?(\d{1,2})",
+            normalized_value,
+        ):
+            try:
+                normalized = datetime(
+                    int(match.group(1)),
+                    int(match.group(2)),
+                    int(match.group(3)),
+                ).strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+            if normalized not in dates:
+                dates.append(normalized)
+    return dates
+
+
+def _detect_roster_grid(
+    image: np.ndarray,
+) -> tuple[tuple[int, int, int, int] | None, list[int], list[int]]:
+    gray = (
+        cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        if len(image.shape) == 3
+        else image
+    )
+    binary = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        41,
+        13,
+    )
+
+    horizontal_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (max(gray.shape[1] // 18, 35), 1),
+    )
+    vertical_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (1, max(gray.shape[0] // 35, 25)),
+    )
+    horizontal = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_OPEN,
+        horizontal_kernel,
+        iterations=1,
+    )
+    vertical = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_OPEN,
+        vertical_kernel,
+        iterations=1,
+    )
+    grid = cv2.bitwise_or(horizontal, vertical)
+
+    contours, _ = cv2.findContours(
+        grid,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    candidates = []
+    image_area = gray.shape[0] * gray.shape[1]
+    for contour in contours:
+        x, y, width, height = cv2.boundingRect(contour)
+        area = width * height
+        if (
+            width >= gray.shape[1] * 0.55
+            and height >= gray.shape[0] * 0.12
+            and area >= image_area * 0.08
+        ):
+            candidates.append((area, x, y, width, height))
+
+    if not candidates:
+        return None, [], []
+
+    _, x, y, width, height = max(candidates)
+    crop_horizontal = horizontal[y:y + height, x:x + width]
+    crop_vertical = vertical[y:y + height, x:x + width]
+
+    horizontal_strength = np.sum(crop_horizontal > 0, axis=1)
+    vertical_strength = np.sum(crop_vertical > 0, axis=0)
+
+    y_values = np.where(
+        horizontal_strength >= max(width * 0.35, 30)
+    )[0].tolist()
+    x_values = np.where(
+        vertical_strength >= max(height * 0.25, 25)
+    )[0].tolist()
+
+    y_lines = _cluster_line_positions(y_values, tolerance=7)
+    x_lines = _cluster_line_positions(x_values, tolerance=7)
+
+    y_lines = [
+        value for value in y_lines
+        if 0 <= value < height
+    ]
+    x_lines = [
+        value for value in x_lines
+        if 0 <= value < width
+    ]
+    return (x, y, width, height), x_lines, y_lines
+
+
+def _select_roster_columns(
+    x_lines: list[int],
+    width: int,
+) -> list[int]:
+    usable = sorted(
+        value
+        for value in x_lines
+        if 0 <= value <= width
+    )
+    if len(usable) >= 8:
+        # The roster table normally has 8 vertical boundaries:
+        # serial, RRN, name and four insurance-date columns.
+        best: list[int] | None = None
+        best_score = float("inf")
+        expected = [0.0, 0.10, 0.31, 0.46, 0.595, 0.73, 0.865, 1.0]
+        for start in range(0, len(usable) - 7):
+            candidate = usable[start:start + 8]
+            span = candidate[-1] - candidate[0]
+            if span < width * 0.65:
+                continue
+            ratios = [
+                (value - candidate[0]) / max(span, 1)
+                for value in candidate
+            ]
+            score = sum(
+                abs(actual - target)
+                for actual, target in zip(ratios, expected)
+            )
+            if score < best_score:
+                best = candidate
+                best_score = score
+        if best is not None:
+            return best
+
+    # Safe proportional fallback for the standardized 4-insurance form.
+    return [
+        int(width * ratio)
+        for ratio in (0.0, 0.10, 0.31, 0.46, 0.595, 0.73, 0.865, 1.0)
+    ]
+
+
+def _parse_roster_grid_image(
+    image: np.ndarray,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    grid_box, x_lines, y_lines = _detect_roster_grid(image)
+    if grid_box is None or len(y_lines) < 4:
+        return [], {
+            "method": "cell_grid_ocr",
+            "grid_found": False,
+            "reason": "table_grid_not_found",
+        }
+
+    x, y, width, height = grid_box
+    table = image[y:y + height, x:x + width]
+    columns = _select_roster_columns(x_lines, width)
+
+    row_pairs: list[tuple[int, int]] = []
+    for top, bottom in zip(y_lines, y_lines[1:]):
+        row_height = bottom - top
+        if 18 <= row_height <= max(int(height * 0.16), 120):
+            row_pairs.append((top, bottom))
+
+    employees: list[dict[str, Any]] = []
+    row_debug: list[dict[str, Any]] = []
+    margin = 3
+
+    for row_index, (top, bottom) in enumerate(row_pairs):
+        rrn_cell = table[
+            top + margin:bottom - margin,
+            columns[1] + margin:columns[2] - margin,
+        ]
+        name_cell = table[
+            top + margin:bottom - margin,
+            columns[2] + margin:columns[3] - margin,
+        ]
+
+        birth = _read_roster_rrn(rrn_cell)
+        name = _read_roster_name(name_cell)
+
+        dates: list[str] = []
+        for column_index in range(3, 7):
+            date_cell = table[
+                top + margin:bottom - margin,
+                columns[column_index] + margin:
+                columns[column_index + 1] - margin,
+            ]
+            for value in _read_roster_dates(date_cell):
+                if value not in dates:
+                    dates.append(value)
+
+        row_debug.append(
+            {
+                "row": row_index,
+                "birth_detected": bool(birth),
+                "name": name,
+                "dates": dates,
+            }
+        )
+        if not birth or not name or not dates:
+            continue
+
+        employee = _normalize_employee(
+            name,
+            birth,
+            min(dates),
+            "",
+            "가입중",
+            "",
+        )
+        if employee:
+            employee["source_dates"] = sorted(dates)
+            employees.append(employee)
+
+    deduped: dict[str, dict[str, Any]] = {}
+    for employee in employees:
+        identity = "|".join(
+            [
+                str(employee.get("name_masked", "")),
+                str(employee.get("birth_year", "")),
+            ]
+        )
+        deduped[identity] = employee
+
+    return list(deduped.values()), {
+        "method": "cell_grid_ocr",
+        "grid_found": True,
+        "grid_box": {
+            "x": x,
+            "y": y,
+            "width": width,
+            "height": height,
+        },
+        "vertical_line_count": len(x_lines),
+        "horizontal_line_count": len(y_lines),
+        "candidate_row_count": len(row_pairs),
+        "recognized_employee_count": len(deduped),
+        "rows": row_debug,
+    }
+
+
 def _parse_roster_image(
     data: bytes,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    image = Image.open(io.BytesIO(data))
-    prepared = _prepare_roster_image(image)
+    pil_image = Image.open(io.BytesIO(data))
+    pil_image = ImageOps.exif_transpose(pil_image).convert("RGB")
+    base = np.array(pil_image)
     candidates: list[dict[str, Any]] = []
 
     for rotation in (0, 90, 180, 270):
-        rotated = prepared.rotate(
-            rotation,
-            expand=True,
-            fillcolor="white",
+        if rotation == 0:
+            rotated = base
+        elif rotation == 90:
+            rotated = cv2.rotate(base, cv2.ROTATE_90_CLOCKWISE)
+        elif rotation == 180:
+            rotated = cv2.rotate(base, cv2.ROTATE_180)
+        else:
+            rotated = cv2.rotate(base, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+        employees, detail = _parse_roster_grid_image(rotated)
+        score = (
+            len(employees) * 1000
+            + int(detail.get("candidate_row_count", 0)) * 10
+            + int(detail.get("horizontal_line_count", 0))
         )
-        text = pytesseract.image_to_string(
-            rotated,
-            lang="kor+eng",
-            config="--oem 1 --psm 6",
-        )
-        employees = _parse_roster_text_blocks(text)
-        rrn_count = len(
-            ROSTER_MASKED_RRN_PATTERN.findall(
-                re.sub(r"\s+", "", text)
-            )
-        )
-        date_count = len(ROSTER_DATE_PATTERN.findall(text))
         candidates.append(
             {
                 "rotation": rotation,
                 "employees": employees,
-                "rrn_count": rrn_count,
-                "date_count": date_count,
-                "score": (
-                    len(employees) * 100
-                    + rrn_count * 20
-                    + date_count
-                ),
+                "detail": detail,
+                "score": score,
             }
         )
 
@@ -491,22 +879,71 @@ def _parse_roster_image(
         key=lambda item: (
             item["score"],
             len(item["employees"]),
-            item["rrn_count"],
         ),
     )
+
+    # Preserve a fallback for unusually photographed forms where grid
+    # detection fails completely.
+    if not best["employees"]:
+        prepared = _prepare_roster_image(pil_image)
+        fallback_candidates = []
+        for rotation in (0, 90, 180, 270):
+            rotated = prepared.rotate(
+                rotation,
+                expand=True,
+                fillcolor="white",
+            )
+            text = pytesseract.image_to_string(
+                rotated,
+                lang="kor+eng",
+                config="--oem 1 --psm 6",
+            )
+            fallback_employees = _parse_roster_text_blocks(text)
+            fallback_candidates.append(
+                {
+                    "rotation": rotation,
+                    "employees": fallback_employees,
+                }
+            )
+        fallback_best = max(
+            fallback_candidates,
+            key=lambda item: len(item["employees"]),
+        )
+        if fallback_best["employees"]:
+            return fallback_best["employees"], {
+                "method": "text_fallback_after_grid",
+                "selected_rotation": fallback_best["rotation"],
+                "recognized_employee_count": len(
+                    fallback_best["employees"]
+                ),
+                "grid_candidates": [
+                    {
+                        "rotation": item["rotation"],
+                        "employee_count": len(item["employees"]),
+                        "detail": item["detail"],
+                    }
+                    for item in candidates
+                ],
+            }
+
     return best["employees"], {
-        "method": "four_insurance_roster_ocr_v2",
+        "method": "four_insurance_cell_grid_ocr_v3",
         "selected_rotation": best["rotation"],
         "recognized_employee_count": len(best["employees"]),
-        "rrn_row_count": best["rrn_count"],
-        "date_token_count": best["date_count"],
+        "selected_detail": best["detail"],
         "rotation_candidates": [
             {
                 "rotation": item["rotation"],
                 "employee_count": len(item["employees"]),
-                "rrn_count": item["rrn_count"],
-                "date_count": item["date_count"],
                 "score": item["score"],
+                "grid_found": item["detail"].get(
+                    "grid_found",
+                    False,
+                ),
+                "candidate_row_count": item["detail"].get(
+                    "candidate_row_count",
+                    0,
+                ),
             }
             for item in candidates
         ],
