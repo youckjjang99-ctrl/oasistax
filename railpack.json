@@ -3,7 +3,9 @@
   "provider": "python",
   "deploy": {
     "aptPackages": [
-      "ffmpeg"
+      "ffmpeg",
+      "tesseract-ocr",
+      "tesseract-ocr-kor"
     ]
   }
 }

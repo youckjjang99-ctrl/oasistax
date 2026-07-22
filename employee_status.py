@@ -608,65 +608,177 @@ def render_employee_status(
 ) -> None:
     st.markdown("#### 직원현황")
     st.caption(
-        "XLSX·CSV·PDF·JPG·JPEG·PNG 형식을 지원합니다. "
+        "XLSX·CSV·PDF·JPG·JPEG·PNG 파일을 여러 개 동시에 업로드할 수 있습니다. "
+        "여러 페이지·파일에서 확인된 직원은 하나의 명부로 합치고 중복을 제거합니다. "
         "4대보험 가입자명부의 주민등록번호는 저장하지 않으며, "
         "직원명은 마스킹하고 생년·자격취득일·근속기간만 고용지원금 매칭에 활용합니다."
     )
 
-    uploaded = st.file_uploader(
+    uploaded_files = st.file_uploader(
         "4대보험 가입자명부 업로드",
         type=["xlsx", "xls", "csv", "pdf", "jpg", "jpeg", "png"],
+        accept_multiple_files=True,
         key=f"employee_roster_upload_{business_no or company_name}",
+        help=(
+            "가입자명부가 여러 장이면 모든 이미지 또는 파일을 함께 선택하세요. "
+            "분석 후 직원정보를 하나로 합칩니다."
+        ),
     )
 
-    if uploaded is not None and st.button(
-        "직원현황 분석·저장",
+    if uploaded_files and st.button(
+        "선택한 파일 전체 분석·저장",
         type="primary",
         use_container_width=True,
         key=f"employee_roster_analyze_{business_no or company_name}",
     ):
+        total_files = len(uploaded_files)
         progress = st.progress(
             0,
-            text="4대보험 가입자명부를 확인하고 있습니다.",
+            text=f"가입자명부 {total_files}개 파일을 확인하고 있습니다.",
         )
 
-        def update_progress(
-            current: int,
-            total: int,
-            message: str = "",
-        ) -> None:
-            progress.progress(
-                min(current / max(total, 1), 1.0),
-                text=message or "직원명부 분석 중",
-            )
+        merged_employees: dict[str, dict[str, Any]] = {}
+        parse_files: list[dict[str, Any]] = []
+        failed_files: list[dict[str, str]] = []
 
-        try:
-            employees, parse_info = parse_roster(
-                uploaded.name,
-                uploaded.getvalue(),
-                progress_callback=update_progress,
-            )
-            if not employees:
-                raise ValueError(
-                    "직원 행을 찾지 못했습니다. "
-                    "성명·자격취득일이 표시된 원본 명부인지 확인해주세요."
+        for file_index, uploaded in enumerate(uploaded_files):
+            file_base = file_index / max(total_files, 1)
+            file_share = 1 / max(total_files, 1)
+
+            def update_progress(
+                current: int,
+                total: int,
+                message: str = "",
+                *,
+                _base: float = file_base,
+                _share: float = file_share,
+                _name: str = uploaded.name,
+                _index: int = file_index,
+            ) -> None:
+                inner_ratio = min(
+                    max(current / max(total, 1), 0.0),
+                    1.0,
                 )
+                overall = min(_base + inner_ratio * _share, 1.0)
+                progress.progress(
+                    overall,
+                    text=(
+                        f"{_index + 1}/{total_files} {_name} · "
+                        f"{message or '직원명부 분석 중'}"
+                    ),
+                )
+
+            try:
+                employees, parse_info = parse_roster(
+                    uploaded.name,
+                    uploaded.getvalue(),
+                    progress_callback=update_progress,
+                )
+                if not employees:
+                    raise ValueError(
+                        "성명·자격취득일이 표시된 직원 행을 찾지 못했습니다."
+                    )
+
+                for employee in employees:
+                    employee_id = str(
+                        employee.get("employee_id", "")
+                    ).strip()
+                    if not employee_id:
+                        continue
+                    merged_employees[employee_id] = employee
+
+                parse_files.append(
+                    {
+                        "filename": uploaded.name,
+                        "employee_count": len(employees),
+                        "status": "success",
+                        "parse_info": parse_info,
+                    }
+                )
+                progress.progress(
+                    min((file_index + 1) / total_files, 1.0),
+                    text=(
+                        f"{file_index + 1}/{total_files} "
+                        f"{uploaded.name} 분석 완료"
+                    ),
+                )
+            except Exception as exc:
+                failed_files.append(
+                    {
+                        "filename": uploaded.name,
+                        "error": str(exc),
+                    }
+                )
+                parse_files.append(
+                    {
+                        "filename": uploaded.name,
+                        "employee_count": 0,
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                )
+                progress.progress(
+                    min((file_index + 1) / total_files, 1.0),
+                    text=(
+                        f"{file_index + 1}/{total_files} "
+                        f"{uploaded.name} 분석 실패 · 다음 파일 계속"
+                    ),
+                )
+
+        employees = list(merged_employees.values())
+        if not employees:
+            st.error(
+                "선택한 파일에서 직원정보를 찾지 못했습니다. "
+                "Railway에 Tesseract 한국어 OCR이 설치된 새 배포인지 확인하고, "
+                "문서가 선명하고 표 전체가 보이는지 확인해주세요."
+            )
+            for failure in failed_files:
+                st.caption(
+                    f"실패: {failure['filename']} · {failure['error']}"
+                )
+        else:
+            combined_filename = (
+                uploaded_files[0].name
+                if total_files == 1
+                else f"다중업로드_{total_files}개파일"
+            )
+            parse_info = {
+                "method": "multi_file_merge",
+                "file_count": total_files,
+                "success_count": len(parse_files) - len(failed_files),
+                "failed_count": len(failed_files),
+                "files": parse_files,
+                "deduplicated_employee_count": len(employees),
+            }
 
             _, message = save_employee_roster(
                 user_id,
                 business_no,
                 company_name,
-                uploaded.name,
+                combined_filename,
                 employees,
                 parse_info,
             )
-            progress.progress(1.0, text="직원현황 저장 완료")
+            progress.progress(1.0, text="통합 직원현황 저장 완료")
             st.success(
-                f"직원 {len(employees)}명을 분석해 {message}했습니다."
+                f"{total_files}개 파일에서 중복을 제거한 직원 "
+                f"{len(employees)}명을 분석해 {message}했습니다."
             )
-            st.rerun()
-        except Exception as exc:
-            st.error(f"직원현황 분석 실패: {exc}")
+
+            if failed_files:
+                st.warning(
+                    f"{len(failed_files)}개 파일은 읽지 못했지만 "
+                    "나머지 파일의 직원현황은 정상 저장했습니다."
+                )
+                with st.expander(
+                    "읽지 못한 파일과 오류 확인",
+                    expanded=True,
+                ):
+                    for failure in failed_files:
+                        st.write(
+                            f"- {failure['filename']}: "
+                            f"{failure['error']}"
+                        )
 
     latest = get_latest_employee_status(
         user_id,
