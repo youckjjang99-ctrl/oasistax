@@ -989,7 +989,7 @@ def render_multi_source_match(
     customer: pd.Series,
     preferences: dict[str, Any],
 ) -> None:
-    st.markdown("#### 다중소스 증거기반 매칭")
+    st.markdown("#### 정책자금·보증·공고형 지원사업 매칭")
     st.caption(
         "매일 새벽 3시에 수집된 내부 정책DB를 사용합니다. "
         "매칭 실행 중에는 기업마당·K-Startup·중진공 API를 직접 호출하지 않습니다."
@@ -1073,6 +1073,11 @@ def render_multi_source_match(
                 for record in records
             ]
             scored.sort(key=lambda item: item["score"], reverse=True)
+            scored = [
+                item
+                for item in scored
+                if classify_support_result(item) != "고용지원금"
+            ]
 
             company_name = _customer_value(customer, "업체명")
             business_no = _customer_value(customer, "사업자등록번호")
@@ -1151,6 +1156,7 @@ def render_multi_source_match(
         result
         for result in results
         if result["score"] >= minimum_score
+        and classify_support_result(result) != "고용지원금"
     ][:50]
 
     if not visible:
@@ -1188,38 +1194,28 @@ def render_multi_source_match(
 
     categorized = {
         "정책자금·보증": [],
-        "고용지원금": [],
         "공고형 지원사업": [],
     }
     for result in visible:
-        categorized[classify_support_result(result)].append(result)
+        category = classify_support_result(result)
+        if category in categorized:
+            categorized[category].append(result)
 
-    tab_all, tab_fund, tab_employment, tab_notice = st.tabs(
+    tab_all, tab_fund, tab_notice = st.tabs(
         [
             f"전체 추천 {len(visible)}건",
             f"정책자금·보증 {len(categorized['정책자금·보증'])}건",
-            f"고용지원금 {len(categorized['고용지원금'])}건",
             f"공고형 지원사업 {len(categorized['공고형 지원사업'])}건",
         ]
     )
 
     with tab_all:
-        _render_result_group(
-            visible,
-            "설정한 점수 이상의 추천 결과가 없습니다.",
-            "all",
-        )
+        _render_result_group(visible, "설정한 점수 이상의 추천 결과가 없습니다.", "all")
     with tab_fund:
         _render_result_group(
             categorized["정책자금·보증"],
             "설정한 점수 이상의 정책자금·보증 추천이 없습니다.",
             "fund",
-        )
-    with tab_employment:
-        _render_result_group(
-            categorized["고용지원금"],
-            "설정한 점수 이상의 고용지원금 추천이 없습니다.",
-            "employment",
         )
     with tab_notice:
         _render_result_group(

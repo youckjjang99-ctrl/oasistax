@@ -923,7 +923,10 @@ def render_enterprise_management_center(
         }
 
         st.divider()
-        st.markdown("#### 다중소스 정책자금·고용지원금 매칭")
+        st.markdown("#### 정책자금·보증·공고형 지원사업 매칭")
+        st.caption(
+            "고용지원금은 직원현황 탭에서 직원명단과 2026년 기준으로 자동 분석합니다."
+        )
         render_multi_source_match(
             user_id,
             selected_row,

@@ -21,6 +21,7 @@ from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from cloud_db import CloudDatabase, cloud_is_configured
 from customer_history import save_customer_event
 from document_preprocessor import preprocess_document
+from employment_support_2026 import render_employment_support_analysis
 from utils import get_user_dirs
 
 TABLE_EMPLOYEE_ROSTERS = "oasis_employee_rosters"
@@ -2236,18 +2237,12 @@ def render_employee_status(
             use_container_width=True,
         )
 
-    st.markdown("##### 고용지원금 매칭 활용정보")
-    matching_points = [
-        f"현재 가입중 직원 {summary.get('active_count', 0)}명",
-        f"최근 3개월 자격취득 {summary.get('recent_3m_count', 0)}명",
-        f"최근 6개월 자격취득 {summary.get('recent_6m_count', 0)}명",
-        f"청년 연령구간 추정 {summary.get('youth_count', 0)}명",
-        f"중장년 연령구간 추정 {summary.get('middle_aged_count', 0)}명",
-        f"고령자 연령구간 추정 {summary.get('senior_count', 0)}명",
-        f"2년 이상 장기근속 {summary.get('long_tenure_count', 0)}명",
-    ]
-    for point in matching_points:
-        st.write(f"- {point}")
+    render_employment_support_analysis(
+        user_id=user_id,
+        business_no=business_no,
+        company_name=company_name,
+        latest=latest,
+    )
 
     versions = load_employee_versions(
         user_id,
