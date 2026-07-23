@@ -6,9 +6,12 @@ from typing import Any, Callable
 
 from contact_matching import normalize_phone
 from prospect_db_repository import (
+    _snapshot_identity,
     existing_prospect_identities,
+    load_prior_employee_snapshots,
     remove_existing_customers,
     remove_existing_prospects,
+    save_employee_snapshots,
 )
 from public_data_api import (
     enrich_employment_growth,
@@ -165,7 +168,7 @@ def collect_contactable_growth_companies(
     minimum_employees: int = 3,
     business_type: str = "stock",
     growth_only: bool = True,
-    growth_basis: str = "year_over_year",
+    growth_basis: str = "combined",
     industry_categories: list[str] | None = None,
     sigungu_code: str = "",
     emd_code: str = "",
@@ -178,9 +181,9 @@ def collect_contactable_growth_companies(
     business_type = str(business_type or "stock").strip().lower()
     if business_type not in {"stock", "individual", "all"}:
         business_type = "stock"
-    growth_basis = str(growth_basis or "year_over_year").strip().lower()
-    if growth_basis not in {"year_over_year", "recent_net", "none"}:
-        growth_basis = "year_over_year"
+    growth_basis = str(growth_basis or "combined").strip().lower()
+    if growth_basis not in {"combined", "none"}:
+        growth_basis = "combined"
     if growth_basis == "none":
         growth_only = False
     selected_industries = {
@@ -217,6 +220,8 @@ def collect_contactable_growth_companies(
         "employment_unavailable": 0,
         "employment_failed": 0,
         "employment_api_attempts": 0,
+        "year_snapshot_found": 0,
+        "year_snapshot_saved": 0,
         "contact_checked": 0,
         "pages_scanned": 0,
         "elapsed_seconds": 0.0,
@@ -238,8 +243,6 @@ def collect_contactable_growth_companies(
             region_code,
             page_no=page_no,
             rows=100,
-            sigungu_code=sigungu_code,
-            emd_code=emd_code,
             detail_workers=8,
             timeout=30,
             retries=2,
@@ -319,6 +322,31 @@ def collect_contactable_growth_companies(
         )
         stats["saved_prospect_excluded"] += prospect_count
 
+        try:
+            previous_snapshots = load_prior_employee_snapshots(
+                minimum_filtered
+            )
+            for item in minimum_filtered:
+                identity = _snapshot_identity(item)
+                previous = previous_snapshots.get(identity)
+                if previous:
+                    previous_count = int(
+                        previous.get("employee_count") or 0
+                    )
+                    item["전년가입자수"] = previous_count
+                    item["전년대비고용증가"] = int(
+                        item.get("가입자수") or 0
+                    ) - previous_count
+                    item["전년자료생성년월"] = previous.get(
+                        "data_created_ym", ""
+                    )
+                    stats["year_snapshot_found"] += 1
+            stats["year_snapshot_saved"] += save_employee_snapshots(
+                minimum_filtered
+            )
+        except Exception as exc:
+            duplicate_warning = duplicate_warning or str(exc)
+
         _notify(
             progress,
             stage="employment",
@@ -355,7 +383,7 @@ def collect_contactable_growth_companies(
             growth_value = _optional_int(item.get("선택고용증가"))
             if growth_basis == "none":
                 page_growth.append(item)
-            elif growth_value is not None and growth_value > 0:
+            elif bool(item.get("고용증가신호")):
                 page_growth.append(item)
             else:
                 page_fallback.append(item)
@@ -416,8 +444,10 @@ def collect_contactable_growth_companies(
         ),
         "priority_basis": (
             {
-                "year_over_year": "전년 동월 대비 가입자수 증가",
-                "recent_net": "최근 월 신규취득자수-상실가입자수 증가",
+                "combined": (
+                    "전년 동월 가입자 증감(스냅샷 축적 시) 또는 "
+                    "최근 월 신규취득자수-상실가입자수 증가"
+                ),
                 "none": "고용 증가 필터 미사용",
             }[growth_basis]
             + (

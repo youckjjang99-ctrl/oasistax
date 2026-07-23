@@ -1,0 +1,7 @@
+git status
+git add prospect_db_center.py prospect_collection_service.py prospect_db_repository.py public_data_api.py supabase_v985_employee_snapshots.sql VERSION.txt APPLY_UPDATE_v9.8.5.py RUN_UPDATE_v9.8.5.bat README_UPDATE_v9.8.5.md GITHUB_UPLOAD_COMMANDS_v9.8.5.txt payload
+git add -f CHANGELOG_v9.8.5.md
+git status
+git commit -m "OASIS CRM v9.8.5 DB발굴 통합 고용증가 신호"
+git pull --rebase origin main
+git push origin main

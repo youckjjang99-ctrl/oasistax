@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -14,6 +15,7 @@ TABLE_PROSPECTS = "oasis_prospect_companies"
 TABLE_CUSTOMERS = "oasis_customers"
 TABLE_CONTACTS = "oasis_prospect_contacts"
 TABLE_SEARCH_HISTORY = "oasis_prospect_search_history"
+TABLE_EMPLOYEE_SNAPSHOTS = "oasis_nps_employee_snapshots"
 
 
 def _business_no(value: Any) -> str:
@@ -21,6 +23,123 @@ def _business_no(value: Any) -> str:
     if len(digits) == 10:
         return f"{digits[:3]}-{digits[3:5]}-{digits[5:]}"
     return str(value or "").strip()
+
+
+def _snapshot_identity(prospect: dict[str, Any]) -> str:
+    business_digits = re.sub(
+        r"[^0-9]", "", str(prospect.get("사업자등록번호") or "")
+    )
+    if len(business_digits) >= 6:
+        return f"business:{business_digits[:6]}"
+    identity = "|".join(
+        (
+            re.sub(r"\s+", "", str(prospect.get("사업장명") or "")),
+            re.sub(r"\s+", "", str(prospect.get("주소") or "")),
+        )
+    )
+    return "name:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _previous_year_month(value: Any) -> str:
+    digits = re.sub(r"[^0-9]", "", str(value or ""))
+    if len(digits) != 6:
+        return ""
+    try:
+        return f"{int(digits[:4]) - 1:04d}{int(digits[4:]):02d}"
+    except ValueError:
+        return ""
+
+
+def load_prior_employee_snapshots(
+    prospects: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """이번 조회의 전년 동월 가입자수 스냅샷을 일괄 조회한다."""
+    targets: dict[str, set[str]] = {}
+    for prospect in prospects:
+        target_ym = _previous_year_month(prospect.get("자료생성년월"))
+        if target_ym:
+            targets.setdefault(target_ym, set()).add(
+                _snapshot_identity(prospect)
+            )
+    if not targets:
+        return {}
+    config = get_cloud_config()
+    if not config.configured:
+        return {}
+    found: dict[str, dict[str, Any]] = {}
+    for target_ym, identities in targets.items():
+        values = sorted(identities)
+        for start in range(0, len(values), 100):
+            group = values[start : start + 100]
+            response = requests.get(
+                f"{config.url}/rest/v1/{TABLE_EMPLOYEE_SNAPSHOTS}",
+                headers=_rest_headers(),
+                params={
+                    "select": (
+                        "snapshot_identity,data_created_ym,employee_count,"
+                        "company_name,address"
+                    ),
+                    "snapshot_identity": f"in.({','.join(group)})",
+                    "data_created_ym": f"eq.{target_ym}",
+                },
+                timeout=max(config.timeout, 30),
+            )
+            if not response.ok:
+                raise RuntimeError(
+                    "전년 동월 가입자 스냅샷 조회 실패 "
+                    f"HTTP {response.status_code}: {response.text[:240]}"
+                )
+            for row in response.json() if response.text else []:
+                if isinstance(row, dict):
+                    found[str(row.get("snapshot_identity") or "")] = row
+    return found
+
+
+def save_employee_snapshots(prospects: list[dict[str, Any]]) -> int:
+    """현재 국민연금 가입자수를 월별로 보관해 1년 뒤 비교에 사용한다."""
+    rows = []
+    for prospect in prospects:
+        data_created_ym = re.sub(
+            r"[^0-9]", "", str(prospect.get("자료생성년월") or "")
+        )
+        if len(data_created_ym) != 6:
+            continue
+        try:
+            employee_count = int(prospect.get("가입자수") or 0)
+        except (TypeError, ValueError):
+            continue
+        rows.append(
+            {
+                "snapshot_identity": _snapshot_identity(prospect),
+                "data_created_ym": data_created_ym,
+                "employee_count": employee_count,
+                "company_name": str(prospect.get("사업장명") or ""),
+                "address": str(prospect.get("주소") or ""),
+                "source_key": str(prospect.get("source_key") or ""),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+    if not rows:
+        return 0
+    config = get_cloud_config()
+    if not config.configured:
+        return 0
+    response = requests.post(
+        f"{config.url}/rest/v1/{TABLE_EMPLOYEE_SNAPSHOTS}",
+        headers={
+            **_rest_headers(),
+            "Prefer": "resolution=merge-duplicates,return=representation",
+        },
+        params={"on_conflict": "snapshot_identity,data_created_ym"},
+        data=json.dumps(rows, ensure_ascii=False),
+        timeout=max(config.timeout, 30),
+    )
+    if not response.ok:
+        raise RuntimeError(
+            "가입자 스냅샷 저장 실패 "
+            f"HTTP {response.status_code}: {response.text[:240]}"
+        )
+    return len(rows)
 
 
 def prospect_table_status() -> tuple[bool, str]:

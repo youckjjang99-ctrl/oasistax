@@ -733,15 +733,15 @@ def fetch_nps_year_over_year(
 def enrich_employment_growth(
     workplaces: list[dict[str, Any]],
     *,
-    basis: str = "year_over_year",
+    basis: str = "combined",
     timeout: int = 15,
     retries: int = 1,
     workers: int = 8,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """선택한 고용 기준을 조회하고 결측을 0명과 구분한다."""
-    normalized_basis = str(basis or "year_over_year").strip().lower()
-    if normalized_basis not in {"year_over_year", "recent_net", "none"}:
-        normalized_basis = "year_over_year"
+    """최근 월 순취득과 보유한 전년 자료를 하나의 신호로 판정한다."""
+    normalized_basis = str(basis or "combined").strip().lower()
+    if normalized_basis not in {"combined", "none"}:
+        normalized_basis = "combined"
     rows = [dict(item) for item in workplaces]
     stats = {
         "employment_checked": 0,
@@ -758,27 +758,18 @@ def enrich_employment_growth(
         return rows, stats
 
     def _lookup(row: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-        if normalized_basis == "recent_net":
-            raw = (
-                row.get("원본데이터")
-                if isinstance(row.get("원본데이터"), dict)
-                else {}
-            )
-            sequence = _first(raw, "seq", "자료순번") or row.get(
-                "source_key"
-            )
-            result = fetch_nps_period_status(
-                sequence,
-                data_created_ym=str(row.get("자료생성년월") or ""),
-                timeout=timeout,
-                retries=retries,
-            )
-        else:
-            result = fetch_nps_year_over_year(
-                row,
-                timeout=timeout,
-                retries=retries,
-            )
+        raw = (
+            row.get("원본데이터")
+            if isinstance(row.get("원본데이터"), dict)
+            else {}
+        )
+        sequence = _first(raw, "seq", "자료순번") or row.get("source_key")
+        result = fetch_nps_period_status(
+            sequence,
+            data_created_ym=str(row.get("자료생성년월") or ""),
+            timeout=timeout,
+            retries=retries,
+        )
         return row, result
 
     completed: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
@@ -806,47 +797,48 @@ def enrich_employment_growth(
         stats["employment_api_attempts"] += int(
             result.get("api_attempt_count") or 0
         )
-        row["고용증가기준"] = normalized_basis
+        row["고용증가기준"] = "combined"
         row["고용자료메시지"] = str(result.get("message") or "")
         if result.get("ok"):
             stats["employment_checked"] += 1
             row["고용자료상태"] = "CONFIRMED"
-            if normalized_basis == "recent_net":
-                row["신규취득자수"] = result["new_count"]
-                row["상실가입자수"] = result["lost_count"]
-                row["순고용증가"] = result["net_growth"]
-                row["선택고용증가"] = result["net_growth"]
-                row["고용증가판정"] = (
-                    "최근 월 순취득 증가"
-                    if result["net_growth"] > 0
-                    else "최근 월 순취득 증가 아님"
+            row["신규취득자수"] = result["new_count"]
+            row["상실가입자수"] = result["lost_count"]
+            row["순고용증가"] = result["net_growth"]
+            year_growth = _optional_integer(row.get("전년대비고용증가"))
+            recent_growth = result["net_growth"]
+            row["선택고용증가"] = max(
+                recent_growth,
+                year_growth if year_growth is not None else -1000000,
+            )
+            reasons: list[str] = []
+            if year_growth is not None:
+                reasons.append(
+                    "전년 동월 가입자 "
+                    + (f"{year_growth:+d}명" if year_growth else "변동 없음")
                 )
             else:
-                row["전년가입자수"] = result["previous_employee_count"]
-                row["전년대비고용증가"] = result[
-                    "year_over_year_growth"
-                ]
-                row["선택고용증가"] = result[
-                    "year_over_year_growth"
-                ]
-                row["고용증가판정"] = (
-                    "전년 동월 대비 가입자 증가"
-                    if result["year_over_year_growth"] > 0
-                    else "전년 동월 대비 증가 아님"
-                )
-                row["전년자료생성년월"] = result[
-                    "previous_data_created_ym"
-                ]
+                reasons.append("전년 동월 가입자 자료 축적 전")
+            reasons.append(f"최근 월 순취득 {recent_growth:+d}명")
+            row["고용증가판정"] = " · ".join(reasons)
+            row["고용증가신호"] = (
+                recent_growth > 0
+                or (year_growth is not None and year_growth > 0)
+            )
+            if year_growth is None:
+                row["전년동월상태"] = "스냅샷 축적 전"
+            else:
+                row["전년동월상태"] = "확인됨"
         else:
             status = str(result.get("status") or "UNAVAILABLE")
             row["고용자료상태"] = status
             row["선택고용증가"] = None
-            row["고용증가판정"] = "고용자료 확인 불가"
+            row["고용증가신호"] = False
+            row["전년동월상태"] = "스냅샷 축적 전"
+            row["고용증가판정"] = "최근 월 고용자료 확인 불가"
             if status in {
-                "PRIOR_WORKPLACE_NOT_FOUND",
                 "NO_PERIOD_DATA",
                 "INCOMPLETE_PERIOD_DATA",
-                "CURRENT_DATA_MISSING",
             }:
                 stats["employment_unavailable"] += 1
             else:

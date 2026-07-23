@@ -74,13 +74,9 @@ BUSINESS_TYPE_LABELS = {
     "individual": "개인사업자 후보",
     "all": "전체",
 }
-GROWTH_BASIS_OPTIONS = {
-    "전년 동월 대비 가입자수 증가": "year_over_year",
-    "최근 월 신규취득−상실 증가": "recent_net",
-    "고용 증가 필터 사용 안 함": "none",
-}
 GROWTH_BASIS_LABELS = {
-    value: label for label, value in GROWTH_BASIS_OPTIONS.items()
+    "combined": "통합 고용 증가 신호",
+    "none": "고용 증가 필터 미사용",
 }
 
 
@@ -384,7 +380,7 @@ def _render_search_history(owner_user_id: str) -> int:
                         " · ".join(categories) if categories else "전체 업종"
                     ),
                     "고용 기준": GROWTH_BASIS_LABELS.get(
-                        str(row.get("growth_basis") or "year_over_year"),
+                        str(row.get("growth_basis") or "combined"),
                         str(row.get("growth_basis") or ""),
                     ),
                     "발굴": f"{int(row.get('found_count') or 0):,}건",
@@ -1541,7 +1537,7 @@ def _render_clean_saved_prospects(owner_user_id: str) -> None:
 def render_prospect_db_center(owner_user_id: str = "") -> None:
     st.markdown("## DB발굴")
     st.caption(
-        "조회할 페이지·사업자 유형·고용 증가 판단 기준을 선택하고, "
+        "전년 동월 가입자 변동(축적된 경우)과 최근 월 순취득을 함께 보며, "
         "전화 또는 휴대전화가 확인된 업체를 찾습니다."
     )
     recommended_start_page = _render_search_history(owner_user_id)
@@ -1594,24 +1590,12 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 help="시작 페이지부터 종료 페이지까지 순서대로 조회합니다.",
                 key="prospect_end_page_v984",
             )
-            growth_basis_name = st.selectbox(
-                "고용 증가 판단 기준",
-                list(GROWTH_BASIS_OPTIONS.keys()),
-                index=0,
-                help=(
-                    "전년 동월 대비는 동일 사업장의 현재 가입자수와 "
-                    "12개월 전 가입자수를 비교합니다. 최근 월 기준은 "
-                    "기간별 API의 신규취득자수에서 상실가입자수를 뺍니다."
-                ),
-                key="prospect_growth_basis_v984",
-            )
             growth_only = st.checkbox(
-                "선택한 기준의 고용 증가 사업장만 표시",
+                "고용 증가 신호 사업장만 표시",
                 value=True,
                 help=(
-                    "증가값이 1명 이상으로 확인된 사업장만 연락처 검색 "
-                    "대상으로 사용합니다. 자료가 없는 사업장은 0명이 "
-                    "아니라 확인 불가로 분리됩니다."
+                    "전년 동월 가입자 증가가 확인됐거나 최근 월 순취득이 "
+                    "1명 이상인 사업장만 연락처 검색 대상으로 사용합니다."
                 ),
                 key="prospect_growth_only_v984",
             )
@@ -1626,16 +1610,6 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 ),
                 key="prospect_industry_categories_v984",
             )
-            sigungu_code = st.text_input(
-                "시·군·구 법정동 코드",
-                placeholder="선택사항",
-                key="prospect_sigungu_v984",
-            )
-            emd_code = st.text_input(
-                "읍·면·동 법정동 코드",
-                placeholder="선택사항",
-                key="prospect_emd_v984",
-            )
         search_clicked = st.form_submit_button(
             f"연락 가능한 성장기업 {target_count}개 찾기",
             type="primary",
@@ -1644,13 +1618,13 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
         )
         st.caption(
             "목표 업체 수를 채우거나 지정한 종료 페이지에 도달할 때까지 "
-            "검색합니다. 전년 동월 대비는 사업장마다 과거 기본·상세조회가 "
-            "추가되어 다른 기준보다 시간이 더 걸릴 수 있습니다."
+            "검색합니다. 최근 월 고용 신호를 먼저 확인하므로 이전 버전보다 "
+            "불필요한 과거 사업장 조회가 줄어듭니다."
         )
 
     business_type = BUSINESS_TYPE_OPTIONS[business_type_name]
-    growth_basis = GROWTH_BASIS_OPTIONS[growth_basis_name]
-    effective_growth_only = bool(growth_only and growth_basis != "none")
+    growth_basis = "combined"
+    effective_growth_only = bool(growth_only)
     page_state_key = (
         f"prospect_next_page_v984_{owner_user_id}_{region_name}_{business_type}"
     )
@@ -1702,7 +1676,7 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 progress_bar.progress(
                     progress_state["value"],
                     text=(
-                        f"{growth_basis_name} 자료 확인 중 "
+                        "최근 월 고용 증가 신호 확인 중 "
                         f"({event.get('page', '')}페이지)"
                     ),
                 )
@@ -1750,8 +1724,6 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 growth_only=effective_growth_only,
                 growth_basis=growth_basis,
                 industry_categories=list(industry_categories),
-                sigungu_code=sigungu_code,
-                emd_code=emd_code,
                 progress=_progress,
             )
         progress_bar.progress(1.0, text="검색을 완료했습니다.")
@@ -1796,15 +1768,7 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             f"{stats.get('basic_received', 0):,}건",
         )
         metric_cols[1].metric(
-            (
-                "전년 대비 증가"
-                if result.get("growth_basis") == "year_over_year"
-                else (
-                    "최근 월 순취득 증가"
-                    if result.get("growth_basis") == "recent_net"
-                    else "고용 필터 미사용"
-                )
-            ),
+            "고용 증가 신호",
             f"{stats.get('growth_candidates', 0):,}건",
         )
         metric_cols[2].metric(
@@ -1851,10 +1815,9 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
         items = list(result.get("items") or [])
         if not items:
             st.info(
-                "선택한 범위에서 고용 증가 조건과 공개 대표전화 조건을 "
-                "모두 충족한 업체를 확인하지 못했습니다. 고용자료 확인 "
-                "불가 건수가 많다면 ‘최근 월’ 기준 또는 ‘고용 증가 필터 "
-                "사용 안 함’으로 비교 검색할 수 있습니다."
+                "선택한 범위에서 고용 증가 신호와 공개 대표전화 조건을 "
+                "모두 충족한 업체를 확인하지 못했습니다. 다음 페이지를 "
+                "이어 조회하거나 고용 증가 신호 필터를 해제해 비교할 수 있습니다."
             )
         else:
             st.markdown("### 이번에 찾은 영업후보")
