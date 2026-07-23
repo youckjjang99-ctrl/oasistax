@@ -193,13 +193,15 @@ def collect_contactable_growth_companies(
     }
 
     try:
-        saved_source_keys, saved_business_nos = (
+        saved_source_keys, saved_business_nos, saved_company_address_keys = (
             existing_prospect_identities()
         )
         duplicate_warning = ""
     except Exception as exc:
         saved_source_keys, saved_business_nos = set(), set()
+        saved_company_address_keys = set()
         duplicate_warning = str(exc)
+    snapshot_warning = ""
 
     seen_source_keys = set(saved_source_keys)
     growth_pool: list[dict[str, Any]] = []
@@ -319,6 +321,7 @@ def collect_contactable_growth_companies(
             minimum_filtered,
             source_keys=saved_source_keys,
             business_nos=saved_business_nos,
+            company_address_keys=saved_company_address_keys,
         )
         stats["saved_prospect_excluded"] += prospect_count
 
@@ -345,7 +348,7 @@ def collect_contactable_growth_companies(
                 minimum_filtered
             )
         except Exception as exc:
-            duplicate_warning = duplicate_warning or str(exc)
+            snapshot_warning = snapshot_warning or str(exc)
 
         _notify(
             progress,
@@ -434,6 +437,7 @@ def collect_contactable_growth_companies(
         "stats": stats,
         "failures": failures,
         "duplicate_warning": duplicate_warning,
+        "snapshot_warning": snapshot_warning,
         "business_type": business_type,
         "growth_only": bool(growth_only),
         "growth_basis": growth_basis,

@@ -25,19 +25,35 @@ def _business_no(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _company_address_key(company_name: Any, address: Any) -> str:
+    """마스킹 사업자번호를 보완할 사업장 단위 식별값이다."""
+    name = re.sub(r"[^0-9a-z가-힣]", "", str(company_name or "").lower())
+    place = re.sub(r"[^0-9a-z가-힣]", "", str(address or "").lower())
+    if not name or not place:
+        return ""
+    return f"{name}|{place}"
+
+
 def _snapshot_identity(prospect: dict[str, Any]) -> str:
+    """동일 사업장을 월별로 비교할 안정적인 식별값을 만든다.
+
+    국민연금 기본조회는 개인사업자 사업자번호를 앞 6자리까지만 제공할
+    수 있다. 따라서 번호 일부만으로 식별하면 서로 다른 사업장이 한
+    스냅샷 행으로 충돌하므로, 상호·주소 해시를 함께 사용한다.
+    """
     business_digits = re.sub(
         r"[^0-9]", "", str(prospect.get("사업자등록번호") or "")
     )
-    if len(business_digits) >= 6:
-        return f"business:{business_digits[:6]}"
-    identity = "|".join(
-        (
-            re.sub(r"\s+", "", str(prospect.get("사업장명") or "")),
-            re.sub(r"\s+", "", str(prospect.get("주소") or "")),
-        )
+    place_key = _company_address_key(
+        prospect.get("사업장명"), prospect.get("주소")
     )
-    return "name:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    if not place_key:
+        place_key = re.sub(
+            r"\s+", "", str(prospect.get("source_key") or "")
+        )
+    place_hash = hashlib.sha256(place_key.encode("utf-8")).hexdigest()
+    business_part = business_digits if business_digits else "unknown"
+    return f"business:{business_part}|place:{place_hash}"
 
 
 def _previous_year_month(value: Any) -> str:
@@ -95,9 +111,9 @@ def load_prior_employee_snapshots(
     return found
 
 
-def save_employee_snapshots(prospects: list[dict[str, Any]]) -> int:
-    """현재 국민연금 가입자수를 월별로 보관해 1년 뒤 비교에 사용한다."""
-    rows = []
+def _snapshot_rows(prospects: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """같은 월·같은 사업장 스냅샷은 POST 전에 한 행으로 정리한다."""
+    unique_rows: dict[tuple[str, str], dict[str, Any]] = {}
     for prospect in prospects:
         data_created_ym = re.sub(
             r"[^0-9]", "", str(prospect.get("자료생성년월") or "")
@@ -108,17 +124,25 @@ def save_employee_snapshots(prospects: list[dict[str, Any]]) -> int:
             employee_count = int(prospect.get("가입자수") or 0)
         except (TypeError, ValueError):
             continue
-        rows.append(
-            {
-                "snapshot_identity": _snapshot_identity(prospect),
-                "data_created_ym": data_created_ym,
-                "employee_count": employee_count,
-                "company_name": str(prospect.get("사업장명") or ""),
-                "address": str(prospect.get("주소") or ""),
-                "source_key": str(prospect.get("source_key") or ""),
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
+        row = {
+            "snapshot_identity": _snapshot_identity(prospect),
+            "data_created_ym": data_created_ym,
+            "employee_count": employee_count,
+            "company_name": str(prospect.get("사업장명") or ""),
+            "address": str(prospect.get("주소") or ""),
+            "source_key": str(prospect.get("source_key") or ""),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        identity = (row["snapshot_identity"], row["data_created_ym"])
+        previous = unique_rows.get(identity)
+        if previous is None or row["employee_count"] >= previous["employee_count"]:
+            unique_rows[identity] = row
+    return list(unique_rows.values())
+
+
+def save_employee_snapshots(prospects: list[dict[str, Any]]) -> int:
+    """현재 국민연금 가입자수를 월별로 보관해 1년 뒤 비교에 사용한다."""
+    rows = _snapshot_rows(prospects)
     if not rows:
         return 0
     config = get_cloud_config()
@@ -250,12 +274,14 @@ def remove_existing_customers(
     return filtered, len(prospects) - len(filtered)
 
 
-def existing_prospect_identities(limit: int = 10000) -> tuple[set[str], set[str]]:
+def existing_prospect_identities(
+    limit: int = 10000,
+) -> tuple[set[str], set[str], set[str]]:
     """사용자 구분 없이 전체 영업후보의 중복 식별값을 반환."""
     db = CloudDatabase()
     rows = db.select(
         TABLE_PROSPECTS,
-        columns="source_key,business_no",
+        columns="source_key,business_no,company_name,address",
         limit=min(10000, max(1, int(limit))),
     )
     source_keys = {
@@ -268,7 +294,12 @@ def existing_prospect_identities(limit: int = 10000) -> tuple[set[str], set[str]
         for row in rows
         if len(re.sub(r"[^0-9]", "", str(row.get("business_no") or ""))) == 10
     }
-    return source_keys, business_nos
+    company_address_keys = {
+        _company_address_key(row.get("company_name"), row.get("address"))
+        for row in rows
+        if _company_address_key(row.get("company_name"), row.get("address"))
+    }
+    return source_keys, business_nos, company_address_keys
 
 
 def remove_existing_prospects(
@@ -276,14 +307,23 @@ def remove_existing_prospects(
     *,
     source_keys: set[str] | None = None,
     business_nos: set[str] | None = None,
+    company_address_keys: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
-    if source_keys is None or business_nos is None:
-        source_keys, business_nos = existing_prospect_identities()
+    if (
+        source_keys is None
+        or business_nos is None
+        or company_address_keys is None
+    ):
+        source_keys, business_nos, company_address_keys = (
+            existing_prospect_identities()
+        )
     filtered = [
         item
         for item in prospects
         if str(item.get("source_key") or "").strip() not in source_keys
         and _business_no(item.get("사업자등록번호")) not in business_nos
+        and _company_address_key(item.get("사업장명"), item.get("주소"))
+        not in company_address_keys
     ]
     return filtered, len(prospects) - len(filtered)
 

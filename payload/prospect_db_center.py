@@ -1805,6 +1805,12 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 "기존 DB 중복확인 일부를 완료하지 못했습니다: "
                 f"{result['duplicate_warning']}"
             )
+        if result.get("snapshot_warning"):
+            st.warning(
+                "월별 가입자 스냅샷 저장을 완료하지 못했습니다. 이번 "
+                "발굴 결과와 기존 DB 제외에는 영향이 없습니다: "
+                f"{result['snapshot_warning']}"
+            )
         if result.get("history_warning"):
             st.warning(
                 "검색 결과는 정상입니다. 페이지 이력은 저장하지 "

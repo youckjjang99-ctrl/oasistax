@@ -1,0 +1,7 @@
+git status
+git add prospect_db_center.py prospect_collection_service.py prospect_db_repository.py VERSION.txt APPLY_UPDATE_v9.8.6.py RUN_UPDATE_v9.8.6.bat README_UPDATE_v9.8.6.md GITHUB_UPLOAD_COMMANDS_v9.8.6.txt payload
+git add -f CHANGELOG_v9.8.6.md
+git status
+git commit -m "OASIS CRM v9.8.6 DB발굴 중복제외 및 스냅샷 안정화"
+git pull --rebase origin main
+git push origin main
