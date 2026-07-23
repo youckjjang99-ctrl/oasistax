@@ -1,0 +1,176 @@
+"""종합소득세 신고서에서 개인사업자·사업장 정보를 안전하게 추출합니다."""
+
+from __future__ import annotations
+
+import re
+from datetime import datetime
+from pathlib import Path
+
+
+def _clean(value) -> str:
+    return " ".join(str(value or "").replace("\x00", " ").split()).strip()
+
+
+def _number(value):
+    text = re.sub(r"[^0-9\-]", "", str(value or ""))
+    if text in {"", "-"}:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _first(pattern, text, flags=0):
+    match = re.search(pattern, text or "", flags)
+    return _clean(match.group(1)) if match else ""
+
+
+def _extract_text(pdf_path):
+    errors = []
+    try:
+        import pdfplumber
+
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            pages = [(page.extract_text(x_tolerance=2, y_tolerance=3) or "") for page in pdf.pages]
+        text = "\f".join(pages)
+        if text.strip():
+            return text, ""
+    except Exception as exc:
+        errors.append(f"pdfplumber: {exc}")
+
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(str(pdf_path))
+        text = "\f".join((page.extract_text() or "") for page in reader.pages)
+        if text.strip():
+            return text, ""
+    except Exception as exc:
+        errors.append(f"pypdf: {exc}")
+
+    return "", "PDF 텍스트를 읽지 못했습니다. " + " / ".join(errors[:2])
+
+
+def _normalize_business_no(value):
+    digits = re.sub(r"[^0-9]", "", str(value or ""))
+    if len(digits) == 10:
+        return f"{digits[:3]}-{digits[3:5]}-{digits[5:]}"
+    return ""
+
+
+def _global_summary(text):
+    first_pages = "\f".join((text or "").split("\f")[:2])
+    dense = re.sub(r"[ \t]", "", first_pages)
+    return {
+        "대표자명": _first(r"(?:①성명|신고인)([가-힣A-Za-z]{2,30})", dense),
+        "귀속연도": _first(r"\((20\d{2})년귀속", dense),
+        "종합소득금액": _number(_first(r"종합소득금액(?:19)?([\-0-9,]+)", dense)),
+        "소득공제": _number(_first(r"소득공제(?:20)?([\-0-9,]+)", dense)),
+        "과세표준": _number(_first(r"과세표준[^\n]*?21([\-0-9,]+?)(?:41|$)", dense, flags=re.M)),
+        "적용세율": _first(r"세율22([0-9.]+?)(?:42|$)", dense, flags=re.M),
+        "산출세액": _number(_first(r"산출세액23([\-0-9,]+?)(?:43|$)", dense, flags=re.M)),
+        "세액감면": _number(_first(r"세액감면(?:24)([\-0-9,]+)", dense)),
+        "세액공제": _number(_first(r"세액공제(?:25)([\-0-9,]+)", dense)),
+        "결정세액": _number(_first(r"합계\(26\+27\)(?:28)([\-0-9,]+)", dense)),
+        "납부환급세액": _number(_first(r"납부\(환급\)할총세액[^\n]*?(?:33)([\-0-9,]+)", dense)),
+    }
+
+
+def _split_business_sections(text):
+    starts = [match.start() for match in re.finditer(r"[❼⑦]?\s*사업소득명세서", text or "")]
+    if not starts:
+        return []
+    sections = []
+    for index, start in enumerate(starts):
+        end = starts[index + 1] if index + 1 < len(starts) else len(text)
+        section = text[start:end]
+        next_form = re.search(
+            r"\f\s*(?:[❽-❿⑧-⑩]|\(?\d{1,2}\)?\s+)[^\n]{0,40}(?:명세서|계산서)",
+            section[30:],
+        )
+        if next_form:
+            section = section[: next_form.start() + 30]
+        sections.append(section)
+    return sections
+
+
+def _extract_business(section, global_data, index):
+    dense = re.sub(r"[ \t]", "", section or "")
+    business_no = _normalize_business_no(
+        _first(r"사업자등록번호([0-9]{3}-[0-9]{2}-[0-9]{5})", dense)
+    )
+    company_name = _first(r"④상호([^\n]+)", dense)
+    if company_name:
+        company_name = company_name.split("⑤사업자등록번호")[0].strip()
+
+    address = _first(
+        r"(?:③\s*)?사\s*업\s*장\s*(?:소재지)?\s+([\s\S]+?)(?:국내1/국외9|④\s*상\s*호)",
+        section,
+    )
+    address = _clean(address)
+
+    revenue = _number(_first(r"(?:⑨|9)총수입금액([\-0-9,]+)", dense))
+    expense = _number(_first(r"(?:⑩|10)필요경비([\-0-9,]+)", dense))
+    income = _number(_first(r"(?:⑪|11)소득금액[^\n]*?([\-0-9,]+)$", dense, flags=re.M))
+
+    result = dict(global_data)
+    result.update(
+        {
+            "사업장순번": index,
+            "사업자유형": "개인사업자",
+            "업체명": company_name or f"개인사업장 {index}",
+            "대표자명": global_data.get("대표자명", ""),
+            "사업자등록번호": business_no,
+            "사업장 소재지": address,
+            "기장의무": _first(r"⑥기장의무([^\n]+)", dense),
+            "신고유형": _first(r"⑦신고유형(?:코드)?([^\n]+)", dense),
+            "주업종코드": _first(r"⑧주업종코드([0-9]+)", dense),
+            "매출액": revenue,
+            "연매출": revenue,
+            "전년도매출": revenue,
+            "필요경비": expense,
+            "사업소득금액": income,
+            "과세기간시작일": _first(r"(?:⑫|12)과세기간개시일([0-9.]+)", dense),
+            "과세기간종료일": _first(r"(?:⑬|13)과세기간종료일([0-9.]+)", dense),
+            "PDF추출일시": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "자료출처": "종합소득세 신고서",
+        }
+    )
+    if revenue not in (None, 0) and income is not None:
+        result["소득률"] = round(income / revenue * 100, 2)
+    if revenue not in (None, 0) and expense is not None:
+        result["필요경비율"] = round(expense / revenue * 100, 2)
+    return result
+
+
+def parse_income_tax_return(pdf_path):
+    """PDF 한 건을 분석해 사업자번호별 등록 후보와 신고서 요약을 반환합니다."""
+    path = Path(pdf_path)
+    if not path.exists():
+        return {"businesses": [], "summary": {}}, "PDF 파일을 찾을 수 없습니다."
+
+    text, error = _extract_text(path)
+    if error:
+        return {"businesses": [], "summary": {}}, error
+
+    global_data = _global_summary(text)
+    businesses = [
+        _extract_business(section, global_data, index)
+        for index, section in enumerate(_split_business_sections(text), start=1)
+    ]
+    businesses = [
+        item for item in businesses
+        if item.get("사업자등록번호") or item.get("업체명")
+    ]
+    if not businesses:
+        return (
+            {"businesses": [], "summary": global_data},
+            "사업소득명세서에서 등록 가능한 사업장을 찾지 못했습니다.",
+        )
+
+    return {
+        "businesses": businesses,
+        "summary": global_data,
+        "page_count": len(text.split("\f")),
+    }, ""

@@ -11,6 +11,8 @@ from runtime_error_log import write_runtime_error
 from ui import apply_oasis_ui
 from maintenance import render_system_management_page
 from cretop_runner import run_cretop_worker
+from income_tax_return_parser import parse_income_tax_return
+from corporate_conversion_analyzer import analyze_corporate_conversion
 from cloud_admin import render_cloud_database_page
 from ai_usage import render_ai_usage_page
 from cloud_restore import restore_customer_db_if_needed
@@ -78,6 +80,7 @@ from utils import (
     move_result_files_to_results, extract_company_previews,
     get_user_dirs, get_user_cumulative_db_path, append_user_customer_db,
     append_cretop_to_user_customer_db,
+    append_income_tax_business_to_user_customer_db,
     check_user_customer_duplicate, link_business_no_to_legacy_customer,
     refresh_existing_customer_from_cretop,
     ensure_user_cumulative_db_format, update_user_customer_record,
@@ -667,7 +670,7 @@ def render_home_page():
         <div class="badge">OASIS TAX & ACCOUNTING · v3.2.2</div>
         <div class="hero-title">오아시스 내부 CRM +<br>지원사업 컨설팅 플랫폼</div>
         <div class="hero-sub">
-            고객DB, 크레탑 자동등록, 정책자금 매칭, 실행이력 관리를 하나의 내부 업무 시스템으로 통합합니다.
+            고객DB, 기업등록, 정책자금 매칭, 실행이력 관리를 하나의 내부 업무 시스템으로 통합합니다.
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -685,7 +688,7 @@ def render_home_page():
         st.markdown("""
         <div class="point-card">
             <div class="point-icon">📄</div>
-            <div class="point-title">크레탑 자동등록</div>
+            <div class="point-title">기업등록</div>
             <div class="point-desc">크레탑 PDF에서 추출 가능한 정보를 고객DB에 자동으로 누적합니다.</div>
         </div>
         """, unsafe_allow_html=True)
@@ -732,7 +735,7 @@ def render_customer_management_page(user_id):
 
     df, path = read_current_user_customer_df(user_id)
     if df.empty:
-        st.info("아직 등록된 고객DB가 없습니다. 고객DB 업로드 또는 크레탑 자동등록으로 먼저 고객을 추가해주세요.")
+        st.info("아직 등록된 고객DB가 없습니다. 고객DB 업로드 또는 기업등록으로 먼저 고객을 추가해주세요.")
         return
 
     df = df.copy()
@@ -1384,6 +1387,185 @@ def render_cumulative_db_page(user_id):
         )
 
 
+def render_personal_business_registration(user_id, user_name, upload_dir):
+    st.markdown("### 👤 종합소득세 신고서로 개인사업자 등록")
+    st.caption(
+        "사업소득명세서를 사업자등록번호별로 분리합니다. "
+        "여러 사업장이 있으면 원하는 사업장만 선택해 등록할 수 있습니다."
+    )
+    manager_name = st.text_input(
+        "담당자명", value=user_name or "", key="income_tax_manager_name"
+    )
+    uploaded = st.file_uploader(
+        "종합소득세 신고서 PDF 업로드",
+        type=["pdf"],
+        key="income_tax_pdf_uploader",
+    )
+    if uploaded is None:
+        st.info(
+            "과세표준확정신고서와 사업소득명세서가 포함된 PDF를 업로드해주세요. "
+            "주민등록번호·계좌번호·연락처는 고객DB에 저장하지 않습니다."
+        )
+        return
+
+    if st.button(
+        "종합소득세 신고서 분석하기",
+        key="income_tax_analyze_button",
+        width='stretch',
+    ):
+        save_name = make_upload_filename(uploaded.name).replace(
+            "업로드고객DB_", "종합소득세신고서_"
+        )
+        save_path = Path(upload_dir) / save_name
+        uploaded.seek(0)
+        with open(save_path, "wb") as destination:
+            shutil.copyfileobj(uploaded, destination, length=1024 * 1024)
+
+        with st.status("종합소득세 신고서를 분석하고 있습니다.", expanded=True) as status:
+            status.write("사업소득명세서를 찾고 사업자등록번호별로 분리합니다.")
+            parsed, error = parse_income_tax_return(save_path)
+            if error:
+                status.update(label="신고서 분석이 중단되었습니다.", state="error")
+            else:
+                status.write(
+                    f"등록 가능한 사업장 {len(parsed.get('businesses', []))}개를 찾았습니다."
+                )
+                status.update(label="신고서 분석이 완료되었습니다.", state="complete")
+        st.session_state["income_tax_parsed"] = parsed
+        st.session_state["income_tax_error"] = error
+        st.session_state["income_tax_pdf_path"] = str(save_path)
+
+    error = st.session_state.get("income_tax_error", "")
+    parsed = st.session_state.get("income_tax_parsed", {}) or {}
+    businesses = parsed.get("businesses", []) or []
+    if error:
+        st.error(error)
+        return
+    if not businesses:
+        st.caption("분석 버튼을 누르면 사업장 선택 화면이 표시됩니다.")
+        return
+
+    st.markdown("#### 1. 등록할 사업장 선택")
+    business_map = {}
+    for index, business in enumerate(businesses):
+        label = (
+            f"{business.get('업체명', '사업장')} | "
+            f"{business.get('사업자등록번호', '사업자번호 미확인')} | "
+            f"매출 {int(business.get('매출액') or 0):,}원"
+        )
+        business_map[f"{index}:{label}"] = index
+    selected_labels = st.multiselect(
+        "사업장",
+        options=list(business_map.keys()),
+        default=list(business_map.keys()),
+        format_func=lambda value: value.split(":", 1)[1],
+        key="income_tax_selected_businesses",
+    )
+    selected_indexes = [business_map[label] for label in selected_labels]
+
+    preview_rows = []
+    analyses = {}
+    for index in selected_indexes:
+        business = businesses[index]
+        analysis = analyze_corporate_conversion(business, businesses)
+        analyses[index] = analysis
+        preview_rows.append(
+            {
+                "상호": business.get("업체명", ""),
+                "사업자등록번호": business.get("사업자등록번호", ""),
+                "업종코드": business.get("주업종코드", ""),
+                "매출액": business.get("매출액"),
+                "필요경비": business.get("필요경비"),
+                "사업소득금액": business.get("사업소득금액"),
+                "법인전환 점수": analysis.get("score"),
+                "검토등급": analysis.get("grade"),
+            }
+        )
+    if preview_rows:
+        st.dataframe(pd.DataFrame(preview_rows), hide_index=True, width='stretch')
+
+    st.markdown("#### 2. 사업장별 법인전환 가능성 분석")
+    for index in selected_indexes:
+        business = businesses[index]
+        analysis = analyses[index]
+        with st.expander(
+            f"{business.get('업체명', '사업장')} - "
+            f"{analysis['grade']} ({analysis['score']}점)",
+            expanded=len(selected_indexes) == 1,
+        ):
+            st.info(analysis["summary"])
+            metric_cols = st.columns(4)
+            metric_cols[0].metric("연 매출", f"{int(business.get('매출액') or 0):,}원")
+            metric_cols[1].metric(
+                "사업소득", f"{int(business.get('사업소득금액') or 0):,}원"
+            )
+            metric_cols[2].metric("소득률", f"{analysis['metrics']['소득률']:.1f}%")
+            metric_cols[3].metric("법인전환 검토", f"{analysis['score']}점")
+            st.markdown("**가능성이 있는 이유**")
+            for reason in analysis["reasons"]:
+                st.write(f"- {reason}")
+            st.markdown("**전환 전 확인사항**")
+            for caution in analysis["cautions"]:
+                st.write(f"- {caution}")
+            st.markdown("**실행계획**")
+            for action in analysis["action_plan"]:
+                st.write(action)
+
+    st.markdown("#### 3. 선택 사업장 등록")
+    if not selected_indexes:
+        st.warning("등록할 사업장을 한 개 이상 선택해주세요.")
+        return
+
+    if st.button(
+        f"선택한 {len(selected_indexes)}개 사업장 등록",
+        key="income_tax_register_selected",
+        width='stretch',
+    ):
+        messages = []
+        added_count = 0
+        for index in selected_indexes:
+            business = dict(businesses[index])
+            analysis = analyses[index]
+            business["법인전환검토점수"] = analysis["score"]
+            business["법인전환검토등급"] = analysis["grade"]
+            business["키워드메모"] = (
+                f"개인사업자 / 업종코드 {business.get('주업종코드', '')} / "
+                f"법인전환 {analysis['grade']} {analysis['score']}점"
+            )
+            try:
+                _, saved_count, message, saved_data, _ = (
+                    append_income_tax_business_to_user_customer_db(
+                        business,
+                        user_id,
+                        manager_name=manager_name.strip() or user_name,
+                    )
+                )
+                added_count += saved_count
+                messages.append(message)
+                save_customer_snapshot(user_id, saved_data, source="income_tax_return")
+                sync_customer_snapshot(
+                    user_id,
+                    saved_data,
+                    source="income_tax_registration",
+                    manager_name=manager_name.strip() or user_name,
+                )
+            except Exception as exc:
+                write_runtime_error(
+                    "income_tax_business_registration",
+                    exc,
+                    {"business_no": business.get("사업자등록번호", "")},
+                )
+                messages.append(
+                    f"{business.get('업체명', '사업장')}: 등록 중 오류가 발생했습니다 - {exc}"
+                )
+        st.success(
+            f"선택 사업장 처리가 완료되었습니다. 신규 {added_count}건, "
+            f"기존자료 갱신 {len(selected_indexes) - added_count}건"
+        )
+        for message in messages:
+            st.write(f"- {message}")
+
+
 if not check_login():
     login_form(logo_html)
 
@@ -1430,7 +1612,7 @@ with st.sidebar:
     st.markdown('<div class="sidebar-section-label">MAIN</div>', unsafe_allow_html=True)
     menu_label_map = {
         "홈": "홈",
-        "크레탑 자동등록": "크레탑 자동등록",
+        "기업등록": "기업등록",
         "기업 컨설팅": "기업관리센터",
         "AI 코파일럿": "AI 코파일럿",
         "내 누적 고객DB": "내 누적 고객DB",
@@ -1456,6 +1638,9 @@ with st.sidebar:
     current_sidebar_value = st.session_state.get(
         "active_main_menu_v311"
     )
+    if current_sidebar_value == "크레탑 자동등록":
+        st.session_state["active_main_menu_v311"] = "기업등록"
+        current_sidebar_value = "기업등록"
     if current_sidebar_value not in menu_label_map:
         st.session_state["active_main_menu_v311"] = "기업 컨설팅"
 
@@ -1484,7 +1669,7 @@ st.markdown(f"""
     <div class="oasis-topbar-logo">{logo_html(365)}</div>
     <div style="margin-left:22px;">
         <div class="oasis-topbar-title">오아시스 내부 업무 시스템</div>
-        <div class="oasis-topbar-sub">기업 컨설팅 · 크레탑 자동등록 · AI 코파일럿</div>
+        <div class="oasis-topbar-sub">기업 컨설팅 · 기업등록 · AI 코파일럿</div>
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -1530,7 +1715,7 @@ elif active_tab == "내 누적 고객DB":
 elif active_tab == "통합 정책자금 매칭":
     st.markdown("### 등록 고객 통합 정책자금 AI 매칭")
     st.caption(
-        "크레탑 자동등록으로 생성된 누적 고객DB에서 업체를 선택하면 "
+        "기업등록으로 생성된 누적 고객DB에서 업체를 선택하면 "
         "별도 엑셀 업로드 없이 바로 정책자금 매칭을 실행합니다."
     )
 
@@ -1542,7 +1727,7 @@ elif active_tab == "통합 정책자금 매칭":
 
     if registered_customers.empty:
         st.info(
-            "등록된 고객이 없습니다. 먼저 크레탑 자동등록 또는 고객DB 업로드로 "
+            "등록된 고객이 없습니다. 먼저 기업등록 또는 고객DB 업로드로 "
             "고객을 등록해주세요."
         )
     else:
@@ -2065,8 +2250,23 @@ elif active_tab == "주가평가":
         CURRENT_USER_NAME,
     )
 
-elif active_tab == "크레탑 자동등록":
-    st.markdown("### 📄 크레탑 PDF로 고객 자동등록")
+elif active_tab == "기업등록":
+    st.markdown("### 🏢 기업등록")
+    registration_type = st.radio(
+        "등록할 사업자 유형",
+        ["법인사업자 - 크레탑 PDF", "개인사업자 - 종합소득세 신고서"],
+        horizontal=True,
+        key="enterprise_registration_type",
+    )
+    if registration_type.startswith("개인사업자"):
+        render_personal_business_registration(
+            CURRENT_USER_ID,
+            CURRENT_USER_NAME,
+            USER_UPLOAD_DIR,
+        )
+        st.stop()
+
+    st.markdown("### 📄 크레탑 PDF로 법인사업자 자동등록")
     st.caption("크레탑 기업종합보고서 PDF를 업로드하면 추출 가능한 항목을 읽어 내 누적 고객DB에 1행으로 추가합니다.")
 
     # v2.3.4: 저장 직후에는 앱을 한 번 재실행하여 상단 다운로드 버튼까지 최신 파일을 읽도록 한다.

@@ -27,3 +27,4 @@ CHANGELOG_v*.md
 !update_engine.py
 !RUN_UPDATE.cmd
 !RUN_PRECHECK.cmd
+_update_backups/

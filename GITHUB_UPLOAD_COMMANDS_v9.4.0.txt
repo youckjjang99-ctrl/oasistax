@@ -1,0 +1,12 @@
+# 정책자금자동화 프로젝트 폴더에서 PowerShell 실행
+
+git status
+git add .
+git status
+git commit -m "OASIS CRM v9.4.0 기업등록 및 개인사업자 법인전환 분석"
+git push origin main
+
+# 업로드 확인
+git status
+git log -1 --oneline
+

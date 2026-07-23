@@ -99,7 +99,11 @@ def make_basic_customer_template_bytes():
         "키워드메모", "주요 사업내용", "비고",
         "벤처", "메인비즈", "이노비즈", "기업부설연구소",
         "특허보유", "R&D수행", "기술제품보유", "기술인력보유",
-        "기술매출발생", "스마트공장도입", "기술보증희망", "기술성메모"
+        "기술매출발생", "스마트공장도입", "기술보증희망", "기술성메모",
+        "주업종코드", "필요경비", "사업소득금액", "소득률", "필요경비율",
+        "종합소득금액", "과세표준", "적용세율", "산출세액", "세액감면",
+        "세액공제", "결정세액", "납부환급세액", "기장의무", "신고유형",
+        "귀속연도", "법인전환검토점수", "법인전환검토등급"
     ]
 
     sample = pd.DataFrame([{
@@ -915,6 +919,7 @@ def get_customer_db_columns():
             cols = [str(c).strip() for c in df.columns if str(c).strip()]
             if cols:
                 required_cretop_columns = [
+                    "사업자유형",
                     "사업자등록번호",
                     "사업장 소재지",
                     "설립일",
@@ -925,6 +930,24 @@ def get_customer_db_columns():
                     "자산총계",
                     "부채총계",
                     "자본총계",
+                    "주업종코드",
+                    "필요경비",
+                    "사업소득금액",
+                    "소득률",
+                    "필요경비율",
+                    "종합소득금액",
+                    "과세표준",
+                    "적용세율",
+                    "산출세액",
+                    "세액감면",
+                    "세액공제",
+                    "결정세액",
+                    "납부환급세액",
+                    "기장의무",
+                    "신고유형",
+                    "귀속연도",
+                    "법인전환검토점수",
+                    "법인전환검토등급",
                 ]
                 for required_column in required_cretop_columns:
                     if required_column not in cols:
@@ -934,7 +957,7 @@ def get_customer_db_columns():
             pass
 
     return [
-        "업체명", "대표자명", "사업자등록번호", "업종명", "사업장 소재지",
+        "업체명", "대표자명", "사업자유형", "사업자등록번호", "업종명", "사업장 소재지",
         "설립년도", "연매출", "전년도매출", "올해예상매출", "매출감소여부",
         "상시근로자수", "고용보험가입인원", "신규채용계획", "청년채용계획",
         "희망상담주제1", "희망상담주제2", "희망상담주제3",
@@ -942,7 +965,11 @@ def get_customer_db_columns():
         "키워드메모", "주요 사업내용", "비고",
         "벤처", "메인비즈", "이노비즈", "기업부설연구소",
         "특허보유", "R&D수행", "기술제품보유", "기술인력보유",
-        "기술매출발생", "스마트공장도입", "기술보증희망", "기술성메모"
+        "기술매출발생", "스마트공장도입", "기술보증희망", "기술성메모",
+        "주업종코드", "필요경비", "사업소득금액", "소득률", "필요경비율",
+        "종합소득금액", "과세표준", "적용세율", "산출세액", "세액감면",
+        "세액공제", "결정세액", "납부환급세액", "기장의무", "신고유형",
+        "귀속연도", "법인전환검토점수", "법인전환검토등급"
     ]
 
 
@@ -953,6 +980,7 @@ def build_customer_row_from_cretop(data, columns=None):
     alias_map = {
         "업체명": ["업체명", "기업명"],
         "대표자명": ["대표자명", "대표자"],
+        "사업자유형": ["사업자유형"],
         "사업자등록번호": ["사업자등록번호", "사업자번호"],
         "법인등록번호": ["법인등록번호", "법인번호", "법인(주민)번호"],
         "업종명": ["업종명", "표준산업분류"],
@@ -983,6 +1011,24 @@ def build_customer_row_from_cretop(data, columns=None):
         "상표": ["상표"],
         "상표권": ["상표"],
         "R&D수행": ["R&D수행"],
+        "주업종코드": ["주업종코드"],
+        "필요경비": ["필요경비"],
+        "사업소득금액": ["사업소득금액"],
+        "소득률": ["소득률"],
+        "필요경비율": ["필요경비율"],
+        "종합소득금액": ["종합소득금액"],
+        "과세표준": ["과세표준"],
+        "적용세율": ["적용세율"],
+        "산출세액": ["산출세액"],
+        "세액감면": ["세액감면"],
+        "세액공제": ["세액공제"],
+        "결정세액": ["결정세액"],
+        "납부환급세액": ["납부환급세액"],
+        "기장의무": ["기장의무"],
+        "신고유형": ["신고유형"],
+        "귀속연도": ["귀속연도"],
+        "법인전환검토점수": ["법인전환검토점수"],
+        "법인전환검토등급": ["법인전환검토등급"],
     }
 
     # 기본 복사
@@ -1176,6 +1222,76 @@ def append_cretop_to_user_customer_db(pdf_path, user_id, manager_name="", duplic
         cumulative_path,
         1,
         "크레탑 PDF 추출값을 내 누적 고객DB에 추가했습니다.",
+        data,
+        df_new,
+    )
+
+
+def append_income_tax_business_to_user_customer_db(
+    business_data,
+    user_id,
+    manager_name="",
+):
+    """선택한 종합소득세 사업장을 개인사업자 고객으로 추가하거나 갱신합니다."""
+    data = dict(business_data or {})
+    data["사업자유형"] = "개인사업자"
+    columns = get_customer_db_columns()
+    row = build_customer_row_from_cretop(data, columns)
+    if "사업자유형" in row:
+        row["사업자유형"] = "개인사업자"
+    if "담당자명" in row and manager_name:
+        row["담당자명"] = str(manager_name).strip()
+    if "비고" in row:
+        row["비고"] = (
+            f"종합소득세 신고서 자동등록"
+            f"({data.get('귀속연도', '')}년 귀속, {data.get('PDF추출일시', '')})"
+        )
+
+    cumulative_path = get_user_cumulative_db_path(user_id)
+    business_no = normalize_business_no(row.get("사업자등록번호", ""))
+    company_name = row.get("업체명", data.get("업체명", ""))
+    representative_name = row.get("대표자명", data.get("대표자명", ""))
+    if not business_no:
+        return cumulative_path, 0, "사업자등록번호를 확인할 수 없어 등록하지 않았습니다.", data, pd.DataFrame()
+
+    df_old = _read_cumulative_customer_db(cumulative_path, columns)
+    normalized = (
+        df_old["사업자등록번호"].map(normalize_business_no)
+        if not df_old.empty and "사업자등록번호" in df_old.columns
+        else pd.Series(dtype=str)
+    )
+    indexes = df_old.index[normalized == business_no].tolist()
+
+    if indexes:
+        df_old = df_old.astype(object)
+        index = indexes[0]
+        updated_count = 0
+        for column in columns:
+            value = row.get(column)
+            if value not in (None, ""):
+                df_old.at[index, column] = value
+                updated_count += 1
+        _write_cumulative_customer_db(cumulative_path, df_old, columns)
+        return (
+            cumulative_path,
+            0,
+            f"{company_name} 기존 고객에 개인사업자 신고자료 {updated_count}개 항목을 갱신했습니다.",
+            data,
+            pd.DataFrame([row], columns=columns),
+        )
+
+    df_new = pd.DataFrame([row], columns=columns)
+    df_new = _normalize_customer_db_frame(df_new, columns)
+    df_all = (
+        pd.concat([df_old, df_new], ignore_index=True, sort=False)
+        if not df_old.empty
+        else df_new
+    )
+    _write_cumulative_customer_db(cumulative_path, df_all, columns)
+    return (
+        cumulative_path,
+        1,
+        f"{company_name} 개인사업자를 내 누적 고객DB에 추가했습니다.",
         data,
         df_new,
     )

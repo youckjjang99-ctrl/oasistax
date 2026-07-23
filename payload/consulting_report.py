@@ -31,6 +31,8 @@ from registered_policy_match import (
 from utils import get_user_cumulative_db_path, get_user_dirs
 from pdf_report import build_representative_pdf
 from tax_diagnosis import build_tax_diagnosis
+from financial_anomaly import build_financial_anomaly
+from enterprise_health import build_enterprise_health
 from comprehensive_financial_diagnosis import (
     build_comprehensive_financial_diagnosis,
 )
@@ -1111,7 +1113,7 @@ def render_ai_consulting_report_page(
         )
         if customers.empty:
             st.info(
-                "등록된 고객이 없습니다. 먼저 크레탑 자동등록으로 고객을 등록해주세요."
+                "등록된 고객이 없습니다. 먼저 기업등록에서 고객을 등록해주세요."
             )
             return
 
@@ -1246,6 +1248,76 @@ def render_ai_consulting_report_page(
                 if item.get("missing"):
                     st.caption("부족 증빙: " + ", ".join(item.get("missing", [])[:4]))
         st.caption(tax_core.get("disclaimer", ""))
+
+    # v9.1.0b 재무 이상징후 분석
+    try:
+        anomaly_result = build_financial_anomaly(user_id, customer)
+    except Exception:
+        anomaly_result = {}
+    if anomaly_result:
+        st.markdown("### 재무 이상징후")
+        ac1, ac2, ac3, ac4 = st.columns(4, gap="medium")
+        ac1.metric("종합 위험도", f"{anomaly_result.get('overall_score', 0)}점", anomaly_result.get("overall_level", ""))
+        ac2.metric("AI 신뢰도", f"{anomaly_result.get('confidence', 0)}%", anomaly_result.get("source", ""))
+        ac3.metric("높음", f"{anomaly_result.get('high_count', 0)}건", "우선 원장 확인")
+        ac4.metric("보통", f"{anomaly_result.get('medium_count', 0)}건", "증빙 보완 검토")
+        anomaly_rows = []
+        for anomaly in anomaly_result.get("items", []):
+            ratio = anomaly.get("ratio")
+            anomaly_rows.append({
+                "이상징후": anomaly.get("name", ""),
+                "분류": anomaly.get("category", ""),
+                "위험도": anomaly.get("severity", ""),
+                "점수": anomaly.get("score", 0),
+                "매출·자산 대비": f"{ratio:.1f}%" if isinstance(ratio, (int, float)) else "자료 부족",
+                "우선 확인자료": " / ".join(anomaly.get("documents", [])[:2]),
+            })
+        if anomaly_rows:
+            st.dataframe(pd.DataFrame(anomaly_rows), hide_index=True, use_container_width=True)
+        with st.expander("이상징후 판단 근거·확인자료", expanded=False):
+            for anomaly in anomaly_result.get("items", []):
+                st.markdown(f"**{anomaly.get('name')} · {anomaly.get('severity')} · {anomaly.get('score', 0)}점**")
+                for reason in anomaly.get("reasons", [])[:4]:
+                    st.write(f"✓ {reason}")
+                if anomaly.get("account_paths"):
+                    st.caption("탐지 계정: " + ", ".join(anomaly.get("account_paths", [])[:5]))
+                st.caption("확인자료: " + ", ".join(anomaly.get("documents", [])[:4]))
+                for question in anomaly.get("questions", [])[:2]:
+                    st.write(f"• {question}")
+                if anomaly.get("caution"):
+                    st.warning(anomaly.get("caution"))
+        st.caption(anomaly_result.get("disclaimer", ""))
+
+    # v9.2.0 AI 기업 건강진단 통합 대시보드
+    try:
+        enterprise_health = build_enterprise_health(analysis, tax_core, anomaly_result)
+    except Exception:
+        enterprise_health = {}
+    if enterprise_health:
+        st.markdown("### AI 기업 건강진단")
+        eh1, eh2, eh3, eh4 = st.columns(4, gap="medium")
+        eh1.metric("기업 건강점수", f"{enterprise_health.get('overall_score', 0)}점", enterprise_health.get("grade", "-"))
+        eh2.metric("종합상태", enterprise_health.get("level", "-"), enterprise_health.get("stage", ""))
+        eh3.metric("AI 신뢰도", f"{enterprise_health.get('confidence', 0)}%", "현재 등록자료 기준")
+        eh4.metric("우선 실행과제", f"{len(enterprise_health.get('actions', []))}건", "점수순 정렬")
+        category_rows = [{"진단영역": item.get("name", ""), "점수": item.get("score", 0),
+                          "상태": item.get("status", ""), "가중치": f"{item.get('weight', 0)}%",
+                          "산정기준": item.get("reason", "")} for item in enterprise_health.get("categories", [])]
+        if category_rows:
+            st.dataframe(pd.DataFrame(category_rows), hide_index=True, use_container_width=True)
+        action_rows = [{"우선순위": action.get("priority", ""), "실행과제": action.get("title", ""),
+                        "영역": action.get("area", ""), "근거": action.get("reason", ""),
+                        "다음 조치": action.get("next_step", "")} for action in enterprise_health.get("actions", [])]
+        if action_rows:
+            st.markdown("#### 대표 우선 실행과제")
+            st.dataframe(pd.DataFrame(action_rows), hide_index=True, use_container_width=True)
+        with st.expander("건강점수 해석", expanded=False):
+            strengths = " / ".join(f"{x.get('name')} {x.get('score')}점" for x in enterprise_health.get("strengths", []))
+            weaknesses = " / ".join(f"{x.get('name')} {x.get('score')}점" for x in enterprise_health.get("weaknesses", []))
+            st.write("강점: " + (strengths or "자료 부족"))
+            st.write("우선 개선영역: " + (weaknesses or "자료 부족"))
+            st.caption(enterprise_health.get("stage_reason", ""))
+        st.caption(enterprise_health.get("disclaimer", ""))
 
     source_columns = st.columns(5, gap="medium")
     source_columns[0].metric(

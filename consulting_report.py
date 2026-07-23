@@ -1113,7 +1113,7 @@ def render_ai_consulting_report_page(
         )
         if customers.empty:
             st.info(
-                "등록된 고객이 없습니다. 먼저 크레탑 자동등록으로 고객을 등록해주세요."
+                "등록된 고객이 없습니다. 먼저 기업등록에서 고객을 등록해주세요."
             )
             return
 

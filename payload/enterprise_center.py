@@ -377,7 +377,7 @@ def render_enterprise_management_center(
     )
     if all_customers.empty:
         st.info(
-            "등록된 고객이 없습니다. 크레탑 자동등록으로 고객을 먼저 등록해주세요."
+            "등록된 고객이 없습니다. 기업등록에서 고객을 먼저 등록해주세요."
         )
         return
 
@@ -452,6 +452,11 @@ def render_enterprise_management_center(
     business_no = _normalize_business_no(
         selected_row.get("사업자등록번호", "")
     )
+    # Keep the currently viewed enterprise available when the user
+    # moves to AI Copilot through the sidebar instead of the dedicated button.
+    st.session_state["_oasis_active_company_business_no"] = business_no
+    st.session_state["_oasis_active_company_name"] = company_name
+
     customer_key = make_customer_key(company_name, business_no)
 
     integration = reconcile_enterprise_consulting_context(
@@ -918,7 +923,10 @@ def render_enterprise_management_center(
         }
 
         st.divider()
-        st.markdown("#### 다중소스 정책자금·고용지원금 매칭")
+        st.markdown("#### 정책자금·보증·공고형 지원사업 매칭")
+        st.caption(
+            "고용지원금은 직원현황 탭에서 직원명단과 2026년 기준으로 자동 분석합니다."
+        )
         render_multi_source_match(
             user_id,
             selected_row,

@@ -377,7 +377,7 @@ def render_enterprise_management_center(
     )
     if all_customers.empty:
         st.info(
-            "등록된 고객이 없습니다. 크레탑 자동등록으로 고객을 먼저 등록해주세요."
+            "등록된 고객이 없습니다. 기업등록에서 고객을 먼저 등록해주세요."
         )
         return
 
