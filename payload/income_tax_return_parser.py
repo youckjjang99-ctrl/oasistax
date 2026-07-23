@@ -126,7 +126,113 @@ def _split_business_sections(text):
     return sections
 
 
-def _extract_business(section, global_data, index):
+def _extract_business_address(section):
+    block = _first(
+        r"②\s*일\s*련\s*번\s*호\s*\d+\s*([\s\S]+?)"
+        r"국내1/국외9\s*소재지국코드",
+        section,
+    )
+    if not block:
+        return ""
+    block = re.sub(r"③\s*사\s*소재지\s*", "", block)
+    block = re.sub(r"\n\s*업\s+", "\n", block)
+    block = re.sub(r"\n\s*장\s*$", "", block)
+    road_address = block.split(")", 1)[0]
+    if ")" in block:
+        road_address += ")"
+    road_address = _clean(road_address)
+    road_address = re.sub(r"([가-힣])\s+([가-힣])", r"\1\2", road_address)
+    regions = (
+        "서울특별시", "부산광역시", "대구광역시", "인천광역시",
+        "광주광역시", "대전광역시", "울산광역시", "세종특별자치시",
+        "경기도", "강원특별자치도", "충청북도", "충청남도",
+        "전북특별자치도", "전라남도", "경상북도", "경상남도",
+        "제주특별자치도",
+    )
+    for region in regions:
+        if road_address.startswith(region):
+            remainder = road_address[len(region):]
+            city_match = re.match(r"([가-힣]+(?:시|군))", remainder)
+            if city_match:
+                city = city_match.group(1)
+                remainder = remainder[len(city):]
+                district_match = re.match(r"([가-힣]+구)", remainder)
+                if district_match:
+                    district = district_match.group(1)
+                    remainder = remainder[len(district):]
+                    road_address = (
+                        f"{region} {city} {district} {remainder}"
+                    )
+                else:
+                    road_address = f"{region} {city} {remainder}"
+            else:
+                road_address = f"{region} {remainder}"
+            break
+    road_address = re.sub(r"(길|로)(\d)", r"\1 \2", road_address)
+    road_address = re.sub(r",\s*", ", ", road_address)
+    road_address = re.sub(r"(동|층)(\d)", r"\1 \2", road_address)
+    return road_address
+
+
+def _financial_statement_data(text):
+    statements = {}
+    pages = (text or "").split("\f")
+    for page in pages:
+        dense = re.sub(r"[ \t]", "", page)
+        business_no = _normalize_business_no(
+            _first(
+                r"사업자등록번호([0-9]{3}-[0-9]{2}-[0-9]{5})",
+                dense,
+            )
+        )
+        if not business_no:
+            continue
+        values = statements.setdefault(business_no, {})
+
+        if "표준재무상태표" in dense:
+            asset = _number(
+                _first(r"자산총계[^\n]*?62([\-0-9,]+)", dense)
+            )
+            liability = _number(
+                _first(r"부채총계[^\n]*?87([\-0-9,]+)", dense)
+            )
+            capital = _number(
+                _first(r"자본총계[^\n]*?90([\-0-9,]+)", dense)
+            )
+            if asset is not None:
+                values["자산총계"] = asset
+            if liability is not None:
+                values["부채총계"] = liability
+            if capital is not None:
+                values["자본총계"] = capital
+
+        if "표준손익계산서" in dense:
+            statement_sales = _number(
+                _first(r"Ⅰ\.매출액\s+01\s+([\-0-9,]+)", page)
+            )
+            operating = _number(
+                _first(
+                    r"Ⅴ\.영업손익[^\n]*?\s62\s+([\-0-9,]+)",
+                    page,
+                )
+            )
+            statement_net = _number(
+                _first(
+                    r"Ⅷ\.당기순손익[^\n]*?\s99\s+([\-0-9,]+)",
+                    page,
+                )
+            )
+            if statement_sales is not None:
+                values["표준손익계산서매출액"] = statement_sales
+            if operating is not None:
+                values["영업손익"] = operating
+                values["영업이익"] = operating
+            if statement_net is not None:
+                values["표준손익계산서당기순손익"] = statement_net
+    return statements
+
+
+def _extract_business(section, global_data, index, statement_data=None):
     dense = re.sub(r"[ \t]", "", section or "")
     business_no = _normalize_business_no(
         _first(r"사업자등록번호([0-9]{3}-[0-9]{2}-[0-9]{5})", dense)
@@ -135,11 +241,7 @@ def _extract_business(section, global_data, index):
     if company_name:
         company_name = company_name.split("⑤사업자등록번호")[0].strip()
 
-    address = _first(
-        r"(?:③\s*)?사\s*업\s*장\s*(?:소재지)?\s+([\s\S]+?)(?:국내1/국외9|④\s*상\s*호)",
-        section,
-    )
-    address = _clean(address)
+    address = _extract_business_address(section)
 
     revenue = _number(_first(r"(?:⑨|9)총수입금액([\-0-9,]+)", dense))
     expense = _number(_first(r"(?:⑩|10)필요경비([\-0-9,]+)", dense))
@@ -162,12 +264,15 @@ def _extract_business(section, global_data, index):
             "전년도매출": revenue,
             "필요경비": expense,
             "사업소득금액": income,
+            "각사업연도소득금액": income,
+            "당기순이익": income,
             "과세기간시작일": _first(r"(?:⑫|12)과세기간개시일([0-9.]+)", dense),
             "과세기간종료일": _first(r"(?:⑬|13)과세기간종료일([0-9.]+)", dense),
             "PDF추출일시": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "자료출처": "종합소득세 신고서",
         }
     )
+    result.update(statement_data or {})
     if revenue not in (None, 0) and income is not None:
         result["소득률"] = round(income / revenue * 100, 2)
     if revenue not in (None, 0) and expense is not None:
@@ -186,8 +291,22 @@ def parse_income_tax_return(pdf_path):
         return {"businesses": [], "summary": {}}, error
 
     global_data = _global_summary(text)
+    statement_map = _financial_statement_data(text)
     businesses = [
-        _extract_business(section, global_data, index)
+        _extract_business(
+            section,
+            global_data,
+            index,
+            statement_map.get(
+                _normalize_business_no(
+                    _first(
+                        r"사업자등록번호([0-9]{3}-[0-9]{2}-[0-9]{5})",
+                        re.sub(r"[ \t]", "", section),
+                    )
+                ),
+                {},
+            ),
+        )
         for index, section in enumerate(_split_business_sections(text), start=1)
     ]
     invalid_businesses = []

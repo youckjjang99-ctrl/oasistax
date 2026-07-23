@@ -1,0 +1,13 @@
+# 정책자금자동화 프로젝트 폴더에서 PowerShell 실행
+
+git status
+git add income_tax_return_parser.py utils.py enterprise_center.py system_precheck.py VERSION.txt APPLY_UPDATE_v9.4.4.py RUN_UPDATE_v9.4.4.bat CHANGELOG_v9.4.4.md README_UPDATE_v9.4.4.md GITHUB_UPLOAD_COMMANDS_v9.4.4.txt payload
+git status
+git commit -m "OASIS CRM v9.4.4 개인사업자 신고정보 및 재무정보 보강"
+git pull --rebase origin main
+git push origin main
+
+# 업로드 확인
+git status
+git log -1 --oneline
+git log origin/main -1 --oneline

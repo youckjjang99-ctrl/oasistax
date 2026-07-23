@@ -190,6 +190,13 @@ def _quick_diagnosis(
     strengths: list[str] = []
     checks: list[str] = []
     actions: list[str] = []
+    is_individual = (
+        _clean(customer.get("사업자유형", "")) == "개인사업자"
+    )
+    operating_label = "영업손익" if is_individual else "영업이익"
+    income_label = (
+        "각사업연도소득금액" if is_individual else "당기순이익"
+    )
 
     sales = _first_value(
         customer,
@@ -201,11 +208,14 @@ def _quick_diagnosis(
     operating = _first_value(
         customer,
         financial,
+        "영업손익",
         "영업이익",
     )
     net_income = _first_value(
         customer,
         financial,
+        "각사업연도소득금액",
+        "사업소득금액",
         "당기순이익",
     )
     employees = _first_value(
@@ -218,9 +228,13 @@ def _quick_diagnosis(
     if _number(sales):
         strengths.append(f"매출액 {_format_number(sales, '원')} 확인")
     if (_number(operating) or 0) > 0:
-        strengths.append(f"영업이익 {_format_number(operating, '원')} 흑자")
+        strengths.append(
+            f"{operating_label} {_format_number(operating, '원')} 흑자"
+        )
     if (_number(net_income) or 0) > 0:
-        strengths.append(f"당기순이익 {_format_number(net_income, '원')} 흑자")
+        strengths.append(
+            f"{income_label} {_format_number(net_income, '원')} 흑자"
+        )
     if _number(employees):
         strengths.append(f"종업원수 {_format_number(employees, '명')} 확인")
 
@@ -231,7 +245,7 @@ def _quick_diagnosis(
     ):
         checks.append("설립일 확인 필요")
     if _number(net_income) is None:
-        checks.append("당기순이익 자료 보완 필요")
+        checks.append(f"{income_label} 자료 보완 필요")
     elif (_number(net_income) or 0) < 0:
         checks.append("당기순손실 원인 확인 필요")
 
@@ -317,7 +331,13 @@ def _render_enterprise_dashboard_styles() -> None:
     )
 
 
-def _render_metric_dashboard(crm_status: str, pipeline_stage: str, sales_text: str, profit_text: str) -> None:
+def _render_metric_dashboard(
+    crm_status: str,
+    pipeline_stage: str,
+    sales_text: str,
+    profit_text: str,
+    profit_label: str = "최근 당기순이익",
+) -> None:
     st.markdown(
         f"""
         <div class="oasis-metric-grid">
@@ -337,7 +357,7 @@ def _render_metric_dashboard(crm_status: str, pipeline_stage: str, sales_text: s
                 <div class="oasis-badge">재무 규모</div>
             </div>
             <div class="oasis-metric-card profit">
-                <div class="oasis-metric-label">최근 당기순이익</div>
+                <div class="oasis-metric-label">{profit_label}</div>
                 <div class="oasis-metric-value">{profit_text}</div>
                 <div class="oasis-badge">수익성</div>
             </div>
@@ -452,6 +472,9 @@ def render_enterprise_management_center(
     business_no = _normalize_business_no(
         selected_row.get("사업자등록번호", "")
     )
+    is_individual = (
+        _clean(selected_row.get("사업자유형", "")) == "개인사업자"
+    )
     # Keep the currently viewed enterprise available when the user
     # moves to AI Copilot through the sidebar instead of the dedicated button.
     st.session_state["_oasis_active_company_business_no"] = business_no
@@ -527,11 +550,14 @@ def render_enterprise_management_center(
     operating = _first_value(
         selected_row,
         financial,
+        "영업손익",
         "영업이익",
     )
     net_income = _first_value(
         selected_row,
         financial,
+        "각사업연도소득금액",
+        "사업소득금액",
         "당기순이익",
     )
 
@@ -540,6 +566,11 @@ def render_enterprise_management_center(
         crm_profile.get("pipeline_stage", "신규"),
         _format_number(sales, "원"),
         _format_number(net_income, "원"),
+        (
+            "최근 각사업연도소득금액"
+            if is_individual
+            else "최근 당기순이익"
+        ),
     )
 
     (
@@ -569,8 +600,24 @@ def render_enterprise_management_center(
             basic_rows = [
                 ["업체명", company_name],
                 ["대표자명", _clean(selected_row.get("대표자명", ""))],
+                [
+                    "사업자유형",
+                    _clean(selected_row.get("사업자유형", "")),
+                ],
                 ["사업자등록번호", business_no],
-                ["업종명", _clean(selected_row.get("업종명", ""))],
+                [
+                    "업종명",
+                    _clean(selected_row.get("업종명", ""))
+                    or (
+                        "신고서에서 확인 불가"
+                        if is_individual
+                        else ""
+                    ),
+                ],
+                [
+                    "주업종코드",
+                    _clean(selected_row.get("주업종코드", "")),
+                ],
                 [
                     "사업장 소재지",
                     _clean(selected_row.get("사업장 소재지", "")),
@@ -585,6 +632,31 @@ def render_enterprise_management_center(
                     ),
                 ],
             ]
+            if is_individual:
+                basic_rows.extend(
+                    [
+                        [
+                            "기장의무",
+                            _clean(selected_row.get("기장의무", "")),
+                        ],
+                        [
+                            "신고유형",
+                            _clean(selected_row.get("신고유형", "")),
+                        ],
+                        [
+                            "귀속연도",
+                            _clean(selected_row.get("귀속연도", "")),
+                        ],
+                        [
+                            "과세기간",
+                            (
+                                f"{_clean(selected_row.get('과세기간시작일', ''))}"
+                                f" ~ "
+                                f"{_clean(selected_row.get('과세기간종료일', ''))}"
+                            ).strip(" ~"),
+                        ],
+                    ]
+                )
             st.dataframe(
                 pd.DataFrame(basic_rows, columns=["항목", "내용"]),
                 hide_index=True,
@@ -594,9 +666,36 @@ def render_enterprise_management_center(
         with right:
             st.markdown("#### 재무정보")
             financial_rows = [
-                ["매출액", _format_number(sales, "원")],
-                ["영업이익", _format_number(operating, "원")],
-                ["당기순이익", _format_number(net_income, "원")],
+                [
+                    "총수입금액" if is_individual else "매출액",
+                    _format_number(sales, "원"),
+                ],
+                [
+                    "필요경비" if is_individual else "영업이익",
+                    (
+                        _format_number(
+                            selected_row.get("필요경비", ""),
+                            "원",
+                        )
+                        if is_individual
+                        else _format_number(operating, "원")
+                    ),
+                ],
+            ]
+            if is_individual:
+                financial_rows.append(
+                    ["영업손익", _format_number(operating, "원")]
+                )
+            financial_rows.extend(
+                [
+                [
+                    (
+                        "각사업연도소득금액"
+                        if is_individual
+                        else "당기순이익"
+                    ),
+                    _format_number(net_income, "원"),
+                ],
                 [
                     "자산총계",
                     _format_number(
@@ -630,9 +729,30 @@ def render_enterprise_management_center(
                         "원",
                     ),
                 ],
-            ]
+                ]
+            )
             st.dataframe(
                 pd.DataFrame(financial_rows, columns=["항목", "내용"]),
+                hide_index=True,
+                use_container_width=True,
+            )
+
+        if is_individual:
+            st.markdown("#### 종합소득세 신고정보")
+            tax_rows = [
+                ["종합소득금액", _format_number(selected_row.get("종합소득금액", ""), "원")],
+                ["과세표준", _format_number(selected_row.get("과세표준", ""), "원")],
+                ["적용세율", f"{_clean(selected_row.get('적용세율', ''))}%"],
+                ["산출세액", _format_number(selected_row.get("산출세액", ""), "원")],
+                ["세액감면", _format_number(selected_row.get("세액감면", ""), "원")],
+                ["세액공제", _format_number(selected_row.get("세액공제", ""), "원")],
+                ["결정세액", _format_number(selected_row.get("결정세액", ""), "원")],
+                ["납부·환급세액", _format_number(selected_row.get("납부환급세액", ""), "원")],
+                ["소득률", f"{_clean(selected_row.get('소득률', ''))}%"],
+                ["필요경비율", f"{_clean(selected_row.get('필요경비율', ''))}%"],
+            ]
+            st.dataframe(
+                pd.DataFrame(tax_rows, columns=["항목", "내용"]),
                 hide_index=True,
                 use_container_width=True,
             )

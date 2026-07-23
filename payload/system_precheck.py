@@ -16,6 +16,7 @@ CORE_FILES = [
     "enterprise_customer_management.py", "employee_status.py",
     "encrypted_excel_reader.py",
     "employment_support_2026.py",
+    "income_tax_return_parser.py",
     "multi_source_policy.py", "integrated_policy_repository.py",
     "maintenance.py", "VERSION.txt",
 ]
@@ -38,6 +39,11 @@ REQUIRED_SYMBOLS = {
         "render_employment_support_analysis",
         "region_type_from_address",
     ],
+    "income_tax_return_parser.py": [
+        "parse_income_tax_return",
+        "_financial_statement_data",
+        "_extract_business_address",
+    ],
     "auth.py": ["render_password_change"],
 }
 
@@ -45,6 +51,7 @@ IMPORT_CHECK_FILES = [
     "enterprise_customer_management.py",
     "employee_status.py",
     "employment_support_2026.py",
+    "income_tax_return_parser.py",
     "enterprise_center.py",
     "multi_source_policy.py",
     "maintenance.py",
