@@ -974,8 +974,18 @@ def render_enterprise_management_center(
             )
 
     with tab_employees:
+        company_address = _first_value(
+            selected_row,
+            {},
+            "사업장 소재지",
+            "사업장주소",
+            "도로명주소",
+            "주소",
+            "소재지",
+        )
         render_employee_status(
             user_id=user_id,
             business_no=business_no,
             company_name=company_name,
+            company_address=company_address,
         )

@@ -760,11 +760,21 @@ def _result_bucket(score: int) -> str:
     return "현재 정보 부족"
 
 
+def region_type_from_address(address: Any) -> str:
+    compact = re.sub(r"\s+", "", str(address or ""))
+    if not compact:
+        return "확인필요"
+    if re.match(r"^(서울|경기|인천)", compact):
+        return "수도권"
+    return "비수도권"
+
+
 def render_employment_support_analysis(
     user_id: str,
     business_no: str,
     company_name: str,
     latest: dict[str, Any],
+    company_address: str = "",
 ) -> None:
     st.divider()
     st.markdown("#### AI 고용지원금 통합진단")
@@ -774,7 +784,12 @@ def render_employment_support_analysis(
     )
 
     metrics = _metrics(latest)
-    current = _load_settings(user_id, business_no, company_name)
+    saved_current = _load_settings(user_id, business_no, company_name)
+    address_region_type = region_type_from_address(company_address)
+    current = {
+        **saved_current,
+        "region_type": address_region_type,
+    }
 
     if not metrics["has_employee_roster"]:
         st.warning(
@@ -798,96 +813,101 @@ def render_employment_support_analysis(
                 f"{metrics['masked_name_count']}명을 정상 인식했습니다."
             )
 
-    with st.expander("기업·채용계획 추가정보", expanded=not bool(current)):
-        st.caption("가입자명부만으로 확인되지 않는 기업계획과 제도 운영 여부만 입력합니다.")
-        options = ["확인필요", "수도권", "비수도권"]
-        region_value = current.get("region_type", "확인필요")
-        region_type = st.radio(
-            "사업장 지역",
-            options,
-            index=options.index(region_value) if region_value in options else 0,
-            horizontal=True,
-            key=f"employment_region_{business_no}",
+    with st.expander("기업·채용계획 추가정보", expanded=not bool(saved_current)):
+        st.caption(
+            "가입자명부만으로 확인되지 않는 기업계획과 제도 운영 여부만 입력합니다. "
+            "입력 중에는 분석값이 바뀌지 않으며 아래 통합진단 버튼을 누를 때 한 번 반영됩니다."
         )
+        if address_region_type == "확인필요":
+            st.warning(
+                "등록된 기업 주소가 없어 수도권 여부를 자동 판정하지 못했습니다. "
+                "기업등록에서 사업장 주소를 확인해주세요."
+            )
+        else:
+            st.info(
+                f"주소 자동판정: {address_region_type} · "
+                f"{company_address or '주소 미표시'}"
+            )
 
-        left, right = st.columns(2)
-        with left:
-            planned_youth_hire = st.checkbox("청년 신규채용 계획", value=bool(current.get("planned_youth_hire")), key=f"emp_youth_{business_no}")
-            vulnerable_hire = st.checkbox("취업취약계층 채용 계획·실적", value=bool(current.get("vulnerable_hire")), key=f"emp_vulnerable_{business_no}")
-            received_youth_leap = st.checkbox("비수도권 도약장려금 기업지원 진행", value=bool(current.get("received_youth_leap")), key=f"emp_leap_{business_no}")
-            senior_increase = st.checkbox("기준기간 대비 60세 이상 근로자 증가", value=bool(current.get("senior_increase")), key=f"emp_senior_inc_{business_no}")
-            continued_employment_system = st.checkbox("정년연장·폐지·재고용 제도 운영·계획", value=bool(current.get("continued_employment_system")), key=f"emp_continue_{business_no}")
-        with right:
-            reduced_hours = st.checkbox("주4.5일제·근로시간 단축", value=bool(current.get("reduced_hours")), key=f"emp_hours_{business_no}")
-            flexible_work = st.checkbox("재택·원격·선택·시차출퇴근", value=bool(current.get("flexible_work")), key=f"emp_flexible_{business_no}")
-            regular_conversion = st.checkbox("기간제 등의 정규직 전환", value=bool(current.get("regular_conversion")), key=f"emp_regular_{business_no}")
-            parental_leave = st.checkbox("육아휴직·대체인력·업무분담", value=bool(current.get("parental_leave")), key=f"emp_parental_{business_no}")
-            employment_difficulty = st.checkbox("경영상 휴업·휴직 고용유지 필요", value=bool(current.get("employment_difficulty")), key=f"emp_maintain_{business_no}")
-            unpaid_leave = st.checkbox("무급휴업·무급휴직 계획", value=bool(current.get("unpaid_leave")), key=f"emp_unpaid_{business_no}")
-            workplace_nursery = st.checkbox("직장어린이집 설치·운영", value=bool(current.get("workplace_nursery")), key=f"emp_nursery_{business_no}")
-            regional_move_invest = st.checkbox("고용위기지역 이전·신설·증설", value=bool(current.get("regional_move_invest")), key=f"emp_regionmove_{business_no}")
+        with st.form(
+            key=f"employment_support_form_{business_no or company_name}",
+            clear_on_submit=False,
+        ):
+            left, right = st.columns(2)
+            with left:
+                planned_youth_hire = st.checkbox("청년 신규채용 계획", value=bool(current.get("planned_youth_hire")))
+                vulnerable_hire = st.checkbox("취업취약계층 채용 계획·실적", value=bool(current.get("vulnerable_hire")))
+                received_youth_leap = st.checkbox("비수도권 도약장려금 기업지원 진행", value=bool(current.get("received_youth_leap")))
+                senior_increase = st.checkbox("기준기간 대비 60세 이상 근로자 증가", value=bool(current.get("senior_increase")))
+                continued_employment_system = st.checkbox("정년연장·폐지·재고용 제도 운영·계획", value=bool(current.get("continued_employment_system")))
+            with right:
+                reduced_hours = st.checkbox("주4.5일제·근로시간 단축", value=bool(current.get("reduced_hours")))
+                flexible_work = st.checkbox("재택·원격·선택·시차출퇴근", value=bool(current.get("flexible_work")))
+                regular_conversion = st.checkbox("기간제 등의 정규직 전환", value=bool(current.get("regular_conversion")))
+                parental_leave = st.checkbox("육아휴직·대체인력·업무분담", value=bool(current.get("parental_leave")))
+                employment_difficulty = st.checkbox("경영상 휴업·휴직 고용유지 필요", value=bool(current.get("employment_difficulty")))
+                unpaid_leave = st.checkbox("무급휴업·무급휴직 계획", value=bool(current.get("unpaid_leave")))
+                workplace_nursery = st.checkbox("직장어린이집 설치·운영", value=bool(current.get("workplace_nursery")))
+                regional_move_invest = st.checkbox("고용위기지역 이전·신설·증설", value=bool(current.get("regional_move_invest")))
 
-        with st.expander("고령자 계속고용장려금 추가정보", expanded=False):
-            st.caption("이 정보는 계속고용장려금 카드의 상세판정에만 사용합니다.")
-            d1, d2 = st.columns(2)
-            with d1:
-                system_options = ["미확인", "정년 연장", "정년 폐지", "재고용"]
-                saved_type = current.get("continued_system_type", "미확인")
-                continued_system_type = st.selectbox(
-                    "계속고용제도 유형",
-                    system_options,
-                    index=system_options.index(saved_type) if saved_type in system_options else 0,
-                    key=f"emp_cont_type_{business_no}",
-                )
-                retirement_known = bool(current.get("retirement_system_start_date"))
-                use_retirement_date = st.checkbox(
-                    "기존 정년제도 시행일을 확인함",
-                    value=retirement_known,
-                    key=f"emp_retirement_known_{business_no}",
-                )
-                retirement_default = _parse_date_value(current.get("retirement_system_start_date")) or date.today()
-                retirement_system_start_date = st.date_input(
-                    "기존 정년제도 시행일",
-                    value=retirement_default,
-                    disabled=not use_retirement_date,
-                    key=f"emp_retirement_start_{business_no}",
-                )
-            with d2:
-                continued_known = bool(current.get("continued_system_effective_date"))
-                use_continued_date = st.checkbox(
-                    "계속고용제도 시행일·예정일을 확인함",
-                    value=continued_known,
-                    key=f"emp_continued_known_{business_no}",
-                )
-                continued_default = _parse_date_value(current.get("continued_system_effective_date")) or date.today()
-                continued_system_effective_date = st.date_input(
-                    "계속고용제도 시행일 또는 예정일",
-                    value=continued_default,
-                    disabled=not use_continued_date,
-                    key=f"emp_cont_start_{business_no}",
-                )
-                report_options = ["확인필요", "완료", "미완료"]
-                saved_report = current.get("continued_work_rules_reported")
-                report_label = "완료" if saved_report is True else "미완료" if saved_report is False else "확인필요"
-                report_choice = st.radio(
-                    "취업규칙 명시·신고",
-                    report_options,
-                    index=report_options.index(report_label),
-                    horizontal=True,
-                    key=f"emp_rules_report_{business_no}",
-                )
-                continued_work_rules_reported = True if report_choice == "완료" else False if report_choice == "미완료" else None
-                continued_support_months = st.number_input(
-                    "예상 지원개월",
-                    min_value=1,
-                    max_value=36,
-                    value=int(current.get("continued_support_months", 36) or 36),
-                    step=1,
-                    key=f"emp_cont_months_{business_no}",
-                )
+            with st.expander("고령자 계속고용장려금 추가정보", expanded=False):
+                st.caption("이 정보는 계속고용장려금 카드의 상세판정에만 사용합니다.")
+                d1, d2 = st.columns(2)
+                with d1:
+                    system_options = ["미확인", "정년 연장", "정년 폐지", "재고용"]
+                    saved_type = current.get("continued_system_type", "미확인")
+                    continued_system_type = st.selectbox(
+                        "계속고용제도 유형",
+                        system_options,
+                        index=system_options.index(saved_type) if saved_type in system_options else 0,
+                    )
+                    use_retirement_date = st.checkbox(
+                        "기존 정년제도 시행일을 확인함",
+                        value=bool(current.get("retirement_system_start_date")),
+                    )
+                    retirement_default = _parse_date_value(current.get("retirement_system_start_date")) or date.today()
+                    retirement_system_start_date = st.date_input(
+                        "기존 정년제도 시행일",
+                        value=retirement_default,
+                    )
+                with d2:
+                    use_continued_date = st.checkbox(
+                        "계속고용제도 시행일·예정일을 확인함",
+                        value=bool(current.get("continued_system_effective_date")),
+                    )
+                    continued_default = _parse_date_value(current.get("continued_system_effective_date")) or date.today()
+                    continued_system_effective_date = st.date_input(
+                        "계속고용제도 시행일 또는 예정일",
+                        value=continued_default,
+                    )
+                    report_options = ["확인필요", "완료", "미완료"]
+                    saved_report = current.get("continued_work_rules_reported")
+                    report_label = "완료" if saved_report is True else "미완료" if saved_report is False else "확인필요"
+                    report_choice = st.radio(
+                        "취업규칙 명시·신고",
+                        report_options,
+                        index=report_options.index(report_label),
+                        horizontal=True,
+                    )
+                    continued_work_rules_reported = True if report_choice == "완료" else False if report_choice == "미완료" else None
+                    continued_support_months = st.number_input(
+                        "예상 지원개월",
+                        min_value=1,
+                        max_value=36,
+                        value=int(current.get("continued_support_months", 36) or 36),
+                        step=1,
+                    )
+
+            submitted = st.form_submit_button(
+                "추가정보 확인 후 통합진단",
+                type="primary",
+                use_container_width=True,
+            )
 
         settings = {
-            "region_type": region_type,
+            "region_type": address_region_type,
+            "region_source": "company_address",
+            "company_address": company_address,
             "planned_youth_hire": planned_youth_hire,
             "vulnerable_hire": vulnerable_hire,
             "received_youth_leap": received_youth_leap,
@@ -907,12 +927,16 @@ def render_employment_support_analysis(
             "continued_work_rules_reported": continued_work_rules_reported,
             "continued_support_months": int(continued_support_months),
         }
-        if st.button("추가정보 저장 후 통합진단", type="primary", use_container_width=True, key=f"emp_save_{business_no}"):
+        if submitted:
             _save_settings(user_id, business_no, company_name, settings)
-            st.success("고용지원금 분석조건을 저장했습니다.")
+            st.success("추가정보를 저장하고 통합진단에 반영했습니다.")
             st.rerun()
 
     settings = _load_settings(user_id, business_no, company_name)
+    settings = {
+        **settings,
+        "region_type": address_region_type,
+    }
     results = sorted(
         [_score(item, metrics, settings) for item in EMPLOYMENT_SUPPORT_CATALOG],
         key=lambda item: item["score"],
@@ -1010,4 +1034,3 @@ def render_employment_support_analysis(
             hide_index=True,
             use_container_width=True,
         )
-

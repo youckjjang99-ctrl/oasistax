@@ -338,6 +338,8 @@ def _vision_result_to_review_rows(
                     "고용보험": _review_date(
                         item.get("employment_insurance_date", "")
                     ),
+                    "재직상태": "가입중",
+                    "고용종료일": "",
                 }
             )
 
@@ -410,6 +412,8 @@ def _employees_to_review_rows(
                 "건강보험": employee.get("acquisition_date", ""),
                 "산재보험": "",
                 "고용보험": "",
+                "재직상태": employee.get("status", "가입중"),
+                "고용종료일": employee.get("loss_date", ""),
             }
         )
     return rows
@@ -467,8 +471,8 @@ def _review_rows_to_employees(
             name,
             birth_six,
             min(dates),
-            "",
-            "가입중",
+            _review_date(row.get("고용종료일", "")),
+            str(row.get("재직상태", "") or "가입중"),
             ", ".join(
                 column
                 for column in ["국민연금", "건강보험", "산재보험", "고용보험"]
@@ -2001,6 +2005,7 @@ def render_employee_status(
     user_id: str,
     business_no: str,
     company_name: str,
+    company_address: str = "",
 ) -> None:
     st.markdown("#### 직원현황")
     st.caption(
@@ -2277,6 +2282,15 @@ def render_employee_status(
                     "생년월일6자리",
                     help="주민등록번호 앞 6자리만 입력합니다.",
                 ),
+                "재직상태": st.column_config.SelectboxColumn(
+                    "재직상태",
+                    options=["가입중", "상실"],
+                    help="고용종료일이 확인된 직원은 상실로 표시됩니다.",
+                ),
+                "고용종료일": st.column_config.TextColumn(
+                    "고용종료일",
+                    help="퇴사·고용종료된 직원의 종료일입니다.",
+                ),
             },
         )
 
@@ -2411,6 +2425,7 @@ def render_employee_status(
         business_no=business_no,
         company_name=company_name,
         latest=latest,
+        company_address=company_address,
     )
 
     versions = load_employee_versions(

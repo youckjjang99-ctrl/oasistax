@@ -15,6 +15,7 @@ CORE_FILES = [
     "app.py", "auth.py", "enterprise_center.py",
     "enterprise_customer_management.py", "employee_status.py",
     "encrypted_excel_reader.py",
+    "employment_support_2026.py",
     "multi_source_policy.py", "integrated_policy_repository.py",
     "maintenance.py", "VERSION.txt",
 ]
@@ -33,12 +34,17 @@ REQUIRED_SYMBOLS = {
         "is_encrypted_office",
         "decrypt_excel_bytes",
     ],
+    "employment_support_2026.py": [
+        "render_employment_support_analysis",
+        "region_type_from_address",
+    ],
     "auth.py": ["render_password_change"],
 }
 
 IMPORT_CHECK_FILES = [
     "enterprise_customer_management.py",
     "employee_status.py",
+    "employment_support_2026.py",
     "enterprise_center.py",
     "multi_source_policy.py",
     "maintenance.py",
