@@ -1,0 +1,7 @@
+git status
+git add app.py public_data_api.py prospect_db_center.py VERSION.txt APPLY_UPDATE_v9.8.7.py RUN_UPDATE_v9.8.7.bat README_UPDATE_v9.8.7.md GITHUB_UPLOAD_COMMANDS_v9.8.7.txt payload
+git add -f CHANGELOG_v9.8.7.md
+git status
+git commit -m "OASIS CRM v9.8.7 설립연차 및 전국 DB발굴"
+git pull --rebase origin main
+git push origin main

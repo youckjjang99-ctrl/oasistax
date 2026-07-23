@@ -28,7 +28,22 @@ NPS_PERIOD_URL = (
 )
 REGION_CODES = {
     "서울특별시": "11",
+    "부산광역시": "26",
+    "대구광역시": "27",
+    "인천광역시": "28",
+    "광주광역시": "29",
+    "대전광역시": "30",
+    "울산광역시": "31",
+    "세종특별자치시": "36",
     "경기도": "41",
+    "강원특별자치도": "42",
+    "충청북도": "43",
+    "충청남도": "44",
+    "전북특별자치도": "45",
+    "전라남도": "46",
+    "경상북도": "47",
+    "경상남도": "48",
+    "제주특별자치도": "50",
 }
 STOCK_COMPANY_MARKERS = ("주식회사", "(주)", "㈜", "（주）")
 EXCLUDED_LEGAL_MARKERS = (
@@ -293,17 +308,38 @@ def _business_no(value: Any) -> str:
 
 def _region_from_address(address: str, region_code: str = "") -> str:
     compact = re.sub(r"\s+", " ", str(address or "")).strip()
-    if compact.startswith(("서울", "서울특별시")):
-        return "서울특별시"
-    if compact.startswith(("경기", "경기도")):
-        return "경기도"
+    region_prefixes = {
+        "서울특별시": ("서울", "서울특별시"),
+        "부산광역시": ("부산", "부산광역시"),
+        "대구광역시": ("대구", "대구광역시"),
+        "인천광역시": ("인천", "인천광역시"),
+        "광주광역시": ("광주", "광주광역시"),
+        "대전광역시": ("대전", "대전광역시"),
+        "울산광역시": ("울산", "울산광역시"),
+        "세종특별자치시": ("세종", "세종특별자치시"),
+        "경기도": ("경기", "경기도"),
+        "강원특별자치도": ("강원", "강원도", "강원특별자치도"),
+        "충청북도": ("충북", "충청북도"),
+        "충청남도": ("충남", "충청남도"),
+        "전북특별자치도": ("전북", "전라북도", "전북특별자치도"),
+        "전라남도": ("전남", "전라남도"),
+        "경상북도": ("경북", "경상북도"),
+        "경상남도": ("경남", "경상남도"),
+        "제주특별자치도": ("제주", "제주도", "제주특별자치도"),
+    }
+    for region_name, prefixes in region_prefixes.items():
+        if compact.startswith(prefixes):
+            return region_name
     if compact:
         return ""
-    if region_code == "11":
-        return "서울특별시"
-    if region_code == "41":
-        return "경기도"
-    return ""
+    return next(
+        (
+            region_name
+            for region_name, code in REGION_CODES.items()
+            if code == region_code
+        ),
+        "",
+    )
 
 
 def _priority(
@@ -985,7 +1021,7 @@ def fetch_nps_workplaces(
         return {
             "ok": False,
             "status": "INVALID_REGION",
-            "message": "서울·경기 지역코드만 조회할 수 있습니다.",
+            "message": "지원하지 않는 시·도 지역코드입니다.",
             "checked_at": checked_at,
         }
     page_no = max(1, int(page_no))

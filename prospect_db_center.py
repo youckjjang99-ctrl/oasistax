@@ -429,17 +429,17 @@ def _contact_result_row(result: dict) -> dict:
 def _render_prospect_db_center_legacy(owner_user_id: str = "") -> None:
     st.markdown("## 영업후보DB")
     st.caption(
-        "서울·경기 주식회사를 찾고 연락처·고용변화를 분석해 "
+        "전국 주식회사를 찾고 연락처·고용변화를 분석해 "
         "전화할 이유와 초회 스크립트까지 준비합니다."
     )
     guide_cols = st.columns(3)
-    guide_cols[0].info("① 서울·경기 주식회사 수집")
+    guide_cols[0].info("① 전국 주식회사 수집")
     guide_cols[1].info("② 연락처·고용 자동분석")
     guide_cols[2].info("③ 후보 저장 후 초회전화")
 
     st.markdown("### 1. 데이터 연결 상태")
     st.info(
-        "인증키와 응답구조를 확인한 뒤 서울·경기 사업장을 "
+        "인증키와 응답구조를 확인한 뒤 전국 사업장을 "
         "최대 100건씩 미리보기로 수집합니다."
     )
 
@@ -604,7 +604,7 @@ def _render_prospect_db_center_legacy(owner_user_id: str = "") -> None:
                 )
 
     st.divider()
-    st.markdown("### 2. 서울·경기 사업장 수집 미리보기")
+    st.markdown("### 2. 전국 사업장 수집 미리보기")
     st.caption(
         "기본조회에서 사업장 순번을 받은 뒤 상세조회를 자동 실행합니다. "
         "조회 50건은 기본조회 1회와 상세조회 최대 50회가 사용됩니다."
@@ -817,7 +817,7 @@ def _render_prospect_db_center_legacy(owner_user_id: str = "") -> None:
                 )
             else:
                 st.warning(
-                    "현재 페이지에서 대표전화까지 확인된 서울·경기 주식회사가 없습니다. "
+                    "현재 페이지에서 대표전화까지 확인된 주식회사가 없습니다. "
                     "다음 페이지를 조회하면 다른 사업장을 확인합니다."
                 )
         elif prospects:

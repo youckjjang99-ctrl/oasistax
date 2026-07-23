@@ -733,6 +733,28 @@ def format_customer_display_value(value, number=False):
         return text
 
 
+def format_establishment_years(value):
+    """설립일에서 현재 설립연차와 신규 여부를 안전하게 표시한다."""
+    text = format_customer_display_value(value)
+    if not text:
+        return "확인 필요"
+    digits = "".join(ch for ch in text if ch.isdigit())
+    try:
+        year = int(digits[:4])
+    except (TypeError, ValueError):
+        return "확인 필요"
+    from datetime import date
+
+    current_year = date.today().year
+    if year < 1900 or year > current_year:
+        return "확인 필요"
+    years = current_year - year + 1
+    stage = "신규기업" if years <= 3 else (
+        "성장초기" if years <= 7 else "기존기업"
+    )
+    return f"{years}년차 · {stage}"
+
+
 def render_customer_management_page(user_id):
     st.markdown("### 👥 고객관리 CRM")
     st.caption("내 누적 고객DB를 기준으로 고객을 검색하고, 고객 상태·상담메모·다음 액션·타임라인을 관리합니다.")
@@ -892,6 +914,10 @@ def render_customer_management_page(user_id):
         st.write(
             f"**설립일**: "
             f"{format_customer_display_value(selected_row.get('설립일', selected_row.get('설립년도', '')))}"
+        )
+        st.write(
+            f"**설립연차**: "
+            f"{format_establishment_years(selected_row.get('설립일', selected_row.get('설립년도', '')))}"
         )
 
     y_cols = [c for c in ["벤처", "이노비즈", "메인비즈", "기업부설연구소", "연구개발전담부서", "특허보유", "상표", "R&D수행", "스마트공장도입"] if c in df.columns]
@@ -1109,6 +1135,11 @@ def render_customer_management_page(user_id):
         analysis_points.append(f"당기순이익은 {net_number:,}원으로 확인됩니다.")
     if employee_number:
         analysis_points.append(f"종업원수는 {employee_number:,}명입니다.")
+    establishment_years = format_establishment_years(
+        selected_row.get("설립일", selected_row.get("설립년도", ""))
+    )
+    if establishment_years != "확인 필요":
+        analysis_points.append(f"기업 연혁은 {establishment_years}로 확인됩니다.")
     if any(word in industry_text for word in ["제조", "건설", "운송", "물류"]):
         analysis_points.append("시설·운전자금 및 보증기관 연계 검토 가치가 있습니다.")
     if str(selected_row.get("벤처", "")).upper() == "Y":
