@@ -231,21 +231,28 @@ def enrich_company(prospect: dict[str, Any]) -> dict[str, Any]:
         score = int(website.get("confidence") or 0)
         if score < REVIEW_SCORE:
             continue
-        website_url = str(website.get("website_url") or candidate.get("url") or "")
-        website_confidence = score
-        contacts.append(
-            {
-                "contact_type": "website",
-                "contact_value": website_url,
-                "contact_label": "공식 홈페이지",
-                "source_type": "naver_web_search",
-                "source_url": website_url,
-                "confidence": score,
-                "verification_status": _verification_status(score),
-                "is_primary": True,
-                "metadata": {"pages_checked": website.get("pages_checked", 0)},
-            }
+        candidate_url = str(
+            website.get("website_url") or candidate.get("url") or ""
         )
+        if not website_url:
+            website_url = candidate_url
+            website_confidence = score
+            contacts.append(
+                {
+                    "contact_type": "website",
+                    "contact_value": website_url,
+                    "contact_label": "공식 홈페이지",
+                    "source_type": "naver_web_search",
+                    "source_url": website_url,
+                    "confidence": score,
+                    "verification_status": _verification_status(score),
+                    "is_primary": True,
+                    "metadata": {
+                        "pages_checked": website.get("pages_checked", 0)
+                    },
+                }
+            )
+        candidate_has_phone = False
         for contact in website.get("contacts", []):
             contact = dict(contact)
             contact_score = int(contact.get("confidence") or 0)
@@ -266,6 +273,8 @@ def enrich_company(prospect: dict[str, Any]) -> dict[str, Any]:
                 contact["verification_status"] == "auto_verified"
             )
             contacts.append(contact)
+            if contact.get("contact_type") == "phone":
+                candidate_has_phone = True
         trace.append(
             {
                 "stage": "website",
@@ -274,7 +283,8 @@ def enrich_company(prospect: dict[str, Any]) -> dict[str, Any]:
                 "confidence": score,
             }
         )
-        break
+        if candidate_has_phone:
+            break
     if not website_url:
         trace.append(
             {

@@ -6,7 +6,6 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-import kipris_patent_client
 from contact_enrichment import api_statuses, enrich_company, test_connections
 from public_data_api import (
     NPS_BASE_URL,
@@ -29,6 +28,33 @@ from sales_intelligence import analyze_sales_candidate, merge_analysis
 
 
 BASE_DIR = Path(__file__).resolve().parent
+STOCK_COMPANY_MARKERS = ("주식회사", "(주)", "㈜", "（주）")
+EXCLUDED_LEGAL_MARKERS = (
+    "농업회사법인",
+    "유한회사",
+    "합자회사",
+    "합명회사",
+    "영농조합법인",
+    "사단법인",
+    "재단법인",
+)
+
+
+def _is_stock_company(value: object) -> bool:
+    name = str(value or "").replace(" ", "")
+    if any(marker in name for marker in EXCLUDED_LEGAL_MARKERS):
+        return False
+    return any(marker in name for marker in STOCK_COMPANY_MARKERS)
+
+
+def _contact_status_label(value: object) -> str:
+    status = str(value or "").upper()
+    labels = {
+        "FOUND": "대표전화 확인",
+        "NOT_FOUND": "공개 대표전화 미확인",
+        "ERROR": "조회 재시도 필요",
+    }
+    return labels.get(status, str(value or "분석 전"))
 
 
 def _display_frame(items: list[dict]) -> pd.DataFrame:
@@ -41,13 +67,15 @@ def _display_frame(items: list[dict]) -> pd.DataFrame:
             "지역": item.get("지역", ""),
             "주소": item.get("주소", ""),
             "대표전화": item.get("대표전화", ""),
+            "전화출처": item.get("전화출처", ""),
+            "연락처상태": _contact_status_label(
+                item.get("연락처상태", "분석 전")
+            ),
             "업종명": item.get("업종명", ""),
             "가입자수": int(item.get("가입자수") or 0),
             "신규취득자수": int(item.get("신규취득자수") or 0),
             "상실가입자수": int(item.get("상실가입자수") or 0),
             "순고용증가": int(item.get("순고용증가") or 0),
-            "특허등록": int(item.get("특허등록") or 0),
-            "특허확인": item.get("특허확인", "분석 전"),
             "영업주제": item.get("영업주제", "분석 전"),
             "추천등급": item.get("추천등급", ""),
             "우선순위점수": int(item.get("우선순위점수") or 0),
@@ -63,13 +91,13 @@ def _display_frame(items: list[dict]) -> pd.DataFrame:
         "지역",
         "주소",
         "대표전화",
+        "전화출처",
+        "연락처상태",
         "업종명",
         "가입자수",
         "신규취득자수",
         "상실가입자수",
         "순고용증가",
-        "특허등록",
-        "특허확인",
         "영업주제",
         "추천등급",
         "우선순위점수",
@@ -155,13 +183,13 @@ def _saved_candidate_frame(
                     phone_by_id.get(prospect_id)
                     or analysis.get("phone", "")
                 ),
+                "전화출처": analysis.get("phone_source", ""),
+                "연락처상태": _contact_status_label(
+                    analysis.get("contact_status", "분석 전")
+                ),
                 "이메일": email_by_id.get(prospect_id, ""),
                 "가입자": int(row.get("employee_count") or 0),
                 "순고용증가": int(analysis.get("net_hiring") or 0),
-                "등록특허": int(
-                    analysis.get("registered_patent_count") or 0
-                ),
-                "특허확인": analysis.get("patent_status", "분석 전"),
                 "영업주제": " · ".join(
                     analysis.get("sales_topics") or []
                 ),
@@ -198,12 +226,12 @@ def _contact_result_row(result: dict) -> dict:
 def render_prospect_db_center(owner_user_id: str = "") -> None:
     st.markdown("## 영업후보DB")
     st.caption(
-        "사업장을 찾고 연락처·특허·고용변화를 분석해 "
+        "서울·경기 주식회사를 찾고 연락처·고용변화를 분석해 "
         "전화할 이유와 초회 스크립트까지 준비합니다."
     )
     guide_cols = st.columns(3)
-    guide_cols[0].info("① 서울·경기 사업장 수집")
-    guide_cols[1].info("② 연락처·특허·고용 자동분석")
+    guide_cols[0].info("① 서울·경기 주식회사 수집")
+    guide_cols[1].info("② 연락처·고용 자동분석")
     guide_cols[2].info("③ 후보 저장 후 초회전화")
 
     st.markdown("### 1. 데이터 연결 상태")
@@ -289,8 +317,7 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
 
     st.markdown("#### 영업정보 데이터")
     contact_api_status = api_statuses()
-    patent_key_status = kipris_patent_client.key_status()
-    api_cols = st.columns(4)
+    api_cols = st.columns(3)
     api_cols[0].metric(
         "카카오 로컬",
         "등록됨" if contact_api_status["kakao"]["configured"] else "미등록",
@@ -307,17 +334,12 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             else "미등록"
         ),
     )
-    api_cols[3].metric(
-        "KIPRIS 특허",
-        "등록됨" if patent_key_status["configured"] else "미등록",
-    )
     with st.expander("외부 데이터 연결 설정"):
         st.code(
             "KAKAO_REST_API_KEY\n"
             "NAVER_CLIENT_ID\n"
             "NAVER_CLIENT_SECRET\n"
-            "DATA_GO_KR_SERVICE_KEY\n"
-            "KIPRIS_API_KEY",
+            "DATA_GO_KR_SERVICE_KEY",
             language="text",
         )
         contact_test_clicked = st.button(
@@ -331,14 +353,9 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
         )
     if contact_test_clicked:
         with st.spinner(
-            "카카오·네이버·인허가·KIPRIS API를 점검하고 있습니다..."
+            "카카오·네이버·인허가 API를 점검하고 있습니다..."
         ):
             connection_result = test_connections()
-            patent_result = kipris_patent_client.test_connection()
-            connection_result.setdefault("sources", {})["kipris"] = patent_result
-            connection_result["ok"] = bool(
-                connection_result.get("ok") and patent_result.get("ok")
-            )
             st.session_state["contact_api_test_result_v970"] = (
                 connection_result
             )
@@ -351,7 +368,6 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             ("kakao", "카카오 로컬"),
             ("naver", "네이버 검색"),
             ("localdata", "승인 인허가 API"),
-            ("kipris", "KIPRIS 특허"),
         ):
             source = sources.get(key) or {}
             test_rows.append(
@@ -429,11 +445,11 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             help="공공데이터포털 명세의 읍면동 코드를 알고 있을 때만 입력합니다.",
         )
         auto_sales_analysis = st.checkbox(
-            "수집 후 대표전화·특허·고용변화·영업주제를 자동분석",
+            "수집 후 대표전화·고용변화·영업주제를 자동분석",
             value=True,
             help=(
-                "최종 후보 중 최대 20개 업체를 분석해 아래 후보표에 "
-                "전화번호와 영업주제를 바로 표시합니다."
+                "주식회사 후보 중 최대 20개 업체를 분석해 아래 후보표에 "
+                "대표전화, 연락처 확인상태와 영업주제를 바로 표시합니다."
             ),
         )
         collect_clicked = st.form_submit_button(
@@ -456,11 +472,19 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 emd_code=emd_code,
             )
             if collection.get("ok"):
-                items = [
+                employee_filtered_items = [
                     item for item in collection.get("items", [])
                     if int(item.get("가입자수") or 0)
                     >= int(minimum_employees)
                 ]
+                items = [
+                    item
+                    for item in employee_filtered_items
+                    if _is_stock_company(item.get("사업장명"))
+                ]
+                collection["non_stock_company_count"] = (
+                    len(employee_filtered_items) - len(items)
+                )
                 duplicate_count = 0
                 duplicate_warning = ""
                 try:
@@ -513,6 +537,7 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             st.caption(
                 f"페이지 {collection.get('page_no', 1):,} · "
                 f"실제 API 호출 시도 {collection.get('api_attempt_count', 1):,}회 · "
+                f"주식회사 외 제외 {collection.get('non_stock_company_count', 0):,}건 · "
                 f"영업정보 분석 {collection.get('sales_analysis_count', 0):,}건"
             )
             if collection.get("duplicate_warning"):
@@ -555,13 +580,13 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 )
             else:
                 st.warning(
-                    "현재 페이지에서 조건에 맞는 서울·경기 사업장이 없습니다. "
+                    "현재 페이지에서 조건에 맞는 서울·경기 주식회사가 없습니다. "
                     "다음 페이지를 조회하거나 시·군·구 법정동 코드를 입력해 주세요."
                 )
         elif prospects:
             action_col1, action_col2 = st.columns([2, 1])
             action_col1.info(
-                "아래 표에서 대표전화·특허등록·순고용증가·영업주제와 "
+                "아래 표에서 대표전화·전화출처·연락처상태·순고용증가·영업주제와 "
                 "초회 전화 스크립트를 한 번에 확인할 수 있습니다."
             )
             reanalyze_clicked = action_col2.button(
@@ -571,7 +596,7 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             )
             if reanalyze_clicked:
                 with st.spinner(
-                    "대표전화·특허·고용변화와 영업주제를 분석하고 있습니다..."
+                    "대표전화·공식홈페이지·고용변화와 영업주제를 분석하고 있습니다..."
                 ):
                     analyzed_items, analysis_failures = (
                         _analyze_candidate_batch(prospects, limit=20)
@@ -596,24 +621,12 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                     )
 
             with st.form("prospect_sales_filter_v971"):
-                filter_view_col1, filter_view_col2, filter_view_col3 = (
-                    st.columns(3)
-                )
-                patent_only = filter_view_col1.checkbox(
-                    "등록특허 보유업체만",
-                    key="prospect_patent_only_v971",
-                    disabled=not patent_key_status["configured"],
-                    help=(
-                        "KIPRIS_API_KEY 등록 후 사용할 수 있습니다."
-                        if not patent_key_status["configured"]
-                        else "등록번호가 확인된 특허가 1건 이상인 업체만 표시합니다."
-                    ),
-                )
-                hiring_only = filter_view_col2.checkbox(
+                filter_view_col1, filter_view_col2 = st.columns(2)
+                hiring_only = filter_view_col1.checkbox(
                     "순고용 증가업체만",
                     key="prospect_hiring_only_v971",
                 )
-                grade_filter = filter_view_col3.selectbox(
+                grade_filter = filter_view_col2.selectbox(
                     "추천등급",
                     ["전체", "A", "B", "C"],
                     key="prospect_grade_filter_v971",
@@ -627,10 +640,6 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 item
                 for item in prospects
                 if (
-                    not patent_only
-                    or int(item.get("특허등록") or 0) > 0
-                )
-                and (
                     not hiring_only
                     or int(item.get("순고용증가") or 0) > 0
                 )
@@ -671,7 +680,7 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 },
                 key=(
                     "prospect_editor_v971_"
-                    f"{int(patent_only)}_{int(hiring_only)}_{grade_filter}"
+                    f"{int(hiring_only)}_{grade_filter}"
                 ),
             )
             selected_keys = set(
@@ -804,7 +813,7 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 key="download_contact_sql_v971",
             )
         st.caption(
-            "두 SQL은 최초 1회만 필요합니다. v9.7.1은 기존 "
+            "두 SQL은 최초 1회만 필요합니다. v9.7.2도 기존 "
             "source_data에 영업분석을 추가하므로 새 SQL이 없습니다."
         )
 
@@ -828,7 +837,18 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
         except Exception as exc:
             st.error(str(exc))
             st.session_state["prospect_saved_list_v960"] = []
-    saved_rows = st.session_state.get("prospect_saved_list_v960", [])
+    all_saved_rows = st.session_state.get("prospect_saved_list_v960", [])
+    saved_rows = [
+        row
+        for row in all_saved_rows
+        if _is_stock_company(row.get("company_name"))
+    ]
+    hidden_non_stock_count = len(all_saved_rows) - len(saved_rows)
+    if hidden_non_stock_count:
+        st.info(
+            f"기존 저장자료 중 주식회사 외 {hidden_non_stock_count:,}건은 "
+            "삭제하지 않고 이 영업후보 화면에서만 숨겼습니다."
+        )
     contact_rows: list[dict] = []
     if saved_rows and saved_contact_status[0]:
         try:
@@ -842,7 +862,7 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
 
     if not saved_rows:
         st.info(
-            "아직 저장된 영업후보가 없습니다. 위 후보표에서 업체를 선택해 "
+            "저장된 주식회사 영업후보가 없습니다. 위 후보표에서 업체를 선택해 "
             "영업후보DB에 저장해 주세요."
         )
         return
@@ -935,7 +955,7 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
         )
         button_col1, button_col2 = st.columns(2)
         analyze_saved_clicked = button_col1.form_submit_button(
-            "연락처·특허·영업주제 분석",
+            "대표전화·고용주제 분석",
             type="primary",
             use_container_width=True,
             disabled=not selected_labels,
@@ -948,7 +968,8 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             ),
         )
         st.caption(
-            "첫 번째 버튼은 전화할 이유와 스크립트를 만듭니다. "
+            "첫 번째 버튼은 카카오·인허가 API에서 번호를 찾지 못하면 "
+            "네이버와 공식 홈페이지까지 자동 확인해 전화할 이유와 스크립트를 만듭니다. "
             "두 번째 버튼은 네이버와 공식 홈페이지까지 확인해 "
             "이메일·홈페이지를 연락처DB에 저장합니다. 공개된 사업용 "
             "연락처만 사용하며 실제 연락 전에는 수신거부 여부를 확인합니다."
@@ -971,9 +992,9 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                     {
                         "업체명": prospect.get("company_name", ""),
                         "대표전화": analysis.get("phone", ""),
-                        "등록특허": analysis.get(
-                            "registered_patent_count",
-                            0,
+                        "전화출처": analysis.get("phone_source", ""),
+                        "연락처상태": _contact_status_label(
+                            analysis.get("contact_status", "")
                         ),
                         "순고용증가": analysis.get("net_hiring", 0),
                         "영업주제": " · ".join(

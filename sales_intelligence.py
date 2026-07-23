@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
 
 import kakao_local_client
-import kipris_patent_client
 import localdata_contact_client
+from contact_enrichment import enrich_company
 from contact_matching import is_mobile_phone
+
+
+REVIEW_SCORE = 65
 
 
 def _number(prospect: dict[str, Any], *keys: str) -> int:
@@ -29,6 +31,94 @@ def _text(prospect: dict[str, Any], *keys: str) -> str:
     return ""
 
 
+def _phone_result(
+    phone: str,
+    source: str,
+    confidence: int,
+    *,
+    status: str = "FOUND",
+    trace: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "phone": phone,
+        "phone_source": source,
+        "phone_confidence": confidence,
+        "phone_review_required": is_mobile_phone(phone),
+        "contact_status": status,
+        "contact_trace": trace or [],
+    }
+
+
+def _source_label(source_type: str) -> str:
+    source_type = str(source_type or "")
+    if source_type == "official_website":
+        return "공식 홈페이지"
+    if source_type == "kakao_local":
+        return "카카오 로컬"
+    if source_type.startswith("localdata:"):
+        return "승인 인허가 API"
+    return source_type or "공개 연락처"
+
+
+def _extended_phone(
+    company_name: str,
+    address: str,
+    industry_name: str,
+) -> dict[str, Any]:
+    """빠른 조회에서 비어 있는 대표전화를 전체 공개 연락처 흐름으로 보강."""
+    try:
+        enriched = enrich_company(
+            {
+                "company_name": company_name,
+                "address": address,
+                "industry_name": industry_name,
+            }
+        )
+    except Exception as exc:
+        return _phone_result(
+            "",
+            "",
+            0,
+            status="ERROR",
+            trace=[
+                {
+                    "stage": "contact_enrichment",
+                    "status": type(exc).__name__,
+                    "message": str(exc),
+                }
+            ],
+        )
+    phone_contacts = [
+        row
+        for row in enriched.get("contacts", [])
+        if row.get("contact_type") == "phone"
+        and str(row.get("contact_value") or "").strip()
+        and str(row.get("verification_status") or "") != "rejected"
+    ]
+    if phone_contacts:
+        phone_contacts.sort(
+            key=lambda row: (
+                row.get("verification_status") != "auto_verified",
+                is_mobile_phone(row.get("contact_value", "")),
+                -int(row.get("confidence") or 0),
+            )
+        )
+        best = phone_contacts[0]
+        return _phone_result(
+            str(best.get("contact_value") or ""),
+            _source_label(str(best.get("source_type") or "")),
+            int(best.get("confidence") or 0),
+            trace=list(enriched.get("trace") or []),
+        )
+    return _phone_result(
+        "",
+        "",
+        0,
+        status="NOT_FOUND",
+        trace=list(enriched.get("trace") or []),
+    )
+
+
 def _best_phone(
     company_name: str,
     address: str,
@@ -38,17 +128,22 @@ def _best_phone(
     candidates = [
         row
         for row in kakao.get("candidates", [])
-        if row.get("phone") and int(row.get("confidence") or 0) >= 65
+        if row.get("phone") and int(row.get("confidence") or 0) >= REVIEW_SCORE
     ]
     if candidates:
         best = candidates[0]
-        return {
-            "phone": best.get("phone", ""),
-            "phone_source": "카카오 로컬",
-            "phone_confidence": int(best.get("confidence") or 0),
-            "phone_review_required": is_mobile_phone(best.get("phone")),
-            "contact_status": "FOUND",
-        }
+        return _phone_result(
+            str(best.get("phone") or ""),
+            "카카오 로컬",
+            int(best.get("confidence") or 0),
+            trace=[
+                {
+                    "stage": "kakao",
+                    "status": kakao.get("status"),
+                    "message": kakao.get("message"),
+                }
+            ],
+        )
 
     localdata = localdata_contact_client.search_company(
         company_name,
@@ -59,50 +154,38 @@ def _best_phone(
     candidates = [
         row
         for row in localdata.get("candidates", [])
-        if row.get("phone") and int(row.get("confidence") or 0) >= 65
+        if row.get("phone") and int(row.get("confidence") or 0) >= REVIEW_SCORE
     ]
     if candidates:
         best = candidates[0]
-        return {
-            "phone": best.get("phone", ""),
-            "phone_source": str(best.get("source_type") or "인허가 API"),
-            "phone_confidence": int(best.get("confidence") or 0),
-            "phone_review_required": is_mobile_phone(best.get("phone")),
-            "contact_status": "FOUND",
-        }
-    return {
-        "phone": "",
-        "phone_source": "",
-        "phone_confidence": 0,
-        "phone_review_required": False,
-        "contact_status": (
-            kakao.get("status")
-            if kakao.get("status") not in {"SUCCESS", None}
-            else localdata.get("status", "NOT_FOUND")
-        ),
-    }
+        return _phone_result(
+            str(best.get("phone") or ""),
+            _source_label(str(best.get("source_type") or "")),
+            int(best.get("confidence") or 0),
+            trace=[
+                {
+                    "stage": "kakao",
+                    "status": kakao.get("status"),
+                    "message": kakao.get("message"),
+                },
+                {
+                    "stage": "localdata",
+                    "status": localdata.get("status"),
+                    "message": localdata.get("message"),
+                },
+            ],
+        )
+
+    return _extended_phone(company_name, address, industry_name)
 
 
 def _sales_needs(
-    patent_count: int,
     new_employee_count: int,
     lost_employee_count: int,
     employee_count: int,
 ) -> list[dict[str, Any]]:
     needs: list[dict[str, Any]] = []
     net_hiring = new_employee_count - lost_employee_count
-    if patent_count > 0:
-        needs.append(
-            {
-                "code": "patent_benefit",
-                "topic": "특허·연구개발 혜택",
-                "reason": f"등록특허 {patent_count}건 확인",
-                "question": (
-                    "보유 특허와 연구개발비에 대해 정책자금·기술보증·"
-                    "세액공제 적용 가능성을 검토하고 계신가요?"
-                ),
-            }
-        )
     if net_hiring > 0:
         needs.append(
             {
@@ -147,7 +230,7 @@ def _sales_needs(
             {
                 "code": "policy_fund",
                 "topic": "정책자금 사전진단",
-                "reason": "서울·경기 사업장 공개정보 확인",
+                "reason": "서울·경기 주식회사 사업장 공개정보 확인",
                 "question": (
                     "올해 시설·운전자금 계획이나 추가 채용계획이 있으신가요?"
                 ),
@@ -162,7 +245,6 @@ def _script(
     phone_review_required: bool,
 ) -> str:
     primary = needs[0]
-    secondary = needs[1] if len(needs) > 1 else None
     opening = (
         f"안녕하세요, {company_name} 대표님 또는 정부지원제도 담당자분 "
         "연결 가능하실까요? 오아시스 기업지원센터입니다."
@@ -171,10 +253,6 @@ def _script(
         f"공개된 기업정보를 확인하던 중 {primary['reason']} 내용이 있어 "
         f"{primary['topic']} 검토 가능성을 안내드리려고 연락드렸습니다."
     )
-    if secondary:
-        reason += (
-            f" 또한 {secondary['reason']} 부분도 함께 확인할 수 있습니다."
-        )
     close = (
         f"{primary['question']} 대상 여부는 세부조건 확인이 필요해서, "
         "20초 정도 몇 가지만 여쭤봐도 괜찮을까요?"
@@ -200,23 +278,8 @@ def analyze_sales_candidate(prospect: dict[str, Any]) -> dict[str, Any]:
         "상실가입자수",
     )
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        phone_future = executor.submit(
-            _best_phone,
-            company_name,
-            address,
-            industry_name,
-        )
-        patent_future = executor.submit(
-            kipris_patent_client.search_registered_patents,
-            company_name,
-        )
-        phone_result = phone_future.result()
-        patent_result = patent_future.result()
-
-    patent_count = int(patent_result.get("registered_count") or 0)
+    phone_result = _best_phone(company_name, address, industry_name)
     needs = _sales_needs(
-        patent_count,
         new_employee_count,
         lost_employee_count,
         employee_count,
@@ -224,15 +287,13 @@ def analyze_sales_candidate(prospect: dict[str, Any]) -> dict[str, Any]:
     net_hiring = new_employee_count - lost_employee_count
     score = 20
     if phone_result.get("phone"):
-        score += 20
-    if patent_count:
-        score += min(30, 20 + patent_count * 2)
+        score += 25
     if net_hiring > 0:
-        score += min(25, 15 + net_hiring * 2)
+        score += min(35, 20 + net_hiring * 3)
     elif new_employee_count > 0:
-        score += 10
+        score += 15
     if employee_count >= 5:
-        score += 5
+        score += 10
     score = min(100, score)
     grade = "A" if score >= 75 else ("B" if score >= 55 else "C")
     analyzed_at = datetime.now(timezone.utc).isoformat()
@@ -246,14 +307,7 @@ def analyze_sales_candidate(prospect: dict[str, Any]) -> dict[str, Any]:
             False,
         ),
         "contact_status": phone_result.get("contact_status", ""),
-        "patent_status": patent_result.get("status", ""),
-        "patent_message": patent_result.get("message", ""),
-        "registered_patent_count": patent_count,
-        "active_patent_count": int(patent_result.get("active_count") or 0),
-        "patent_titles": [
-            row.get("invention_title", "")
-            for row in patent_result.get("patents", [])[:5]
-        ],
+        "contact_trace": phone_result.get("contact_trace", []),
         "employee_count": employee_count,
         "new_employee_count": new_employee_count,
         "lost_employee_count": lost_employee_count,
@@ -281,10 +335,12 @@ def merge_analysis(
     existing_reasons = list(prospect.get("추천사유") or [])
     sales_reasons = list(analysis.get("sales_reasons") or [])
     combined_reasons = list(dict.fromkeys(existing_reasons + sales_reasons))
+    merged.pop("특허등록", None)
+    merged.pop("특허확인", None)
     merged["영업분석"] = analysis
     merged["대표전화"] = analysis.get("phone", "")
-    merged["특허등록"] = analysis.get("registered_patent_count", 0)
-    merged["특허확인"] = analysis.get("patent_status", "")
+    merged["전화출처"] = analysis.get("phone_source", "")
+    merged["연락처상태"] = analysis.get("contact_status", "")
     merged["순고용증가"] = analysis.get("net_hiring", 0)
     merged["영업주제"] = " · ".join(analysis.get("sales_topics") or [])
     merged["추천등급"] = analysis.get("recommendation_grade", "")
