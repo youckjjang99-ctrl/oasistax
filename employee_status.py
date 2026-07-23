@@ -21,6 +21,7 @@ from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from cloud_db import CloudDatabase, cloud_is_configured
 from customer_history import save_customer_event
 from document_preprocessor import preprocess_document
+from encrypted_excel_reader import decrypt_excel_bytes
 from employment_support_2026 import render_employment_support_analysis
 from utils import get_user_dirs
 
@@ -674,6 +675,10 @@ def _normalize_employee(
     insurance: Any = "",
 ) -> dict[str, Any] | None:
     raw_name = _clean(name)
+    if raw_name in {
+        "성명", "가입자명", "근로자명", "직원명", "피보험자명", "이름",
+    }:
+        return None
     acquisition_date = _parse_date(acquisition)
     loss_date = _parse_date(loss)
     birth_date, age = _birth_info(birth)
@@ -713,6 +718,8 @@ def _parse_dataframe(df: pd.DataFrame) -> list[dict[str, Any]]:
     birth_col = _find_column(df, COLUMN_ALIASES["birth"])
     acquisition_col = _find_column(df, COLUMN_ALIASES["acquisition"])
     loss_col = _find_column(df, COLUMN_ALIASES["loss"])
+    industrial_acquisition_col = _find_column(df, ["고용일"])
+    industrial_loss_col = _find_column(df, ["고용종료일"])
     status_col = _find_column(df, COLUMN_ALIASES["status"])
     insurance_col = _find_column(df, COLUMN_ALIASES["insurance"])
 
@@ -735,8 +742,20 @@ def _parse_dataframe(df: pd.DataFrame) -> list[dict[str, Any]]:
         employee = _normalize_employee(
             row.get(name_col, "") if name_col else "",
             row.get(birth_col, "") if birth_col else "",
-            row.get(acquisition_col, "") if acquisition_col else "",
-            row.get(loss_col, "") if loss_col else "",
+            (
+                row.get(acquisition_col, "")
+                if acquisition_col and _clean(row.get(acquisition_col, ""))
+                else row.get(industrial_acquisition_col, "")
+                if industrial_acquisition_col
+                else ""
+            ),
+            (
+                row.get(loss_col, "")
+                if loss_col and _clean(row.get(loss_col, ""))
+                else row.get(industrial_loss_col, "")
+                if industrial_loss_col
+                else ""
+            ),
             row.get(status_col, "") if status_col else "",
             row.get(insurance_col, "") if insurance_col else "",
         )
@@ -752,6 +771,7 @@ def _parse_dataframe(df: pd.DataFrame) -> list[dict[str, Any]]:
 def _parse_excel(data: bytes) -> list[dict[str, Any]]:
     workbook = pd.ExcelFile(io.BytesIO(data))
     best: list[dict[str, Any]] = []
+    best_score = -1
 
     for sheet_name in workbook.sheet_names:
         for header_row in range(0, 10):
@@ -765,10 +785,22 @@ def _parse_excel(data: bytes) -> list[dict[str, Any]]:
             except Exception:
                 continue
             parsed = _parse_dataframe(df)
-            if len(parsed) > len(best):
+            score = (
+                len(parsed) * 100
+                + sum(
+                    10
+                    for employee in parsed
+                    if employee.get("acquisition_date")
+                )
+                + sum(
+                    2
+                    for employee in parsed
+                    if employee.get("birth_year")
+                )
+            )
+            if score > best_score:
                 best = parsed
-            if len(best) >= 2:
-                break
+                best_score = score
     return best
 
 
@@ -1574,10 +1606,16 @@ def parse_roster(
     suffix = Path(filename).suffix.lower()
 
     if suffix in {".xlsx", ".xls"}:
-        employees = _parse_excel(data)
+        excel_data, encryption = decrypt_excel_bytes(data)
+        employees = _parse_excel(excel_data)
         return employees, {
-            "method": "excel",
+            "method": (
+                "encrypted_excel_auto_decrypt"
+                if encryption["decrypted"]
+                else "excel"
+            ),
             "filename": filename,
+            "encryption": encryption,
         }
 
     if suffix == ".csv":
@@ -1968,7 +2006,8 @@ def render_employee_status(
     st.caption(
         "가입자명부 이미지는 AI 비전으로 표 전체를 분석한 뒤, "
         "편집 가능한 검수표에서 확인한 내용만 저장합니다. "
-        "주민등록번호 뒷자리는 AI에 출력하도록 요청하지 않으며 저장하지 않습니다."
+        "주민등록번호 뒷자리는 AI에 출력하도록 요청하지 않으며 저장하지 않습니다. "
+        "암호 1111인 근로자 고용정보 Excel은 메모리에서 자동으로 열어 분석합니다."
     )
     st.info(
         "JPG·JPEG·PNG 이미지는 OpenAI API로 전송되어 분석됩니다. "
@@ -1987,7 +2026,8 @@ def render_employee_status(
         key=f"employee_roster_upload_{business_no or company_name}",
         help=(
             "가입내역 페이지와 안내 페이지를 함께 올려도 됩니다. "
-            "AI가 직원 행이 없는 안내 페이지는 제외합니다."
+            "AI가 직원 행이 없는 안내 페이지는 제외합니다. "
+            "암호화된 근로자 고용정보 현황(.xls/.xlsx)도 그대로 선택할 수 있습니다."
         ),
     )
 

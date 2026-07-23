@@ -1,0 +1,13 @@
+# 정책자금자동화 프로젝트 폴더에서 PowerShell 실행
+
+git status
+git add employee_status.py encrypted_excel_reader.py requirements.txt system_precheck.py VERSION.txt APPLY_UPDATE_v9.4.2.py RUN_UPDATE_v9.4.2.bat CHANGELOG_v9.4.2.md README_UPDATE_v9.4.2.md GITHUB_UPLOAD_COMMANDS_v9.4.2.txt payload
+git status
+git commit -m "OASIS CRM v9.4.2 암호화 고용정보 직원 자동입력"
+git pull --rebase origin main
+git push origin main
+
+# 업로드 확인
+git status
+git log -1 --oneline
+git log origin/main -1 --oneline
