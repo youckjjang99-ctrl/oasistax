@@ -1,0 +1,9 @@
+git status
+git add prospect_db_center.py sales_intelligence.py contact_enrichment.py kakao_local_client.py naver_web_search_client.py VERSION.txt APPLY_UPDATE_v9.7.5.py RUN_UPDATE_v9.7.5.bat README_UPDATE_v9.7.5.md GITHUB_UPLOAD_COMMANDS_v9.7.5.txt payload
+git add -f CHANGELOG_v9.7.5.md
+git status
+git commit -m "OASIS CRM v9.7.5 공식홈페이지 연락처 보강"
+git pull --rebase origin main
+git push origin main
+
+# CHANGELOG_v9.7.5.md가 .gitignore에 포함된 경우를 대비해 add -f를 사용합니다.

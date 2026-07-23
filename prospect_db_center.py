@@ -71,6 +71,10 @@ def _display_frame(items: list[dict]) -> pd.DataFrame:
             "연락처상태": _contact_status_label(
                 item.get("연락처상태", "분석 전")
             ),
+            "연락처조회이력": " · ".join(
+                f"{row.get('stage', '')}:{row.get('status', '')}"
+                for row in (item.get("연락처조회이력") or [])
+            ),
             "업종명": item.get("업종명", ""),
             "가입자수": int(item.get("가입자수") or 0),
             "신규취득자수": int(item.get("신규취득자수") or 0),
@@ -93,6 +97,7 @@ def _display_frame(items: list[dict]) -> pd.DataFrame:
         "대표전화",
         "전화출처",
         "연락처상태",
+        "연락처조회이력",
         "업종명",
         "가입자수",
         "신규취득자수",
@@ -504,6 +509,12 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 collection["contact_missing_count"] = (
                     len(items) - len(contact_ready_items)
                 )
+                collection["contact_analysis_attempted_count"] = len(items)
+                collection["contact_missing_items"] = [
+                    item
+                    for item in items
+                    if not str(item.get("대표전화") or "").strip()
+                ]
                 items = contact_ready_items
                 collection["items"] = items
                 collection["existing_customer_count"] = duplicate_count
@@ -546,7 +557,8 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 f"페이지 {collection.get('page_no', 1):,} · "
                 f"실제 API 호출 시도 {collection.get('api_attempt_count', 1):,}회 · "
                 f"주식회사 외 제외 {collection.get('non_stock_company_count', 0):,}건 · "
-                f"영업정보 분석 {collection.get('sales_analysis_count', 0):,}건 · "
+                f"연락처 분석 {collection.get('contact_analysis_attempted_count', 0):,}건 · "
+                f"번호 확인 {collection.get('sales_analysis_count', 0):,}건 · "
                 f"연락처 미확인 제외 {collection.get('contact_missing_count', 0):,}건"
             )
             if collection.get("duplicate_warning"):
@@ -581,6 +593,24 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 )
 
         prospects = collection.get("items", [])
+        contact_missing_items = collection.get("contact_missing_items") or []
+        if contact_missing_items:
+            with st.expander(
+                f"대표전화 미확인 제외 사유 {len(contact_missing_items):,}건"
+            ):
+                st.dataframe(
+                    _display_frame(contact_missing_items)[
+                        [
+                            "사업장명",
+                            "주소",
+                            "업종명",
+                            "연락처상태",
+                            "연락처조회이력",
+                        ]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
         if collection.get("ok") and not prospects:
             if detail_failures:
                 st.warning(
@@ -618,6 +648,14 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                         collection.get("contact_missing_count", 0)
                         + len(analyzed_items) - len(contact_ready_items)
                     )
+                    collection["contact_analysis_attempted_count"] = len(
+                        analyzed_items
+                    )
+                    collection["contact_missing_items"] = [
+                        item
+                        for item in analyzed_items
+                        if not str(item.get("대표전화") or "").strip()
+                    ]
                     collection["items"] = contact_ready_items
                     collection["sales_analysis_count"] = sum(
                         1 for item in analyzed_items if item.get("영업분석")

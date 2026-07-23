@@ -238,7 +238,24 @@ def enrich_company(prospect: dict[str, Any]) -> dict[str, Any]:
         if not website.get("ok"):
             continue
         score = int(website.get("confidence") or 0)
-        if score < REVIEW_SCORE:
+        website_contacts = list(website.get("contacts") or [])
+        has_public_phone = any(
+            row.get("contact_type") == "phone"
+            and str(row.get("contact_value") or "").strip()
+            for row in website_contacts
+        )
+        # Exact company-name matches score 45 before address/business-number
+        # signals are available. Keep a published phone in that case as a
+        # manual-review lead instead of silently dropping it.
+        if score < 45 or (score < REVIEW_SCORE and not has_public_phone):
+            trace.append(
+                {
+                    "stage": "website",
+                    "status": "LOW_CONFIDENCE",
+                    "message": "회사 확인 점수가 낮고 공개 전화가 없습니다.",
+                    "confidence": score,
+                }
+            )
             continue
         candidate_url = str(
             website.get("website_url") or candidate.get("url") or ""
@@ -262,9 +279,18 @@ def enrich_company(prospect: dict[str, Any]) -> dict[str, Any]:
                 }
             )
         candidate_has_phone = False
-        for contact in website.get("contacts", []):
+        for contact in website_contacts:
             contact = dict(contact)
             contact_score = int(contact.get("confidence") or 0)
+            is_phone = contact.get("contact_type") == "phone"
+            review_only = is_phone and contact_score < REVIEW_SCORE
+            if review_only:
+                contact_score = REVIEW_SCORE
+                contact.setdefault("metadata", {})["review_only"] = True
+                contact.setdefault("metadata", {})["review_reason"] = (
+                    "회사명은 확인됐으나 주소 또는 사업자번호 교차확인이 부족합니다."
+                )
+                contact["confidence"] = contact_score
             domain_match = bool(
                 (contact.get("metadata") or {}).get("domain_match")
             )
@@ -272,7 +298,7 @@ def enrich_company(prospect: dict[str, Any]) -> dict[str, Any]:
                 contact_score,
                 phone=(
                     contact.get("contact_value", "")
-                    if contact.get("contact_type") == "phone"
+                    if is_phone
                     else ""
                 ),
                 is_email=contact.get("contact_type") == "email",

@@ -341,6 +341,7 @@ def merge_analysis(
     merged["대표전화"] = analysis.get("phone", "")
     merged["전화출처"] = analysis.get("phone_source", "")
     merged["연락처상태"] = analysis.get("contact_status", "")
+    merged["연락처조회이력"] = analysis.get("contact_trace", [])
     merged["순고용증가"] = analysis.get("net_hiring", 0)
     merged["영업주제"] = " · ".join(analysis.get("sales_topics") or [])
     merged["추천등급"] = analysis.get("recommendation_grade", "")
