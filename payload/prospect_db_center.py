@@ -7,6 +7,8 @@ import pandas as pd
 import streamlit as st
 
 from contact_enrichment import api_statuses, enrich_company, test_connections
+from contact_matching import normalize_phone
+from prospect_collection_service import collect_contactable_growth_companies
 from public_data_api import (
     NPS_BASE_URL,
     REGION_CODES,
@@ -228,7 +230,7 @@ def _contact_result_row(result: dict) -> dict:
     }
 
 
-def render_prospect_db_center(owner_user_id: str = "") -> None:
+def _render_prospect_db_center_legacy(owner_user_id: str = "") -> None:
     st.markdown("## 영업후보DB")
     st.caption(
         "서울·경기 주식회사를 찾고 연락처·고용변화를 분석해 "
@@ -1209,3 +1211,384 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             disabled=True,
             key="saved_call_script_v971",
         )
+
+
+def _render_clean_saved_prospects(owner_user_id: str) -> None:
+    st.markdown("### 저장된 영업후보")
+    st.caption("대표전화가 확인된 업체만 표시합니다.")
+    try:
+        rows = [
+            row
+            for row in list_prospects(limit=1000)
+            if _is_stock_company(row.get("company_name"))
+        ]
+    except Exception as exc:
+        st.warning(f"저장목록을 불러오지 못했습니다: {exc}")
+        return
+    if not rows:
+        st.info("저장된 영업후보가 없습니다.")
+        return
+
+    contacts: list[dict] = []
+    try:
+        if contact_table_status()[0]:
+            contacts = list_contacts_for_prospects(
+                [str(row.get("id") or "") for row in rows]
+            )
+    except Exception:
+        contacts = []
+
+    frame = _saved_candidate_frame(rows, contacts)
+    if not frame.empty:
+        frame["대표전화"] = frame["대표전화"].map(normalize_phone)
+        frame = frame[frame["대표전화"] != ""].reset_index(drop=True)
+    if frame.empty:
+        st.info("유효한 대표전화가 확인된 저장 업체가 없습니다.")
+        return
+    st.dataframe(
+        frame,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "초회전화스크립트": st.column_config.TextColumn(
+                "초회 전화 스크립트",
+                width="large",
+            )
+        },
+    )
+
+
+def render_prospect_db_center(owner_user_id: str = "") -> None:
+    st.markdown("## 연락 가능한 성장기업 찾기")
+    st.caption(
+        "서울·경기 주식회사 중 최근 순고용이 증가한 업체를 먼저 찾고, "
+        "유효한 대표전화가 확인된 업체만 보여드립니다."
+    )
+
+    with st.form("prospect_search_v980"):
+        col1, col2, col3 = st.columns(3)
+        region_name = col1.selectbox(
+            "수집 지역",
+            list(REGION_CODES.keys()),
+            key="prospect_region_v980",
+        )
+        target_count = col2.selectbox(
+            "필요한 업체 수",
+            [10, 20, 30, 50],
+            index=2,
+            key="prospect_target_v980",
+        )
+        minimum_employees = col3.number_input(
+            "최소 가입자 수",
+            min_value=3,
+            max_value=300,
+            value=3,
+            step=1,
+            key="prospect_min_employee_v980",
+        )
+        with st.expander("검색 범위 조정"):
+            max_pages = st.select_slider(
+                "최대 검색 페이지",
+                options=[3, 5, 10, 15, 20],
+                value=10,
+                help=(
+                    "페이지를 늘리면 연락 가능한 업체를 더 많이 찾지만 "
+                    "검색시간과 API 호출량이 증가합니다."
+                ),
+            )
+            sigungu_code = st.text_input(
+                "시·군·구 법정동 코드",
+                placeholder="선택사항",
+            )
+            emd_code = st.text_input(
+                "읍·면·동 법정동 코드",
+                placeholder="선택사항",
+            )
+        search_clicked = st.form_submit_button(
+            f"연락 가능한 성장기업 {target_count}개 찾기",
+            type="primary",
+            use_container_width=True,
+            disabled=not service_key_status()["configured"],
+        )
+
+    page_state_key = f"prospect_next_page_v980_{region_name}"
+    if search_clicked:
+        start_page = int(st.session_state.get(page_state_key, 1))
+        progress_bar = st.progress(
+            0,
+            text="검색 준비 중입니다.",
+        )
+        status_box = st.empty()
+
+        def _progress(event: dict) -> None:
+            stage = event.get("stage")
+            if stage == "nps":
+                current = int(event.get("pages_scanned") or 0)
+                ratio = min(0.55, (current + 1) / max(1, max_pages) * 0.55)
+                progress_bar.progress(
+                    ratio,
+                    text=f"국민연금 사업장 {event.get('page', '')}페이지 확인 중",
+                )
+            elif stage == "quick_contact":
+                progress_bar.progress(
+                    0.72,
+                    text=(
+                        "카카오·인허가 대표전화 빠른 확인 "
+                        f"{event.get('checked', 0)}건"
+                    ),
+                )
+            elif stage == "full_contact":
+                progress_bar.progress(
+                    0.88,
+                    text=(
+                        "네이버·공식 홈페이지 정밀 확인 "
+                        f"{event.get('checked', 0)}건"
+                    ),
+                )
+            status_box.caption(
+                f"현재 확인된 대표전화 업체: {event.get('found', 0)}건"
+            )
+
+        with st.spinner(
+            "기존 고객·저장 영업후보를 제외하고 성장기업을 찾고 있습니다."
+        ):
+            result = collect_contactable_growth_companies(
+                REGION_CODES[region_name],
+                target_count=int(target_count),
+                start_page=start_page,
+                max_pages=int(max_pages),
+                minimum_employees=int(minimum_employees),
+                sigungu_code=sigungu_code,
+                emd_code=emd_code,
+                progress=_progress,
+            )
+        progress_bar.progress(1.0, text="검색을 완료했습니다.")
+        status_box.empty()
+        st.session_state["prospect_result_v980"] = result
+        st.session_state[page_state_key] = int(
+            result.get("next_page") or start_page + int(max_pages)
+        )
+
+    result = st.session_state.get("prospect_result_v980")
+    if result:
+        stats = result.get("stats") or {}
+        metric_cols = st.columns(5)
+        metric_cols[0].metric(
+            "확인한 사업장",
+            f"{stats.get('basic_received', 0):,}건",
+        )
+        metric_cols[1].metric(
+            "최근 순고용 증가",
+            f"{stats.get('growth_candidates', 0):,}건",
+        )
+        metric_cols[2].metric(
+            "기존 DB 제외",
+            f"{stats.get('saved_prospect_excluded', 0):,}건",
+        )
+        metric_cols[3].metric(
+            "전화 확인",
+            f"{result.get('found_count', 0):,}건",
+        )
+        metric_cols[4].metric(
+            "다음 검색 페이지",
+            f"{result.get('next_page', 1):,}",
+        )
+        st.caption(
+            f"우선순위: {result.get('priority_basis', '')} · "
+            f"상세조회 대상 {stats.get('detail_targets', 0):,}건 · "
+            f"연락처 확인 대상 {stats.get('contact_checked', 0):,}건"
+        )
+        if result.get("duplicate_warning"):
+            st.warning(
+                "기존 DB 중복확인 일부를 완료하지 못했습니다: "
+                f"{result['duplicate_warning']}"
+            )
+
+        items = list(result.get("items") or [])
+        if not items:
+            st.info(
+                "선택한 검색 범위에서 유효한 대표전화가 있는 업체를 찾지 못했습니다. "
+                "같은 버튼을 다시 누르면 다음 페이지부터 이어서 찾습니다."
+            )
+        else:
+            st.markdown("### 이번에 찾은 영업후보")
+            display = _display_frame(items)
+            display["대표전화"] = display["대표전화"].map(normalize_phone)
+            display = display[display["대표전화"] != ""].reset_index(drop=True)
+            visible_columns = [
+                "선택",
+                "사업장명",
+                "대표전화",
+                "전화출처",
+                "지역",
+                "주소",
+                "업종명",
+                "가입자수",
+                "신규취득자수",
+                "상실가입자수",
+                "순고용증가",
+                "영업주제",
+                "추천등급",
+                "초회전화스크립트",
+                "source_key",
+            ]
+            edited = st.data_editor(
+                display[visible_columns],
+                use_container_width=True,
+                hide_index=True,
+                disabled=[
+                    column
+                    for column in visible_columns
+                    if column != "선택"
+                ],
+                column_config={
+                    "선택": st.column_config.CheckboxColumn("저장"),
+                    "초회전화스크립트": st.column_config.TextColumn(
+                        "초회 전화 스크립트",
+                        width="large",
+                    ),
+                    "source_key": None,
+                },
+                key=f"prospect_editor_v980_{result.get('next_page', 1)}",
+            )
+            selected_keys = set(
+                edited.loc[edited["선택"] == True, "source_key"].tolist()
+            )
+            selected_items = [
+                item
+                for item in items
+                if item.get("source_key") in selected_keys
+                and normalize_phone(item.get("대표전화"))
+            ]
+            if st.button(
+                f"선택한 {len(selected_items):,}개 업체 영업DB에 저장",
+                type="primary",
+                use_container_width=True,
+                disabled=not selected_items,
+                key="save_prospects_v980",
+            ):
+                try:
+                    saved_count = save_prospects(
+                        selected_items,
+                        owner_user_id,
+                    )
+                    st.success(f"{saved_count:,}개 업체를 저장했습니다.")
+                    st.session_state.pop("prospect_result_v980", None)
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"영업후보 저장 실패: {exc}")
+
+        failures = result.get("failures") or []
+        if failures:
+            with st.expander("검색 중 확인하지 못한 항목"):
+                st.dataframe(
+                    pd.DataFrame(failures),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+    st.divider()
+    _render_clean_saved_prospects(owner_user_id)
+
+
+def render_prospect_admin_settings() -> None:
+    st.markdown("## 영업후보 데이터 연결 관리")
+    st.caption(
+        "국민연금·카카오·네이버·인허가 API와 Supabase 테이블을 "
+        "관리자가 점검하는 화면입니다."
+    )
+    nps_status = service_key_status()
+    contact_status = api_statuses()
+    status_cols = st.columns(4)
+    status_cols[0].metric(
+        "국민연금",
+        "키 등록" if nps_status["configured"] else "미등록",
+    )
+    status_cols[1].metric(
+        "카카오",
+        "키 등록" if contact_status["kakao"]["configured"] else "미등록",
+    )
+    status_cols[2].metric(
+        "네이버",
+        "키 등록" if contact_status["naver"]["configured"] else "미등록",
+    )
+    status_cols[3].metric(
+        "인허가",
+        (
+            f"{contact_status['localdata'].get('service_count', 0)}종"
+            if contact_status["localdata"]["configured"]
+            else "미등록"
+        ),
+    )
+
+    test_col1, test_col2 = st.columns(2)
+    nps_test = test_col1.button(
+        "국민연금 연결 점검",
+        use_container_width=True,
+        disabled=not nps_status["configured"],
+        key="admin_nps_test_v980",
+    )
+    contact_test = test_col2.button(
+        "연락처 API 연결 점검",
+        use_container_width=True,
+        disabled=not all(
+            row.get("configured") for row in contact_status.values()
+        ),
+        key="admin_contact_test_v980",
+    )
+    if nps_test:
+        st.session_state["admin_nps_result_v980"] = test_nps_connection("11")
+    if contact_test:
+        st.session_state["admin_contact_result_v980"] = test_connections()
+
+    nps_result = st.session_state.get("admin_nps_result_v980")
+    if nps_result:
+        st.success(nps_result.get("message", "연결 완료")) if nps_result.get(
+            "ok"
+        ) else st.error(nps_result.get("message", "연결 실패"))
+    contact_result = st.session_state.get("admin_contact_result_v980")
+    if contact_result:
+        rows = []
+        for key, label in (
+            ("kakao", "카카오 로컬"),
+            ("naver", "네이버 검색"),
+            ("localdata", "승인 인허가 API"),
+        ):
+            source = (contact_result.get("sources") or {}).get(key) or {}
+            rows.append(
+                {
+                    "연결": label,
+                    "상태": source.get("status", "-"),
+                    "결과": source.get("message", "-"),
+                }
+            )
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.markdown("### Supabase 영업후보 테이블")
+    prospect_status = prospect_table_status()
+    contacts_status = contact_table_status()
+    db_cols = st.columns(2)
+    db_cols[0].success(prospect_status[1]) if prospect_status[0] else db_cols[
+        0
+    ].warning(prospect_status[1])
+    db_cols[1].success(contacts_status[1]) if contacts_status[0] else db_cols[
+        1
+    ].warning(contacts_status[1])
+
+    for path_name, label in (
+        ("supabase_v960_prospect_db.sql", "영업후보DB SQL 다운로드"),
+        (
+            "supabase_v970_contact_enrichment.sql",
+            "연락처DB SQL 다운로드",
+        ),
+    ):
+        path = BASE_DIR / path_name
+        if path.exists():
+            st.download_button(
+                label,
+                data=path.read_bytes(),
+                file_name=path_name,
+                mime="text/plain",
+                use_container_width=True,
+                key=f"admin_download_{path_name}",
+            )

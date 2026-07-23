@@ -26,6 +26,23 @@ REGION_CODES = {
     "서울특별시": "11",
     "경기도": "41",
 }
+STOCK_COMPANY_MARKERS = ("주식회사", "(주)", "㈜", "（주）")
+EXCLUDED_LEGAL_MARKERS = (
+    "농업회사법인",
+    "유한회사",
+    "합자회사",
+    "합명회사",
+    "영농조합법인",
+    "사단법인",
+    "재단법인",
+)
+
+
+def is_stock_company_name(value: Any) -> bool:
+    name = re.sub(r"\s+", "", str(value or ""))
+    if any(marker in name for marker in EXCLUDED_LEGAL_MARKERS):
+        return False
+    return any(marker in name for marker in STOCK_COMPANY_MARKERS)
 
 
 def _service_key() -> str:
@@ -397,6 +414,8 @@ def fetch_nps_workplaces(
     timeout: int = 30,
     retries: int = 2,
     detail_workers: int = 5,
+    stock_company_only: bool = False,
+    exclude_source_keys: set[str] | None = None,
 ) -> dict[str, Any]:
     checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     key = _service_key()
@@ -470,6 +489,28 @@ def fetch_nps_workplaces(
                 "message": "API 응답 구조가 예상과 다릅니다.",
             }
         code, message, total_count, items = _items_from_json(payload)
+        basic_received_count = len(items)
+        excluded_keys = {
+            str(value or "").strip()
+            for value in (exclude_source_keys or set())
+            if str(value or "").strip()
+        }
+        if stock_company_only:
+            items = [
+                item
+                for item in items
+                if is_stock_company_name(
+                    _first(item, "wkplNm", "wkpl_nm", "사업장명")
+                )
+            ]
+        if excluded_keys:
+            items = [
+                item
+                for item in items
+                if str(_first(item, "seq", "자료순번")).strip()
+                not in excluded_keys
+            ]
+        basic_pre_filtered_count = basic_received_count - len(items)
         success = response.ok and code in {"00", "0", ""}
         detail_items, detail_failures, detail_attempts = _enrich_nps_details(
             items,
@@ -520,7 +561,9 @@ def fetch_nps_workplaces(
             "result_message": message,
             "total_count": total_count,
             "received_count": len(normalized),
-            "basic_received_count": len(items),
+            "basic_received_count": basic_received_count,
+            "basic_detail_target_count": len(items),
+            "basic_pre_filtered_count": basic_pre_filtered_count,
             "detail_success_count": len(normalized),
             "detail_failed_count": len(failed_normalized),
             "filtered_out_count": (

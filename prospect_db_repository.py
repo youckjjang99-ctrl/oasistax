@@ -118,6 +118,44 @@ def remove_existing_customers(
     return filtered, len(prospects) - len(filtered)
 
 
+def existing_prospect_identities(limit: int = 5000) -> tuple[set[str], set[str]]:
+    """Return saved prospect source keys and business numbers."""
+    db = CloudDatabase()
+    rows = db.select(
+        TABLE_PROSPECTS,
+        columns="source_key,business_no",
+        limit=min(10000, max(1, int(limit))),
+    )
+    source_keys = {
+        str(row.get("source_key") or "").strip()
+        for row in rows
+        if str(row.get("source_key") or "").strip()
+    }
+    business_nos = {
+        _business_no(row.get("business_no"))
+        for row in rows
+        if len(re.sub(r"[^0-9]", "", str(row.get("business_no") or ""))) == 10
+    }
+    return source_keys, business_nos
+
+
+def remove_existing_prospects(
+    prospects: list[dict[str, Any]],
+    *,
+    source_keys: set[str] | None = None,
+    business_nos: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    if source_keys is None or business_nos is None:
+        source_keys, business_nos = existing_prospect_identities()
+    filtered = [
+        item
+        for item in prospects
+        if str(item.get("source_key") or "").strip() not in source_keys
+        and _business_no(item.get("사업자등록번호")) not in business_nos
+    ]
+    return filtered, len(prospects) - len(filtered)
+
+
 def _database_row(
     prospect: dict[str, Any],
     owner_user_id: str,

@@ -143,19 +143,53 @@ def normalize_phone(value: Any) -> str:
     digits = re.sub(r"[^0-9]", "", str(value or ""))
     if digits.startswith("82"):
         digits = "0" + digits[2:]
+    # 대표번호(15xx/16xx/18xx)를 제외한 임의의 8자리 숫자는
+    # 날짜(20260723), 문서번호, 사업자 관련 숫자일 가능성이 높다.
+    if len(digits) == 8:
+        if re.fullmatch(r"1[568]\d{2}\d{4}", digits):
+            return f"{digits[:4]}-{digits[4:]}"
+        return ""
     if len(digits) == 11 and digits.startswith("010"):
         return f"{digits[:3]}-{digits[3:7]}-{digits[7:]}"
+    if len(digits) in {10, 11} and digits.startswith(
+        ("011", "016", "017", "018", "019")
+    ):
+        middle = 6 if len(digits) == 10 else 7
+        return f"{digits[:3]}-{digits[3:middle]}-{digits[middle:]}"
     if len(digits) == 10 and digits.startswith("02"):
         return f"{digits[:2]}-{digits[2:6]}-{digits[6:]}"
     if len(digits) == 9 and digits.startswith("02"):
         return f"{digits[:2]}-{digits[2:5]}-{digits[5:]}"
-    if len(digits) == 10:
+    landline_prefixes = (
+        "031",
+        "032",
+        "033",
+        "041",
+        "042",
+        "043",
+        "044",
+        "051",
+        "052",
+        "053",
+        "054",
+        "055",
+        "061",
+        "062",
+        "063",
+        "064",
+        "050",
+        "070",
+        "080",
+    )
+    if len(digits) == 10 and digits.startswith(landline_prefixes):
         return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
-    if len(digits) == 11:
+    if len(digits) == 11 and digits.startswith(landline_prefixes):
         return f"{digits[:3]}-{digits[3:7]}-{digits[7:]}"
-    if 8 <= len(digits) <= 12:
-        return digits
     return ""
+
+
+def is_valid_phone(value: Any) -> bool:
+    return bool(normalize_phone(value))
 
 
 def is_mobile_phone(value: Any) -> bool:
@@ -184,4 +218,3 @@ def email_matches_domain(email: Any, website_url: Any) -> bool:
         return False
     email_domain = normalized.rsplit("@", 1)[-1]
     return email_domain == host or email_domain.endswith("." + host)
-

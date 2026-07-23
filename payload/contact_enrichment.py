@@ -136,7 +136,12 @@ def _deduplicate(contacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return ordered
 
 
-def enrich_company(prospect: dict[str, Any]) -> dict[str, Any]:
+def enrich_company(
+    prospect: dict[str, Any],
+    *,
+    skip_kakao: bool = False,
+    skip_localdata: bool = False,
+) -> dict[str, Any]:
     company_name = str(
         prospect.get("company_name") or prospect.get("사업장명") or ""
     ).strip()
@@ -154,7 +159,11 @@ def enrich_company(prospect: dict[str, Any]) -> dict[str, Any]:
     contacts: list[dict[str, Any]] = []
     trace: list[dict[str, Any]] = []
 
-    kakao = kakao_local_client.search_company(company_name, address)
+    kakao = (
+        {"candidates": [], "status": "SKIPPED", "message": "빠른 조회에서 확인 완료"}
+        if skip_kakao
+        else kakao_local_client.search_company(company_name, address)
+    )
     trace.append(
         {
             "stage": "kakao",
@@ -180,7 +189,7 @@ def enrich_company(prospect: dict[str, Any]) -> dict[str, Any]:
         and int(kakao_best.get("confidence") or 0) >= AUTO_CONFIRM_SCORE
         and not is_mobile_phone(kakao_best.get("phone"))
     )
-    if not reliable_kakao_phone:
+    if not reliable_kakao_phone and not skip_localdata:
         localdata = localdata_contact_client.search_company(
             company_name,
             address,
@@ -211,7 +220,11 @@ def enrich_company(prospect: dict[str, Any]) -> dict[str, Any]:
             {
                 "stage": "localdata",
                 "status": "SKIPPED",
-                "message": "카카오에서 신뢰도 높은 대표전화를 확인했습니다.",
+                "message": (
+                    "빠른 조회에서 확인 완료"
+                    if skip_localdata
+                    else "카카오에서 신뢰도 높은 대표전화를 확인했습니다."
+                ),
             }
         )
 

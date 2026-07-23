@@ -6,7 +6,7 @@ from typing import Any
 import kakao_local_client
 import localdata_contact_client
 from contact_enrichment import enrich_company
-from contact_matching import is_mobile_phone
+from contact_matching import is_mobile_phone, normalize_phone
 
 
 REVIEW_SCORE = 65
@@ -39,12 +39,15 @@ def _phone_result(
     status: str = "FOUND",
     trace: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    normalized_phone = normalize_phone(phone)
     return {
-        "phone": phone,
+        "phone": normalized_phone,
         "phone_source": source,
         "phone_confidence": confidence,
-        "phone_review_required": is_mobile_phone(phone),
-        "contact_status": status,
+        "phone_review_required": is_mobile_phone(normalized_phone),
+        "contact_status": status if normalized_phone else (
+            status if status in {"ERROR", "NOT_FOUND"} else "NOT_FOUND"
+        ),
         "contact_trace": trace or [],
     }
 
@@ -72,7 +75,9 @@ def _extended_phone(
                 "company_name": company_name,
                 "address": address,
                 "industry_name": industry_name,
-            }
+            },
+            skip_kakao=True,
+            skip_localdata=True,
         )
     except Exception as exc:
         return _phone_result(
@@ -123,6 +128,8 @@ def _best_phone(
     company_name: str,
     address: str,
     industry_name: str,
+    *,
+    allow_extended: bool = True,
 ) -> dict[str, Any]:
     kakao = kakao_local_client.search_company(company_name, address)
     candidates = [
@@ -176,7 +183,21 @@ def _best_phone(
             ],
         )
 
-    return _extended_phone(company_name, address, industry_name)
+    if allow_extended:
+        return _extended_phone(company_name, address, industry_name)
+    return _phone_result(
+        "",
+        "",
+        0,
+        status="NOT_FOUND",
+        trace=[
+            {
+                "stage": "quick_contact",
+                "status": "NOT_FOUND",
+                "message": "카카오·인허가 빠른 조회에서 대표전화가 없습니다.",
+            }
+        ],
+    )
 
 
 def _sales_needs(
@@ -262,7 +283,11 @@ def _script(
     return " ".join((opening, reason, close))
 
 
-def analyze_sales_candidate(prospect: dict[str, Any]) -> dict[str, Any]:
+def analyze_sales_candidate(
+    prospect: dict[str, Any],
+    *,
+    contact_mode: str = "full",
+) -> dict[str, Any]:
     company_name = _text(prospect, "company_name", "사업장명")
     address = _text(prospect, "address", "주소")
     industry_name = _text(prospect, "industry_name", "업종명")
@@ -278,7 +303,12 @@ def analyze_sales_candidate(prospect: dict[str, Any]) -> dict[str, Any]:
         "상실가입자수",
     )
 
-    phone_result = _best_phone(company_name, address, industry_name)
+    phone_result = _best_phone(
+        company_name,
+        address,
+        industry_name,
+        allow_extended=contact_mode != "quick",
+    )
     needs = _sales_needs(
         new_employee_count,
         lost_employee_count,
@@ -324,6 +354,7 @@ def analyze_sales_candidate(prospect: dict[str, Any]) -> dict[str, Any]:
             bool(phone_result.get("phone_review_required")),
         ),
         "analyzed_at": analyzed_at,
+        "contact_mode": contact_mode,
     }
 
 

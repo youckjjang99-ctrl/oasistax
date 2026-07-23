@@ -19,7 +19,10 @@ from cloud_restore import restore_customer_db_if_needed
 from cloud_crm_restore import restore_crm_from_cloud
 from enterprise_center import render_enterprise_management_center
 from enterprise_customer_management import render_customer_trash_page
-from prospect_db_center import render_prospect_db_center
+from prospect_db_center import (
+    render_prospect_admin_settings,
+    render_prospect_db_center,
+)
 from address_tools import (
     enrich_address_fields,
     repair_user_customer_addresses,
@@ -2877,6 +2880,8 @@ elif CURRENT_USER_IS_ADMIN and active_tab == "시스템 관리":
         project_root=ROOT_DIR,
         current_user_id=CURRENT_USER_ID,
     )
+    st.divider()
+    render_prospect_admin_settings()
 
 elif CURRENT_USER_IS_ADMIN and active_tab == "AI 사용량":
     render_ai_usage_page(
