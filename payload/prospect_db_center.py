@@ -108,7 +108,10 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
         result_cols[1].metric("HTTP", result.get("http_status", "-"))
         result_cols[2].metric("전체 건수", f"{result.get('total_count', 0):,}")
         result_cols[3].metric("응답형식", result.get("response_format", "-"))
-        st.caption(f"마지막 점검: {result.get('checked_at', '-')}")
+        st.caption(
+            f"마지막 점검: {result.get('checked_at', '-')} · "
+            f"호출 시도: {result.get('attempt_count', 1)}회"
+        )
 
         samples = result.get("sample") or []
         if samples:
@@ -132,8 +135,8 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
     st.divider()
     st.markdown("### 2. 서울·경기 사업장 수집 미리보기")
     st.caption(
-        "한 번에 최대 100건만 조회합니다. 주소와 지역코드를 다시 확인해 "
-        "선택지역 이외의 사업장은 자동 제외합니다."
+        "기본조회에서 사업장 순번을 받은 뒤 상세조회를 자동 실행합니다. "
+        "조회 50건은 기본조회 1회와 상세조회 최대 50회가 사용됩니다."
     )
 
     with st.form("prospect_collection_form_v960"):
@@ -153,7 +156,7 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
         collect_rows = collect_col3.selectbox(
             "조회 건수",
             [10, 30, 50, 100],
-            index=2,
+            index=1,
         )
         filter_col1, filter_col2, filter_col3 = st.columns(3)
         minimum_employees = filter_col1.number_input(
@@ -181,7 +184,10 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
         )
 
     if collect_clicked:
-        with st.spinner("국민연금 사업장 데이터를 조회하고 있습니다..."):
+        with st.spinner(
+            "기본 사업장을 조회하고 상세정보를 확인하고 있습니다. "
+            "조회 건수에 따라 시간이 걸릴 수 있습니다..."
+        ):
             collection = fetch_nps_workplaces(
                 REGION_CODES[collect_region],
                 page_no=int(collect_page),
@@ -209,26 +215,34 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
     collection = st.session_state.get("prospect_collection_v960")
     if collection:
         if collection.get("ok"):
-            summary_cols = st.columns(5)
+            summary_cols = st.columns(6)
             summary_cols[0].metric(
-                "API 수신",
-                f"{collection.get('received_count', 0):,}건",
+                "기본조회",
+                f"{collection.get('basic_received_count', 0):,}건",
             )
             summary_cols[1].metric(
+                "상세조회 성공",
+                f"{collection.get('detail_success_count', 0):,}건",
+            )
+            summary_cols[2].metric(
+                "상세조회 실패",
+                f"{collection.get('detail_failed_count', 0):,}건",
+            )
+            summary_cols[3].metric(
                 "지역 외 제외",
                 f"{collection.get('filtered_out_count', 0):,}건",
             )
-            summary_cols[2].metric(
+            summary_cols[4].metric(
                 "기존 고객 제외",
                 f"{collection.get('existing_customer_count', 0):,}건",
             )
-            summary_cols[3].metric(
-                "후보",
+            summary_cols[5].metric(
+                "최종 후보",
                 f"{len(collection.get('items', [])):,}건",
             )
-            summary_cols[4].metric(
-                "페이지",
-                f"{collection.get('page_no', 1):,}",
+            st.caption(
+                f"페이지 {collection.get('page_no', 1):,} · "
+                f"실제 API 호출 시도 {collection.get('api_attempt_count', 1):,}회"
             )
             if collection.get("duplicate_warning"):
                 st.warning(
@@ -238,12 +252,41 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
         else:
             st.error(collection.get("message", "사업장 조회 실패"))
 
+        detail_failures = collection.get("detail_failures", [])
+        if detail_failures:
+            st.warning(
+                f"상세조회에 실패한 사업장 {len(detail_failures):,}건은 "
+                "가입자 수 필터를 적용하지 않고 저장대상에서 제외했습니다. "
+                "같은 페이지를 다시 조회하면 자동으로 재시도합니다."
+            )
+            failure_rows = [
+                {
+                    "사업장명": item.get("사업장명", ""),
+                    "지역코드": item.get("지역코드", ""),
+                    "사업장순번": item.get("source_key", ""),
+                    "실패사유": item.get("상세조회메시지", ""),
+                }
+                for item in detail_failures
+            ]
+            with st.expander("상세조회 실패 사업장 보기"):
+                st.dataframe(
+                    pd.DataFrame(failure_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
         prospects = collection.get("items", [])
         if collection.get("ok") and not prospects:
-            st.warning(
-                "현재 페이지에서 조건에 맞는 서울·경기 사업장이 없습니다. "
-                "다음 페이지를 조회하거나 시·군·구 법정동 코드를 입력해 주세요."
-            )
+            if detail_failures:
+                st.warning(
+                    "상세조회 성공 사업장 중 현재 조건에 맞는 후보가 없습니다. "
+                    "같은 페이지를 재시도하거나 최소 가입자 수를 확인해 주세요."
+                )
+            else:
+                st.warning(
+                    "현재 페이지에서 조건에 맞는 서울·경기 사업장이 없습니다. "
+                    "다음 페이지를 조회하거나 시·군·구 법정동 코드를 입력해 주세요."
+                )
         elif prospects:
             display = _display_frame(prospects)
             edited = st.data_editor(
