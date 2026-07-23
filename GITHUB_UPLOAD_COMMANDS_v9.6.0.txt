@@ -1,0 +1,13 @@
+# 정책자금자동화 프로젝트 폴더에서 PowerShell 실행
+
+git status
+git add app.py public_data_api.py prospect_db_center.py prospect_db_repository.py supabase_v960_prospect_db.sql VERSION.txt APPLY_UPDATE_v9.6.0.py RUN_UPDATE_v9.6.0.bat CHANGELOG_v9.6.0.md README_UPDATE_v9.6.0.md GITHUB_UPLOAD_COMMANDS_v9.6.0.txt payload
+git status
+git commit -m "OASIS CRM v9.6.0 서울경기 영업후보DB 수집 및 저장"
+git pull --rebase origin main
+git push origin main
+
+# 업로드 확인
+git status
+git log -1 --oneline
+git log origin/main -1 --oneline

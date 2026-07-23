@@ -1755,7 +1755,7 @@ elif active_tab == "내 누적 고객DB":
     render_cumulative_db_page(CURRENT_USER_ID)
 
 elif active_tab == "영업후보DB":
-    render_prospect_db_center()
+    render_prospect_db_center(CURRENT_USER_ID)
 
 elif active_tab == "통합 정책자금 매칭":
     st.markdown("### 등록 고객 통합 정책자금 AI 매칭")
