@@ -165,32 +165,54 @@ def search_official_websites(
             "candidates": [],
         }
 
-    candidates: list[dict[str, Any]] = []
-    for item in payload.get("items", []) if isinstance(payload, dict) else []:
-        if not isinstance(item, dict):
-            continue
-        url = str(item.get("link") or "").strip()
-        if not url.startswith(("http://", "https://")) or _blocked(url):
-            continue
-        title = _plain(item.get("title"))
-        description = _plain(item.get("description"))
-        score = company_score(company_name, f"{title} {description}")
-        if score <= 0:
-            continue
-        candidates.append(
-            {
-                "url": url,
-                "title": title,
-                "description": description,
-                "search_confidence": min(50, score + 5),
-            }
-        )
+    def _candidates(current_payload: Any) -> list[dict[str, Any]]:
+        found: list[dict[str, Any]] = []
+        for item in (
+            current_payload.get("items", [])
+            if isinstance(current_payload, dict)
+            else []
+        ):
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("link") or "").strip()
+            if not url.startswith(("http://", "https://")) or _blocked(url):
+                continue
+            title = _plain(item.get("title"))
+            description = _plain(item.get("description"))
+            score = company_score(company_name, f"{title} {description}")
+            if score <= 0:
+                continue
+            found.append(
+                {
+                    "url": url,
+                    "title": title,
+                    "description": description,
+                    "search_confidence": min(50, score + 5),
+                }
+            )
+        return found
+
+    candidates = _candidates(payload)
+    fallback_query = ""
+    if not candidates and base_name:
+        fallback_query = f'"{base_name}" {address_hint(address)}'.strip()
+        try:
+            fallback_response = requests.get(
+                NAVER_WEB_URL,
+                headers=_headers(),
+                params={"query": fallback_query, "display": min(20, max(1, int(display))), "start": 1},
+                timeout=timeout,
+            )
+            if fallback_response.ok:
+                candidates = _candidates(fallback_response.json())
+        except (requests.RequestException, ValueError):
+            pass
     candidates.sort(key=lambda row: row["search_confidence"], reverse=True)
     return {
         "ok": True,
         "status": "SUCCESS",
         "message": f"공식 홈페이지 후보 {len(candidates)}건",
         "query": query,
+        "fallback_query": fallback_query,
         "candidates": candidates,
     }
-

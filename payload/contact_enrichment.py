@@ -65,8 +65,16 @@ def _verification_status(
 def _phone_contact(candidate: dict[str, Any]) -> dict[str, Any] | None:
     phone = str(candidate.get("phone") or "").strip()
     score = int(candidate.get("confidence") or 0)
-    if not phone or score < REVIEW_SCORE:
+    source_type = str(candidate.get("source_type") or "")
+    # A phone displayed on a page that contains the company name can still be
+    # useful for a manual call check even when the address is not written there.
+    if not phone or (
+        score < REVIEW_SCORE
+        and not (source_type == "official_website" and score >= 45)
+    ):
         return None
+    review_only = score < REVIEW_SCORE
+    verified_score = max(REVIEW_SCORE, score) if review_only else score
     return {
         "contact_type": "phone",
         "contact_value": phone,
@@ -75,15 +83,16 @@ def _phone_contact(candidate: dict[str, Any]) -> dict[str, Any] | None:
             if is_mobile_phone(phone)
             else "사업장 공개 대표전화"
         ),
-        "source_type": str(candidate.get("source_type") or ""),
+        "source_type": source_type,
         "source_url": str(candidate.get("source_url") or ""),
-        "confidence": score,
-        "verification_status": _verification_status(score, phone=phone),
+        "confidence": verified_score,
+        "verification_status": _verification_status(verified_score, phone=phone),
         "is_primary": score >= AUTO_CONFIRM_SCORE and not is_mobile_phone(phone),
         "metadata": {
             "matched_company_name": candidate.get("company_name", ""),
             "matched_address": candidate.get("address", ""),
             "phone_type": candidate.get("phone_type", ""),
+            "review_only": review_only,
         },
     }
 

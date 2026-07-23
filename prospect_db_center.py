@@ -111,7 +111,7 @@ def _display_frame(items: list[dict]) -> pd.DataFrame:
 def _analyze_candidate_batch(
     items: list[dict],
     *,
-    limit: int = 20,
+    limit: int = 100,
 ) -> tuple[list[dict], list[dict]]:
     targets = items[: max(1, int(limit))]
     analysis_by_key: dict[str, dict] = {}
@@ -445,11 +445,11 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             help="공공데이터포털 명세의 읍면동 코드를 알고 있을 때만 입력합니다.",
         )
         auto_sales_analysis = st.checkbox(
-            "수집 후 대표전화·고용변화·영업주제를 자동분석",
+            "대표전화 확인 후 고용변화·영업주제 자동생성",
             value=True,
+            disabled=True,
             help=(
-                "주식회사 후보 중 최대 20개 업체를 분석해 아래 후보표에 "
-                "대표전화, 연락처 확인상태와 영업주제를 바로 표시합니다."
+                "대표전화가 확인되지 않은 업체는 영업후보로 표시하거나 저장하지 않습니다."
             ),
         )
         collect_clicked = st.form_submit_button(
@@ -492,11 +492,19 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 except Exception as exc:
                     duplicate_warning = str(exc)
                 analysis_failures: list[dict] = []
-                if items and auto_sales_analysis:
+                if items:
                     items, analysis_failures = _analyze_candidate_batch(
                         items,
-                        limit=20,
+                        limit=len(items),
                     )
+                contact_ready_items = [
+                    item for item in items
+                    if str(item.get("대표전화") or "").strip()
+                ]
+                collection["contact_missing_count"] = (
+                    len(items) - len(contact_ready_items)
+                )
+                items = contact_ready_items
                 collection["items"] = items
                 collection["existing_customer_count"] = duplicate_count
                 collection["duplicate_warning"] = duplicate_warning
@@ -538,7 +546,8 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 f"페이지 {collection.get('page_no', 1):,} · "
                 f"실제 API 호출 시도 {collection.get('api_attempt_count', 1):,}회 · "
                 f"주식회사 외 제외 {collection.get('non_stock_company_count', 0):,}건 · "
-                f"영업정보 분석 {collection.get('sales_analysis_count', 0):,}건"
+                f"영업정보 분석 {collection.get('sales_analysis_count', 0):,}건 · "
+                f"연락처 미확인 제외 {collection.get('contact_missing_count', 0):,}건"
             )
             if collection.get("duplicate_warning"):
                 st.warning(
@@ -580,8 +589,8 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 )
             else:
                 st.warning(
-                    "현재 페이지에서 조건에 맞는 서울·경기 주식회사가 없습니다. "
-                    "다음 페이지를 조회하거나 시·군·구 법정동 코드를 입력해 주세요."
+                    "현재 페이지에서 대표전화까지 확인된 서울·경기 주식회사가 없습니다. "
+                    "다음 페이지를 조회하면 다른 사업장을 확인합니다."
                 )
         elif prospects:
             action_col1, action_col2 = st.columns([2, 1])
@@ -599,15 +608,23 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                     "대표전화·공식홈페이지·고용변화와 영업주제를 분석하고 있습니다..."
                 ):
                     analyzed_items, analysis_failures = (
-                        _analyze_candidate_batch(prospects, limit=20)
+                        _analyze_candidate_batch(prospects, limit=len(prospects))
                     )
-                    collection["items"] = analyzed_items
+                    contact_ready_items = [
+                        item for item in analyzed_items
+                        if str(item.get("대표전화") or "").strip()
+                    ]
+                    collection["contact_missing_count"] = (
+                        collection.get("contact_missing_count", 0)
+                        + len(analyzed_items) - len(contact_ready_items)
+                    )
+                    collection["items"] = contact_ready_items
                     collection["sales_analysis_count"] = sum(
                         1 for item in analyzed_items if item.get("영업분석")
                     )
                     collection["sales_analysis_failures"] = analysis_failures
                     st.session_state["prospect_collection_v960"] = collection
-                    prospects = analyzed_items
+                    prospects = contact_ready_items
 
             analysis_failures = collection.get("sales_analysis_failures") or []
             if analysis_failures:
@@ -838,27 +855,47 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             st.error(str(exc))
             st.session_state["prospect_saved_list_v960"] = []
     all_saved_rows = st.session_state.get("prospect_saved_list_v960", [])
-    saved_rows = [
+    stock_company_rows = [
         row
         for row in all_saved_rows
         if _is_stock_company(row.get("company_name"))
     ]
-    hidden_non_stock_count = len(all_saved_rows) - len(saved_rows)
+    hidden_non_stock_count = len(all_saved_rows) - len(stock_company_rows)
     if hidden_non_stock_count:
         st.info(
             f"기존 저장자료 중 주식회사 외 {hidden_non_stock_count:,}건은 "
             "삭제하지 않고 이 영업후보 화면에서만 숨겼습니다."
         )
     contact_rows: list[dict] = []
-    if saved_rows and saved_contact_status[0]:
+    if stock_company_rows and saved_contact_status[0]:
         try:
             contact_rows = list_contacts_for_prospects(
-                [str(row.get("id")) for row in saved_rows]
+                [str(row.get("id")) for row in stock_company_rows]
             )
             st.session_state["prospect_contacts_v970"] = contact_rows
         except Exception as exc:
             st.warning(f"연락처 목록 확인 실패: {exc}")
             contact_rows = st.session_state.get("prospect_contacts_v970", [])
+
+    phone_prospect_ids = {
+        str(row.get("prospect_id") or "")
+        for row in contact_rows
+        if row.get("contact_type") == "phone"
+        and row.get("contact_value")
+        and not row.get("do_not_contact")
+    }
+    saved_rows = [
+        row
+        for row in stock_company_rows
+        if str(_saved_sales_analysis(row).get("phone") or "").strip()
+        or str(row.get("id") or "") in phone_prospect_ids
+    ]
+    hidden_no_phone_count = len(stock_company_rows) - len(saved_rows)
+    if hidden_no_phone_count:
+        st.info(
+            f"대표전화가 확인되지 않은 저장자료 {hidden_no_phone_count:,}건은 "
+            "삭제하지 않고 영업 목록에서만 숨겼습니다."
+        )
 
     if not saved_rows:
         st.info(

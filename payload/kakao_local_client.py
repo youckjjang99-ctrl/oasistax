@@ -133,45 +133,77 @@ def search_company(
             "candidates": [],
         }
 
+    payloads = [payload]
+    # Address spelling in NPS data often differs from Kakao's registered address.
+    # Retry with the company name alone when the combined query has no result.
+    initial_documents = payload.get("documents", []) if isinstance(payload, dict) else []
+    if not initial_documents and base_name and query != base_name:
+        try:
+            fallback_response = requests.get(
+                KAKAO_KEYWORD_URL,
+                headers=_headers(),
+                params={"query": base_name, "size": min(15, max(1, int(size)))},
+                timeout=timeout,
+            )
+            if fallback_response.ok:
+                fallback_payload = fallback_response.json()
+                payloads.append(fallback_payload)
+        except (requests.RequestException, ValueError):
+            pass
+
     candidates: list[dict[str, Any]] = []
-    for item in payload.get("documents", []) if isinstance(payload, dict) else []:
-        if not isinstance(item, dict):
-            continue
-        candidate_address = (
-            str(item.get("road_address_name") or "").strip()
-            or str(item.get("address_name") or "").strip()
-        )
-        phone = normalize_phone(item.get("phone"))
-        score = contact_match_score(
-            company_name,
-            address,
-            item.get("place_name"),
-            candidate_address,
-            has_phone=bool(phone),
-            active=True,
-        )
-        candidates.append(
-            {
-                "company_name": str(item.get("place_name") or ""),
-                "address": candidate_address,
-                "phone": phone,
-                "phone_type": (
-                    "mobile_unverified"
-                    if is_mobile_phone(phone)
-                    else "company_main"
-                ),
-                "source_type": "kakao_local",
-                "source_url": str(item.get("place_url") or ""),
-                "confidence": score,
-                "raw": item,
-            }
-        )
+    seen: set[tuple[str, str, str]] = set()
+    for current_payload in payloads:
+        for item in (
+            current_payload.get("documents", [])
+            if isinstance(current_payload, dict)
+            else []
+        ):
+            if not isinstance(item, dict):
+                continue
+            candidate_address = (
+                str(item.get("road_address_name") or "").strip()
+                or str(item.get("address_name") or "").strip()
+            )
+            phone = normalize_phone(item.get("phone"))
+            score = contact_match_score(
+                company_name,
+                address,
+                item.get("place_name"),
+                candidate_address,
+                has_phone=bool(phone),
+                active=True,
+            )
+            key = (
+                str(item.get("place_name") or ""),
+                candidate_address,
+                phone,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(
+                {
+                    "company_name": str(item.get("place_name") or ""),
+                    "address": candidate_address,
+                    "phone": phone,
+                    "phone_type": (
+                        "mobile_unverified"
+                        if is_mobile_phone(phone)
+                        else "company_main"
+                    ),
+                    "source_type": "kakao_local",
+                    "source_url": str(item.get("place_url") or ""),
+                    "confidence": score,
+                    "raw": item,
+                }
+            )
     candidates.sort(key=lambda row: row["confidence"], reverse=True)
     return {
         "ok": True,
         "status": "SUCCESS",
         "message": f"카카오 검색결과 {len(candidates)}건",
         "query": query,
+        "fallback_query": base_name if len(payloads) > 1 else "",
         "candidates": candidates,
     }
-
