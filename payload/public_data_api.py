@@ -36,6 +36,16 @@ EXCLUDED_LEGAL_MARKERS = (
     "사단법인",
     "재단법인",
 )
+OTHER_LEGAL_ENTITY_MARKERS = (
+    "의료법인",
+    "사회복지법인",
+    "학교법인",
+    "법무법인",
+    "세무법인",
+    "회계법인",
+    "특허법인",
+    "협동조합",
+)
 
 
 def is_stock_company_name(value: Any) -> bool:
@@ -43,6 +53,27 @@ def is_stock_company_name(value: Any) -> bool:
     if any(marker in name for marker in EXCLUDED_LEGAL_MARKERS):
         return False
     return any(marker in name for marker in STOCK_COMPANY_MARKERS)
+
+
+def is_individual_business_candidate(value: Any) -> bool:
+    """법인 형태가 이름에 표시되지 않은 사업장을 개인사업자 후보로 분류."""
+    name = re.sub(r"\s+", "", str(value or ""))
+    if len(name) < 2:
+        return False
+    legal_markers = (
+        STOCK_COMPANY_MARKERS
+        + EXCLUDED_LEGAL_MARKERS
+        + OTHER_LEGAL_ENTITY_MARKERS
+    )
+    return not any(marker in name for marker in legal_markers)
+
+
+def business_type_label(value: Any) -> str:
+    if is_stock_company_name(value):
+        return "주식회사"
+    if is_individual_business_candidate(value):
+        return "개인사업자 후보"
+    return "기타 법인·단체"
 
 
 def _service_key() -> str:
@@ -266,6 +297,7 @@ def normalize_nps_workplace(
         "source": "nps_workplace_v2",
         "source_key": source_key,
         "사업장명": company_name,
+        "사업자유형": business_type_label(company_name),
         "사업자등록번호": business_no,
         "주소": address,
         "지역": region,
@@ -415,6 +447,7 @@ def fetch_nps_workplaces(
     retries: int = 2,
     detail_workers: int = 5,
     stock_company_only: bool = False,
+    business_type: str = "all",
     exclude_source_keys: set[str] | None = None,
 ) -> dict[str, Any]:
     checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -495,11 +528,22 @@ def fetch_nps_workplaces(
             for value in (exclude_source_keys or set())
             if str(value or "").strip()
         }
+        normalized_business_type = str(business_type or "all").strip().lower()
         if stock_company_only:
+            normalized_business_type = "stock"
+        if normalized_business_type == "stock":
             items = [
                 item
                 for item in items
                 if is_stock_company_name(
+                    _first(item, "wkplNm", "wkpl_nm", "사업장명")
+                )
+            ]
+        elif normalized_business_type == "individual":
+            items = [
+                item
+                for item in items
+                if is_individual_business_candidate(
                     _first(item, "wkplNm", "wkpl_nm", "사업장명")
                 )
             ]

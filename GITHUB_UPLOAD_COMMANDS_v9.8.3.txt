@@ -1,0 +1,7 @@
+git status
+git add prospect_db_center.py prospect_collection_service.py prospect_db_repository.py public_data_api.py sales_intelligence.py contact_enrichment.py localdata_contact_client.py kakao_local_client.py naver_web_search_client.py VERSION.txt APPLY_UPDATE_v9.8.3.py RUN_UPDATE_v9.8.3.bat README_UPDATE_v9.8.3.md GITHUB_UPLOAD_COMMANDS_v9.8.3.txt payload
+git add -f CHANGELOG_v9.8.3.md
+git status
+git commit -m "OASIS CRM v9.8.3 페이지 지정 개인사업자 성장기업 검색"
+git pull --rebase origin main
+git push origin main

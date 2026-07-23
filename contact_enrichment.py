@@ -142,9 +142,9 @@ def enrich_company(
     *,
     skip_kakao: bool = False,
     skip_localdata: bool = False,
-    max_website_candidates: int = 2,
-    website_timeout: int = 5,
-    website_max_pages: int = 2,
+    max_website_candidates: int = 3,
+    website_timeout: int = 10,
+    website_max_pages: int = 4,
 ) -> dict[str, Any]:
     company_name = str(
         prospect.get("company_name") or prospect.get("사업장명") or ""

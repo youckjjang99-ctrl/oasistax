@@ -118,8 +118,8 @@ def remove_existing_customers(
     return filtered, len(prospects) - len(filtered)
 
 
-def existing_prospect_identities(limit: int = 5000) -> tuple[set[str], set[str]]:
-    """Return saved prospect source keys and business numbers."""
+def existing_prospect_identities(limit: int = 10000) -> tuple[set[str], set[str]]:
+    """사용자 구분 없이 전체 영업후보의 중복 식별값을 반환."""
     db = CloudDatabase()
     rows = db.select(
         TABLE_PROSPECTS,
@@ -162,6 +162,9 @@ def _database_row(
 ) -> dict[str, Any]:
     now = datetime.now(timezone.utc).isoformat()
     source_data = dict(prospect.get("원본데이터") or {})
+    source_data["business_type"] = str(
+        prospect.get("사업자유형") or ""
+    )
     sales_analysis = prospect.get("영업분석")
     if isinstance(sales_analysis, dict):
         source_data["sales_intelligence_v971"] = sales_analysis

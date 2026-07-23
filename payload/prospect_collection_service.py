@@ -88,8 +88,7 @@ def _find_contactable(
     progress: ProgressCallback | None = None,
     run_quick: bool = True,
     run_full: bool = True,
-    deadline_monotonic: float | None = None,
-    max_full_checks: int = 12,
+    found_offset: int = 0,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
     if needed <= 0 or not items:
         return [], [], 0
@@ -97,9 +96,7 @@ def _find_contactable(
     ordered = sorted(items, key=_growth_sort_key, reverse=True)
     quick_found: list[dict[str, Any]] = []
     quick_failures: list[dict[str, Any]] = []
-    if run_quick and (
-        deadline_monotonic is None or time.monotonic() < deadline_monotonic
-    ):
+    if run_quick:
         quick_found, quick_failures = _analyze_parallel(
             ordered,
             contact_mode="quick",
@@ -113,7 +110,7 @@ def _find_contactable(
         progress,
         stage="quick_contact",
         checked=len(ordered),
-        found=len(quick_found),
+        found=found_offset + len(selected),
     )
 
     remaining_needed = needed - len(selected)
@@ -125,16 +122,10 @@ def _find_contactable(
             for item in ordered
             if str(item.get("source_key") or "") not in selected_keys
         ]
-        no_quick_phone = no_quick_phone[: max(1, int(max_full_checks))]
-        for start in range(0, len(no_quick_phone), 4):
+        for start in range(0, len(no_quick_phone), 8):
             if remaining_needed <= 0:
                 break
-            if (
-                deadline_monotonic is not None
-                and time.monotonic() >= deadline_monotonic
-            ):
-                break
-            batch = no_quick_phone[start : start + 4]
+            batch = no_quick_phone[start : start + 8]
             full_found, full_failures = _analyze_parallel(
                 batch,
                 contact_mode="full",
@@ -148,7 +139,7 @@ def _find_contactable(
                 progress,
                 stage="full_contact",
                 checked=full_checked,
-                found=len(selected),
+                found=found_offset + len(selected),
             )
 
     selected.sort(key=_growth_sort_key, reverse=True)
@@ -163,16 +154,19 @@ def collect_contactable_growth_companies(
     start_page: int = 1,
     max_pages: int = 10,
     minimum_employees: int = 3,
+    business_type: str = "stock",
+    growth_only: bool = True,
     sigungu_code: str = "",
     emd_code: str = "",
     progress: ProgressCallback | None = None,
-    time_limit_seconds: int = 120,
 ) -> dict[str, Any]:
     target_count = min(100, max(1, int(target_count)))
-    max_pages = min(30, max(1, int(max_pages)))
+    max_pages = min(100, max(1, int(max_pages)))
     start_page = max(1, int(start_page))
     started_at = time.monotonic()
-    deadline = started_at + max(30, min(240, int(time_limit_seconds)))
+    business_type = str(business_type or "stock").strip().lower()
+    if business_type not in {"stock", "individual", "all"}:
+        business_type = "stock"
 
     try:
         saved_source_keys, saved_business_nos = (
@@ -200,14 +194,11 @@ def collect_contactable_growth_companies(
         "contact_checked": 0,
         "pages_scanned": 0,
         "elapsed_seconds": 0.0,
-        "time_limit_reached": False,
+        "growth_only": bool(growth_only),
     }
 
     for offset in range(max_pages):
         if len(selected) >= target_count:
-            break
-        if time.monotonic() >= deadline:
-            stats["time_limit_reached"] = True
             break
         page_no = start_page + offset
         _notify(
@@ -224,9 +215,9 @@ def collect_contactable_growth_companies(
             sigungu_code=sigungu_code,
             emd_code=emd_code,
             detail_workers=8,
-            timeout=8,
-            retries=0,
-            stock_company_only=True,
+            timeout=30,
+            retries=2,
+            business_type=business_type,
             exclude_source_keys=seen_source_keys,
         )
         stats["pages_scanned"] += 1
@@ -308,34 +299,9 @@ def collect_contactable_growth_companies(
             page_growth,
             needed=target_count - len(selected),
             progress=progress,
-            run_full=False,
-            deadline_monotonic=deadline,
-        )
-        selected.extend(growth_found)
-        failures.extend(contact_failures)
-        stats["contact_checked"] += checked
-
-    selected_source_keys = {
-        str(row.get("source_key") or "") for row in selected
-    }
-    remaining_growth = [
-        row
-        for row in sorted(growth_pool, key=_growth_sort_key, reverse=True)
-        if str(row.get("source_key") or "") not in selected_source_keys
-    ]
-    if (
-        len(selected) < target_count
-        and remaining_growth
-        and time.monotonic() < deadline
-    ):
-        growth_found, contact_failures, checked = _find_contactable(
-            remaining_growth,
-            needed=target_count - len(selected),
-            progress=progress,
-            run_quick=False,
+            run_quick=True,
             run_full=True,
-            deadline_monotonic=deadline,
-            max_full_checks=12,
+            found_offset=len(selected),
         )
         selected.extend(growth_found)
         failures.extend(contact_failures)
@@ -344,16 +310,15 @@ def collect_contactable_growth_companies(
     if (
         len(selected) < target_count
         and fallback_pool
-        and time.monotonic() < deadline
+        and not growth_only
     ):
         fallback_found, contact_failures, checked = _find_contactable(
-            sorted(fallback_pool, key=_growth_sort_key, reverse=True)[
-                : max(target_count * 2, 20)
-            ],
+            sorted(fallback_pool, key=_growth_sort_key, reverse=True),
             needed=target_count - len(selected),
             progress=progress,
-            run_full=False,
-            deadline_monotonic=deadline,
+            run_quick=True,
+            run_full=True,
+            found_offset=len(selected),
         )
         selected.extend(fallback_found)
         failures.extend(contact_failures)
@@ -364,8 +329,6 @@ def collect_contactable_growth_companies(
     ][:target_count]
     selected.sort(key=_growth_sort_key, reverse=True)
     stats["elapsed_seconds"] = round(time.monotonic() - started_at, 1)
-    if time.monotonic() >= deadline:
-        stats["time_limit_reached"] = True
     return {
         "ok": True,
         "items": selected,
@@ -375,7 +338,14 @@ def collect_contactable_growth_companies(
         "stats": stats,
         "failures": failures,
         "duplicate_warning": duplicate_warning,
+        "business_type": business_type,
+        "growth_only": bool(growth_only),
+        "searched_start_page": start_page,
+        "searched_end_page": (
+            start_page + max(0, stats["pages_scanned"] - 1)
+        ),
         "priority_basis": (
-            "최근 월간 순고용 증가(신규취득자수-상실가입자수) 우선"
+            "최근 월간 순고용 증가(신규취득자수-상실가입자수) "
+            + ("사업장만" if growth_only else "사업장 우선")
         ),
     }

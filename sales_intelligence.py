@@ -82,9 +82,9 @@ def _extended_phone(
             },
             skip_kakao=True,
             skip_localdata=True,
-            max_website_candidates=1,
-            website_timeout=4,
-            website_max_pages=2,
+            max_website_candidates=3,
+            website_timeout=10,
+            website_max_pages=4,
         )
     except Exception as exc:
         return _phone_result(
@@ -146,21 +146,21 @@ def _best_phone(
                 kakao_local_client.search_company,
                 company_name,
                 address,
-                timeout=5,
+                timeout=10,
             ),
             "localdata": executor.submit(
                 localdata_contact_client.search_company,
                 company_name,
                 address,
                 industry_name,
-                timeout=5,
-                max_services=2,
+                timeout=12,
+                max_services=6,
             ),
             "naver": executor.submit(
                 naver_web_search_client.search_public_phones,
                 company_name,
                 address,
-                timeout=5,
+                timeout=10,
             ),
         }
         source_results: dict[str, dict[str, Any]] = {}
