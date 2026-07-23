@@ -1,0 +1,6 @@
+git status
+git add kipris_patent_client.py sales_intelligence.py localdata_contact_client.py prospect_db_center.py prospect_db_repository.py VERSION.txt APPLY_UPDATE_v9.7.1.py RUN_UPDATE_v9.7.1.bat CHANGELOG_v9.7.1.md README_UPDATE_v9.7.1.md GITHUB_UPLOAD_COMMANDS_v9.7.1.txt payload
+git status
+git commit -m "OASIS CRM v9.7.1 영업후보 연락처 특허 니즈 분석"
+git pull --rebase origin main
+git push origin main

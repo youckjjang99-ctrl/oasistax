@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
+import kipris_patent_client
 from contact_enrichment import api_statuses, enrich_company, test_connections
 from public_data_api import (
     NPS_BASE_URL,
@@ -19,9 +21,11 @@ from prospect_db_repository import (
     list_prospects,
     prospect_table_status,
     remove_existing_customers,
+    save_sales_analysis,
     save_prospect_contacts,
     save_prospects,
 )
+from sales_intelligence import analyze_sales_candidate, merge_analysis
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -36,16 +40,139 @@ def _display_frame(items: list[dict]) -> pd.DataFrame:
             "사업자등록번호": item.get("사업자등록번호", ""),
             "지역": item.get("지역", ""),
             "주소": item.get("주소", ""),
+            "대표전화": item.get("대표전화", ""),
             "업종명": item.get("업종명", ""),
             "가입자수": int(item.get("가입자수") or 0),
             "신규취득자수": int(item.get("신규취득자수") or 0),
             "상실가입자수": int(item.get("상실가입자수") or 0),
+            "순고용증가": int(item.get("순고용증가") or 0),
+            "특허등록": int(item.get("특허등록") or 0),
+            "특허확인": item.get("특허확인", "분석 전"),
+            "영업주제": item.get("영업주제", "분석 전"),
+            "추천등급": item.get("추천등급", ""),
             "우선순위점수": int(item.get("우선순위점수") or 0),
             "추천사유": " · ".join(item.get("추천사유") or []),
+            "초회전화스크립트": item.get("초회전화스크립트", ""),
             "source_key": item.get("source_key", ""),
         }
         rows.append(row)
-    return pd.DataFrame(rows)
+    columns = [
+        "선택",
+        "사업장명",
+        "사업자등록번호",
+        "지역",
+        "주소",
+        "대표전화",
+        "업종명",
+        "가입자수",
+        "신규취득자수",
+        "상실가입자수",
+        "순고용증가",
+        "특허등록",
+        "특허확인",
+        "영업주제",
+        "추천등급",
+        "우선순위점수",
+        "추천사유",
+        "초회전화스크립트",
+        "source_key",
+    ]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _analyze_candidate_batch(
+    items: list[dict],
+    *,
+    limit: int = 20,
+) -> tuple[list[dict], list[dict]]:
+    targets = items[: max(1, int(limit))]
+    analysis_by_key: dict[str, dict] = {}
+    failures: list[dict] = []
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        future_map = {
+            executor.submit(analyze_sales_candidate, item): item
+            for item in targets
+        }
+        for future in as_completed(future_map):
+            item = future_map[future]
+            source_key = str(item.get("source_key") or "")
+            try:
+                analysis_by_key[source_key] = future.result()
+            except Exception as exc:
+                failures.append(
+                    {
+                        "사업장명": item.get("사업장명", ""),
+                        "실패사유": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+    merged = [
+        (
+            merge_analysis(item, analysis_by_key[str(item.get("source_key") or "")])
+            if str(item.get("source_key") or "") in analysis_by_key
+            else item
+        )
+        for item in items
+    ]
+    return merged, failures
+
+
+def _saved_sales_analysis(row: dict) -> dict:
+    source_data = row.get("source_data") or {}
+    if not isinstance(source_data, dict):
+        return {}
+    analysis = source_data.get("sales_intelligence_v971") or {}
+    return analysis if isinstance(analysis, dict) else {}
+
+
+def _saved_candidate_frame(
+    rows: list[dict],
+    contacts: list[dict],
+) -> pd.DataFrame:
+    phone_by_id: dict[str, str] = {}
+    email_by_id: dict[str, str] = {}
+    for contact in contacts:
+        prospect_id = str(contact.get("prospect_id") or "")
+        if contact.get("do_not_contact"):
+            continue
+        if (
+            contact.get("contact_type") == "phone"
+            and prospect_id not in phone_by_id
+        ):
+            phone_by_id[prospect_id] = str(contact.get("contact_value") or "")
+        if (
+            contact.get("contact_type") == "email"
+            and prospect_id not in email_by_id
+        ):
+            email_by_id[prospect_id] = str(contact.get("contact_value") or "")
+    display: list[dict] = []
+    for row in rows:
+        prospect_id = str(row.get("id") or "")
+        analysis = _saved_sales_analysis(row)
+        display.append(
+            {
+                "업체명": row.get("company_name", ""),
+                "대표전화": (
+                    phone_by_id.get(prospect_id)
+                    or analysis.get("phone", "")
+                ),
+                "이메일": email_by_id.get(prospect_id, ""),
+                "가입자": int(row.get("employee_count") or 0),
+                "순고용증가": int(analysis.get("net_hiring") or 0),
+                "등록특허": int(
+                    analysis.get("registered_patent_count") or 0
+                ),
+                "특허확인": analysis.get("patent_status", "분석 전"),
+                "영업주제": " · ".join(
+                    analysis.get("sales_topics") or []
+                ),
+                "추천등급": analysis.get("recommendation_grade", ""),
+                "초회전화스크립트": analysis.get(
+                    "first_call_script",
+                    "",
+                ),
+            }
+        )
+    return pd.DataFrame(display)
 
 
 def _contact_result_row(result: dict) -> dict:
@@ -71,11 +198,15 @@ def _contact_result_row(result: dict) -> dict:
 def render_prospect_db_center(owner_user_id: str = "") -> None:
     st.markdown("## 영업후보DB")
     st.caption(
-        "공공데이터를 활용해 서울·경기 사업장 후보DB를 생성하기 위한 "
-        "관리자 전용 화면입니다."
+        "사업장을 찾고 연락처·특허·고용변화를 분석해 "
+        "전화할 이유와 초회 스크립트까지 준비합니다."
     )
+    guide_cols = st.columns(3)
+    guide_cols[0].info("① 서울·경기 사업장 수집")
+    guide_cols[1].info("② 연락처·특허·고용 자동분석")
+    guide_cols[2].info("③ 후보 저장 후 초회전화")
 
-    st.markdown("### 1. 공공데이터 API 연결 점검")
+    st.markdown("### 1. 데이터 연결 상태")
     st.info(
         "인증키와 응답구조를 확인한 뒤 서울·경기 사업장을 "
         "최대 100건씩 미리보기로 수집합니다."
@@ -90,7 +221,7 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
     col2.metric("인증키 마스킹", key_status["masked"])
     col3.metric("대상 API", "국민연금 사업장")
 
-    with st.expander("연결 설정", expanded=True):
+    with st.expander("국민연금 연결 설정", expanded=False):
         st.code("DATA_GO_KR_SERVICE_KEY", language="text")
         st.caption(
             "호출주소: "
@@ -156,9 +287,10 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             elif status in {"LIMITED_NUMBER_OF_SERVICE_REQUESTS_EXCEEDS_ERROR", "22"}:
                 st.warning("개발계정의 일일 호출한도를 확인해 주세요.")
 
-    st.markdown("#### 연락처 보강 API")
+    st.markdown("#### 영업정보 데이터")
     contact_api_status = api_statuses()
-    api_cols = st.columns(3)
+    patent_key_status = kipris_patent_client.key_status()
+    api_cols = st.columns(4)
     api_cols[0].metric(
         "카카오 로컬",
         "등록됨" if contact_api_status["kakao"]["configured"] else "미등록",
@@ -175,16 +307,21 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             else "미등록"
         ),
     )
-    with st.expander("연락처 보강 연결 설정"):
+    api_cols[3].metric(
+        "KIPRIS 특허",
+        "등록됨" if patent_key_status["configured"] else "미등록",
+    )
+    with st.expander("외부 데이터 연결 설정"):
         st.code(
             "KAKAO_REST_API_KEY\n"
             "NAVER_CLIENT_ID\n"
             "NAVER_CLIENT_SECRET\n"
-            "DATA_GO_KR_SERVICE_KEY",
+            "DATA_GO_KR_SERVICE_KEY\n"
+            "KIPRIS_API_KEY",
             language="text",
         )
         contact_test_clicked = st.button(
-            "연락처 보강 API 연결 점검",
+            "외부 데이터 연결 점검",
             use_container_width=True,
             disabled=not all(
                 row.get("configured")
@@ -193,8 +330,18 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             key="contact_api_connection_test_v970",
         )
     if contact_test_clicked:
-        with st.spinner("카카오·네이버·승인 인허가 API를 점검하고 있습니다..."):
-            st.session_state["contact_api_test_result_v970"] = test_connections()
+        with st.spinner(
+            "카카오·네이버·인허가·KIPRIS API를 점검하고 있습니다..."
+        ):
+            connection_result = test_connections()
+            patent_result = kipris_patent_client.test_connection()
+            connection_result.setdefault("sources", {})["kipris"] = patent_result
+            connection_result["ok"] = bool(
+                connection_result.get("ok") and patent_result.get("ok")
+            )
+            st.session_state["contact_api_test_result_v970"] = (
+                connection_result
+            )
 
     contact_test = st.session_state.get("contact_api_test_result_v970")
     if contact_test:
@@ -204,6 +351,7 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             ("kakao", "카카오 로컬"),
             ("naver", "네이버 검색"),
             ("localdata", "승인 인허가 API"),
+            ("kipris", "KIPRIS 특허"),
         ):
             source = sources.get(key) or {}
             test_rows.append(
@@ -280,8 +428,16 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             placeholder="선택사항",
             help="공공데이터포털 명세의 읍면동 코드를 알고 있을 때만 입력합니다.",
         )
+        auto_sales_analysis = st.checkbox(
+            "수집 후 대표전화·특허·고용변화·영업주제를 자동분석",
+            value=True,
+            help=(
+                "최종 후보 중 최대 20개 업체를 분석해 아래 후보표에 "
+                "전화번호와 영업주제를 바로 표시합니다."
+            ),
+        )
         collect_clicked = st.form_submit_button(
-            "사업장 미리보기 수집",
+            "사업장 수집 및 영업정보 자동완성",
             type="primary",
             use_container_width=True,
             disabled=not key_status["configured"],
@@ -311,9 +467,19 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                     items, duplicate_count = remove_existing_customers(items)
                 except Exception as exc:
                     duplicate_warning = str(exc)
+                analysis_failures: list[dict] = []
+                if items and auto_sales_analysis:
+                    items, analysis_failures = _analyze_candidate_batch(
+                        items,
+                        limit=20,
+                    )
                 collection["items"] = items
                 collection["existing_customer_count"] = duplicate_count
                 collection["duplicate_warning"] = duplicate_warning
+                collection["sales_analysis_count"] = sum(
+                    1 for item in items if item.get("영업분석")
+                )
+                collection["sales_analysis_failures"] = analysis_failures
             st.session_state["prospect_collection_v960"] = collection
 
     collection = st.session_state.get("prospect_collection_v960")
@@ -346,7 +512,8 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             )
             st.caption(
                 f"페이지 {collection.get('page_no', 1):,} · "
-                f"실제 API 호출 시도 {collection.get('api_attempt_count', 1):,}회"
+                f"실제 API 호출 시도 {collection.get('api_attempt_count', 1):,}회 · "
+                f"영업정보 분석 {collection.get('sales_analysis_count', 0):,}건"
             )
             if collection.get("duplicate_warning"):
                 st.warning(
@@ -392,7 +559,89 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                     "다음 페이지를 조회하거나 시·군·구 법정동 코드를 입력해 주세요."
                 )
         elif prospects:
-            display = _display_frame(prospects)
+            action_col1, action_col2 = st.columns([2, 1])
+            action_col1.info(
+                "아래 표에서 대표전화·특허등록·순고용증가·영업주제와 "
+                "초회 전화 스크립트를 한 번에 확인할 수 있습니다."
+            )
+            reanalyze_clicked = action_col2.button(
+                "영업정보 다시 분석",
+                use_container_width=True,
+                key="reanalyze_candidates_v971",
+            )
+            if reanalyze_clicked:
+                with st.spinner(
+                    "대표전화·특허·고용변화와 영업주제를 분석하고 있습니다..."
+                ):
+                    analyzed_items, analysis_failures = (
+                        _analyze_candidate_batch(prospects, limit=20)
+                    )
+                    collection["items"] = analyzed_items
+                    collection["sales_analysis_count"] = sum(
+                        1 for item in analyzed_items if item.get("영업분석")
+                    )
+                    collection["sales_analysis_failures"] = analysis_failures
+                    st.session_state["prospect_collection_v960"] = collection
+                    prospects = analyzed_items
+
+            analysis_failures = collection.get("sales_analysis_failures") or []
+            if analysis_failures:
+                with st.expander(
+                    f"영업정보를 확인하지 못한 업체 {len(analysis_failures)}건"
+                ):
+                    st.dataframe(
+                        pd.DataFrame(analysis_failures),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+            with st.form("prospect_sales_filter_v971"):
+                filter_view_col1, filter_view_col2, filter_view_col3 = (
+                    st.columns(3)
+                )
+                patent_only = filter_view_col1.checkbox(
+                    "등록특허 보유업체만",
+                    key="prospect_patent_only_v971",
+                    disabled=not patent_key_status["configured"],
+                    help=(
+                        "KIPRIS_API_KEY 등록 후 사용할 수 있습니다."
+                        if not patent_key_status["configured"]
+                        else "등록번호가 확인된 특허가 1건 이상인 업체만 표시합니다."
+                    ),
+                )
+                hiring_only = filter_view_col2.checkbox(
+                    "순고용 증가업체만",
+                    key="prospect_hiring_only_v971",
+                )
+                grade_filter = filter_view_col3.selectbox(
+                    "추천등급",
+                    ["전체", "A", "B", "C"],
+                    key="prospect_grade_filter_v971",
+                )
+                st.form_submit_button(
+                    "조건 적용",
+                    use_container_width=True,
+                )
+
+            visible_prospects = [
+                item
+                for item in prospects
+                if (
+                    not patent_only
+                    or int(item.get("특허등록") or 0) > 0
+                )
+                and (
+                    not hiring_only
+                    or int(item.get("순고용증가") or 0) > 0
+                )
+                and (
+                    grade_filter == "전체"
+                    or item.get("추천등급") == grade_filter
+                )
+            ]
+            display = _display_frame(visible_prospects)
+            if display.empty:
+                st.warning("선택한 조건에 맞는 영업후보가 없습니다.")
             edited = st.data_editor(
                 display,
                 use_container_width=True,
@@ -406,18 +655,57 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                         "저장",
                         help="영업후보DB에 저장할 업체를 선택합니다.",
                     ),
+                    "대표전화": st.column_config.TextColumn(
+                        "대표전화",
+                        width="medium",
+                    ),
+                    "영업주제": st.column_config.TextColumn(
+                        "영업주제",
+                        width="large",
+                    ),
+                    "초회전화스크립트": st.column_config.TextColumn(
+                        "초회 전화 스크립트",
+                        width="large",
+                    ),
                     "source_key": None,
                 },
-                key="prospect_editor_v960",
+                key=(
+                    "prospect_editor_v971_"
+                    f"{int(patent_only)}_{int(hiring_only)}_{grade_filter}"
+                ),
             )
             selected_keys = set(
                 edited.loc[edited["선택"] == True, "source_key"].tolist()
             )
             selected_items = [
-                item for item in prospects
+                item for item in visible_prospects
                 if item.get("source_key") in selected_keys
             ]
             st.caption(f"저장 선택: {len(selected_items):,}건")
+
+            script_options = {
+                str(item.get("사업장명") or item.get("source_key")): item
+                for item in visible_prospects
+                if item.get("초회전화스크립트")
+            }
+            if script_options:
+                with st.expander("초회 영업전화 스크립트 크게 보기"):
+                    script_company = st.selectbox(
+                        "업체 선택",
+                        list(script_options.keys()),
+                        key="preview_call_script_company_v971",
+                    )
+                    selected_script_item = script_options[script_company]
+                    st.text_area(
+                        "전화 스크립트",
+                        value=selected_script_item.get(
+                            "초회전화스크립트",
+                            "",
+                        ),
+                        height=180,
+                        disabled=True,
+                        key="preview_call_script_v971",
+                    )
 
             if st.button(
                 "선택한 업체를 영업후보DB에 저장",
@@ -443,219 +731,159 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                         st.error(str(exc))
 
     st.divider()
-    st.markdown("### 3. Supabase 영업후보DB")
-    status_col, action_col = st.columns([2, 1])
-    table_status = st.session_state.get("prospect_table_status_v960")
-    if action_col.button(
-        "테이블 연결 확인",
-        use_container_width=True,
-        key="check_prospect_table_v960",
+    st.markdown("### 3. 저장된 영업후보 관리")
+    st.caption(
+        "기술적인 DB 설정은 아래 관리자 설정 안에 모았습니다. "
+        "평소에는 업체를 선택하고 분석 또는 정밀 연락처 보강만 누르면 됩니다."
+    )
+
+    if "prospect_table_status_v960" not in st.session_state:
+        st.session_state["prospect_table_status_v960"] = prospect_table_status()
+    if "contact_table_status_v970" not in st.session_state:
+        st.session_state["contact_table_status_v970"] = contact_table_status()
+    table_status = st.session_state["prospect_table_status_v960"]
+    saved_contact_status = st.session_state["contact_table_status_v970"]
+
+    setup_ok = bool(table_status[0] and saved_contact_status[0])
+    with st.expander(
+        "관리자 설정 · DB 연결 상태",
+        expanded=not setup_ok,
     ):
-        table_status = prospect_table_status()
-        st.session_state["prospect_table_status_v960"] = table_status
-    if table_status:
+        setup_col1, setup_col2 = st.columns(2)
         if table_status[0]:
-            status_col.success(table_status[1])
+            setup_col1.success("영업후보 저장 준비 완료")
         else:
-            status_col.warning(table_status[1])
-    else:
-        status_col.info("테이블 생성 후 연결 확인을 눌러 주세요.")
-
-    sql_path = BASE_DIR / "supabase_v960_prospect_db.sql"
-    if sql_path.exists():
-        st.download_button(
-            "Supabase 영업후보DB 생성 SQL 다운로드",
-            data=sql_path.read_bytes(),
-            file_name="supabase_v960_prospect_db.sql",
-            mime="text/plain",
-            use_container_width=True,
-        )
-    st.caption(
-        "SQL은 Supabase SQL Editor에서 한 번만 실행합니다. "
-        "기존 고객DB 테이블은 변경하지 않습니다."
-    )
-
-    saved_rows = st.session_state.get("prospect_saved_list_v960", [])
-    if table_status and table_status[0]:
-        if st.button(
-            "저장된 영업후보 새로고침",
-            use_container_width=True,
-            key="refresh_saved_prospects_v960",
-        ):
-            try:
-                st.session_state["prospect_saved_list_v960"] = list_prospects()
-            except Exception as exc:
-                st.error(str(exc))
-        saved_rows = st.session_state.get("prospect_saved_list_v960", [])
-        if saved_rows:
-            st.dataframe(
-                pd.DataFrame(saved_rows),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-    st.divider()
-    st.markdown("### 4. 잠재고객 연락처 자동 보강")
-    st.caption(
-        "카카오 로컬 → 승인 인허가 API → 네이버 웹검색 → 공식 홈페이지 "
-        "순서로 공개된 대표전화·이메일·홈페이지를 확인합니다. "
-        "휴대전화와 일치도가 낮은 자료는 확인 필요로 저장합니다."
-    )
-
-    contact_status_col, contact_action_col = st.columns([2, 1])
-    saved_contact_status = st.session_state.get("contact_table_status_v970")
-    if contact_action_col.button(
-        "연락처 테이블 연결 확인",
-        use_container_width=True,
-        key="check_contact_table_v970",
-    ):
-        saved_contact_status = contact_table_status()
-        st.session_state["contact_table_status_v970"] = saved_contact_status
-    if saved_contact_status:
+            setup_col1.warning("영업후보 테이블 설정 필요")
         if saved_contact_status[0]:
-            contact_status_col.success(saved_contact_status[1])
+            setup_col2.success("연락처 저장 준비 완료")
         else:
-            contact_status_col.warning(saved_contact_status[1])
-    else:
-        contact_status_col.info("추가 SQL 실행 후 연결 확인을 눌러 주세요.")
+            setup_col2.warning("연락처 테이블 설정 필요")
 
-    contact_sql_path = BASE_DIR / "supabase_v970_contact_enrichment.sql"
-    if contact_sql_path.exists():
-        st.download_button(
-            "Supabase 연락처 테이블 추가 SQL 다운로드",
-            data=contact_sql_path.read_bytes(),
-            file_name="supabase_v970_contact_enrichment.sql",
-            mime="text/plain",
+        if st.button(
+            "DB 연결상태 새로 확인",
             use_container_width=True,
-            key="download_contact_sql_v970",
-        )
-    st.caption(
-        "이 SQL은 연락처 전용 테이블만 추가하며 기존 고객DB와 "
-        "영업후보DB의 구조·데이터는 변경하지 않습니다."
-    )
+            key="refresh_db_status_v971",
+        ):
+            st.session_state["prospect_table_status_v960"] = (
+                prospect_table_status()
+            )
+            st.session_state["contact_table_status_v970"] = (
+                contact_table_status()
+            )
+            table_status = st.session_state["prospect_table_status_v960"]
+            saved_contact_status = st.session_state[
+                "contact_table_status_v970"
+            ]
 
-    if saved_contact_status and saved_contact_status[0]:
-        if not saved_rows:
+        sql_path = BASE_DIR / "supabase_v960_prospect_db.sql"
+        contact_sql_path = BASE_DIR / "supabase_v970_contact_enrichment.sql"
+        if not table_status[0] and sql_path.exists():
             st.info(
-                "먼저 위의 ‘저장된 영업후보 새로고침’을 눌러 "
-                "연락처를 보강할 업체를 불러와 주세요."
+                "① 아래 영업후보DB SQL을 Supabase SQL Editor에서 "
+                "먼저 한 번 실행합니다."
+            )
+            st.download_button(
+                "① 영업후보DB 설정파일 다운로드",
+                data=sql_path.read_bytes(),
+                file_name="supabase_v960_prospect_db.sql",
+                mime="text/plain",
+                use_container_width=True,
+                key="download_prospect_sql_v971",
+            )
+        if not saved_contact_status[0] and contact_sql_path.exists():
+            st.info(
+                "② 영업후보DB 설정 후 아래 연락처 SQL을 "
+                "Supabase SQL Editor에서 한 번 실행합니다."
+            )
+            st.download_button(
+                "② 연락처DB 설정파일 다운로드",
+                data=contact_sql_path.read_bytes(),
+                file_name="supabase_v970_contact_enrichment.sql",
+                mime="text/plain",
+                use_container_width=True,
+                key="download_contact_sql_v971",
+            )
+        st.caption(
+            "두 SQL은 최초 1회만 필요합니다. v9.7.1은 기존 "
+            "source_data에 영업분석을 추가하므로 새 SQL이 없습니다."
+        )
+
+    if not table_status[0]:
+        st.warning(
+            "관리자 설정에서 ① 영업후보DB 설정을 완료하면 "
+            "저장된 영업후보 관리 화면이 열립니다."
+        )
+        return
+
+    load_col1, load_col2 = st.columns([3, 1])
+    load_col1.success("영업후보DB 연결 완료")
+    refresh_saved = load_col2.button(
+        "저장목록 새로고침",
+        use_container_width=True,
+        key="refresh_saved_prospects_v971",
+    )
+    if refresh_saved or "prospect_saved_list_v960" not in st.session_state:
+        try:
+            st.session_state["prospect_saved_list_v960"] = list_prospects()
+        except Exception as exc:
+            st.error(str(exc))
+            st.session_state["prospect_saved_list_v960"] = []
+    saved_rows = st.session_state.get("prospect_saved_list_v960", [])
+    contact_rows: list[dict] = []
+    if saved_rows and saved_contact_status[0]:
+        try:
+            contact_rows = list_contacts_for_prospects(
+                [str(row.get("id")) for row in saved_rows]
+            )
+            st.session_state["prospect_contacts_v970"] = contact_rows
+        except Exception as exc:
+            st.warning(f"연락처 목록 확인 실패: {exc}")
+            contact_rows = st.session_state.get("prospect_contacts_v970", [])
+
+    if not saved_rows:
+        st.info(
+            "아직 저장된 영업후보가 없습니다. 위 후보표에서 업체를 선택해 "
+            "영업후보DB에 저장해 주세요."
+        )
+        return
+
+    saved_frame = _saved_candidate_frame(saved_rows, contact_rows)
+    st.dataframe(
+        saved_frame,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "초회전화스크립트": st.column_config.TextColumn(
+                "초회 전화 스크립트",
+                width="large",
+            )
+        },
+    )
+    with st.expander("기존 영업후보 원본데이터 보기"):
+        st.dataframe(
+            pd.DataFrame(saved_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with st.expander("저장된 연락처 상세보기"):
+        if not saved_contact_status[0]:
+            st.info(
+                "관리자 설정에서 연락처 테이블 연결을 먼저 완료해 주세요."
             )
         else:
-            label_to_id = {
-                (
-                    f"{row.get('company_name', '(업체명 없음)')} | "
-                    f"{row.get('address', '')} | {row.get('id', '')}"
-                ): str(row.get("id") or "")
-                for row in saved_rows
-                if row.get("id")
-            }
-            row_by_id = {
-                str(row.get("id")): row
-                for row in saved_rows
-                if row.get("id")
-            }
-            with st.form("contact_enrichment_form_v970"):
-                selected_labels = st.multiselect(
-                    "연락처를 보강할 영업후보",
-                    list(label_to_id.keys()),
-                    max_selections=10,
-                    help="한 번에 최대 10개 업체를 처리합니다.",
-                )
-                st.warning(
-                    "공개된 사업용 연락처만 수집합니다. 실제 연락 전에는 "
-                    "출처와 수신거부 여부를 확인해 주세요."
-                )
-                enrich_clicked = st.form_submit_button(
-                    "선택 업체 연락처 자동 보강",
-                    type="primary",
-                    use_container_width=True,
-                    disabled=not selected_labels,
-                )
-
-            if enrich_clicked:
-                selected_ids = [
-                    label_to_id[label]
-                    for label in selected_labels
-                    if label in label_to_id
-                ]
-                results: list[dict] = []
-                progress = st.progress(0, text="연락처 보강을 시작합니다.")
-                for index, prospect_id in enumerate(selected_ids, start=1):
-                    prospect = row_by_id[prospect_id]
-                    try:
-                        result = enrich_company(prospect)
-                        result["prospect_id"] = prospect_id
-                        result["saved_count"] = save_prospect_contacts(
-                            prospect_id,
-                            result.get("contacts") or [],
-                            owner_user_id,
-                        )
-                    except Exception as exc:
-                        result = {
-                            "ok": False,
-                            "prospect_id": prospect_id,
-                            "company_name": prospect.get("company_name", ""),
-                            "status": "error",
-                            "contacts": [],
-                            "saved_count": 0,
-                            "trace": [
-                                {
-                                    "stage": "error",
-                                    "status": type(exc).__name__,
-                                    "message": str(exc),
-                                }
-                            ],
-                        }
-                    results.append(result)
-                    progress.progress(
-                        index / max(1, len(selected_ids)),
-                        text=f"{index}/{len(selected_ids)} 업체 확인 완료",
-                    )
-                st.session_state["contact_enrichment_results_v970"] = results
-                try:
-                    st.session_state["prospect_contacts_v970"] = (
-                        list_contacts_for_prospects(
-                            [str(row.get("id")) for row in saved_rows]
-                        )
-                    )
-                except Exception as exc:
-                    st.warning(f"저장 후 연락처 새로고침 실패: {exc}")
-
-            enrichment_results = st.session_state.get(
-                "contact_enrichment_results_v970",
-                [],
-            )
-            if enrichment_results:
-                st.dataframe(
-                    pd.DataFrame(
-                        [_contact_result_row(row) for row in enrichment_results]
-                    ),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-                with st.expander("업체별 수집 경로와 판정 보기"):
-                    for result in enrichment_results:
-                        st.markdown(f"**{result.get('company_name', '')}**")
-                        st.dataframe(
-                            pd.DataFrame(result.get("trace") or []),
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-
             if st.button(
                 "저장된 연락처 새로고침",
                 use_container_width=True,
                 key="refresh_prospect_contacts_v970",
             ):
                 try:
-                    st.session_state["prospect_contacts_v970"] = (
-                        list_contacts_for_prospects(
-                            [str(row.get("id")) for row in saved_rows]
-                        )
+                    contact_rows = list_contacts_for_prospects(
+                        [str(row.get("id")) for row in saved_rows]
                     )
+                    st.session_state["prospect_contacts_v970"] = contact_rows
                 except Exception as exc:
                     st.error(str(exc))
-            contact_rows = st.session_state.get("prospect_contacts_v970", [])
             if contact_rows:
                 company_by_id = {
                     str(row.get("id")): row.get("company_name", "")
@@ -682,3 +910,206 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                     use_container_width=True,
                     hide_index=True,
                 )
+            else:
+                st.caption("아직 저장된 연락처가 없습니다.")
+
+    label_to_id = {
+        (
+            f"{row.get('company_name', '(업체명 없음)')} | "
+            f"{row.get('address', '')} | {str(row.get('id', ''))[-8:]}"
+        ): str(row.get("id") or "")
+        for row in saved_rows
+        if row.get("id")
+    }
+    row_by_id = {
+        str(row.get("id")): row
+        for row in saved_rows
+        if row.get("id")
+    }
+    with st.form("saved_sales_action_form_v971"):
+        selected_labels = st.multiselect(
+            "작업할 영업후보 선택",
+            list(label_to_id.keys()),
+            max_selections=10,
+            help="한 번에 최대 10개 업체를 선택합니다.",
+        )
+        button_col1, button_col2 = st.columns(2)
+        analyze_saved_clicked = button_col1.form_submit_button(
+            "연락처·특허·영업주제 분석",
+            type="primary",
+            use_container_width=True,
+            disabled=not selected_labels,
+        )
+        enrich_saved_clicked = button_col2.form_submit_button(
+            "이메일·홈페이지 정밀 보강",
+            use_container_width=True,
+            disabled=(
+                not selected_labels or not saved_contact_status[0]
+            ),
+        )
+        st.caption(
+            "첫 번째 버튼은 전화할 이유와 스크립트를 만듭니다. "
+            "두 번째 버튼은 네이버와 공식 홈페이지까지 확인해 "
+            "이메일·홈페이지를 연락처DB에 저장합니다. 공개된 사업용 "
+            "연락처만 사용하며 실제 연락 전에는 수신거부 여부를 확인합니다."
+        )
+
+    selected_ids = [
+        label_to_id[label]
+        for label in selected_labels
+        if label in label_to_id
+    ]
+    if analyze_saved_clicked:
+        sales_results: list[dict] = []
+        progress = st.progress(0, text="영업정보 분석을 시작합니다.")
+        for index, prospect_id in enumerate(selected_ids, start=1):
+            prospect = row_by_id[prospect_id]
+            try:
+                analysis = analyze_sales_candidate(prospect)
+                save_sales_analysis(prospect_id, analysis)
+                sales_results.append(
+                    {
+                        "업체명": prospect.get("company_name", ""),
+                        "대표전화": analysis.get("phone", ""),
+                        "등록특허": analysis.get(
+                            "registered_patent_count",
+                            0,
+                        ),
+                        "순고용증가": analysis.get("net_hiring", 0),
+                        "영업주제": " · ".join(
+                            analysis.get("sales_topics") or []
+                        ),
+                        "추천등급": analysis.get(
+                            "recommendation_grade",
+                            "",
+                        ),
+                        "결과": "저장 완료",
+                    }
+                )
+            except Exception as exc:
+                sales_results.append(
+                    {
+                        "업체명": prospect.get("company_name", ""),
+                        "결과": f"실패: {exc}",
+                    }
+                )
+            progress.progress(
+                index / max(1, len(selected_ids)),
+                text=f"{index}/{len(selected_ids)} 업체 분석 완료",
+            )
+        st.session_state["sales_analysis_results_v971"] = sales_results
+        try:
+            st.session_state["prospect_saved_list_v960"] = list_prospects()
+            saved_rows = st.session_state["prospect_saved_list_v960"]
+        except Exception as exc:
+            st.warning(f"분석 후 목록 새로고침 실패: {exc}")
+        st.rerun()
+
+    if enrich_saved_clicked:
+        enrichment_results: list[dict] = []
+        progress = st.progress(0, text="정밀 연락처 보강을 시작합니다.")
+        for index, prospect_id in enumerate(selected_ids, start=1):
+            prospect = row_by_id[prospect_id]
+            try:
+                result = enrich_company(prospect)
+                result["prospect_id"] = prospect_id
+                result["saved_count"] = save_prospect_contacts(
+                    prospect_id,
+                    result.get("contacts") or [],
+                    owner_user_id,
+                )
+            except Exception as exc:
+                result = {
+                    "ok": False,
+                    "prospect_id": prospect_id,
+                    "company_name": prospect.get("company_name", ""),
+                    "status": "error",
+                    "contacts": [],
+                    "saved_count": 0,
+                    "trace": [
+                        {
+                            "stage": "error",
+                            "status": type(exc).__name__,
+                            "message": str(exc),
+                        }
+                    ],
+                }
+            enrichment_results.append(result)
+            progress.progress(
+                index / max(1, len(selected_ids)),
+                text=f"{index}/{len(selected_ids)} 업체 보강 완료",
+            )
+        st.session_state["contact_enrichment_results_v970"] = (
+            enrichment_results
+        )
+        st.session_state.pop("prospect_contacts_v970", None)
+        st.rerun()
+
+    sales_results = st.session_state.get("sales_analysis_results_v971", [])
+    if sales_results:
+        st.markdown("#### 최근 영업정보 분석 결과")
+        st.dataframe(
+            pd.DataFrame(sales_results),
+            use_container_width=True,
+            hide_index=True,
+        )
+    enrichment_results = st.session_state.get(
+        "contact_enrichment_results_v970",
+        [],
+    )
+    if enrichment_results:
+        st.markdown("#### 최근 정밀 연락처 보강 결과")
+        st.dataframe(
+            pd.DataFrame(
+                [_contact_result_row(row) for row in enrichment_results]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+        with st.expander("업체별 연락처 수집 경로 보기"):
+            for result in enrichment_results:
+                st.markdown(f"**{result.get('company_name', '')}**")
+                st.dataframe(
+                    pd.DataFrame(result.get("trace") or []),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+    script_rows = [
+        row for row in saved_rows if _saved_sales_analysis(row).get(
+            "first_call_script"
+        )
+    ]
+    if script_rows:
+        st.markdown("#### 초회 영업전화 준비")
+        script_labels = {
+            (
+                f"{row.get('company_name', '')} | "
+                f"{str(row.get('id', ''))[-8:]}"
+            ): row
+            for row in script_rows
+        }
+        selected_script_label = st.selectbox(
+            "전화할 업체",
+            list(script_labels.keys()),
+            key="saved_call_script_company_v971",
+        )
+        script_analysis = _saved_sales_analysis(
+            script_labels[selected_script_label]
+        )
+        script_col1, script_col2 = st.columns([1, 2])
+        script_col1.metric(
+            "추천등급",
+            script_analysis.get("recommendation_grade", "-"),
+        )
+        script_col1.write(
+            "영업주제: "
+            + " · ".join(script_analysis.get("sales_topics") or [])
+        )
+        script_col2.text_area(
+            "초회 전화 스크립트",
+            value=script_analysis.get("first_call_script", ""),
+            height=200,
+            disabled=True,
+            key="saved_call_script_v971",
+        )

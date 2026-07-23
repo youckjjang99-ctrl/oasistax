@@ -123,6 +123,10 @@ def _database_row(
     owner_user_id: str,
 ) -> dict[str, Any]:
     now = datetime.now(timezone.utc).isoformat()
+    source_data = dict(prospect.get("원본데이터") or {})
+    sales_analysis = prospect.get("영업분석")
+    if isinstance(sales_analysis, dict):
+        source_data["sales_intelligence_v971"] = sales_analysis
     return {
         "source": str(prospect.get("source") or "nps_workplace_v2"),
         "source_key": str(prospect.get("source_key") or ""),
@@ -141,7 +145,7 @@ def _database_row(
         "priority_reasons": prospect.get("추천사유") or [],
         "status": "candidate",
         "owner_user_id": str(owner_user_id or ""),
-        "source_data": prospect.get("원본데이터") or {},
+        "source_data": source_data,
         "collected_at": now,
         "updated_at": now,
     }
@@ -193,7 +197,7 @@ def list_prospects(limit: int = 300) -> list[dict[str, Any]]:
             "industry_name,"
             "employee_count,new_employee_count,lost_employee_count,"
             "priority_score,priority_reasons,status,data_created_ym,"
-            "owner_user_id,updated_at"
+            "owner_user_id,source_data,updated_at"
         ),
         order="priority_score.desc,updated_at.desc",
         limit=min(1000, max(1, int(limit))),
@@ -234,6 +238,59 @@ def list_contacts_for_prospects(
         )
     rows = response.json() if response.text else []
     return rows if isinstance(rows, list) else []
+
+
+def save_sales_analysis(
+    prospect_id: str,
+    analysis: dict[str, Any],
+) -> bool:
+    prospect_id = str(prospect_id or "").strip()
+    if not prospect_id:
+        raise ValueError("영업분석을 저장할 영업후보 ID가 없습니다.")
+    config = get_cloud_config()
+    response = requests.get(
+        f"{config.url}/rest/v1/{TABLE_PROSPECTS}",
+        headers=_rest_headers(),
+        params={
+            "select": "id,source_data",
+            "id": f"eq.{prospect_id}",
+            "limit": 1,
+        },
+        timeout=config.timeout,
+    )
+    if not response.ok:
+        raise RuntimeError(
+            f"기존 영업분석 조회 실패 HTTP {response.status_code}: "
+            f"{response.text[:300]}"
+        )
+    rows = response.json() if response.text else []
+    if not rows:
+        raise RuntimeError("영업후보를 찾을 수 없습니다.")
+    source_data = dict(rows[0].get("source_data") or {})
+    source_data["sales_intelligence_v971"] = analysis
+    update_response = requests.patch(
+        f"{config.url}/rest/v1/{TABLE_PROSPECTS}",
+        headers={
+            **_rest_headers(),
+            "Prefer": "return=minimal",
+        },
+        params={"id": f"eq.{prospect_id}"},
+        data=json.dumps(
+            {
+                "source_data": source_data,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            ensure_ascii=False,
+            default=str,
+        ),
+        timeout=max(config.timeout, 30),
+    )
+    if not update_response.ok:
+        raise RuntimeError(
+            f"영업분석 저장 실패 HTTP {update_response.status_code}: "
+            f"{update_response.text[:400]}"
+        )
+    return True
 
 
 def save_prospect_contacts(
