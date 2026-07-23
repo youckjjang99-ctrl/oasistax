@@ -390,6 +390,9 @@ def save_prospects(
     prospects: list[dict[str, Any]],
     owner_user_id: str,
 ) -> int:
+    # 화면 외 경로에서 저장을 시도해도 기존 전사 영업후보의 담당자가
+    # 바뀌지 않도록 한 번 더 공통 중복제외를 적용한다.
+    prospects, _excluded_count = remove_existing_prospects(prospects)
     rows = [
         _database_row(item, owner_user_id)
         for item in prospects
@@ -423,7 +426,15 @@ def save_prospects(
     return len(saved) if isinstance(saved, list) else len(rows)
 
 
-def list_prospects(limit: int = 300) -> list[dict[str, Any]]:
+def list_prospects(
+    owner_user_id: str,
+    *,
+    limit: int = 300,
+) -> list[dict[str, Any]]:
+    """로그인 사용자가 직접 저장한 영업후보만 반환한다."""
+    owner_user_id = str(owner_user_id or "").strip()
+    if not owner_user_id:
+        return []
     db = CloudDatabase()
     common_columns = (
         "id,source,source_key,company_name,business_no,address,region,"
@@ -436,6 +447,7 @@ def list_prospects(limit: int = 300) -> list[dict[str, Any]]:
     try:
         return db.select(
             TABLE_PROSPECTS,
+            filters={"owner_user_id": owner_user_id},
             columns=f"{common_columns},memo",
             order="priority_score.desc,updated_at.desc",
             limit=query_limit,
@@ -450,6 +462,7 @@ def list_prospects(limit: int = 300) -> list[dict[str, Any]]:
             raise
         rows = db.select(
             TABLE_PROSPECTS,
+            filters={"owner_user_id": owner_user_id},
             columns=common_columns,
             order="priority_score.desc,updated_at.desc",
             limit=query_limit,
@@ -459,10 +472,17 @@ def list_prospects(limit: int = 300) -> list[dict[str, Any]]:
         return rows
 
 
-def save_prospect_memo(prospect_id: str, memo: str) -> bool:
+def save_prospect_memo(
+    prospect_id: str,
+    memo: str,
+    owner_user_id: str,
+) -> bool:
     prospect_id = str(prospect_id or "").strip()
+    owner_user_id = str(owner_user_id or "").strip()
     if not prospect_id:
         raise ValueError("메모를 저장할 영업후보 ID가 없습니다.")
+    if not owner_user_id:
+        raise ValueError("로그인 사용자 정보가 없습니다.")
     config = get_cloud_config()
     response = requests.patch(
         f"{config.url}/rest/v1/{TABLE_PROSPECTS}",
@@ -470,7 +490,10 @@ def save_prospect_memo(prospect_id: str, memo: str) -> bool:
             **_rest_headers(),
             "Prefer": "return=minimal",
         },
-        params={"id": f"eq.{prospect_id}"},
+        params={
+            "id": f"eq.{prospect_id}",
+            "owner_user_id": f"eq.{owner_user_id}",
+        },
         data=json.dumps(
             {
                 "memo": str(memo or "").strip(),

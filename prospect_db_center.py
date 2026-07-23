@@ -1086,7 +1086,9 @@ def _render_prospect_db_center_legacy(owner_user_id: str = "") -> None:
     )
     if refresh_saved or "prospect_saved_list_v960" not in st.session_state:
         try:
-            st.session_state["prospect_saved_list_v960"] = list_prospects()
+            st.session_state["prospect_saved_list_v960"] = list_prospects(
+                owner_user_id
+            )
         except Exception as exc:
             st.error(str(exc))
             st.session_state["prospect_saved_list_v960"] = []
@@ -1293,7 +1295,9 @@ def _render_prospect_db_center_legacy(owner_user_id: str = "") -> None:
             )
         st.session_state["sales_analysis_results_v971"] = sales_results
         try:
-            st.session_state["prospect_saved_list_v960"] = list_prospects()
+            st.session_state["prospect_saved_list_v960"] = list_prospects(
+                owner_user_id
+            )
             saved_rows = st.session_state["prospect_saved_list_v960"]
         except Exception as exc:
             st.warning(f"분석 후 목록 새로고침 실패: {exc}")
@@ -1412,17 +1416,17 @@ def _render_prospect_db_center_legacy(owner_user_id: str = "") -> None:
 def _render_clean_saved_prospects(owner_user_id: str) -> None:
     st.markdown("### 저장된 영업후보")
     st.caption(
-        "모든 사용자가 함께 사용하는 영업DB입니다. 대표전화 또는 "
-        "휴대전화가 확인된 업체를 선택한 고용 증가 기준 순으로 표시하며, "
-        "업체별 메모를 바로 기록할 수 있습니다."
+        "내가 저장한 영업후보만 표시합니다. 다른 사용자가 저장한 업체는 "
+        "보이지 않지만, 전사 중복 제외 기준에는 계속 반영됩니다. 대표전화 "
+        "또는 휴대전화가 확인된 업체를 고용 증가 기준 순으로 표시합니다."
     )
     try:
-        rows = list_prospects(limit=1000)
+        rows = list_prospects(owner_user_id, limit=1000)
     except Exception as exc:
         st.warning(f"저장목록을 불러오지 못했습니다: {exc}")
         return
     if not rows:
-        st.info("저장된 영업후보가 없습니다.")
+        st.info("내가 저장한 영업후보가 없습니다.")
         return
 
     contacts: list[dict] = []
@@ -1444,7 +1448,7 @@ def _render_clean_saved_prospects(owner_user_id: str) -> None:
             kind="stable",
         ).reset_index(drop=True)
     if frame.empty:
-        st.info("유효한 대표전화가 확인된 저장 업체가 없습니다.")
+        st.info("내 저장 업체 중 유효한 대표전화가 확인된 업체가 없습니다.")
         return
 
     export_frame = frame.drop(
@@ -1524,7 +1528,7 @@ def _render_clean_saved_prospects(owner_user_id: str) -> None:
     ):
         try:
             for prospect_id, memo in changed_memos:
-                save_prospect_memo(prospect_id, memo)
+                save_prospect_memo(prospect_id, memo, owner_user_id)
             st.success(f"업체 메모 {len(changed_memos):,}건을 저장했습니다.")
             st.rerun()
         except Exception as exc:

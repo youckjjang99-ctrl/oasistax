@@ -1,0 +1,7 @@
+git status
+git add prospect_db_repository.py prospect_db_center.py VERSION.txt APPLY_UPDATE_v9.8.8.py RUN_UPDATE_v9.8.8.bat README_UPDATE_v9.8.8.md GITHUB_UPLOAD_COMMANDS_v9.8.8.txt payload
+git add -f CHANGELOG_v9.8.8.md
+git status
+git commit -m "OASIS CRM v9.8.8 영업후보 사용자별 조회 분리"
+git pull --rebase origin main
+git push origin main
