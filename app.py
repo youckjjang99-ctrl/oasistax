@@ -1445,6 +1445,39 @@ def render_personal_business_registration(user_id, user_name, upload_dir):
         st.caption("분석 버튼을 누르면 사업장 선택 화면이 표시됩니다.")
         return
 
+    def _registration_missing_fields(business):
+        missing = []
+        company_name = str(business.get("업체명", "") or "").strip()
+        business_no = str(business.get("사업자등록번호", "") or "").strip()
+        if not company_name or company_name.startswith("개인사업장 "):
+            missing.append("상호")
+        if len("".join(ch for ch in business_no if ch.isdigit())) != 10:
+            missing.append("사업자등록번호")
+        for key, label in [
+            ("매출액", "총수입금액"),
+            ("필요경비", "필요경비"),
+            ("사업소득금액", "사업소득금액"),
+        ]:
+            if business.get(key) is None:
+                missing.append(label)
+        return missing
+
+    invalid_rows = [
+        (business, _registration_missing_fields(business))
+        for business in businesses
+        if _registration_missing_fields(business)
+    ]
+    if invalid_rows:
+        missing_labels = sorted(
+            {label for _, missing in invalid_rows for label in missing}
+        )
+        st.error(
+            "필수정보가 누락된 분석 결과는 등록할 수 없습니다. "
+            f"누락항목: {', '.join(missing_labels)}. "
+            "Railway 최신 배포 완료 후 신고서를 다시 분석해주세요."
+        )
+        return
+
     st.markdown("#### 1. 등록할 사업장 선택")
     business_map = {}
     for index, business in enumerate(businesses):
@@ -1525,6 +1558,13 @@ def render_personal_business_registration(user_id, user_name, upload_dir):
         added_count = 0
         for index in selected_indexes:
             business = dict(businesses[index])
+            missing_fields = _registration_missing_fields(business)
+            if missing_fields:
+                messages.append(
+                    f"{business.get('업체명', '사업장')}: "
+                    f"필수항목 누락으로 등록 차단({', '.join(missing_fields)})"
+                )
+                continue
             analysis = analyses[index]
             business["법인전환검토점수"] = analysis["score"]
             business["법인전환검토등급"] = analysis["grade"]

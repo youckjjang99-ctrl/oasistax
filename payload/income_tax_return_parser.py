@@ -43,7 +43,14 @@ def _extract_text(pdf_path):
         from pypdf import PdfReader
 
         reader = PdfReader(str(pdf_path))
-        text = "\f".join((page.extract_text() or "") for page in reader.pages)
+        pages = []
+        for page in reader.pages:
+            try:
+                page_text = page.extract_text(extraction_mode="layout") or ""
+            except (TypeError, ValueError):
+                page_text = page.extract_text() or ""
+            pages.append(page_text)
+        text = "\f".join(pages)
         if text.strip():
             return text, ""
     except Exception as exc:
@@ -59,6 +66,22 @@ def _normalize_business_no(value):
     return ""
 
 
+def _business_validation_errors(business):
+    errors = []
+    company_name = str(business.get("업체명", "") or "").strip()
+    if not company_name or company_name.startswith("개인사업장 "):
+        errors.append("상호")
+    if not _normalize_business_no(business.get("사업자등록번호", "")):
+        errors.append("사업자등록번호")
+    if business.get("매출액") is None:
+        errors.append("총수입금액")
+    if business.get("필요경비") is None:
+        errors.append("필요경비")
+    if business.get("사업소득금액") is None:
+        errors.append("사업소득금액")
+    return errors
+
+
 def _global_summary(text):
     first_pages = "\f".join((text or "").split("\f")[:2])
     dense = re.sub(r"[ \t]", "", first_pages)
@@ -72,8 +95,16 @@ def _global_summary(text):
         "산출세액": _number(_first(r"산출세액23([\-0-9,]+?)(?:43|$)", dense, flags=re.M)),
         "세액감면": _number(_first(r"세액감면(?:24)([\-0-9,]+)", dense)),
         "세액공제": _number(_first(r"세액공제(?:25)([\-0-9,]+)", dense)),
-        "결정세액": _number(_first(r"합계\(26\+27\)(?:28)([\-0-9,]+)", dense)),
-        "납부환급세액": _number(_first(r"납부\(환급\)할총세액[^\n]*?(?:33)([\-0-9,]+)", dense)),
+        "결정세액": _number(
+            _first(r"합계\(26\+27\)28([\-0-9,]+?)(?:46|$)", dense, flags=re.M)
+        ),
+        "납부환급세액": _number(
+            _first(
+                r"납부\(환급\)할총세액[^\n]*?33([\-0-9,]+?)(?:51|$)",
+                dense,
+                flags=re.M,
+            )
+        ),
     }
 
 
@@ -159,18 +190,47 @@ def parse_income_tax_return(pdf_path):
         _extract_business(section, global_data, index)
         for index, section in enumerate(_split_business_sections(text), start=1)
     ]
-    businesses = [
-        item for item in businesses
-        if item.get("사업자등록번호") or item.get("업체명")
-    ]
+    invalid_businesses = []
+    valid_businesses = []
+    for item in businesses:
+        missing = _business_validation_errors(item)
+        if missing:
+            invalid_businesses.append(
+                {
+                    "사업장순번": item.get("사업장순번"),
+                    "누락항목": missing,
+                }
+            )
+        else:
+            valid_businesses.append(item)
+    businesses = valid_businesses
     if not businesses:
+        missing_labels = sorted(
+            {
+                label
+                for item in invalid_businesses
+                for label in item.get("누락항목", [])
+            }
+        )
+        detail = (
+            f" 필수항목 누락: {', '.join(missing_labels)}."
+            if missing_labels
+            else ""
+        )
         return (
-            {"businesses": [], "summary": global_data},
-            "사업소득명세서에서 등록 가능한 사업장을 찾지 못했습니다.",
+            {
+                "businesses": [],
+                "summary": global_data,
+                "invalid_businesses": invalid_businesses,
+            },
+            "사업소득명세서의 필수정보를 정확히 읽지 못해 등록을 차단했습니다."
+            + detail
+            + " Railway 재배포 완료 후 다시 분석해주세요.",
         )
 
     return {
         "businesses": businesses,
         "summary": global_data,
+        "invalid_businesses": invalid_businesses,
         "page_count": len(text.split("\f")),
     }, ""
