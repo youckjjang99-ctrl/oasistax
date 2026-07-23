@@ -12,6 +12,7 @@ from cloud_db import CloudDatabase, get_cloud_config
 
 TABLE_PROSPECTS = "oasis_prospect_companies"
 TABLE_CUSTOMERS = "oasis_customers"
+TABLE_CONTACTS = "oasis_prospect_contacts"
 
 
 def _business_no(value: Any) -> str:
@@ -31,6 +32,32 @@ def prospect_table_status() -> tuple[bool, str]:
         if "PGRST205" in message or "404" in message:
             return False, "Supabase에 영업후보DB 테이블을 먼저 생성해 주세요."
         return False, f"영업후보DB 연결 실패: {message[:240]}"
+
+
+def contact_table_status() -> tuple[bool, str]:
+    try:
+        db = CloudDatabase()
+        db.select(TABLE_CONTACTS, columns="id", limit=1)
+        return True, "잠재고객 연락처 테이블 연결 완료"
+    except Exception as exc:
+        message = str(exc)
+        if "PGRST205" in message or "404" in message:
+            return False, "Supabase에 잠재고객 연락처 테이블을 먼저 생성해 주세요."
+        return False, f"잠재고객 연락처 연결 실패: {message[:240]}"
+
+
+def _rest_headers(*, representation: bool = False) -> dict[str, str]:
+    config = get_cloud_config()
+    if not config.configured:
+        raise RuntimeError("Supabase 환경변수가 설정되지 않았습니다.")
+    headers = {
+        "apikey": config.secret_key,
+        "Authorization": f"Bearer {config.secret_key}",
+        "Content-Type": "application/json",
+    }
+    if representation:
+        headers["Prefer"] = "resolution=merge-duplicates,return=representation"
+    return headers
 
 
 def existing_customer_business_nos(values: list[str]) -> set[str]:
@@ -162,11 +189,139 @@ def list_prospects(limit: int = 300) -> list[dict[str, Any]]:
     return db.select(
         TABLE_PROSPECTS,
         columns=(
-            "id,company_name,business_no,address,region,industry_name,"
+            "id,source,source_key,company_name,business_no,address,region,"
+            "industry_name,"
             "employee_count,new_employee_count,lost_employee_count,"
-            "priority_score,priority_reasons,status,data_created_ym,updated_at"
+            "priority_score,priority_reasons,status,data_created_ym,"
+            "owner_user_id,updated_at"
         ),
         order="priority_score.desc,updated_at.desc",
         limit=min(1000, max(1, int(limit))),
     )
 
+
+def list_contacts_for_prospects(
+    prospect_ids: list[str],
+) -> list[dict[str, Any]]:
+    normalized = sorted(
+        {
+            str(value or "").strip()
+            for value in prospect_ids
+            if str(value or "").strip()
+        }
+    )
+    if not normalized:
+        return []
+    config = get_cloud_config()
+    response = requests.get(
+        f"{config.url}/rest/v1/{TABLE_CONTACTS}",
+        headers=_rest_headers(),
+        params={
+            "select": (
+                "id,prospect_id,contact_type,contact_value,contact_label,"
+                "source_type,source_url,confidence,verification_status,"
+                "is_primary,do_not_contact,collected_at,verified_at,updated_at"
+            ),
+            "prospect_id": f"in.({','.join(normalized)})",
+            "order": "prospect_id.asc,is_primary.desc,confidence.desc",
+        },
+        timeout=max(config.timeout, 30),
+    )
+    if not response.ok:
+        raise RuntimeError(
+            f"잠재고객 연락처 조회 실패 HTTP {response.status_code}: "
+            f"{response.text[:400]}"
+        )
+    rows = response.json() if response.text else []
+    return rows if isinstance(rows, list) else []
+
+
+def save_prospect_contacts(
+    prospect_id: str,
+    contacts: list[dict[str, Any]],
+    owner_user_id: str = "",
+) -> int:
+    prospect_id = str(prospect_id or "").strip()
+    if not prospect_id:
+        raise ValueError("연락처를 저장할 영업후보 ID가 없습니다.")
+    valid_contacts = [
+        item
+        for item in contacts
+        if str(item.get("contact_type") or "") in {"phone", "email", "website"}
+        and str(item.get("contact_value") or "").strip()
+        and str(item.get("verification_status") or "") != "rejected"
+    ]
+    if not valid_contacts:
+        return 0
+
+    existing = list_contacts_for_prospects([prospect_id])
+    existing_map = {
+        (
+            str(row.get("contact_type") or ""),
+            str(row.get("contact_value") or ""),
+        ): row
+        for row in existing
+    }
+    protected_statuses = {"manual_verified", "auto_verified"}
+    now = datetime.now(timezone.utc).isoformat()
+    rows: list[dict[str, Any]] = []
+    for item in valid_contacts:
+        contact_type = str(item.get("contact_type") or "").strip()
+        contact_value = str(item.get("contact_value") or "").strip()
+        current = existing_map.get((contact_type, contact_value), {})
+        incoming_status = str(
+            item.get("verification_status") or "review_required"
+        )
+        current_status = str(current.get("verification_status") or "")
+        verification_status = (
+            current_status
+            if current_status in protected_statuses
+            else incoming_status
+        )
+        rows.append(
+            {
+                "prospect_id": prospect_id,
+                "contact_type": contact_type,
+                "contact_value": contact_value,
+                "contact_label": str(item.get("contact_label") or ""),
+                "source_type": str(item.get("source_type") or ""),
+                "source_url": str(item.get("source_url") or ""),
+                "confidence": max(
+                    int(current.get("confidence") or 0),
+                    int(item.get("confidence") or 0),
+                ),
+                "verification_status": verification_status,
+                "is_primary": bool(
+                    current.get("is_primary") or item.get("is_primary")
+                ),
+                "owner_user_id": str(owner_user_id or ""),
+                "metadata": item.get("metadata") or {},
+                "collected_at": str(item.get("collected_at") or now),
+                "verified_at": (
+                    current.get("verified_at")
+                    or (
+                        now
+                        if verification_status
+                        in {"manual_verified", "auto_verified"}
+                        else None
+                    )
+                ),
+                "updated_at": now,
+            }
+        )
+
+    config = get_cloud_config()
+    response = requests.post(
+        f"{config.url}/rest/v1/{TABLE_CONTACTS}",
+        headers=_rest_headers(representation=True),
+        params={"on_conflict": "prospect_id,contact_type,contact_value"},
+        data=json.dumps(rows, ensure_ascii=False, default=str),
+        timeout=max(config.timeout, 30),
+    )
+    if not response.ok:
+        raise RuntimeError(
+            f"잠재고객 연락처 저장 실패 HTTP {response.status_code}: "
+            f"{response.text[:500]}"
+        )
+    saved = response.json() if response.text else []
+    return len(saved) if isinstance(saved, list) else len(rows)

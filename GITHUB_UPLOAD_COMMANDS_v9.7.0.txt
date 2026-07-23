@@ -1,0 +1,6 @@
+git status
+git add contact_matching.py kakao_local_client.py localdata_contact_client.py naver_web_search_client.py website_contact_parser.py contact_enrichment.py prospect_db_center.py prospect_db_repository.py supabase_v970_contact_enrichment.sql VERSION.txt APPLY_UPDATE_v9.7.0.py RUN_UPDATE_v9.7.0.bat CHANGELOG_v9.7.0.md README_UPDATE_v9.7.0.md GITHUB_UPLOAD_COMMANDS_v9.7.0.txt payload
+git status
+git commit -m "OASIS CRM v9.7.0 잠재고객 연락처 순차 보강"
+git pull --rebase origin main
+git push origin main
