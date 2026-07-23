@@ -13,6 +13,7 @@ from cloud_db import CloudDatabase, get_cloud_config
 TABLE_PROSPECTS = "oasis_prospect_companies"
 TABLE_CUSTOMERS = "oasis_customers"
 TABLE_CONTACTS = "oasis_prospect_contacts"
+TABLE_SEARCH_HISTORY = "oasis_prospect_search_history"
 
 
 def _business_no(value: Any) -> str:
@@ -44,6 +45,18 @@ def contact_table_status() -> tuple[bool, str]:
         if "PGRST205" in message or "404" in message:
             return False, "Supabase에 잠재고객 연락처 테이블을 먼저 생성해 주세요."
         return False, f"잠재고객 연락처 연결 실패: {message[:240]}"
+
+
+def search_history_table_status() -> tuple[bool, str]:
+    try:
+        db = CloudDatabase()
+        db.select(TABLE_SEARCH_HISTORY, columns="id", limit=1)
+        return True, "사용자별 검색 이력 테이블 연결 완료"
+    except Exception as exc:
+        message = str(exc)
+        if "PGRST205" in message or "404" in message:
+            return False, "Supabase에 사용자별 검색 이력 테이블이 없습니다."
+        return False, f"검색 이력 테이블 연결 실패: {message[:240]}"
 
 
 def _rest_headers(*, representation: bool = False) -> dict[str, str]:
@@ -165,6 +178,28 @@ def _database_row(
     source_data["business_type"] = str(
         prospect.get("사업자유형") or ""
     )
+    source_data["industry_category"] = str(
+        prospect.get("업종분류") or ""
+    )
+    source_data["employment_growth"] = {
+        "basis": str(prospect.get("고용증가기준") or ""),
+        "status": str(prospect.get("고용자료상태") or ""),
+        "message": str(prospect.get("고용자료메시지") or ""),
+        "judgement": str(prospect.get("고용증가판정") or ""),
+        "current_employee_count": prospect.get("가입자수"),
+        "previous_employee_count": prospect.get("전년가입자수"),
+        "year_over_year_growth": prospect.get("전년대비고용증가"),
+        "new_employee_count": prospect.get("신규취득자수"),
+        "lost_employee_count": prospect.get("상실가입자수"),
+        "recent_net_growth": prospect.get("순고용증가"),
+        "selected_growth": prospect.get("선택고용증가"),
+        "current_data_created_ym": str(
+            prospect.get("자료생성년월") or ""
+        ),
+        "previous_data_created_ym": str(
+            prospect.get("전년자료생성년월") or ""
+        ),
+    }
     sales_analysis = prospect.get("영업분석")
     if isinstance(sales_analysis, dict):
         source_data["sales_intelligence_v971"] = sales_analysis
@@ -231,17 +266,138 @@ def save_prospects(
 
 def list_prospects(limit: int = 300) -> list[dict[str, Any]]:
     db = CloudDatabase()
-    return db.select(
-        TABLE_PROSPECTS,
-        columns=(
-            "id,source,source_key,company_name,business_no,address,region,"
-            "industry_name,"
-            "employee_count,new_employee_count,lost_employee_count,"
-            "priority_score,priority_reasons,status,data_created_ym,"
-            "owner_user_id,source_data,updated_at"
+    common_columns = (
+        "id,source,source_key,company_name,business_no,address,region,"
+        "industry_name,"
+        "employee_count,new_employee_count,lost_employee_count,"
+        "priority_score,priority_reasons,status,data_created_ym,"
+        "owner_user_id,source_data,updated_at"
+    )
+    query_limit = min(1000, max(1, int(limit)))
+    try:
+        return db.select(
+            TABLE_PROSPECTS,
+            columns=f"{common_columns},memo",
+            order="priority_score.desc,updated_at.desc",
+            limit=query_limit,
+        )
+    except Exception as exc:
+        message = str(exc)
+        if (
+            "memo" not in message.lower()
+            and "PGRST204" not in message
+            and "400" not in message
+        ):
+            raise
+        rows = db.select(
+            TABLE_PROSPECTS,
+            columns=common_columns,
+            order="priority_score.desc,updated_at.desc",
+            limit=query_limit,
+        )
+        for row in rows:
+            row["memo"] = ""
+        return rows
+
+
+def save_prospect_memo(prospect_id: str, memo: str) -> bool:
+    prospect_id = str(prospect_id or "").strip()
+    if not prospect_id:
+        raise ValueError("메모를 저장할 영업후보 ID가 없습니다.")
+    config = get_cloud_config()
+    response = requests.patch(
+        f"{config.url}/rest/v1/{TABLE_PROSPECTS}",
+        headers={
+            **_rest_headers(),
+            "Prefer": "return=minimal",
+        },
+        params={"id": f"eq.{prospect_id}"},
+        data=json.dumps(
+            {
+                "memo": str(memo or "").strip(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            ensure_ascii=False,
         ),
-        order="priority_score.desc,updated_at.desc",
-        limit=min(1000, max(1, int(limit))),
+        timeout=max(config.timeout, 30),
+    )
+    if not response.ok:
+        raise RuntimeError(
+            f"업체 메모 저장 실패 HTTP {response.status_code}: "
+            f"{response.text[:400]}"
+        )
+    return True
+
+
+def save_search_history(
+    owner_user_id: str,
+    *,
+    region: str,
+    region_code: str,
+    business_type: str,
+    start_page: int,
+    end_page: int,
+    target_count: int,
+    minimum_employees: int,
+    growth_only: bool,
+    growth_basis: str,
+    industry_categories: list[str] | None,
+    found_count: int,
+    pages_scanned: int,
+    elapsed_seconds: float,
+) -> bool:
+    owner_user_id = str(owner_user_id or "").strip()
+    if not owner_user_id:
+        return False
+    db = CloudDatabase()
+    rows = db.insert(
+        TABLE_SEARCH_HISTORY,
+        [
+            {
+                "owner_user_id": owner_user_id,
+                "region": str(region or ""),
+                "region_code": str(region_code or ""),
+                "business_type": str(business_type or ""),
+                "start_page": max(1, int(start_page)),
+                "end_page": max(1, int(end_page)),
+                "target_count": max(1, int(target_count)),
+                "minimum_employees": max(1, int(minimum_employees)),
+                "growth_only": bool(growth_only),
+                "growth_basis": str(growth_basis or "year_over_year"),
+                "industry_categories": [
+                    str(value or "").strip()
+                    for value in (industry_categories or [])
+                    if str(value or "").strip()
+                ],
+                "found_count": max(0, int(found_count)),
+                "pages_scanned": max(0, int(pages_scanned)),
+                "elapsed_seconds": max(0.0, float(elapsed_seconds)),
+            }
+        ],
+    )
+    return bool(rows)
+
+
+def list_search_history(
+    owner_user_id: str,
+    *,
+    limit: int = 30,
+) -> list[dict[str, Any]]:
+    owner_user_id = str(owner_user_id or "").strip()
+    if not owner_user_id:
+        return []
+    db = CloudDatabase()
+    return db.select(
+        TABLE_SEARCH_HISTORY,
+        filters={"owner_user_id": owner_user_id},
+        columns=(
+            "id,owner_user_id,region,region_code,business_type,"
+            "start_page,end_page,target_count,minimum_employees,"
+            "growth_only,growth_basis,industry_categories,found_count,pages_scanned,"
+            "elapsed_seconds,searched_at"
+        ),
+        order="searched_at.desc",
+        limit=min(200, max(1, int(limit))),
     )
 
 

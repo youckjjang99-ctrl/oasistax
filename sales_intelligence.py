@@ -25,6 +25,20 @@ def _number(prospect: dict[str, Any], *keys: str) -> int:
     return 0
 
 
+def _optional_number(
+    prospect: dict[str, Any],
+    *keys: str,
+) -> int | None:
+    for key in keys:
+        value = prospect.get(key)
+        if value not in (None, ""):
+            try:
+                return int(float(str(value).replace(",", "")))
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
 def _text(prospect: dict[str, Any], *keys: str) -> str:
     for key in keys:
         value = str(prospect.get(key) or "").strip()
@@ -227,13 +241,38 @@ def _best_phone(
 
 
 def _sales_needs(
-    new_employee_count: int,
-    lost_employee_count: int,
+    new_employee_count: int | None,
+    lost_employee_count: int | None,
     employee_count: int,
+    *,
+    employment_basis: str = "",
+    year_over_year_growth: int | None = None,
 ) -> list[dict[str, Any]]:
     needs: list[dict[str, Any]] = []
-    net_hiring = new_employee_count - lost_employee_count
-    if net_hiring > 0:
+    net_hiring = (
+        new_employee_count - lost_employee_count
+        if new_employee_count is not None and lost_employee_count is not None
+        else None
+    )
+    if employment_basis == "year_over_year" and (
+        year_over_year_growth is not None
+        and year_over_year_growth > 0
+    ):
+        needs.append(
+            {
+                "code": "year_over_year_employment_growth",
+                "topic": "고용지원금",
+                "reason": (
+                    "전년 동월 대비 국민연금 가입자가 "
+                    f"{year_over_year_growth}명 증가"
+                ),
+                "question": (
+                    "지난 1년간 늘어난 인원의 연령·채용일을 기준으로 "
+                    "고용지원금 적용 여부를 확인해보셨나요?"
+                ),
+            }
+        )
+    elif net_hiring is not None and net_hiring > 0:
         needs.append(
             {
                 "code": "employment_growth",
@@ -248,7 +287,7 @@ def _sales_needs(
                 ),
             }
         )
-    elif new_employee_count > 0:
+    elif new_employee_count is not None and new_employee_count > 0:
         needs.append(
             {
                 "code": "recent_hiring",
@@ -318,15 +357,25 @@ def analyze_sales_candidate(
     address = _text(prospect, "address", "주소")
     industry_name = _text(prospect, "industry_name", "업종명")
     employee_count = _number(prospect, "employee_count", "가입자수")
-    new_employee_count = _number(
+    new_employee_count = _optional_number(
         prospect,
         "new_employee_count",
         "신규취득자수",
     )
-    lost_employee_count = _number(
+    lost_employee_count = _optional_number(
         prospect,
         "lost_employee_count",
         "상실가입자수",
+    )
+    year_over_year_growth = _optional_number(
+        prospect,
+        "year_over_year_growth",
+        "전년대비고용증가",
+    )
+    employment_basis = str(
+        prospect.get("고용증가기준")
+        or prospect.get("employment_growth_basis")
+        or ""
     )
 
     phone_result = _best_phone(
@@ -339,14 +388,25 @@ def analyze_sales_candidate(
         new_employee_count,
         lost_employee_count,
         employee_count,
+        employment_basis=employment_basis,
+        year_over_year_growth=year_over_year_growth,
     )
-    net_hiring = new_employee_count - lost_employee_count
+    net_hiring = (
+        new_employee_count - lost_employee_count
+        if new_employee_count is not None and lost_employee_count is not None
+        else None
+    )
+    selected_growth = (
+        year_over_year_growth
+        if employment_basis == "year_over_year"
+        else net_hiring
+    )
     score = 20
     if phone_result.get("phone"):
         score += 25
-    if net_hiring > 0:
-        score += min(35, 20 + net_hiring * 3)
-    elif new_employee_count > 0:
+    if selected_growth is not None and selected_growth > 0:
+        score += min(35, 20 + selected_growth * 3)
+    elif new_employee_count is not None and new_employee_count > 0:
         score += 15
     if employee_count >= 5:
         score += 10
@@ -368,6 +428,9 @@ def analyze_sales_candidate(
         "new_employee_count": new_employee_count,
         "lost_employee_count": lost_employee_count,
         "net_hiring": net_hiring,
+        "year_over_year_growth": year_over_year_growth,
+        "employment_growth_basis": employment_basis,
+        "selected_growth": selected_growth,
         "sales_topics": [row["topic"] for row in needs],
         "sales_reasons": [row["reason"] for row in needs],
         "needs_questions": [row["question"] for row in needs],
@@ -399,7 +462,8 @@ def merge_analysis(
     merged["전화출처"] = analysis.get("phone_source", "")
     merged["연락처상태"] = analysis.get("contact_status", "")
     merged["연락처조회이력"] = analysis.get("contact_trace", [])
-    merged["순고용증가"] = analysis.get("net_hiring", 0)
+    if analysis.get("net_hiring") is not None:
+        merged["순고용증가"] = analysis.get("net_hiring")
     merged["영업주제"] = " · ".join(analysis.get("sales_topics") or [])
     merged["추천등급"] = analysis.get("recommendation_grade", "")
     merged["우선순위점수"] = analysis.get("recommendation_score", 0)

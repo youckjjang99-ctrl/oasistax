@@ -22,6 +22,10 @@ NPS_DETAIL_URL = (
     "https://apis.data.go.kr/B552015/"
     "NpsBplcInfoInqireServiceV2/getDetailInfoSearchV2"
 )
+NPS_PERIOD_URL = (
+    "https://apis.data.go.kr/B552015/"
+    "NpsBplcInfoInqireServiceV2/getPdAcctoSttusInfoSearchV2"
+)
 REGION_CODES = {
     "서울특별시": "11",
     "경기도": "41",
@@ -46,6 +50,44 @@ OTHER_LEGAL_ENTITY_MARKERS = (
     "특허법인",
     "협동조합",
 )
+INDUSTRY_CATEGORY_KEYWORDS = {
+    "병원·의원": (
+        "병원",
+        "의원",
+        "치과",
+        "한의원",
+        "의료",
+        "요양",
+    ),
+    "음식점": (
+        "음식",
+        "한식",
+        "중식",
+        "일식",
+        "양식",
+        "분식",
+        "카페",
+        "커피",
+        "제과",
+        "주점",
+    ),
+    "서비스업": (
+        "서비스",
+        "미용",
+        "세탁",
+        "수리",
+        "교육",
+        "학원",
+        "스포츠",
+        "여행",
+        "광고",
+        "컨설팅",
+        "임대",
+    ),
+    "도소매업": ("도매", "소매", "판매", "유통", "전자상거래"),
+    "제조업": ("제조", "가공", "생산"),
+    "건설업": ("건설", "공사", "설비", "토목", "인테리어"),
+}
 
 
 def is_stock_company_name(value: Any) -> bool:
@@ -74,6 +116,14 @@ def business_type_label(value: Any) -> str:
     if is_individual_business_candidate(value):
         return "개인사업자 후보"
     return "기타 법인·단체"
+
+
+def industry_category(value: Any) -> str:
+    name = re.sub(r"\s+", "", str(value or ""))
+    for category, keywords in INDUSTRY_CATEGORY_KEYWORDS.items():
+        if any(keyword in name for keyword in keywords):
+            return category
+    return "기타"
 
 
 def _service_key() -> str:
@@ -161,7 +211,7 @@ def _get_with_retry(
                 url,
                 params=params,
                 timeout=max(5, int(timeout)),
-                headers={"User-Agent": "OASIS-CRM/9.6.1"},
+                headers={"User-Agent": "OASIS-CRM/9.8.4"},
             )
             if response.status_code >= 500 and attempt + 1 < attempts:
                 last_status = f"HTTP_{response.status_code}"
@@ -196,6 +246,43 @@ def _integer(value: Any) -> int:
         return 0
 
 
+def _optional_integer(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    digits = re.sub(r"[^0-9-]", "", str(value))
+    if not digits or digits == "-":
+        return None
+    try:
+        return int(digits)
+    except (TypeError, ValueError):
+        return None
+
+
+def _previous_year_month(value: Any) -> str:
+    text = re.sub(r"[^0-9]", "", str(value or ""))
+    if len(text) != 6:
+        return ""
+    try:
+        year = int(text[:4]) - 1
+        month = int(text[4:])
+    except ValueError:
+        return ""
+    if year < 2000 or not 1 <= month <= 12:
+        return ""
+    return f"{year:04d}{month:02d}"
+
+
+def _company_identity(value: Any) -> str:
+    text = str(value or "").lower()
+    text = re.sub(r"(주식회사|㈜|（주）|\(주\))", "", text)
+    return re.sub(r"[^0-9a-z가-힣]", "", text)
+
+
+def _address_identity(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip().lower()
+    return re.sub(r"[^0-9a-z가-힣]", "", text)[:36]
+
+
 def _business_no(value: Any) -> str:
     text = str(value or "").strip()
     digits = re.sub(r"[^0-9]", "", text)
@@ -219,7 +306,11 @@ def _region_from_address(address: str, region_code: str = "") -> str:
     return ""
 
 
-def _priority(employee_count: int, new_count: int, lost_count: int) -> tuple[int, list[str]]:
+def _priority(
+    employee_count: int,
+    new_count: int | None,
+    lost_count: int | None,
+) -> tuple[int, list[str]]:
     score = 10
     reasons: list[str] = []
     if 5 <= employee_count <= 49:
@@ -231,13 +322,13 @@ def _priority(employee_count: int, new_count: int, lost_count: int) -> tuple[int
     elif employee_count >= 3:
         score += 12
         reasons.append("국민연금 가입자 3인 이상")
-    if new_count > 0:
+    if new_count is not None and new_count > 0:
         score += min(25, 10 + new_count * 3)
         reasons.append(f"최근 신규취득자 {new_count}명")
-    if lost_count > 0:
+    if lost_count is not None and lost_count > 0:
         score += min(10, lost_count * 2)
         reasons.append(f"최근 상실가입자 {lost_count}명")
-    if employee_count >= 10 and new_count >= 2:
+    if employee_count >= 10 and new_count is not None and new_count >= 2:
         score += 10
         reasons.append("채용활동이 확인되는 사업장")
     return min(score, 100), reasons
@@ -278,13 +369,16 @@ def normalize_nps_workplace(
     employee_count = _integer(
         _first(item, "jnngpCnt", "jnngp_cnt", "가입자수")
     )
-    new_count = _integer(
+    new_count = _optional_integer(
         _first(item, "nwAcqzrCnt", "nw_acqzr_cnt", "신규취득자수")
     )
-    lost_count = _integer(
+    lost_count = _optional_integer(
         _first(item, "lssJnngpCnt", "lss_jnngp_cnt", "상실가입자수")
     )
     score, reasons = _priority(employee_count, new_count, lost_count)
+    industry_name = str(
+        _first(item, "vldtVlKrnNm", "vldt_vl_krn_nm", "업종명")
+    ).strip()
     sequence = str(_first(item, "seq", "자료순번")).strip()
     identity = "|".join((company_name, business_no, address))
     source_key = sequence or hashlib.sha256(
@@ -305,12 +399,20 @@ def normalize_nps_workplace(
         "업종코드": str(
             _first(item, "wkplIntpCd", "wkpl_intp_cd", "사업장업종코드")
         ).strip(),
-        "업종명": str(
-            _first(item, "vldtVlKrnNm", "vldt_vl_krn_nm", "업종명")
-        ).strip(),
+        "업종명": industry_name,
+        "업종분류": industry_category(industry_name),
         "가입자수": employee_count,
         "신규취득자수": new_count,
         "상실가입자수": lost_count,
+        "순고용증가": (
+            new_count - lost_count
+            if new_count is not None and lost_count is not None
+            else None
+        ),
+        "전년가입자수": None,
+        "전년대비고용증가": None,
+        "고용자료상태": "NOT_CHECKED",
+        "고용증가판정": "고용자료 미조회",
         "당월고지금액": _integer(
             _first(item, "crrmmNtcAmt", "crrmm_ntc_amt", "당월고지금액")
         ),
@@ -323,6 +425,434 @@ def normalize_nps_workplace(
         "상세조회메시지": detail_message,
         "원본데이터": item,
     }
+
+
+def fetch_nps_period_status(
+    sequence: Any,
+    *,
+    data_created_ym: str = "",
+    timeout: int = 15,
+    retries: int = 1,
+) -> dict[str, Any]:
+    """기간별 API에서 최근 월 신규취득·상실 인원을 확인한다."""
+    key = _service_key()
+    sequence = str(sequence or "").strip()
+    if not key:
+        return {
+            "ok": False,
+            "status": "KEY_MISSING",
+            "message": f"{SERVICE_KEY_ENV}가 없습니다.",
+            "api_attempt_count": 0,
+        }
+    if not sequence:
+        return {
+            "ok": False,
+            "status": "SEQ_MISSING",
+            "message": "사업장 순번(seq)이 없습니다.",
+            "api_attempt_count": 0,
+        }
+    params: dict[str, Any] = {
+        "serviceKey": key,
+        "seq": sequence,
+        "pageNo": 1,
+        "numOfRows": 10,
+        "dataType": "json",
+    }
+    if str(data_created_ym or "").strip():
+        params["dataCrtYm"] = str(data_created_ym).strip()
+    response, error_status, error_message, attempts = _get_with_retry(
+        NPS_PERIOD_URL,
+        params=params,
+        timeout=timeout,
+        retries=retries,
+    )
+    if response is None:
+        return {
+            "ok": False,
+            "status": error_status,
+            "message": error_message,
+            "api_attempt_count": attempts,
+        }
+    text = response.text or ""
+    content_type = response.headers.get("content-type", "").lower()
+    if not (
+        "json" in content_type
+        or text.lstrip().startswith(("{", "["))
+    ):
+        code, message = _xml_error(text)
+        return {
+            "ok": False,
+            "status": code or f"HTTP_{response.status_code}",
+            "message": message or "기간별 조회 응답을 해석하지 못했습니다.",
+            "api_attempt_count": attempts,
+        }
+    try:
+        payload = response.json()
+    except ValueError:
+        return {
+            "ok": False,
+            "status": "INVALID_JSON",
+            "message": "기간별 조회 JSON 해석에 실패했습니다.",
+            "api_attempt_count": attempts,
+        }
+    code, message, _total_count, items = _items_from_json(payload)
+    if not response.ok or code not in {"00", "0", ""}:
+        return {
+            "ok": False,
+            "status": code or f"HTTP_{response.status_code}",
+            "message": message or "기간별 조회에 실패했습니다.",
+            "api_attempt_count": attempts,
+        }
+    if not items:
+        return {
+            "ok": False,
+            "status": "NO_PERIOD_DATA",
+            "message": "최근 월 신규취득·상실 자료가 없습니다.",
+            "api_attempt_count": attempts,
+        }
+    target_ym = str(data_created_ym or "").strip()
+    selected = next(
+        (
+            row
+            for row in items
+            if not target_ym
+            or str(_first(row, "dataCrtYm", "data_crt_ym")).strip()
+            == target_ym
+        ),
+        items[0],
+    )
+    new_count = _optional_integer(
+        _first(selected, "nwAcqzrCnt", "nw_acqzr_cnt")
+    )
+    lost_count = _optional_integer(
+        _first(selected, "lssJnngpCnt", "lss_jnngp_cnt")
+    )
+    if new_count is None or lost_count is None:
+        return {
+            "ok": False,
+            "status": "INCOMPLETE_PERIOD_DATA",
+            "message": "신규취득자수 또는 상실가입자수가 비어 있습니다.",
+            "api_attempt_count": attempts,
+        }
+    return {
+        "ok": True,
+        "status": "SUCCESS",
+        "message": "최근 월 순취득 자료를 확인했습니다.",
+        "data_created_ym": str(
+            _first(selected, "dataCrtYm", "data_crt_ym")
+        ).strip(),
+        "new_count": new_count,
+        "lost_count": lost_count,
+        "net_growth": new_count - lost_count,
+        "api_attempt_count": attempts,
+    }
+
+
+def _prior_workplace_match(
+    current: dict[str, Any],
+    rows: list[dict[str, Any]],
+    target_ym: str,
+) -> dict[str, Any] | None:
+    current_name = _company_identity(current.get("사업장명"))
+    current_address = _address_identity(current.get("주소"))
+    current_business_digits = re.sub(
+        r"[^0-9]",
+        "",
+        str(current.get("사업자등록번호") or ""),
+    )
+    candidates = []
+    for row in rows:
+        row_ym = str(_first(row, "dataCrtYm", "data_crt_ym")).strip()
+        if row_ym and row_ym != target_ym:
+            continue
+        if _company_identity(_first(row, "wkplNm", "wkpl_nm")) != current_name:
+            continue
+        row_business_digits = re.sub(
+            r"[^0-9]",
+            "",
+            str(_first(row, "bzowrRgstNo", "bzowr_rgst_no")),
+        )
+        if (
+            current_business_digits
+            and row_business_digits
+            and current_business_digits[:6] != row_business_digits[:6]
+        ):
+            continue
+        row_address = _address_identity(
+            _first(
+                row,
+                "wkplRoadNmDtlAddr",
+                "wkpl_road_nm_dtl_addr",
+                "wkplAddr",
+                "wkpl_addr",
+            )
+        )
+        address_score = int(
+            bool(
+                current_address
+                and row_address
+                and (
+                    current_address.startswith(row_address[:18])
+                    or row_address.startswith(current_address[:18])
+                )
+            )
+        )
+        candidates.append((address_score, row))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda value: value[0], reverse=True)
+    return candidates[0][1]
+
+
+def fetch_nps_year_over_year(
+    workplace: dict[str, Any],
+    *,
+    timeout: int = 15,
+    retries: int = 1,
+) -> dict[str, Any]:
+    """동일 사업장의 전년 동월 가입자수와 현재 가입자수를 비교한다."""
+    key = _service_key()
+    if not key:
+        return {
+            "ok": False,
+            "status": "KEY_MISSING",
+            "message": f"{SERVICE_KEY_ENV}가 없습니다.",
+            "api_attempt_count": 0,
+        }
+    current_ym = str(workplace.get("자료생성년월") or "").strip()
+    target_ym = _previous_year_month(current_ym)
+    current_count = _optional_integer(workplace.get("가입자수"))
+    if not target_ym or current_count is None:
+        return {
+            "ok": False,
+            "status": "CURRENT_DATA_MISSING",
+            "message": "현재 기준월 또는 가입자수가 없습니다.",
+            "api_attempt_count": 0,
+        }
+    company_name = str(workplace.get("사업장명") or "").strip()
+    params: dict[str, Any] = {
+        "serviceKey": key,
+        "pageNo": 1,
+        "numOfRows": 100,
+        "dataType": "json",
+        "wkplNm": company_name,
+        "dataCrtYm": target_ym,
+        "ldongAddrMgplDgCd": str(workplace.get("지역코드") or ""),
+    }
+    business_digits = re.sub(
+        r"[^0-9]",
+        "",
+        str(workplace.get("사업자등록번호") or ""),
+    )
+    if len(business_digits) >= 6:
+        params["bzowrRgstNo"] = business_digits[:6]
+    response, error_status, error_message, basic_attempts = _get_with_retry(
+        NPS_BASE_URL,
+        params=params,
+        timeout=timeout,
+        retries=retries,
+    )
+    if response is None:
+        return {
+            "ok": False,
+            "status": error_status,
+            "message": error_message,
+            "api_attempt_count": basic_attempts,
+        }
+    text = response.text or ""
+    content_type = response.headers.get("content-type", "").lower()
+    if not (
+        "json" in content_type
+        or text.lstrip().startswith(("{", "["))
+    ):
+        code, message = _xml_error(text)
+        return {
+            "ok": False,
+            "status": code or f"HTTP_{response.status_code}",
+            "message": message or "전년 동월 조회 응답을 해석하지 못했습니다.",
+            "api_attempt_count": basic_attempts,
+        }
+    try:
+        payload = response.json()
+    except ValueError:
+        return {
+            "ok": False,
+            "status": "INVALID_JSON",
+            "message": "전년 동월 조회 JSON 해석에 실패했습니다.",
+            "api_attempt_count": basic_attempts,
+        }
+    code, message, _total_count, rows = _items_from_json(payload)
+    if not response.ok or code not in {"00", "0", ""}:
+        return {
+            "ok": False,
+            "status": code or f"HTTP_{response.status_code}",
+            "message": message or "전년 동월 기본조회에 실패했습니다.",
+            "api_attempt_count": basic_attempts,
+        }
+    prior_basic = _prior_workplace_match(workplace, rows, target_ym)
+    if prior_basic is None:
+        return {
+            "ok": False,
+            "status": "PRIOR_WORKPLACE_NOT_FOUND",
+            "message": "동일 사업장의 전년 동월 자료를 찾지 못했습니다.",
+            "api_attempt_count": basic_attempts,
+            "previous_data_created_ym": target_ym,
+        }
+    prior_detail, detail_ok, detail_message, detail_attempts = (
+        _fetch_nps_detail(
+            prior_basic,
+            key=key,
+            timeout=timeout,
+            retries=retries,
+        )
+    )
+    previous_count = _optional_integer(
+        _first(prior_detail, "jnngpCnt", "jnngp_cnt", "가입자수")
+    )
+    if not detail_ok or previous_count is None:
+        return {
+            "ok": False,
+            "status": "PRIOR_DETAIL_UNAVAILABLE",
+            "message": detail_message or "전년 동월 가입자수가 없습니다.",
+            "api_attempt_count": basic_attempts + detail_attempts,
+            "previous_data_created_ym": target_ym,
+        }
+    return {
+        "ok": True,
+        "status": "SUCCESS",
+        "message": "전년 동월 가입자수 비교를 완료했습니다.",
+        "current_data_created_ym": current_ym,
+        "previous_data_created_ym": target_ym,
+        "current_employee_count": current_count,
+        "previous_employee_count": previous_count,
+        "year_over_year_growth": current_count - previous_count,
+        "api_attempt_count": basic_attempts + detail_attempts,
+    }
+
+
+def enrich_employment_growth(
+    workplaces: list[dict[str, Any]],
+    *,
+    basis: str = "year_over_year",
+    timeout: int = 15,
+    retries: int = 1,
+    workers: int = 8,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """선택한 고용 기준을 조회하고 결측을 0명과 구분한다."""
+    normalized_basis = str(basis or "year_over_year").strip().lower()
+    if normalized_basis not in {"year_over_year", "recent_net", "none"}:
+        normalized_basis = "year_over_year"
+    rows = [dict(item) for item in workplaces]
+    stats = {
+        "employment_checked": 0,
+        "employment_unavailable": 0,
+        "employment_failed": 0,
+        "employment_api_attempts": 0,
+    }
+    if normalized_basis == "none":
+        for row in rows:
+            row["고용증가기준"] = "none"
+            row["선택고용증가"] = None
+            row["고용자료상태"] = "NOT_CHECKED"
+            row["고용증가판정"] = "고용 증가 필터 미사용"
+        return rows, stats
+
+    def _lookup(row: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        if normalized_basis == "recent_net":
+            raw = (
+                row.get("원본데이터")
+                if isinstance(row.get("원본데이터"), dict)
+                else {}
+            )
+            sequence = _first(raw, "seq", "자료순번") or row.get(
+                "source_key"
+            )
+            result = fetch_nps_period_status(
+                sequence,
+                data_created_ym=str(row.get("자료생성년월") or ""),
+                timeout=timeout,
+                retries=retries,
+            )
+        else:
+            result = fetch_nps_year_over_year(
+                row,
+                timeout=timeout,
+                retries=retries,
+            )
+        return row, result
+
+    completed: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+    maximum_workers = min(max(1, int(workers)), max(1, len(rows)))
+    with ThreadPoolExecutor(max_workers=maximum_workers) as executor:
+        future_map = {
+            executor.submit(_lookup, row): index
+            for index, row in enumerate(rows)
+        }
+        for future in as_completed(future_map):
+            index = future_map[future]
+            row = rows[index]
+            try:
+                _original, result = future.result()
+            except Exception as exc:
+                result = {
+                    "ok": False,
+                    "status": "LOOKUP_ERROR",
+                    "message": f"{type(exc).__name__}: {exc}",
+                    "api_attempt_count": 0,
+                }
+            completed.append((index, row, result))
+
+    for index, row, result in completed:
+        stats["employment_api_attempts"] += int(
+            result.get("api_attempt_count") or 0
+        )
+        row["고용증가기준"] = normalized_basis
+        row["고용자료메시지"] = str(result.get("message") or "")
+        if result.get("ok"):
+            stats["employment_checked"] += 1
+            row["고용자료상태"] = "CONFIRMED"
+            if normalized_basis == "recent_net":
+                row["신규취득자수"] = result["new_count"]
+                row["상실가입자수"] = result["lost_count"]
+                row["순고용증가"] = result["net_growth"]
+                row["선택고용증가"] = result["net_growth"]
+                row["고용증가판정"] = (
+                    "최근 월 순취득 증가"
+                    if result["net_growth"] > 0
+                    else "최근 월 순취득 증가 아님"
+                )
+            else:
+                row["전년가입자수"] = result["previous_employee_count"]
+                row["전년대비고용증가"] = result[
+                    "year_over_year_growth"
+                ]
+                row["선택고용증가"] = result[
+                    "year_over_year_growth"
+                ]
+                row["고용증가판정"] = (
+                    "전년 동월 대비 가입자 증가"
+                    if result["year_over_year_growth"] > 0
+                    else "전년 동월 대비 증가 아님"
+                )
+                row["전년자료생성년월"] = result[
+                    "previous_data_created_ym"
+                ]
+        else:
+            status = str(result.get("status") or "UNAVAILABLE")
+            row["고용자료상태"] = status
+            row["선택고용증가"] = None
+            row["고용증가판정"] = "고용자료 확인 불가"
+            if status in {
+                "PRIOR_WORKPLACE_NOT_FOUND",
+                "NO_PERIOD_DATA",
+                "INCOMPLETE_PERIOD_DATA",
+                "CURRENT_DATA_MISSING",
+            }:
+                stats["employment_unavailable"] += 1
+            else:
+                stats["employment_failed"] += 1
+        rows[index] = row
+    return rows, stats
 
 
 def _fetch_nps_detail(

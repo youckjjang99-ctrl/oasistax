@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
@@ -20,11 +21,15 @@ from prospect_db_repository import (
     contact_table_status,
     list_contacts_for_prospects,
     list_prospects,
+    list_search_history,
     prospect_table_status,
     remove_existing_customers,
+    save_prospect_memo,
+    save_search_history,
     save_sales_analysis,
     save_prospect_contacts,
     save_prospects,
+    search_history_table_status,
 )
 from sales_intelligence import analyze_sales_candidate, merge_analysis
 
@@ -54,6 +59,28 @@ BUSINESS_TYPE_OPTIONS = {
     "주식회사": "stock",
     "개인사업자 후보": "individual",
     "전체": "all",
+}
+INDUSTRY_FILTER_OPTIONS = (
+    "병원·의원",
+    "음식점",
+    "서비스업",
+    "도소매업",
+    "제조업",
+    "건설업",
+    "기타",
+)
+BUSINESS_TYPE_LABELS = {
+    "stock": "주식회사",
+    "individual": "개인사업자 후보",
+    "all": "전체",
+}
+GROWTH_BASIS_OPTIONS = {
+    "전년 동월 대비 가입자수 증가": "year_over_year",
+    "최근 월 신규취득−상실 증가": "recent_net",
+    "고용 증가 필터 사용 안 함": "none",
+}
+GROWTH_BASIS_LABELS = {
+    value: label for label, value in GROWTH_BASIS_OPTIONS.items()
 }
 
 
@@ -86,6 +113,15 @@ def _contact_status_label(value: object) -> str:
     return labels.get(status, str(value or "분석 전"))
 
 
+def _employment_value(value: object) -> int | str:
+    if value in (None, ""):
+        return "확인 불가"
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return "확인 불가"
+
+
 def _display_frame(items: list[dict]) -> pd.DataFrame:
     rows = []
     for item in items:
@@ -108,11 +144,27 @@ def _display_frame(items: list[dict]) -> pd.DataFrame:
                 f"{row.get('stage', '')}:{row.get('status', '')}"
                 for row in (item.get("연락처조회이력") or [])
             ),
+            "업종분류": item.get("업종분류", ""),
             "업종명": item.get("업종명", ""),
+            "자료생성년월": item.get("자료생성년월", ""),
             "가입자수": int(item.get("가입자수") or 0),
-            "신규취득자수": int(item.get("신규취득자수") or 0),
-            "상실가입자수": int(item.get("상실가입자수") or 0),
-            "순고용증가": int(item.get("순고용증가") or 0),
+            "전년가입자수": _employment_value(
+                item.get("전년가입자수")
+            ),
+            "전년대비고용증가": _employment_value(
+                item.get("전년대비고용증가")
+            ),
+            "신규취득자수": _employment_value(
+                item.get("신규취득자수")
+            ),
+            "상실가입자수": _employment_value(
+                item.get("상실가입자수")
+            ),
+            "최근월순취득": _employment_value(
+                item.get("순고용증가")
+            ),
+            "고용판정": item.get("고용증가판정", ""),
+            "고용자료상태": item.get("고용자료상태", ""),
             "영업주제": item.get("영업주제", "분석 전"),
             "추천등급": item.get("추천등급", ""),
             "우선순위점수": int(item.get("우선순위점수") or 0),
@@ -132,11 +184,17 @@ def _display_frame(items: list[dict]) -> pd.DataFrame:
         "전화출처",
         "연락처상태",
         "연락처조회이력",
+        "업종분류",
         "업종명",
+        "자료생성년월",
         "가입자수",
+        "전년가입자수",
+        "전년대비고용증가",
         "신규취득자수",
         "상실가입자수",
-        "순고용증가",
+        "최근월순취득",
+        "고용판정",
+        "고용자료상태",
         "영업주제",
         "추천등급",
         "우선순위점수",
@@ -215,13 +273,22 @@ def _saved_candidate_frame(
     for row in rows:
         prospect_id = str(row.get("id") or "")
         analysis = _saved_sales_analysis(row)
+        source_data = (
+            row.get("source_data")
+            if isinstance(row.get("source_data"), dict)
+            else {}
+        )
+        employment = (
+            source_data.get("employment_growth")
+            if isinstance(source_data.get("employment_growth"), dict)
+            else {}
+        )
+        selected_growth = employment.get("selected_growth")
         display.append(
             {
                 "업체명": row.get("company_name", ""),
                 "사업자유형": (
-                    (row.get("source_data") or {}).get("business_type")
-                    if isinstance(row.get("source_data"), dict)
-                    else ""
+                    source_data.get("business_type")
                 )
                 or _business_type_label(row.get("company_name")),
                 "대표전화": (
@@ -233,8 +300,22 @@ def _saved_candidate_frame(
                     analysis.get("contact_status", "분석 전")
                 ),
                 "이메일": email_by_id.get(prospect_id, ""),
+                "업종분류": (
+                    source_data.get("industry_category")
+                ),
+                "업종명": row.get("industry_name", ""),
                 "가입자": int(row.get("employee_count") or 0),
-                "순고용증가": int(analysis.get("net_hiring") or 0),
+                "고용증가기준": GROWTH_BASIS_LABELS.get(
+                    str(employment.get("basis") or ""),
+                    "기존 저장자료",
+                ),
+                "고용증가값": _employment_value(selected_growth),
+                "고용판정": str(employment.get("judgement") or ""),
+                "_고용정렬": (
+                    int(selected_growth)
+                    if selected_growth not in (None, "")
+                    else -1000000
+                ),
                 "영업주제": " · ".join(
                     analysis.get("sales_topics") or []
                 ),
@@ -243,9 +324,90 @@ def _saved_candidate_frame(
                     "first_call_script",
                     "",
                 ),
+                "메모": str(row.get("memo") or ""),
+                "_prospect_id": prospect_id,
             }
         )
     return pd.DataFrame(display)
+
+
+def _excel_bytes(frame: pd.DataFrame, sheet_name: str) -> bytes:
+    output = BytesIO()
+    safe_sheet_name = str(sheet_name or "DB발굴")[:31]
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        frame.to_excel(writer, sheet_name=safe_sheet_name, index=False)
+    return output.getvalue()
+
+
+def _render_search_history(owner_user_id: str) -> int:
+    with st.expander("내 검색 페이지 이력", expanded=False):
+        try:
+            history_ok, history_message = search_history_table_status()
+        except Exception as exc:
+            history_ok = False
+            history_message = f"검색 이력 연결 확인 실패: {exc}"
+        if not history_ok:
+            st.info(
+                f"{history_message} 관리자 설정의 v9.8.4 SQL을 한 번 "
+                "실행하면 이후 검색 구간이 사용자별로 자동 저장됩니다."
+            )
+            return 1
+        try:
+            rows = list_search_history(owner_user_id, limit=50)
+        except Exception as exc:
+            st.warning(f"검색 이력을 불러오지 못했습니다: {exc}")
+            return 1
+        if not rows:
+            st.caption(
+                "아직 저장된 검색 이력이 없습니다. 검색을 완료하면 "
+                "지역·사업자 유형·페이지 구간이 자동 기록됩니다."
+            )
+            return 1
+        display_rows = []
+        for row in rows:
+            categories = row.get("industry_categories") or []
+            display_rows.append(
+                {
+                    "검색일시": str(row.get("searched_at") or "").replace(
+                        "T", " "
+                    )[:19],
+                    "지역": row.get("region", ""),
+                    "사업자 유형": BUSINESS_TYPE_LABELS.get(
+                        str(row.get("business_type") or ""),
+                        row.get("business_type", ""),
+                    ),
+                    "조회 페이지": (
+                        f"{int(row.get('start_page') or 1):,}"
+                        f"~{int(row.get('end_page') or 1):,}"
+                    ),
+                    "업종 필터": (
+                        " · ".join(categories) if categories else "전체 업종"
+                    ),
+                    "고용 기준": GROWTH_BASIS_LABELS.get(
+                        str(row.get("growth_basis") or "year_over_year"),
+                        str(row.get("growth_basis") or ""),
+                    ),
+                    "발굴": f"{int(row.get('found_count') or 0):,}건",
+                    "검색시간": (
+                        f"{float(row.get('elapsed_seconds') or 0):,.1f}초"
+                    ),
+                }
+            )
+        st.dataframe(
+            pd.DataFrame(display_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+        latest = rows[0]
+        next_page = min(
+            100000,
+            int(latest.get("end_page") or 0) + 1,
+        )
+        st.caption(
+            "최근 조회 다음 권장 페이지: "
+            f"{next_page:,} · 검색 입력값에 자동 반영됩니다."
+        )
+        return next_page
 
 
 def _contact_result_row(result: dict) -> dict:
@@ -1255,7 +1417,8 @@ def _render_clean_saved_prospects(owner_user_id: str) -> None:
     st.markdown("### 저장된 영업후보")
     st.caption(
         "모든 사용자가 함께 사용하는 영업DB입니다. 대표전화 또는 "
-        "휴대전화가 확인된 업체를 순고용 증가 순으로 표시합니다."
+        "휴대전화가 확인된 업체를 선택한 고용 증가 기준 순으로 표시하며, "
+        "업체별 메모를 바로 기록할 수 있습니다."
     )
     try:
         rows = list_prospects(limit=1000)
@@ -1280,50 +1443,126 @@ def _render_clean_saved_prospects(owner_user_id: str) -> None:
         frame["대표전화"] = frame["대표전화"].map(normalize_phone)
         frame = frame[frame["대표전화"] != ""].reset_index(drop=True)
         frame = frame.sort_values(
-            by=["순고용증가", "가입자"],
+            by=["_고용정렬", "가입자"],
             ascending=[False, False],
             kind="stable",
         ).reset_index(drop=True)
     if frame.empty:
         st.info("유효한 대표전화가 확인된 저장 업체가 없습니다.")
         return
-    st.dataframe(
-        frame,
+
+    export_frame = frame.drop(
+        columns=["_prospect_id", "_고용정렬"],
+        errors="ignore",
+    )
+    st.download_button(
+        "저장된 영업후보 엑셀 다운로드",
+        data=_excel_bytes(export_frame, "저장된 영업후보"),
+        file_name="OASIS_저장된_영업후보.xlsx",
+        mime=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+        use_container_width=True,
+        key="saved_prospect_excel_v984",
+    )
+    visible_columns = [
+        "업체명",
+        "사업자유형",
+        "대표전화",
+        "전화출처",
+        "연락처상태",
+        "이메일",
+        "업종분류",
+        "업종명",
+        "가입자",
+        "고용증가기준",
+        "고용증가값",
+        "고용판정",
+        "영업주제",
+        "추천등급",
+        "초회전화스크립트",
+        "메모",
+        "_prospect_id",
+    ]
+    original_memos = {
+        str(row["_prospect_id"]): str(row.get("메모") or "")
+        for row in frame[visible_columns].to_dict("records")
+    }
+    edited = st.data_editor(
+        frame[visible_columns],
         use_container_width=True,
         hide_index=True,
+        disabled=[
+            column for column in visible_columns if column != "메모"
+        ],
         column_config={
             "초회전화스크립트": st.column_config.TextColumn(
                 "초회 전화 스크립트",
                 width="large",
-            )
+            ),
+            "메모": st.column_config.TextColumn(
+                "업체 메모",
+                width="large",
+                help="담당자·통화 결과·다음 연락일 등을 기록합니다.",
+            ),
+            "_prospect_id": None,
         },
+        key="saved_prospect_memo_editor_v984",
     )
+    changed_memos = [
+        (
+            str(row.get("_prospect_id") or ""),
+            str(row.get("메모") or ""),
+        )
+        for row in edited.to_dict("records")
+        if str(row.get("메모") or "")
+        != original_memos.get(str(row.get("_prospect_id") or ""), "")
+    ]
+    if st.button(
+        f"변경한 메모 {len(changed_memos):,}건 저장",
+        type="primary",
+        use_container_width=True,
+        disabled=not changed_memos,
+        key="save_prospect_memos_v984",
+    ):
+        try:
+            for prospect_id, memo in changed_memos:
+                save_prospect_memo(prospect_id, memo)
+            st.success(f"업체 메모 {len(changed_memos):,}건을 저장했습니다.")
+            st.rerun()
+        except Exception as exc:
+            st.error(
+                "메모를 저장하지 못했습니다. 관리자 설정에서 v9.8.4 "
+                f"SQL 실행 여부를 확인해 주세요: {exc}"
+            )
 
 
 def render_prospect_db_center(owner_user_id: str = "") -> None:
-    st.markdown("## 연락 가능한 성장기업 찾기")
+    st.markdown("## DB발굴")
     st.caption(
-        "조회할 페이지와 사업자 유형을 직접 선택하고, 순고용이 증가한 "
-        "사업장 중 전화 또는 휴대전화가 확인된 업체를 찾습니다."
+        "조회할 페이지·사업자 유형·고용 증가 판단 기준을 선택하고, "
+        "전화 또는 휴대전화가 확인된 업체를 찾습니다."
     )
+    recommended_start_page = _render_search_history(owner_user_id)
 
-    with st.form("prospect_search_v983"):
+    with st.form("prospect_search_v984"):
         col1, col2, col3, col4 = st.columns(4)
         region_name = col1.selectbox(
             "수집 지역",
             list(REGION_CODES.keys()),
-            key="prospect_region_v983",
+            key="prospect_region_v984",
         )
         business_type_name = col2.selectbox(
             "사업자 유형",
             list(BUSINESS_TYPE_OPTIONS.keys()),
-            key="prospect_business_type_v983",
+            key="prospect_business_type_v984",
         )
         target_count = col3.selectbox(
             "필요한 업체 수",
             [10, 20, 30, 50],
             index=2,
-            key="prospect_target_v983",
+            key="prospect_target_v984",
         )
         minimum_employees = col4.number_input(
             "최소 가입자 수",
@@ -1331,7 +1570,7 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             max_value=300,
             value=3,
             step=1,
-            key="prospect_min_employee_v983",
+            key="prospect_min_employee_v984",
         )
         with st.expander("검색 범위 조정", expanded=True):
             page_col1, page_col2 = st.columns(2)
@@ -1339,40 +1578,63 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 "시작 페이지",
                 min_value=1,
                 max_value=100000,
-                value=1,
+                value=int(recommended_start_page),
                 step=1,
                 help=(
                     "이미 1~10페이지를 조회했다면 11을 입력할 수 있습니다."
                 ),
-                key="prospect_start_page_v983",
+                key="prospect_start_page_v984",
             )
             end_page = page_col2.number_input(
                 "종료 페이지",
                 min_value=1,
                 max_value=100000,
-                value=10,
+                value=min(100000, int(recommended_start_page) + 9),
                 step=1,
                 help="시작 페이지부터 종료 페이지까지 순서대로 조회합니다.",
-                key="prospect_end_page_v983",
+                key="prospect_end_page_v984",
+            )
+            growth_basis_name = st.selectbox(
+                "고용 증가 판단 기준",
+                list(GROWTH_BASIS_OPTIONS.keys()),
+                index=0,
+                help=(
+                    "전년 동월 대비는 동일 사업장의 현재 가입자수와 "
+                    "12개월 전 가입자수를 비교합니다. 최근 월 기준은 "
+                    "기간별 API의 신규취득자수에서 상실가입자수를 뺍니다."
+                ),
+                key="prospect_growth_basis_v984",
             )
             growth_only = st.checkbox(
-                "순고용 증가 사업장만 표시",
+                "선택한 기준의 고용 증가 사업장만 표시",
                 value=True,
                 help=(
-                    "신규취득자수에서 상실가입자수를 뺀 값이 1명 이상인 "
-                    "사업장만 연락처 검색 대상으로 사용합니다."
+                    "증가값이 1명 이상으로 확인된 사업장만 연락처 검색 "
+                    "대상으로 사용합니다. 자료가 없는 사업장은 0명이 "
+                    "아니라 확인 불가로 분리됩니다."
                 ),
-                key="prospect_growth_only_v983",
+                key="prospect_growth_only_v984",
+            )
+            industry_categories = st.multiselect(
+                "업종 필터",
+                list(INDUSTRY_FILTER_OPTIONS),
+                default=[],
+                help=(
+                    "선택하지 않으면 전체 업종을 검색합니다. 개인사업자 "
+                    "후보에서 병원·음식점·서비스업 등을 골라 검색할 수 "
+                    "있습니다."
+                ),
+                key="prospect_industry_categories_v984",
             )
             sigungu_code = st.text_input(
                 "시·군·구 법정동 코드",
                 placeholder="선택사항",
-                key="prospect_sigungu_v983",
+                key="prospect_sigungu_v984",
             )
             emd_code = st.text_input(
                 "읍·면·동 법정동 코드",
                 placeholder="선택사항",
-                key="prospect_emd_v983",
+                key="prospect_emd_v984",
             )
         search_clicked = st.form_submit_button(
             f"연락 가능한 성장기업 {target_count}개 찾기",
@@ -1382,12 +1644,15 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
         )
         st.caption(
             "목표 업체 수를 채우거나 지정한 종료 페이지에 도달할 때까지 "
-            "검색합니다. 페이지 범위가 넓으면 시간이 오래 걸릴 수 있습니다."
+            "검색합니다. 전년 동월 대비는 사업장마다 과거 기본·상세조회가 "
+            "추가되어 다른 기준보다 시간이 더 걸릴 수 있습니다."
         )
 
     business_type = BUSINESS_TYPE_OPTIONS[business_type_name]
+    growth_basis = GROWTH_BASIS_OPTIONS[growth_basis_name]
+    effective_growth_only = bool(growth_only and growth_basis != "none")
     page_state_key = (
-        f"prospect_next_page_v983_{region_name}_{business_type}"
+        f"prospect_next_page_v984_{owner_user_id}_{region_name}_{business_type}"
     )
     page_count = int(end_page) - int(start_page) + 1
     if search_clicked and page_count <= 0:
@@ -1432,6 +1697,24 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                         f"국민연금 {event.get('page', '')}페이지 확인 완료"
                     ),
                 )
+            elif stage == "employment":
+                progress_state["value"] = max(progress_state["value"], 0.62)
+                progress_bar.progress(
+                    progress_state["value"],
+                    text=(
+                        f"{growth_basis_name} 자료 확인 중 "
+                        f"({event.get('page', '')}페이지)"
+                    ),
+                )
+            elif stage == "employment_complete":
+                progress_state["value"] = max(progress_state["value"], 0.68)
+                progress_bar.progress(
+                    progress_state["value"],
+                    text=(
+                        f"고용자료 확인 {event.get('checked', 0)}건 · "
+                        f"확인 불가 {event.get('unavailable', 0)}건"
+                    ),
+                )
             elif stage == "quick_contact":
                 progress_state["value"] = max(progress_state["value"], 0.72)
                 progress_bar.progress(
@@ -1464,19 +1747,47 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 max_pages=page_count,
                 minimum_employees=int(minimum_employees),
                 business_type=business_type,
-                growth_only=bool(growth_only),
+                growth_only=effective_growth_only,
+                growth_basis=growth_basis,
+                industry_categories=list(industry_categories),
                 sigungu_code=sigungu_code,
                 emd_code=emd_code,
                 progress=_progress,
             )
         progress_bar.progress(1.0, text="검색을 완료했습니다.")
         status_box.empty()
-        st.session_state["prospect_result_v983"] = result
+        try:
+            result_stats = result.get("stats") or {}
+            save_search_history(
+                owner_user_id,
+                region=region_name,
+                region_code=REGION_CODES[region_name],
+                business_type=business_type,
+                start_page=int(
+                    result.get("searched_start_page") or start_page
+                ),
+                end_page=int(
+                    result.get("searched_end_page") or end_page
+                ),
+                target_count=int(target_count),
+                minimum_employees=int(minimum_employees),
+                growth_only=effective_growth_only,
+                growth_basis=growth_basis,
+                industry_categories=list(industry_categories),
+                found_count=int(result.get("found_count") or 0),
+                pages_scanned=int(result_stats.get("pages_scanned") or 0),
+                elapsed_seconds=float(
+                    result_stats.get("elapsed_seconds") or 0
+                ),
+            )
+        except Exception as exc:
+            result["history_warning"] = str(exc)
+        st.session_state["prospect_result_v984"] = result
         st.session_state[page_state_key] = int(
             result.get("next_page") or int(end_page) + 1
         )
 
-    result = st.session_state.get("prospect_result_v983")
+    result = st.session_state.get("prospect_result_v984")
     if result:
         stats = result.get("stats") or {}
         metric_cols = st.columns(5)
@@ -1485,7 +1796,15 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             f"{stats.get('basic_received', 0):,}건",
         )
         metric_cols[1].metric(
-            "최근 순고용 증가",
+            (
+                "전년 대비 증가"
+                if result.get("growth_basis") == "year_over_year"
+                else (
+                    "최근 월 순취득 증가"
+                    if result.get("growth_basis") == "recent_net"
+                    else "고용 필터 미사용"
+                )
+            ),
             f"{stats.get('growth_candidates', 0):,}건",
         )
         metric_cols[2].metric(
@@ -1505,7 +1824,11 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             f"조회 페이지 {result.get('searched_start_page', start_page)}"
             f"~{result.get('searched_end_page', end_page)} · "
             f"상세조회 대상 {stats.get('detail_targets', 0):,}건 · "
+            f"고용자료 확인 {stats.get('employment_checked', 0):,}건 · "
+            f"고용자료 확인 불가 "
+            f"{stats.get('employment_unavailable', 0):,}건 · "
             f"연락처 확인 대상 {stats.get('contact_checked', 0):,}건 · "
+            f"업종 제외 {stats.get('industry_excluded', 0):,}건 · "
             f"검색시간 {stats.get('elapsed_seconds', 0):,.1f}초"
         )
         st.info(
@@ -1518,19 +1841,52 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 "기존 DB 중복확인 일부를 완료하지 못했습니다: "
                 f"{result['duplicate_warning']}"
             )
+        if result.get("history_warning"):
+            st.warning(
+                "검색 결과는 정상입니다. 페이지 이력은 저장하지 "
+                "못했습니다. 관리자 설정에서 v9.8.4 SQL 실행 여부를 "
+                f"확인해 주세요: {result['history_warning']}"
+            )
 
         items = list(result.get("items") or [])
         if not items:
             st.info(
-                "선택한 범위의 무료 공개 소스에서 회사명·주소가 일치하는 "
-                "전화번호를 확인하지 못했습니다. 다음 검색 권장 페이지를 "
-                "시작 페이지에 입력해 이어서 조회할 수 있습니다."
+                "선택한 범위에서 고용 증가 조건과 공개 대표전화 조건을 "
+                "모두 충족한 업체를 확인하지 못했습니다. 고용자료 확인 "
+                "불가 건수가 많다면 ‘최근 월’ 기준 또는 ‘고용 증가 필터 "
+                "사용 안 함’으로 비교 검색할 수 있습니다."
             )
         else:
             st.markdown("### 이번에 찾은 영업후보")
             display = _display_frame(items)
             display["대표전화"] = display["대표전화"].map(normalize_phone)
             display = display[display["대표전화"] != ""].reset_index(drop=True)
+            excel_columns = [
+                column
+                for column in display.columns
+                if column not in {"선택", "source_key"}
+            ]
+            st.download_button(
+                "이번 발굴결과 엑셀 다운로드",
+                data=_excel_bytes(
+                    display[excel_columns],
+                    "DB발굴 결과",
+                ),
+                file_name=(
+                    f"OASIS_DB발굴_{region_name}_"
+                    f"{result.get('searched_start_page', start_page)}-"
+                    f"{result.get('searched_end_page', end_page)}.xlsx"
+                ),
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                ),
+                use_container_width=True,
+                key=(
+                    "prospect_result_excel_v984_"
+                    f"{result.get('next_page', 1)}"
+                ),
+            )
             visible_columns = [
                 "선택",
                 "사업장명",
@@ -1539,11 +1895,17 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 "전화출처",
                 "지역",
                 "주소",
+                "업종분류",
                 "업종명",
+                "자료생성년월",
                 "가입자수",
+                "전년가입자수",
+                "전년대비고용증가",
                 "신규취득자수",
                 "상실가입자수",
-                "순고용증가",
+                "최근월순취득",
+                "고용판정",
+                "고용자료상태",
                 "영업주제",
                 "추천등급",
                 "초회전화스크립트",
@@ -1566,7 +1928,7 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                     ),
                     "source_key": None,
                 },
-                key=f"prospect_editor_v983_{result.get('next_page', 1)}",
+                key=f"prospect_editor_v984_{result.get('next_page', 1)}",
             )
             selected_keys = set(
                 edited.loc[edited["선택"] == True, "source_key"].tolist()
@@ -1582,7 +1944,7 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 type="primary",
                 use_container_width=True,
                 disabled=not selected_items,
-                key="save_prospects_v983",
+                key="save_prospects_v984",
             ):
                 try:
                     saved_count = save_prospects(
@@ -1590,7 +1952,7 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                         owner_user_id,
                     )
                     st.success(f"{saved_count:,}개 업체를 저장했습니다.")
-                    st.session_state.pop("prospect_result_v983", None)
+                    st.session_state.pop("prospect_result_v984", None)
                     st.rerun()
                 except Exception as exc:
                     st.error(f"영업후보 저장 실패: {exc}")
@@ -1684,19 +2046,27 @@ def render_prospect_admin_settings() -> None:
     st.markdown("### Supabase 영업후보 테이블")
     prospect_status = prospect_table_status()
     contacts_status = contact_table_status()
-    db_cols = st.columns(2)
+    history_status = search_history_table_status()
+    db_cols = st.columns(3)
     db_cols[0].success(prospect_status[1]) if prospect_status[0] else db_cols[
         0
     ].warning(prospect_status[1])
     db_cols[1].success(contacts_status[1]) if contacts_status[0] else db_cols[
         1
     ].warning(contacts_status[1])
+    db_cols[2].success(history_status[1]) if history_status[0] else db_cols[
+        2
+    ].warning(history_status[1])
 
     for path_name, label in (
         ("supabase_v960_prospect_db.sql", "영업후보DB SQL 다운로드"),
         (
             "supabase_v970_contact_enrichment.sql",
             "연락처DB SQL 다운로드",
+        ),
+        (
+            "supabase_v984_db_discovery.sql",
+            "DB발굴 검색이력·메모 SQL 다운로드",
         ),
     ):
         path = BASE_DIR / path_name

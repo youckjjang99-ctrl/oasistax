@@ -1,0 +1,7 @@
+git status
+git add app.py prospect_db_center.py prospect_collection_service.py prospect_db_repository.py public_data_api.py sales_intelligence.py contact_enrichment.py localdata_contact_client.py kakao_local_client.py naver_web_search_client.py supabase_v984_db_discovery.sql VERSION.txt APPLY_UPDATE_v9.8.4.py RUN_UPDATE_v9.8.4.bat README_UPDATE_v9.8.4.md GITHUB_UPLOAD_COMMANDS_v9.8.4.txt payload
+git add -f CHANGELOG_v9.8.4.md
+git status
+git commit -m "OASIS CRM v9.8.4 DB발굴 전년대비 고용증가 판정"
+git pull --rebase origin main
+git push origin main

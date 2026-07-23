@@ -10,23 +10,32 @@ from prospect_db_repository import (
     remove_existing_customers,
     remove_existing_prospects,
 )
-from public_data_api import fetch_nps_workplaces
+from public_data_api import (
+    enrich_employment_growth,
+    fetch_nps_workplaces,
+    industry_category,
+)
 from sales_intelligence import analyze_sales_candidate, merge_analysis
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 
 
-def _net_growth(item: dict[str, Any]) -> int:
-    return int(item.get("신규취득자수") or 0) - int(
-        item.get("상실가입자수") or 0
-    )
+def _optional_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _growth_sort_key(item: dict[str, Any]) -> tuple[int, int, int]:
+    selected_growth = _optional_int(item.get("선택고용증가"))
+    recent_new = _optional_int(item.get("신규취득자수"))
     return (
-        _net_growth(item),
-        int(item.get("신규취득자수") or 0),
+        selected_growth if selected_growth is not None else -1000000,
+        recent_new if recent_new is not None else -1000000,
         int(item.get("가입자수") or 0),
     )
 
@@ -156,6 +165,8 @@ def collect_contactable_growth_companies(
     minimum_employees: int = 3,
     business_type: str = "stock",
     growth_only: bool = True,
+    growth_basis: str = "year_over_year",
+    industry_categories: list[str] | None = None,
     sigungu_code: str = "",
     emd_code: str = "",
     progress: ProgressCallback | None = None,
@@ -167,6 +178,16 @@ def collect_contactable_growth_companies(
     business_type = str(business_type or "stock").strip().lower()
     if business_type not in {"stock", "individual", "all"}:
         business_type = "stock"
+    growth_basis = str(growth_basis or "year_over_year").strip().lower()
+    if growth_basis not in {"year_over_year", "recent_net", "none"}:
+        growth_basis = "year_over_year"
+    if growth_basis == "none":
+        growth_only = False
+    selected_industries = {
+        str(value or "").strip()
+        for value in (industry_categories or [])
+        if str(value or "").strip()
+    }
 
     try:
         saved_source_keys, saved_business_nos = (
@@ -190,7 +211,12 @@ def collect_contactable_growth_companies(
         "existing_customer_excluded": 0,
         "saved_prospect_excluded": 0,
         "under_minimum_excluded": 0,
+        "industry_excluded": 0,
         "growth_candidates": 0,
+        "employment_checked": 0,
+        "employment_unavailable": 0,
+        "employment_failed": 0,
+        "employment_api_attempts": 0,
         "contact_checked": 0,
         "pages_scanned": 0,
         "elapsed_seconds": 0.0,
@@ -264,6 +290,20 @@ def collect_contactable_growth_companies(
         stats["under_minimum_excluded"] += (
             len(items) - len(minimum_filtered)
         )
+        if selected_industries:
+            industry_filtered = []
+            for item in minimum_filtered:
+                category = str(
+                    item.get("업종분류")
+                    or industry_category(item.get("업종명"))
+                )
+                item["업종분류"] = category
+                if category in selected_industries:
+                    industry_filtered.append(item)
+            stats["industry_excluded"] += (
+                len(minimum_filtered) - len(industry_filtered)
+            )
+            minimum_filtered = industry_filtered
         try:
             minimum_filtered, customer_count = remove_existing_customers(
                 minimum_filtered
@@ -279,15 +319,43 @@ def collect_contactable_growth_companies(
         )
         stats["saved_prospect_excluded"] += prospect_count
 
+        _notify(
+            progress,
+            stage="employment",
+            page=page_no,
+            checked=stats["employment_checked"],
+            found=len(selected),
+        )
+        minimum_filtered, employment_stats = enrich_employment_growth(
+            minimum_filtered,
+            basis=growth_basis,
+            timeout=15,
+            retries=1,
+            workers=8,
+        )
+        for name in (
+            "employment_checked",
+            "employment_unavailable",
+            "employment_failed",
+            "employment_api_attempts",
+        ):
+            stats[name] += int(employment_stats.get(name) or 0)
+        _notify(
+            progress,
+            stage="employment_complete",
+            page=page_no,
+            checked=stats["employment_checked"],
+            unavailable=stats["employment_unavailable"],
+            found=len(selected),
+        )
+
         page_growth = []
         page_fallback = []
         for item in minimum_filtered:
-            net_growth = _net_growth(item)
-            item["순고용증가"] = net_growth
-            item["고용증가판정"] = (
-                "최근 순고용 증가" if net_growth > 0 else "증가 미확인"
-            )
-            if net_growth > 0:
+            growth_value = _optional_int(item.get("선택고용증가"))
+            if growth_basis == "none":
+                page_growth.append(item)
+            elif growth_value is not None and growth_value > 0:
                 page_growth.append(item)
             else:
                 page_fallback.append(item)
@@ -340,12 +408,26 @@ def collect_contactable_growth_companies(
         "duplicate_warning": duplicate_warning,
         "business_type": business_type,
         "growth_only": bool(growth_only),
+        "growth_basis": growth_basis,
+        "industry_categories": sorted(selected_industries),
         "searched_start_page": start_page,
         "searched_end_page": (
             start_page + max(0, stats["pages_scanned"] - 1)
         ),
         "priority_basis": (
-            "최근 월간 순고용 증가(신규취득자수-상실가입자수) "
-            + ("사업장만" if growth_only else "사업장 우선")
+            {
+                "year_over_year": "전년 동월 대비 가입자수 증가",
+                "recent_net": "최근 월 신규취득자수-상실가입자수 증가",
+                "none": "고용 증가 필터 미사용",
+            }[growth_basis]
+            + (
+                " 사업장만"
+                if growth_only
+                else (
+                    " 사업장 우선"
+                    if growth_basis != "none"
+                    else ""
+                )
+            )
         ),
     }

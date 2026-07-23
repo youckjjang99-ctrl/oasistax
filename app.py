@@ -1656,6 +1656,7 @@ with st.sidebar:
     st.markdown('<div class="sidebar-section-label">MAIN</div>', unsafe_allow_html=True)
     menu_label_map = {
         "홈": "홈",
+        "DB발굴": "DB발굴",
         "기업등록": "기업등록",
         "기업 컨설팅": "기업관리센터",
         "AI 코파일럿": "AI 코파일럿",
@@ -1664,7 +1665,6 @@ with st.sidebar:
         "담당자 통계": "담당자 통계",
     }
     if CURRENT_USER_IS_ADMIN:
-        menu_label_map["영업후보DB"] = "영업후보DB"
         menu_label_map["회원 승인 관리"] = "회원 승인 관리"
         menu_label_map["시스템 관리"] = "시스템 관리"
         menu_label_map["클라우드 DB 관리"] = "클라우드 DB 관리"
@@ -1686,6 +1686,9 @@ with st.sidebar:
     if current_sidebar_value == "크레탑 자동등록":
         st.session_state["active_main_menu_v311"] = "기업등록"
         current_sidebar_value = "기업등록"
+    if current_sidebar_value == "영업후보DB":
+        st.session_state["active_main_menu_v311"] = "DB발굴"
+        current_sidebar_value = "DB발굴"
     if current_sidebar_value not in menu_label_map:
         st.session_state["active_main_menu_v311"] = "기업 컨설팅"
 
@@ -1757,7 +1760,7 @@ elif active_tab == "AI 코파일럿":
 elif active_tab == "내 누적 고객DB":
     render_cumulative_db_page(CURRENT_USER_ID)
 
-elif active_tab == "영업후보DB":
+elif active_tab == "DB발굴":
     render_prospect_db_center(CURRENT_USER_ID)
 
 elif active_tab == "통합 정책자금 매칭":
