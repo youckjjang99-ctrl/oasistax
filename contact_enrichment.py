@@ -101,6 +101,7 @@ def _deduplicate(contacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     source_priority = {
         "official_website": 3,
         "kakao_local": 2,
+        "naver_web_snippet": 1,
     }
     selected: dict[tuple[str, str], dict[str, Any]] = {}
     for contact in contacts:
@@ -141,6 +142,9 @@ def enrich_company(
     *,
     skip_kakao: bool = False,
     skip_localdata: bool = False,
+    max_website_candidates: int = 2,
+    website_timeout: int = 5,
+    website_max_pages: int = 2,
 ) -> dict[str, Any]:
     company_name = str(
         prospect.get("company_name") or prospect.get("사업장명") or ""
@@ -233,6 +237,8 @@ def enrich_company(
     naver = naver_web_search_client.search_official_websites(
         company_name,
         address,
+        timeout=max(2, int(website_timeout)),
+        display=8,
     )
     trace.append(
         {
@@ -241,12 +247,16 @@ def enrich_company(
             "message": naver.get("message"),
         }
     )
-    for candidate in naver.get("candidates", [])[:3]:
+    for candidate in naver.get("candidates", [])[
+        : max(1, int(max_website_candidates))
+    ]:
         website = inspect_website(
             candidate.get("url", ""),
             company_name,
             address,
             business_no,
+            timeout=max(2, int(website_timeout)),
+            max_pages=max(1, int(website_max_pages)),
         )
         if not website.get("ok"):
             continue

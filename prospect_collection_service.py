@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable
 
@@ -85,15 +86,25 @@ def _find_contactable(
     *,
     needed: int,
     progress: ProgressCallback | None = None,
+    run_quick: bool = True,
+    run_full: bool = True,
+    deadline_monotonic: float | None = None,
+    max_full_checks: int = 12,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
     if needed <= 0 or not items:
         return [], [], 0
 
     ordered = sorted(items, key=_growth_sort_key, reverse=True)
-    quick_found, quick_failures = _analyze_parallel(
-        ordered,
-        contact_mode="quick",
-    )
+    quick_found: list[dict[str, Any]] = []
+    quick_failures: list[dict[str, Any]] = []
+    if run_quick and (
+        deadline_monotonic is None or time.monotonic() < deadline_monotonic
+    ):
+        quick_found, quick_failures = _analyze_parallel(
+            ordered,
+            contact_mode="quick",
+            workers=8,
+        )
     selected = quick_found[:needed]
     selected_keys = {
         str(row.get("source_key") or "") for row in quick_found
@@ -108,16 +119,22 @@ def _find_contactable(
     remaining_needed = needed - len(selected)
     full_checked = 0
     failures = list(quick_failures)
-    if remaining_needed > 0:
+    if run_full and remaining_needed > 0:
         no_quick_phone = [
             item
             for item in ordered
             if str(item.get("source_key") or "") not in selected_keys
         ]
-        for start in range(0, len(no_quick_phone), 8):
+        no_quick_phone = no_quick_phone[: max(1, int(max_full_checks))]
+        for start in range(0, len(no_quick_phone), 4):
             if remaining_needed <= 0:
                 break
-            batch = no_quick_phone[start : start + 8]
+            if (
+                deadline_monotonic is not None
+                and time.monotonic() >= deadline_monotonic
+            ):
+                break
+            batch = no_quick_phone[start : start + 4]
             full_found, full_failures = _analyze_parallel(
                 batch,
                 contact_mode="full",
@@ -135,7 +152,8 @@ def _find_contactable(
             )
 
     selected.sort(key=_growth_sort_key, reverse=True)
-    return selected[:needed], failures, len(ordered)
+    checked = (len(ordered) if run_quick else 0) + full_checked
+    return selected[:needed], failures, checked
 
 
 def collect_contactable_growth_companies(
@@ -148,10 +166,13 @@ def collect_contactable_growth_companies(
     sigungu_code: str = "",
     emd_code: str = "",
     progress: ProgressCallback | None = None,
+    time_limit_seconds: int = 120,
 ) -> dict[str, Any]:
     target_count = min(100, max(1, int(target_count)))
     max_pages = min(30, max(1, int(max_pages)))
     start_page = max(1, int(start_page))
+    started_at = time.monotonic()
+    deadline = started_at + max(30, min(240, int(time_limit_seconds)))
 
     try:
         saved_source_keys, saved_business_nos = (
@@ -178,10 +199,15 @@ def collect_contactable_growth_companies(
         "growth_candidates": 0,
         "contact_checked": 0,
         "pages_scanned": 0,
+        "elapsed_seconds": 0.0,
+        "time_limit_reached": False,
     }
 
     for offset in range(max_pages):
         if len(selected) >= target_count:
+            break
+        if time.monotonic() >= deadline:
+            stats["time_limit_reached"] = True
             break
         page_no = start_page + offset
         _notify(
@@ -198,10 +224,19 @@ def collect_contactable_growth_companies(
             sigungu_code=sigungu_code,
             emd_code=emd_code,
             detail_workers=8,
+            timeout=8,
+            retries=0,
             stock_company_only=True,
             exclude_source_keys=seen_source_keys,
         )
         stats["pages_scanned"] += 1
+        _notify(
+            progress,
+            stage="nps_complete",
+            page=page_no,
+            pages_scanned=stats["pages_scanned"],
+            found=len(selected),
+        )
         if not page_result.get("ok"):
             failures.append(
                 {
@@ -273,16 +308,52 @@ def collect_contactable_growth_companies(
             page_growth,
             needed=target_count - len(selected),
             progress=progress,
+            run_full=False,
+            deadline_monotonic=deadline,
         )
         selected.extend(growth_found)
         failures.extend(contact_failures)
         stats["contact_checked"] += checked
 
-    if len(selected) < target_count and fallback_pool:
-        fallback_found, contact_failures, checked = _find_contactable(
-            fallback_pool,
+    selected_source_keys = {
+        str(row.get("source_key") or "") for row in selected
+    }
+    remaining_growth = [
+        row
+        for row in sorted(growth_pool, key=_growth_sort_key, reverse=True)
+        if str(row.get("source_key") or "") not in selected_source_keys
+    ]
+    if (
+        len(selected) < target_count
+        and remaining_growth
+        and time.monotonic() < deadline
+    ):
+        growth_found, contact_failures, checked = _find_contactable(
+            remaining_growth,
             needed=target_count - len(selected),
             progress=progress,
+            run_quick=False,
+            run_full=True,
+            deadline_monotonic=deadline,
+            max_full_checks=12,
+        )
+        selected.extend(growth_found)
+        failures.extend(contact_failures)
+        stats["contact_checked"] += checked
+
+    if (
+        len(selected) < target_count
+        and fallback_pool
+        and time.monotonic() < deadline
+    ):
+        fallback_found, contact_failures, checked = _find_contactable(
+            sorted(fallback_pool, key=_growth_sort_key, reverse=True)[
+                : max(target_count * 2, 20)
+            ],
+            needed=target_count - len(selected),
+            progress=progress,
+            run_full=False,
+            deadline_monotonic=deadline,
         )
         selected.extend(fallback_found)
         failures.extend(contact_failures)
@@ -292,6 +363,9 @@ def collect_contactable_growth_companies(
         row for row in selected if normalize_phone(row.get("대표전화"))
     ][:target_count]
     selected.sort(key=_growth_sort_key, reverse=True)
+    stats["elapsed_seconds"] = round(time.monotonic() - started_at, 1)
+    if time.monotonic() >= deadline:
+        stats["time_limit_reached"] = True
     return {
         "ok": True,
         "items": selected,

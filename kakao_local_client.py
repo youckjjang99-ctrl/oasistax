@@ -81,7 +81,7 @@ def search_company(
     company_name: str,
     address: str,
     *,
-    timeout: int = 10,
+    timeout: int = 5,
     size: int = 10,
 ) -> dict[str, Any]:
     if not key_status()["configured"]:
@@ -134,10 +134,15 @@ def search_company(
         }
 
     payloads = [payload]
-    # Address spelling in NPS data often differs from Kakao's registered address.
-    # Retry with the company name alone when the combined query has no result.
+    # 국민연금 주소와 카카오 등록주소의 표기가 다르거나 첫 검색결과에
+    # 전화번호가 없는 경우 회사명 단독검색까지 한 번 더 확인한다.
     initial_documents = payload.get("documents", []) if isinstance(payload, dict) else []
-    if not initial_documents and base_name and query != base_name:
+    initial_has_phone = any(
+        normalize_phone(item.get("phone"))
+        for item in initial_documents
+        if isinstance(item, dict)
+    )
+    if not initial_has_phone and base_name and query != base_name:
         try:
             fallback_response = requests.get(
                 KAKAO_KEYWORD_URL,

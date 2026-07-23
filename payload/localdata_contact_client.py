@@ -276,7 +276,7 @@ def search_company(
     address: str,
     industry_name: str = "",
     *,
-    timeout: int = 12,
+    timeout: int = 5,
     max_services: int | None = None,
 ) -> dict[str, Any]:
     if not key_status()["configured"]:
@@ -291,7 +291,9 @@ def search_company(
     candidates: list[dict[str, Any]] = []
     ordered_services = _ordered_services(industry_name, company_name)
     if max_services is not None:
-        ordered_services = ordered_services[: max(1, int(max_services))]
+        ordered_services = ordered_services[
+            : max(1, min(len(ordered_services), int(max_services)))
+        ]
     for service_key in ordered_services:
         result = _search_service(
             service_key,

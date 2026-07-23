@@ -1310,6 +1310,10 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             use_container_width=True,
             disabled=not service_key_status()["configured"],
         )
+        st.caption(
+            "공개 API 응답이 느려도 약 2분 안에 검색을 종료하고, "
+            "그때까지 확인된 업체를 먼저 보여드립니다."
+        )
 
     page_state_key = f"prospect_next_page_v980_{region_name}"
     if search_clicked:
@@ -1319,29 +1323,45 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             text="검색 준비 중입니다.",
         )
         status_box = st.empty()
+        progress_state = {"value": 0.0}
 
         def _progress(event: dict) -> None:
             stage = event.get("stage")
             if stage == "nps":
                 current = int(event.get("pages_scanned") or 0)
                 ratio = min(0.55, (current + 1) / max(1, max_pages) * 0.55)
+                progress_state["value"] = max(progress_state["value"], ratio)
                 progress_bar.progress(
-                    ratio,
-                    text=f"국민연금 사업장 {event.get('page', '')}페이지 확인 중",
+                    progress_state["value"],
+                    text=(
+                        f"국민연금 {event.get('page', '')}페이지 기본·상세조회 중"
+                    ),
+                )
+            elif stage == "nps_complete":
+                current = int(event.get("pages_scanned") or 0)
+                ratio = min(0.60, current / max(1, max_pages) * 0.60)
+                progress_state["value"] = max(progress_state["value"], ratio)
+                progress_bar.progress(
+                    progress_state["value"],
+                    text=(
+                        f"국민연금 {event.get('page', '')}페이지 확인 완료"
+                    ),
                 )
             elif stage == "quick_contact":
+                progress_state["value"] = max(progress_state["value"], 0.72)
                 progress_bar.progress(
-                    0.72,
+                    progress_state["value"],
                     text=(
-                        "카카오·인허가 대표전화 빠른 확인 "
+                        "카카오·네이버 공개검색·인허가 대표전화 확인 "
                         f"{event.get('checked', 0)}건"
                     ),
                 )
             elif stage == "full_contact":
+                progress_state["value"] = max(progress_state["value"], 0.88)
                 progress_bar.progress(
-                    0.88,
+                    progress_state["value"],
                     text=(
-                        "네이버·공식 홈페이지 정밀 확인 "
+                        "공식 홈페이지 정밀 확인 "
                         f"{event.get('checked', 0)}건"
                     ),
                 )
@@ -1361,6 +1381,7 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 sigungu_code=sigungu_code,
                 emd_code=emd_code,
                 progress=_progress,
+                time_limit_seconds=120,
             )
         progress_bar.progress(1.0, text="검색을 완료했습니다.")
         status_box.empty()
@@ -1396,8 +1417,14 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
         st.caption(
             f"우선순위: {result.get('priority_basis', '')} · "
             f"상세조회 대상 {stats.get('detail_targets', 0):,}건 · "
-            f"연락처 확인 대상 {stats.get('contact_checked', 0):,}건"
+            f"연락처 확인 대상 {stats.get('contact_checked', 0):,}건 · "
+            f"검색시간 {stats.get('elapsed_seconds', 0):,.1f}초"
         )
+        if stats.get("time_limit_reached"):
+            st.info(
+                "2분 검색 제한에 도달해 확인된 결과를 먼저 표시했습니다. "
+                "같은 버튼을 다시 누르면 다음 페이지부터 이어서 검색합니다."
+            )
         if result.get("duplicate_warning"):
             st.warning(
                 "기존 DB 중복확인 일부를 완료하지 못했습니다: "
@@ -1407,8 +1434,9 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
         items = list(result.get("items") or [])
         if not items:
             st.info(
-                "선택한 검색 범위에서 유효한 대표전화가 있는 업체를 찾지 못했습니다. "
-                "같은 버튼을 다시 누르면 다음 페이지부터 이어서 찾습니다."
+                "선택한 범위의 무료 공개 소스에서 회사명·주소가 일치하는 "
+                "대표전화를 확인하지 못했습니다. 같은 버튼을 다시 누르면 "
+                "다음 페이지부터 이어서 찾습니다."
             )
         else:
             st.markdown("### 이번에 찾은 영업후보")

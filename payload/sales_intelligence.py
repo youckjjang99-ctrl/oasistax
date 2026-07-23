@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
 
 import kakao_local_client
 import localdata_contact_client
+import naver_web_search_client
 from contact_enrichment import enrich_company
 from contact_matching import is_mobile_phone, normalize_phone
 
@@ -58,6 +60,8 @@ def _source_label(source_type: str) -> str:
         return "공식 홈페이지"
     if source_type == "kakao_local":
         return "카카오 로컬"
+    if source_type == "naver_web_snippet":
+        return "네이버 공개검색"
     if source_type.startswith("localdata:"):
         return "승인 인허가 API"
     return source_type or "공개 연락처"
@@ -78,6 +82,9 @@ def _extended_phone(
             },
             skip_kakao=True,
             skip_localdata=True,
+            max_website_candidates=1,
+            website_timeout=4,
+            website_max_pages=2,
         )
     except Exception as exc:
         return _phone_result(
@@ -131,56 +138,81 @@ def _best_phone(
     *,
     allow_extended: bool = True,
 ) -> dict[str, Any]:
-    kakao = kakao_local_client.search_company(company_name, address)
-    candidates = [
-        row
-        for row in kakao.get("candidates", [])
-        if row.get("phone") and int(row.get("confidence") or 0) >= REVIEW_SCORE
-    ]
-    if candidates:
-        best = candidates[0]
-        return _phone_result(
-            str(best.get("phone") or ""),
-            "카카오 로컬",
-            int(best.get("confidence") or 0),
-            trace=[
-                {
-                    "stage": "kakao",
-                    "status": kakao.get("status"),
-                    "message": kakao.get("message"),
+    # 서로 독립적인 무료 공개 소스를 병렬 조회한다. 기존 순차 방식은
+    # 업체 한 곳마다 타임아웃이 누적되어 전체 검색이 수분 이상 지연됐다.
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {
+            "kakao": executor.submit(
+                kakao_local_client.search_company,
+                company_name,
+                address,
+                timeout=5,
+            ),
+            "localdata": executor.submit(
+                localdata_contact_client.search_company,
+                company_name,
+                address,
+                industry_name,
+                timeout=5,
+                max_services=2,
+            ),
+            "naver": executor.submit(
+                naver_web_search_client.search_public_phones,
+                company_name,
+                address,
+                timeout=5,
+            ),
+        }
+        source_results: dict[str, dict[str, Any]] = {}
+        trace: list[dict[str, Any]] = []
+        for source_name, future in futures.items():
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {
+                    "status": type(exc).__name__,
+                    "message": str(exc),
+                    "candidates": [],
                 }
-            ],
-        )
+            source_results[source_name] = result
+            trace.append(
+                {
+                    "stage": source_name,
+                    "status": result.get("status"),
+                    "message": result.get("message"),
+                }
+            )
 
-    localdata = localdata_contact_client.search_company(
-        company_name,
-        address,
-        industry_name,
-        max_services=2,
-    )
-    candidates = [
-        row
-        for row in localdata.get("candidates", [])
-        if row.get("phone") and int(row.get("confidence") or 0) >= REVIEW_SCORE
-    ]
+    candidates: list[dict[str, Any]] = []
+    for result in source_results.values():
+        candidates.extend(
+            row
+            for row in result.get("candidates", [])
+            if row.get("phone")
+            and int(row.get("confidence") or 0) >= REVIEW_SCORE
+        )
     if candidates:
+        source_priority = {
+            "kakao_local": 3,
+            "localdata": 2,
+            "naver_web_snippet": 1,
+        }
+        candidates.sort(
+            key=lambda row: (
+                int(row.get("confidence") or 0),
+                source_priority.get(
+                    str(row.get("source_type") or "").split(":", 1)[0],
+                    0,
+                ),
+            ),
+            reverse=True,
+        )
         best = candidates[0]
         return _phone_result(
             str(best.get("phone") or ""),
             _source_label(str(best.get("source_type") or "")),
             int(best.get("confidence") or 0),
-            trace=[
-                {
-                    "stage": "kakao",
-                    "status": kakao.get("status"),
-                    "message": kakao.get("message"),
-                },
-                {
-                    "stage": "localdata",
-                    "status": localdata.get("status"),
-                    "message": localdata.get("message"),
-                },
-            ],
+            trace=trace,
         )
 
     if allow_extended:
@@ -190,13 +222,7 @@ def _best_phone(
         "",
         0,
         status="NOT_FOUND",
-        trace=[
-            {
-                "stage": "quick_contact",
-                "status": "NOT_FOUND",
-                "message": "카카오·인허가 빠른 조회에서 대표전화가 없습니다.",
-            }
-        ],
+        trace=trace,
     )
 
 

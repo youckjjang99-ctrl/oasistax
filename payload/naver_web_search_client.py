@@ -9,7 +9,12 @@ from urllib.parse import urlparse
 
 import requests
 
-from contact_matching import address_hint, company_score, search_company_name
+from contact_matching import (
+    address_hint,
+    contact_match_score,
+    normalize_phone,
+    search_company_name,
+)
 
 
 NAVER_ID_ENV = "NAVER_CLIENT_ID"
@@ -50,7 +55,7 @@ def _headers() -> dict[str, str]:
     return {
         "X-Naver-Client-Id": os.environ.get(NAVER_ID_ENV, "").strip(),
         "X-Naver-Client-Secret": os.environ.get(NAVER_SECRET_ENV, "").strip(),
-        "User-Agent": "OASIS-CRM/9.7.0",
+        "User-Agent": "OASIS-CRM/9.8.1",
     }
 
 
@@ -62,6 +67,123 @@ def _plain(value: Any) -> str:
 def _blocked(url: str) -> bool:
     host = (urlparse(url).hostname or "").lower()
     return any(host == domain or host.endswith("." + domain) for domain in BLOCKED_DOMAINS)
+
+
+def _phones_from_text(value: Any) -> list[str]:
+    text = _plain(value)
+    pattern = (
+        r"(?<!\d)(?:\+?82[\s().-]?)?"
+        r"(?:0?2|0?1[016789]|0?[3-6][1-5]|0?50|0?70|0?80)"
+        r"[\s().-]*\d{3,4}[\s.-]*\d{4}(?!\d)"
+        r"|(?<!\d)1[568]\d{2}[\s.-]*\d{4}(?!\d)"
+    )
+    return list(
+        dict.fromkeys(
+            normalized
+            for raw in re.findall(pattern, text)
+            if (normalized := normalize_phone(raw))
+        )
+    )
+
+
+def search_public_phones(
+    company_name: str,
+    address: str,
+    *,
+    timeout: int = 5,
+    display: int = 10,
+) -> dict[str, Any]:
+    """네이버 웹 검색 결과에 공개 노출된 회사 전화만 보수적으로 수집."""
+    if not key_status()["configured"]:
+        return {
+            "ok": False,
+            "status": "KEY_MISSING",
+            "message": "네이버 검색 API 키가 없습니다.",
+            "candidates": [],
+        }
+    base_name = search_company_name(company_name)
+    queries = [
+        f'"{base_name}" 대표전화 {address_hint(address)}'.strip(),
+        f'"{base_name}" 전화번호'.strip(),
+    ]
+    candidates: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    checked_queries: list[str] = []
+    last_status = "SUCCESS"
+    for query in queries:
+        if candidates:
+            break
+        checked_queries.append(query)
+        try:
+            response = requests.get(
+                NAVER_WEB_URL,
+                headers=_headers(),
+                params={
+                    "query": query,
+                    "display": min(20, max(1, int(display))),
+                    "start": 1,
+                },
+                timeout=max(2, int(timeout)),
+            )
+        except requests.Timeout:
+            last_status = "TIMEOUT"
+            continue
+        except requests.RequestException:
+            last_status = "NETWORK_ERROR"
+            continue
+        if not response.ok:
+            last_status = f"HTTP_{response.status_code}"
+            continue
+        try:
+            payload = response.json()
+        except ValueError:
+            last_status = "INVALID_JSON"
+            continue
+        for item in payload.get("items", []) if isinstance(payload, dict) else []:
+            if not isinstance(item, dict):
+                continue
+            title = _plain(item.get("title"))
+            description = _plain(item.get("description"))
+            combined = f"{title} {description}"
+            for phone in _phones_from_text(combined):
+                score = contact_match_score(
+                    company_name,
+                    address,
+                    title,
+                    description,
+                    has_phone=True,
+                    active=True,
+                )
+                if score < 65:
+                    continue
+                url = str(item.get("link") or "").strip()
+                key = (phone, url)
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append(
+                    {
+                        "company_name": title,
+                        "address": description,
+                        "phone": phone,
+                        "phone_type": "company_main",
+                        "source_type": "naver_web_snippet",
+                        "source_url": url,
+                        "confidence": score,
+                        "raw": {
+                            "title": title,
+                            "description": description,
+                        },
+                    }
+                )
+    candidates.sort(key=lambda row: int(row["confidence"]), reverse=True)
+    return {
+        "ok": last_status == "SUCCESS",
+        "status": last_status,
+        "message": f"네이버 공개검색 대표전화 {len(candidates)}건",
+        "queries": checked_queries,
+        "candidates": candidates,
+    }
 
 
 def test_connection(timeout: int = 10) -> dict[str, Any]:

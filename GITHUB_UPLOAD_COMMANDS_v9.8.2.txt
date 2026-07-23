@@ -1,0 +1,7 @@
+git status
+git add prospect_db_center.py prospect_collection_service.py sales_intelligence.py contact_enrichment.py localdata_contact_client.py kakao_local_client.py naver_web_search_client.py VERSION.txt APPLY_UPDATE_v9.8.2.py RUN_UPDATE_v9.8.2.bat README_UPDATE_v9.8.2.md GITHUB_UPLOAD_COMMANDS_v9.8.2.txt payload
+git add -f CHANGELOG_v9.8.2.md
+git status
+git commit -m "OASIS CRM v9.8.2 휴대전화 영업후보 포함"
+git pull --rebase origin main
+git push origin main
