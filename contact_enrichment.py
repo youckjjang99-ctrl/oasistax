@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from datetime import datetime, timezone
+from threading import Lock
+from time import monotonic
 from typing import Any
 
 import kakao_local_client
@@ -13,6 +16,10 @@ from website_contact_parser import inspect_website
 
 AUTO_CONFIRM_SCORE = 85
 REVIEW_SCORE = 65
+CACHE_TTL_SECONDS = 30 * 60
+CACHE_MAX_ITEMS = 500
+_CACHE: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
+_CACHE_LOCK = Lock()
 
 
 def api_statuses() -> dict[str, dict[str, Any]]:
@@ -49,8 +56,11 @@ def _verification_status(
     phone: str = "",
     is_email: bool = False,
     email_domain_match: bool = False,
+    public_business_source: bool = False,
 ) -> str:
     if phone and is_mobile_phone(phone):
+        if public_business_source and score >= AUTO_CONFIRM_SCORE:
+            return "auto_verified"
         return "review_required"
     if is_email:
         if score >= 90 and email_domain_match:
@@ -69,6 +79,13 @@ def _phone_contact(candidate: dict[str, Any]) -> dict[str, Any] | None:
     phone = str(candidate.get("phone") or "").strip()
     score = int(candidate.get("confidence") or 0)
     source_type = str(candidate.get("source_type") or "")
+    mobile = is_mobile_phone(phone)
+    phone_type = str(candidate.get("phone_type") or "")
+    public_business_source = bool(
+        candidate.get("public_business_source")
+        or phone_type == "public_business_mobile"
+        or source_type in {"official_website", "kakao_local", "naver_web_snippet"}
+    )
     # A phone displayed on a page that contains the company name can still be
     # useful for a manual call check even when the address is not written there.
     if not phone or (
@@ -82,19 +99,28 @@ def _phone_contact(candidate: dict[str, Any]) -> dict[str, Any] | None:
         "contact_type": "phone",
         "contact_value": phone,
         "contact_label": (
-            "휴대전화 확인 필요"
-            if is_mobile_phone(phone)
+            "공개 업무용 휴대전화"
+            if mobile
             else "사업장 공개 대표전화"
         ),
         "source_type": source_type,
         "source_url": str(candidate.get("source_url") or ""),
         "confidence": verified_score,
-        "verification_status": _verification_status(verified_score, phone=phone),
-        "is_primary": score >= AUTO_CONFIRM_SCORE and not is_mobile_phone(phone),
+        "verification_status": _verification_status(
+            verified_score,
+            phone=phone,
+            public_business_source=public_business_source,
+        ),
+        "is_primary": score >= AUTO_CONFIRM_SCORE,
         "metadata": {
             "matched_company_name": candidate.get("company_name", ""),
             "matched_address": candidate.get("address", ""),
-            "phone_type": candidate.get("phone_type", ""),
+            "phone_type": (
+                "public_business_mobile"
+                if mobile
+                else (phone_type or "company_main")
+            ),
+            "public_business_source": public_business_source,
             "review_only": review_only,
         },
     }
@@ -102,8 +128,9 @@ def _phone_contact(candidate: dict[str, Any]) -> dict[str, Any] | None:
 
 def _deduplicate(contacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     source_priority = {
-        "official_website": 3,
-        "kakao_local": 2,
+        "official_website": 4,
+        "kakao_local": 3,
+        "localdata": 2,
         "naver_web_snippet": 1,
     }
     selected: dict[tuple[str, str], dict[str, Any]] = {}
@@ -140,6 +167,37 @@ def _deduplicate(contacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return ordered
 
 
+def _cache_key(
+    prospect: dict[str, Any],
+    options: tuple[Any, ...],
+) -> tuple[Any, ...]:
+    return (
+        str(prospect.get("company_name") or prospect.get("사업장명") or "").strip(),
+        str(prospect.get("address") or prospect.get("주소") or "").strip(),
+        str(prospect.get("business_no") or prospect.get("사업자등록번호") or "").strip(),
+        *options,
+    )
+
+
+def _cached(key: tuple[Any, ...]) -> dict[str, Any] | None:
+    now = monotonic()
+    with _CACHE_LOCK:
+        item = _CACHE.get(key)
+        if not item or now - item[0] > CACHE_TTL_SECONDS:
+            if item:
+                _CACHE.pop(key, None)
+            return None
+        return deepcopy(item[1])
+
+
+def _remember(key: tuple[Any, ...], result: dict[str, Any]) -> None:
+    with _CACHE_LOCK:
+        if len(_CACHE) >= CACHE_MAX_ITEMS:
+            oldest = min(_CACHE, key=lambda item: _CACHE[item][0])
+            _CACHE.pop(oldest, None)
+        _CACHE[key] = (monotonic(), deepcopy(result))
+
+
 def enrich_company(
     prospect: dict[str, Any],
     *,
@@ -149,6 +207,20 @@ def enrich_company(
     website_timeout: int = 10,
     website_max_pages: int = 4,
 ) -> dict[str, Any]:
+    cache_key = _cache_key(
+        prospect,
+        (
+            skip_kakao,
+            skip_localdata,
+            max_website_candidates,
+            website_timeout,
+            website_max_pages,
+        ),
+    )
+    cached_result = _cached(cache_key)
+    if cached_result is not None:
+        cached_result["cache_hit"] = True
+        return cached_result
     company_name = str(
         prospect.get("company_name") or prospect.get("사업장명") or ""
     ).strip()
@@ -166,11 +238,27 @@ def enrich_company(
     contacts: list[dict[str, Any]] = []
     trace: list[dict[str, Any]] = []
 
-    kakao = (
-        {"candidates": [], "status": "SKIPPED", "message": "빠른 조회에서 확인 완료"}
-        if skip_kakao
-        else kakao_local_client.search_company(company_name, address)
-    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        kakao_future = (
+            None
+            if skip_kakao
+            else executor.submit(
+                kakao_local_client.search_company, company_name, address
+            )
+        )
+        naver_phone_future = executor.submit(
+            naver_web_search_client.search_public_phones,
+            company_name,
+            address,
+            timeout=max(2, min(website_timeout, 6)),
+            display=10,
+        )
+        kakao = (
+            {"candidates": [], "status": "SKIPPED", "message": "빠른 조회에서 확인 완료"}
+            if kakao_future is None
+            else kakao_future.result()
+        )
+        naver_phones = naver_phone_future.result()
     trace.append(
         {
             "stage": "kakao",
@@ -190,13 +278,28 @@ def enrich_company(
         contact = _phone_contact(kakao_best)
         if contact:
             contacts.append(contact)
-
-    reliable_kakao_phone = bool(
-        kakao_best
-        and int(kakao_best.get("confidence") or 0) >= AUTO_CONFIRM_SCORE
-        and not is_mobile_phone(kakao_best.get("phone"))
+    trace.append(
+        {
+            "stage": "naver_phone",
+            "status": naver_phones.get("status"),
+            "message": naver_phones.get("message"),
+        }
     )
-    if not reliable_kakao_phone and not skip_localdata:
+    for candidate in naver_phones.get("candidates", []):
+        contact = _phone_contact(candidate)
+        if contact:
+            contacts.append(contact)
+
+    phone_types = {
+        str((row.get("metadata") or {}).get("phone_type") or "")
+        for row in contacts
+        if row.get("contact_type") == "phone"
+    }
+    has_both_phone_types = {
+        "company_main",
+        "public_business_mobile",
+    }.issubset(phone_types)
+    if not has_both_phone_types and not skip_localdata:
         localdata = localdata_contact_client.search_company(
             company_name,
             address,
@@ -230,7 +333,7 @@ def enrich_company(
                 "message": (
                     "빠른 조회에서 확인 완료"
                     if skip_localdata
-                    else "카카오에서 신뢰도 높은 대표전화를 확인했습니다."
+                    else "대표번호와 공개 업무용 휴대전화를 모두 확인했습니다."
                 ),
             }
         )
@@ -320,6 +423,9 @@ def enrich_company(
             domain_match = bool(
                 (contact.get("metadata") or {}).get("domain_match")
             )
+            public_business_source = bool(
+                (contact.get("metadata") or {}).get("public_business_source")
+            )
             contact["verification_status"] = _verification_status(
                 contact_score,
                 phone=(
@@ -329,6 +435,7 @@ def enrich_company(
                 ),
                 is_email=contact.get("contact_type") == "email",
                 email_domain_match=domain_match,
+                public_business_source=public_business_source,
             )
             contact["is_primary"] = (
                 contact["verification_status"] == "auto_verified"
@@ -365,7 +472,7 @@ def enrich_company(
     for contact in contacts:
         contact["collected_at"] = collected_at
         contact.setdefault("metadata", {})
-    return {
+    result = {
         "ok": True,
         "company_name": company_name,
         "address": address,
@@ -375,4 +482,7 @@ def enrich_company(
         "website_confidence": website_confidence,
         "trace": trace,
         "collected_at": collected_at,
+        "cache_hit": False,
     }
+    _remember(cache_key, result)
+    return result

@@ -14,6 +14,7 @@ import requests
 from contact_matching import (
     address_tokens,
     email_matches_domain,
+    is_mobile_phone,
     normalize_company_name,
     normalize_email,
     normalize_phone,
@@ -146,8 +147,9 @@ def extract_public_contacts(text: str) -> tuple[list[str], list[str]]:
     email_pattern = r"(?<![\w.+-])[\w.%+\-]+@[\w.\-]+\.[A-Za-z]{2,}(?![\w.-])"
     phone_pattern = (
         r"(?<!\d)(?:\+?82[\s.-]?)?"
-        r"(?:0?2|0?1[016789]|0?[3-6][1-5])"
+        r"(?:0?2|0?1[016789]|0?[3-6][1-5]|0?50|0?70|0?80)"
         r"[\s).-]*\d{3,4}[\s.-]*\d{4}(?!\d)"
+        r"|(?<!\d)1[568]\d{2}[\s.-]*\d{4}(?!\d)"
     )
     emails = sorted(
         {
@@ -284,11 +286,22 @@ def inspect_website(
                 {
                     "contact_type": "phone",
                     "contact_value": phone,
-                    "contact_label": "공식 홈페이지 공개전화",
+                    "contact_label": (
+                        "공식 홈페이지 공개 업무용 휴대전화"
+                        if is_mobile_phone(phone)
+                        else "공식 홈페이지 대표전화"
+                    ),
                     "source_type": "official_website",
                     "source_url": page["url"],
                     "confidence": confidence,
-                    "metadata": {},
+                    "metadata": {
+                        "phone_type": (
+                            "public_business_mobile"
+                            if is_mobile_phone(phone)
+                            else "company_main"
+                        ),
+                        "public_business_source": True,
+                    },
                 }
             )
         for email in page["emails"]:
