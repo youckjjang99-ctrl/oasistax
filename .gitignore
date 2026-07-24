@@ -28,3 +28,6 @@ CHANGELOG_v*.md
 !RUN_UPDATE.cmd
 !RUN_PRECHECK.cmd
 _update_backups/
+
+# Local service connection tools
+.tools/

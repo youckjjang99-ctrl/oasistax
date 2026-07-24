@@ -7,6 +7,9 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+import localdata_contact_client
+from licensed_business_repository import table_status as license_table_status
+from licensed_business_sync import sync_services as sync_license_services
 from contact_enrichment import api_statuses, enrich_company, test_connections
 from contact_matching import normalize_phone
 from prospect_collection_service import collect_contactable_growth_companies
@@ -587,7 +590,9 @@ def _render_prospect_db_center_legacy(owner_user_id: str = "") -> None:
         st.dataframe(pd.DataFrame(test_rows), use_container_width=True, hide_index=True)
         local_services = (sources.get("localdata") or {}).get("services") or []
         if local_services:
-            with st.expander("승인 인허가 API 6종 상세"):
+            with st.expander(
+                "전국 인허가 API 대표 업종 연결 상세"
+            ):
                 st.dataframe(
                     pd.DataFrame(
                         [
@@ -1973,7 +1978,7 @@ def render_prospect_admin_settings() -> None:
         ),
     )
 
-    test_col1, test_col2 = st.columns(2)
+    test_col1, test_col2, test_col3 = st.columns(3)
     nps_test = test_col1.button(
         "국민연금 연결 점검",
         use_container_width=True,
@@ -1988,10 +1993,28 @@ def render_prospect_admin_settings() -> None:
         ),
         key="admin_contact_test_v980",
     )
+    all_license_test = test_col3.button(
+        "인허가 195종 승인 점검",
+        use_container_width=True,
+        disabled=not contact_status["localdata"]["configured"],
+        key="admin_localdata_all_test_v990",
+        help=(
+            "공공데이터포털 195개 인허가 API를 병렬 점검합니다. "
+            "완료까지 약 1분이 걸릴 수 있습니다."
+        ),
+    )
     if nps_test:
         st.session_state["admin_nps_result_v980"] = test_nps_connection("11")
     if contact_test:
         st.session_state["admin_contact_result_v980"] = test_connections()
+    if all_license_test:
+        with st.spinner("인허가 API 195종의 승인 상태를 확인하고 있습니다..."):
+            st.session_state["admin_localdata_all_result_v990"] = (
+                localdata_contact_client.test_services(
+                    timeout=8,
+                    workers=20,
+                )
+            )
 
     nps_result = st.session_state.get("admin_nps_result_v980")
     if nps_result:
@@ -2016,6 +2039,123 @@ def render_prospect_admin_settings() -> None:
             )
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
+    license_result = st.session_state.get("admin_localdata_all_result_v990")
+    if license_result:
+        license_rows = [
+            {
+                "분류": localdata_contact_client.SERVICES.get(
+                    str(row.get("service") or ""), {}
+                ).get("category", ""),
+                "업종": row.get("label", ""),
+                "상태": row.get("status", ""),
+                "결과": row.get("message", ""),
+            }
+            for row in license_result.get("services", [])
+        ]
+        connected_count = sum(
+            1 for row in license_result.get("services", []) if row.get("ok")
+        )
+        st.info(
+            f"전체 195종 중 {connected_count:,}종 연결 가능 · "
+            f"{len(license_rows) - connected_count:,}종 확인 필요"
+        )
+        st.dataframe(
+            pd.DataFrame(license_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.download_button(
+            "인허가 API 승인 점검결과 다운로드",
+            data=pd.DataFrame(license_rows).to_csv(
+                index=False,
+                encoding="utf-8-sig",
+            ),
+            file_name="인허가_API_195종_승인점검.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="admin_localdata_all_csv_v990",
+        )
+
+    st.markdown("### 인허가 원천업체 수집")
+    license_categories = sorted(
+        {
+            str(row.get("category") or "")
+            for row in localdata_contact_client.SERVICES.values()
+            if str(row.get("category") or "")
+        }
+    )
+    selected_license_categories = st.multiselect(
+        "수집할 인허가 분류",
+        license_categories,
+        default=[],
+        help="선택한 분류에 포함된 업종을 Supabase 원천업체DB로 수집합니다.",
+        key="admin_license_categories_v990",
+    )
+    selected_license_services = [
+        key
+        for key, row in localdata_contact_client.SERVICES.items()
+        if str(row.get("category") or "") in selected_license_categories
+    ]
+    sync_col1, sync_col2 = st.columns(2)
+    license_pages = sync_col1.number_input(
+        "업종별 최대 페이지",
+        min_value=1,
+        max_value=100,
+        value=1,
+        step=1,
+        key="admin_license_pages_v990",
+    )
+    start_license_sync = sync_col2.button(
+        f"선택 분류 {len(selected_license_services):,}개 업종 수집",
+        type="primary",
+        use_container_width=True,
+        disabled=not selected_license_services,
+        key="admin_license_sync_v990",
+    )
+    if start_license_sync:
+        status_ok, status_message = license_table_status()
+        if not status_ok:
+            st.error(
+                "Supabase에 인허가 원천업체 테이블을 먼저 생성해 주세요. "
+                f"{status_message}"
+            )
+        else:
+            progress_bar = st.progress(0.0, text="인허가 업체 수집 준비 중")
+
+            def update_license_progress(stats: dict) -> None:
+                total = max(1, int(stats.get("service_count") or 1))
+                current = int(stats.get("service_index") or 0)
+                progress_bar.progress(
+                    min(1.0, current / total),
+                    text=(
+                        f"{current:,}/{total:,}개 업종 · "
+                        f"{int(stats.get('saved') or 0):,}건 저장"
+                    ),
+                )
+
+            result = sync_license_services(
+                selected_license_services,
+                max_pages_per_service=int(license_pages),
+                rows_per_page=100,
+                progress=update_license_progress,
+            )
+            progress_bar.progress(1.0, text="인허가 업체 수집 완료")
+            st.success(
+                f"{result['service_count']:,}개 업종 · "
+                f"{result['received']:,}건 수신 · "
+                f"{result['saved']:,}건 저장"
+            )
+            if result["failures"]:
+                st.warning(
+                    f"{len(result['failures']):,}개 호출은 승인 또는 연결 확인이 "
+                    "필요합니다."
+                )
+                st.dataframe(
+                    pd.DataFrame(result["failures"]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
     st.markdown("### Supabase 영업후보 테이블")
     prospect_status = prospect_table_status()
     contacts_status = contact_table_status()
@@ -2030,6 +2170,11 @@ def render_prospect_admin_settings() -> None:
     db_cols[2].success(history_status[1]) if history_status[0] else db_cols[
         2
     ].warning(history_status[1])
+    license_status = license_table_status()
+    st.success(license_status[1]) if license_status[0] else st.warning(
+        "인허가 원천업체 테이블 준비 필요: "
+        "아래 v9.9.0 SQL을 Supabase에서 실행해 주세요."
+    )
 
     for path_name, label in (
         ("supabase_v960_prospect_db.sql", "영업후보DB SQL 다운로드"),
@@ -2040,6 +2185,10 @@ def render_prospect_admin_settings() -> None:
         (
             "supabase_v984_db_discovery.sql",
             "DB발굴 검색이력·메모 SQL 다운로드",
+        ),
+        (
+            "supabase_v990_licensed_businesses.sql",
+            "인허가 195종 원천업체DB SQL 다운로드",
         ),
     ):
         path = BASE_DIR / path_name
