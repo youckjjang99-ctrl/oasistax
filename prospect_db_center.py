@@ -2177,6 +2177,16 @@ def render_prospect_admin_settings() -> None:
             "주소로 걸러냅니다. 지역 수집은 10페이지 이상을 권장합니다."
         ),
     )
+    estimated_license_calls = (
+        len(selected_license_services) * int(license_pages)
+    )
+    if selected_license_services:
+        st.caption(
+            f"최대 API 호출량: {len(selected_license_services):,}개 업종 × "
+            f"{int(license_pages):,}페이지 = "
+            f"{estimated_license_calls:,}회 (업종 8개씩 동시 수집, "
+            "데이터가 끝난 업종은 즉시 종료)"
+        )
     start_license_sync = sync_col2.button(
         (
             f"{selected_region_label} · {license_sync_mode_label} · "
@@ -2215,6 +2225,7 @@ def render_prospect_admin_settings() -> None:
                 province=selected_license_province,
                 district=selected_license_district,
                 sync_mode=license_sync_mode,
+                workers=8,
                 progress=update_license_progress,
             )
             progress_bar.progress(1.0, text="인허가 업체 수집 완료")
