@@ -27,7 +27,10 @@ def test_connections() -> dict[str, Any]:
     with ThreadPoolExecutor(max_workers=3) as executor:
         kakao_future = executor.submit(kakao_local_client.test_connection)
         naver_future = executor.submit(naver_web_search_client.test_connection)
-        localdata_future = executor.submit(localdata_contact_client.test_services)
+        localdata_future = executor.submit(
+            localdata_contact_client.test_services,
+            representative=True,
+        )
         results = {
             "kakao": kakao_future.result(),
             "naver": naver_future.result(),
