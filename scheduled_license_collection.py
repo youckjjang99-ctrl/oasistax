@@ -11,6 +11,7 @@ import localdata_contact_client
 from cloud_db import CloudDatabase
 from korea_regions import ALL_DISTRICTS, ALL_PROVINCES
 from licensed_business_repository import save_businesses, save_sync_run
+from scheduled_license_phone_enrichment import run_enrichment
 
 
 TABLE_RUNS = "oasis_license_collection_runs"
@@ -22,7 +23,9 @@ def _now() -> str:
 
 
 def _monthly_run_key() -> str:
-    return datetime.now(timezone.utc).strftime("monthly-%Y-%m")
+    # Start a fresh checkpoint after fixing the old first-page-only logic.
+    # Saved businesses are upserted, so existing rows are not duplicated.
+    return datetime.now(timezone.utc).strftime("monthly-%Y-%m-pagination-v2")
 
 
 def _upsert_run(run_key: str, values: dict[str, Any]) -> None:
@@ -132,7 +135,18 @@ def _collect_service(
         saved = save_businesses(result.get("items") or [])
         received_total += received
         saved_total += saved
-        complete = raw_received < rows_per_page
+        total_count = max(0, int(result.get("total_count") or 0))
+        response_page_size = max(
+            0, int(result.get("response_page_size") or 0)
+        )
+        if total_count:
+            if response_page_size:
+                complete = page_no * response_page_size >= total_count
+            else:
+                complete = raw_received == 0 or received_total >= total_count
+        else:
+            effective_page_size = response_page_size or rows_per_page
+            complete = raw_received == 0 or raw_received < effective_page_size
         save_sync_run(
             service_key=service_key,
             page_no=page_no,
@@ -320,11 +334,13 @@ def main() -> int:
         default=int(os.environ.get("LICENSE_COLLECTION_MAX_PAGES", "1000")),
     )
     args = parser.parse_args()
-    return run_collection(
+    collection_status = run_collection(
         run_key=args.run_key,
         workers=args.workers,
         max_pages=args.max_pages,
     )
+    enrichment_status = run_enrichment()
+    return collection_status or enrichment_status
 
 
 if __name__ == "__main__":
