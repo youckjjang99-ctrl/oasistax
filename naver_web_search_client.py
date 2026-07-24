@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
@@ -12,6 +13,7 @@ import requests
 from contact_matching import (
     address_hint,
     contact_match_score,
+    is_mobile_phone,
     normalize_phone,
     search_company_name,
 )
@@ -104,16 +106,14 @@ def search_public_phones(
     base_name = search_company_name(company_name)
     queries = [
         f'"{base_name}" 대표전화 {address_hint(address)}'.strip(),
+        f'"{base_name}" 문의 연락처 {address_hint(address)}'.strip(),
+        f'"{base_name}" 업무용 휴대전화 010'.strip(),
         f'"{base_name}" 전화번호'.strip(),
     ]
     candidates: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     checked_queries: list[str] = []
-    last_status = "SUCCESS"
-    for query in queries:
-        if candidates:
-            break
-        checked_queries.append(query)
+    def _search_query(query: str) -> tuple[str, list[dict[str, Any]]]:
         try:
             response = requests.get(
                 NAVER_WEB_URL,
@@ -126,22 +126,33 @@ def search_public_phones(
                 timeout=max(2, int(timeout)),
             )
         except requests.Timeout:
-            last_status = "TIMEOUT"
-            continue
+            return "TIMEOUT", []
         except requests.RequestException:
-            last_status = "NETWORK_ERROR"
-            continue
+            return "NETWORK_ERROR", []
         if not response.ok:
-            last_status = f"HTTP_{response.status_code}"
-            continue
+            return f"HTTP_{response.status_code}", []
         try:
             payload = response.json()
         except ValueError:
-            last_status = "INVALID_JSON"
+            return "INVALID_JSON", []
+        items = payload.get("items", []) if isinstance(payload, dict) else []
+        return "SUCCESS", [
+            item for item in items if isinstance(item, dict)
+        ]
+
+    last_status = "SUCCESS"
+    # 네이버 호출은 동시에 2개까지만 실행해 응답시간은 줄이되
+    # 공개 API의 순간 호출량이 과도하게 늘어나지 않게 제한한다.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        query_results = list(executor.map(_search_query, queries))
+    successful_queries = 0
+    for query, (query_status, items) in zip(queries, query_results):
+        checked_queries.append(query)
+        if query_status != "SUCCESS":
+            last_status = query_status
             continue
-        for item in payload.get("items", []) if isinstance(payload, dict) else []:
-            if not isinstance(item, dict):
-                continue
+        successful_queries += 1
+        for item in items:
             title = _plain(item.get("title"))
             description = _plain(item.get("description"))
             combined = f"{title} {description}"
@@ -166,7 +177,11 @@ def search_public_phones(
                         "company_name": title,
                         "address": description,
                         "phone": phone,
-                        "phone_type": "company_main",
+                        "phone_type": (
+                            "public_business_mobile"
+                            if is_mobile_phone(phone)
+                            else "company_main"
+                        ),
                         "source_type": "naver_web_snippet",
                         "source_url": url,
                         "confidence": score,
@@ -177,10 +192,12 @@ def search_public_phones(
                     }
                 )
     candidates.sort(key=lambda row: int(row["confidence"]), reverse=True)
+    if successful_queries:
+        last_status = "SUCCESS"
     return {
         "ok": last_status == "SUCCESS",
         "status": last_status,
-        "message": f"네이버 공개검색 대표전화 {len(candidates)}건",
+        "message": f"네이버 공개 업무전화 {len(candidates)}건",
         "queries": checked_queries,
         "candidates": candidates,
     }
