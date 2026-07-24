@@ -241,6 +241,27 @@ class LicenseApiRegionTest(unittest.TestCase):
         self.assertEqual(mock_fetch.call_args.kwargs["updated_since"], "")
         self.assertEqual(mock_run.call_args.kwargs["sync_mode"], "full")
 
+    @patch("licensed_business_repository.CloudDatabase")
+    def test_sync_run_writes_null_for_empty_timestamps(
+        self,
+        cloud_database,
+    ) -> None:
+        import licensed_business_repository
+
+        licensed_business_repository.save_sync_run(
+            service_key="test-service",
+            page_no=1,
+            received_count=0,
+            saved_count=0,
+            status="SUCCESS",
+            window_start="",
+            window_end="",
+        )
+
+        row = cloud_database.return_value.insert.call_args.args[1][0]
+        self.assertIsNone(row["window_start"])
+        self.assertIsNone(row["window_end"])
+
 
 if __name__ == "__main__":
     unittest.main()
