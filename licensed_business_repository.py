@@ -121,8 +121,12 @@ def save_sync_run(
                 "province": str(province or ""),
                 "district": str(district or ""),
                 "sync_mode": str(sync_mode or "full"),
-                "window_start": str(window_start or ""),
-                "window_end": str(window_end or ""),
+                "window_start": (
+                    str(window_start).strip() if window_start else None
+                ),
+                "window_end": (
+                    str(window_end).strip() if window_end else None
+                ),
                 "is_complete": bool(is_complete),
                 "created_at": _timestamp(),
             }
