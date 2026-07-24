@@ -11,6 +11,7 @@ import localdata_contact_client
 from cloud_db import CloudDatabase
 from korea_regions import ALL_DISTRICTS, ALL_PROVINCES
 from licensed_business_repository import save_businesses, save_sync_run
+from scheduled_license_phone_enrichment import run_enrichment
 
 
 TABLE_RUNS = "oasis_license_collection_runs"
@@ -320,11 +321,13 @@ def main() -> int:
         default=int(os.environ.get("LICENSE_COLLECTION_MAX_PAGES", "1000")),
     )
     args = parser.parse_args()
-    return run_collection(
+    collection_status = run_collection(
         run_key=args.run_key,
         workers=args.workers,
         max_pages=args.max_pages,
     )
+    enrichment_status = run_enrichment()
+    return collection_status or enrichment_status
 
 
 if __name__ == "__main__":
