@@ -17,6 +17,13 @@ from contact_matching import (
     normalize_phone,
     search_company_name,
 )
+from korea_regions import (
+    ALL_DISTRICTS,
+    ALL_PROVINCES,
+    matches_region,
+    region_query,
+    resolve_region,
+)
 
 
 SERVICE_KEY_ENV = "DATA_GO_KR_SERVICE_KEY"
@@ -325,6 +332,8 @@ def fetch_business_page(
     page_no: int = 1,
     rows: int = 100,
     timeout: int = 15,
+    province: str = ALL_PROVINCES,
+    district: str = ALL_DISTRICTS,
 ) -> dict[str, Any]:
     """업종별 인허가 원천 데이터를 공통 업체 형식으로 반환."""
     if service_key not in SERVICES:
@@ -348,6 +357,11 @@ def fetch_business_page(
         "numOfRows": min(1000, max(1, int(rows))),
         "returnType": "json",
     }
+    requested_region = region_query(province, district)
+    if requested_region:
+        # 다수의 지방행정 인허가 API가 지원하는 도로명주소 포함검색 조건이다.
+        # 업종별 명세 차이에 대비해 응답 주소를 아래에서 한 번 더 검증한다.
+        params["cond[ROAD_NM_ADDR::LIKE]"] = requested_region
     try:
         response = requests.get(
             config["url"],
@@ -407,6 +421,7 @@ def fetch_business_page(
                 "소재지전체주소",
             )
         ).strip()
+        resolved_province, resolved_district = resolve_region(address)
         items.append(
             {
                 "source": "public_license_195",
@@ -421,6 +436,8 @@ def fetch_business_page(
                 "management_no": management_no,
                 "company_name": company_name,
                 "address": address,
+                "province": resolved_province,
+                "district": resolved_district,
                 "phone": normalize_phone(
                     _first(
                         raw,
@@ -458,12 +475,27 @@ def fetch_business_page(
                 "raw": raw,
             }
         )
+    raw_received_count = len(items)
+    if requested_region:
+        items = [
+            item
+            for item in items
+            if matches_region(
+                item.get("address"),
+                province,
+                district,
+            )
+        ]
     return {
         "ok": ok,
         "status": "SUCCESS" if ok else (code or "API_ERROR"),
         "message": message or f"{total}건 중 {len(items)}건 수신",
         "total_count": total,
         "page_no": params["pageNo"],
+        "province": "" if province == ALL_PROVINCES else province,
+        "district": "" if district == ALL_DISTRICTS else district,
+        "raw_received_count": raw_received_count,
+        "region_filtered_count": raw_received_count - len(items),
         "items": items,
     }
 

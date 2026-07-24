@@ -37,6 +37,8 @@ def save_businesses(items: list[dict[str, Any]]) -> int:
             "management_no": str(item.get("management_no") or ""),
             "company_name": str(item.get("company_name") or ""),
             "address": str(item.get("address") or ""),
+            "province": str(item.get("province") or ""),
+            "district": str(item.get("district") or ""),
             "phone": str(item.get("phone") or ""),
             "business_status_code": str(
                 item.get("business_status_code") or ""
@@ -73,6 +75,8 @@ def save_sync_run(
     saved_count: int,
     status: str,
     message: str = "",
+    province: str = "",
+    district: str = "",
 ) -> None:
     CloudDatabase().insert(
         TABLE_LICENSE_SYNC_RUNS,
@@ -84,6 +88,8 @@ def save_sync_run(
                 "saved_count": max(0, int(saved_count)),
                 "status": str(status or ""),
                 "message": str(message or "")[:1000],
+                "province": str(province or ""),
+                "district": str(district or ""),
                 "created_at": _timestamp(),
             }
         ],
