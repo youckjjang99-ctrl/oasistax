@@ -172,6 +172,18 @@ def _items(payload: Any) -> tuple[str, str, int, list[dict[str, Any]]]:
     return code, message, total, [row for row in block if isinstance(row, dict)]
 
 
+def _response_page_size(payload: Any) -> int:
+    if not isinstance(payload, dict):
+        return 0
+    response = payload.get("response", payload)
+    if not isinstance(response, dict):
+        return 0
+    body = response.get("body", {})
+    if not isinstance(body, dict):
+        return 0
+    return _safe_int(body.get("numOfRows") or body.get("num_of_rows"))
+
+
 def _active(item: dict[str, Any]) -> bool:
     code = str(
         _first(item, "SALS_STTS_CD", "salsSttsCd", "sals_stts_cd")
@@ -405,6 +417,7 @@ def fetch_business_page(
             "items": [],
         }
     code, message, total, raw_rows = _items(payload)
+    response_page_size = _response_page_size(payload)
     ok = code in {"", "00", "0"}
     items: list[dict[str, Any]] = []
     for raw in raw_rows:
@@ -506,6 +519,7 @@ def fetch_business_page(
         "status": "SUCCESS" if ok else (code or "API_ERROR"),
         "message": message or f"{total}건 중 {len(items)}건 수신",
         "total_count": total,
+        "response_page_size": response_page_size,
         "page_no": params["pageNo"],
         "province": "" if province == ALL_PROVINCES else province,
         "district": "" if district == ALL_DISTRICTS else district,
