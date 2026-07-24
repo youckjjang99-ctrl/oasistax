@@ -8,6 +8,13 @@ import pandas as pd
 import streamlit as st
 
 import localdata_contact_client
+from korea_regions import (
+    ALL_DISTRICTS,
+    ALL_PROVINCES,
+    district_label,
+    district_options,
+    province_options,
+)
 from licensed_business_repository import table_status as license_table_status
 from licensed_business_sync import sync_services as sync_license_services
 from contact_enrichment import api_statuses, enrich_company, test_connections
@@ -2096,17 +2103,85 @@ def render_prospect_admin_settings() -> None:
         for key, row in localdata_contact_client.SERVICES.items()
         if str(row.get("category") or "") in selected_license_categories
     ]
+    st.markdown("#### 수집 지역")
+    region_col1, region_col2 = st.columns(2)
+    selected_license_province = region_col1.selectbox(
+        "시·도",
+        province_options(),
+        key="admin_license_province_v991",
+    )
+    license_district_options = district_options(selected_license_province)
+    selected_license_district = region_col2.selectbox(
+        district_label(selected_license_province),
+        license_district_options,
+        key=f"admin_license_district_v991_{selected_license_province}",
+        disabled=(
+            selected_license_province == ALL_PROVINCES
+            or len(license_district_options) == 1
+        ),
+    )
+    if selected_license_province == ALL_PROVINCES:
+        selected_license_district = ALL_DISTRICTS
+    selected_region_label = (
+        "전국"
+        if selected_license_province == ALL_PROVINCES
+        else " ".join(
+            value
+            for value in (
+                selected_license_province,
+                (
+                    selected_license_district
+                    if selected_license_district != ALL_DISTRICTS
+                    else ""
+                ),
+            )
+            if value
+        )
+    )
+    st.caption(
+        "선택 지역을 API 주소검색 조건에 적용하고, 응답 주소를 다시 검증해 "
+        "다른 지역 업체는 저장하지 않습니다."
+    )
+
+    license_sync_mode_label = st.radio(
+        "수집 방식",
+        ["최초·정기 전수 수집", "변경분만 빠른 갱신"],
+        horizontal=True,
+        key="admin_license_sync_mode_v992",
+        help=(
+            "처음에는 전수 수집으로 오래 영업한 업체까지 확보하세요. "
+            "그다음부터는 변경분 갱신을 사용하고, 월 1회 전수 수집을 권장합니다."
+        ),
+    )
+    license_sync_mode = (
+        "incremental"
+        if license_sync_mode_label == "변경분만 빠른 갱신"
+        else "full"
+    )
+    if license_sync_mode == "incremental":
+        st.info(
+            "이 지역·업종의 이전 수집 기록이 없으면 자동으로 전수 수집부터 "
+            "실행합니다. 기존 DB에 들어간 업체는 삭제되지 않습니다."
+        )
+
     sync_col1, sync_col2 = st.columns(2)
     license_pages = sync_col1.number_input(
         "업종별 최대 페이지",
         min_value=1,
         max_value=100,
-        value=1,
+        value=10 if selected_license_province != ALL_PROVINCES else 1,
         step=1,
-        key="admin_license_pages_v990",
+        key=f"admin_license_pages_v991_{selected_license_province}",
+        help=(
+            "지역 검색을 지원하지 않는 일부 업종은 페이지를 순서대로 확인한 뒤 "
+            "주소로 걸러냅니다. 지역 수집은 10페이지 이상을 권장합니다."
+        ),
     )
     start_license_sync = sync_col2.button(
-        f"선택 분류 {len(selected_license_services):,}개 업종 수집",
+        (
+            f"{selected_region_label} · {license_sync_mode_label} · "
+            f"{len(selected_license_services):,}개 업종 수집"
+        ),
         type="primary",
         use_container_width=True,
         disabled=not selected_license_services,
@@ -2136,15 +2211,36 @@ def render_prospect_admin_settings() -> None:
             result = sync_license_services(
                 selected_license_services,
                 max_pages_per_service=int(license_pages),
-                rows_per_page=100,
+                rows_per_page=1000,
+                province=selected_license_province,
+                district=selected_license_district,
+                sync_mode=license_sync_mode,
                 progress=update_license_progress,
             )
             progress_bar.progress(1.0, text="인허가 업체 수집 완료")
             st.success(
+                f"{selected_region_label} · "
                 f"{result['service_count']:,}개 업종 · "
                 f"{result['received']:,}건 수신 · "
                 f"{result['saved']:,}건 저장"
             )
+            if result.get("full_fallback_services"):
+                st.info(
+                    f"기준 데이터가 없던 "
+                    f"{int(result['full_fallback_services']):,}개 업종은 "
+                    "누락 방지를 위해 전수 수집으로 자동 전환했습니다."
+                )
+            if result.get("incomplete_services"):
+                st.warning(
+                    f"{int(result['incomplete_services']):,}개 업종은 설정한 최대 "
+                    "페이지까지 데이터가 계속 있어 전수 수집이 아직 끝나지 "
+                    "않았습니다. 최대 페이지를 늘려 다시 실행해 주세요."
+                )
+            if result.get("region_filtered"):
+                st.caption(
+                    f"다른 지역으로 확인된 "
+                    f"{int(result['region_filtered']):,}건은 저장에서 제외했습니다."
+                )
             if result["failures"]:
                 st.warning(
                     f"{len(result['failures']):,}개 호출은 승인 또는 연결 확인이 "
