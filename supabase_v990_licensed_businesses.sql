@@ -17,6 +17,7 @@ create table if not exists public.oasis_licensed_businesses (
     is_active boolean not null default true,
     license_date text not null default '',
     close_date text not null default '',
+    source_updated_at text not null default '',
     source_data jsonb not null default '{}'::jsonb,
     last_seen_at timestamptz not null default now(),
     created_at timestamptz not null default now(),
@@ -27,6 +28,8 @@ alter table public.oasis_licensed_businesses
     add column if not exists province text not null default '';
 alter table public.oasis_licensed_businesses
     add column if not exists district text not null default '';
+alter table public.oasis_licensed_businesses
+    add column if not exists source_updated_at text not null default '';
 
 update public.oasis_licensed_businesses
 set
@@ -75,6 +78,10 @@ create table if not exists public.oasis_license_sync_runs (
     message text not null default '',
     province text not null default '',
     district text not null default '',
+    sync_mode text not null default 'full',
+    window_start timestamptz,
+    window_end timestamptz,
+    is_complete boolean not null default false,
     created_at timestamptz not null default now()
 );
 
@@ -82,6 +89,24 @@ alter table public.oasis_license_sync_runs
     add column if not exists province text not null default '';
 alter table public.oasis_license_sync_runs
     add column if not exists district text not null default '';
+alter table public.oasis_license_sync_runs
+    add column if not exists sync_mode text not null default 'full';
+alter table public.oasis_license_sync_runs
+    add column if not exists window_start timestamptz;
+alter table public.oasis_license_sync_runs
+    add column if not exists window_end timestamptz;
+alter table public.oasis_license_sync_runs
+    add column if not exists is_complete boolean not null default false;
+
+create index if not exists oasis_license_sync_watermark_idx
+    on public.oasis_license_sync_runs (
+        service_key,
+        province,
+        district,
+        status,
+        is_complete,
+        created_at desc
+    );
 
 alter table public.oasis_licensed_businesses enable row level security;
 alter table public.oasis_license_sync_runs enable row level security;

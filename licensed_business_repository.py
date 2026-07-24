@@ -26,6 +26,31 @@ def table_status() -> tuple[bool, str]:
         return False, str(exc)
 
 
+def latest_sync_watermark(
+    *,
+    service_key: str,
+    province: str = "",
+    district: str = "",
+) -> str:
+    rows = CloudDatabase().select(
+        TABLE_LICENSE_SYNC_RUNS,
+        filters={
+            "service_key": service_key,
+            "province": province,
+            "district": district,
+            "status": "SUCCESS",
+            "is_complete": "true",
+        },
+        columns="window_end,created_at",
+        order="created_at.desc",
+        limit=1,
+    )
+    if not rows:
+        return ""
+    row = rows[0]
+    return str(row.get("window_end") or row.get("created_at") or "").strip()
+
+
 def save_businesses(items: list[dict[str, Any]]) -> int:
     now = _timestamp()
     rows = [
@@ -49,6 +74,7 @@ def save_businesses(items: list[dict[str, Any]]) -> int:
             "is_active": bool(item.get("is_active")),
             "license_date": str(item.get("license_date") or ""),
             "close_date": str(item.get("close_date") or ""),
+            "source_updated_at": str(item.get("source_updated_at") or ""),
             "source_data": item.get("raw") or {},
             "last_seen_at": now,
             "updated_at": now,
@@ -77,6 +103,10 @@ def save_sync_run(
     message: str = "",
     province: str = "",
     district: str = "",
+    sync_mode: str = "full",
+    window_start: str = "",
+    window_end: str = "",
+    is_complete: bool = False,
 ) -> None:
     CloudDatabase().insert(
         TABLE_LICENSE_SYNC_RUNS,
@@ -90,6 +120,10 @@ def save_sync_run(
                 "message": str(message or "")[:1000],
                 "province": str(province or ""),
                 "district": str(district or ""),
+                "sync_mode": str(sync_mode or "full"),
+                "window_start": str(window_start or ""),
+                "window_end": str(window_end or ""),
+                "is_complete": bool(is_complete),
                 "created_at": _timestamp(),
             }
         ],

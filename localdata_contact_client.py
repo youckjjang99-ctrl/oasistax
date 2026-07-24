@@ -334,6 +334,8 @@ def fetch_business_page(
     timeout: int = 15,
     province: str = ALL_PROVINCES,
     district: str = ALL_DISTRICTS,
+    updated_since: str = "",
+    updated_before: str = "",
 ) -> dict[str, Any]:
     """업종별 인허가 원천 데이터를 공통 업체 형식으로 반환."""
     if service_key not in SERVICES:
@@ -362,6 +364,10 @@ def fetch_business_page(
         # 다수의 지방행정 인허가 API가 지원하는 도로명주소 포함검색 조건이다.
         # 업종별 명세 차이에 대비해 응답 주소를 아래에서 한 번 더 검증한다.
         params["cond[ROAD_NM_ADDR::LIKE]"] = requested_region
+    if str(updated_since or "").strip():
+        params["cond[DAT_UPDT_PNT::GTE]"] = str(updated_since).strip()
+    if str(updated_before or "").strip():
+        params["cond[DAT_UPDT_PNT::LT]"] = str(updated_before).strip()
     try:
         response = requests.get(
             config["url"],
@@ -472,6 +478,15 @@ def fetch_business_page(
                 "close_date": str(
                     _first(raw, "CLSBIZ_YMD", "clsbizYmd", "close_date")
                 ).strip(),
+                "source_updated_at": str(
+                    _first(
+                        raw,
+                        "DAT_UPDT_PNT",
+                        "datUpdtPnt",
+                        "dat_updt_pnt",
+                        "최종수정시점",
+                    )
+                ).strip(),
                 "raw": raw,
             }
         )
@@ -494,6 +509,8 @@ def fetch_business_page(
         "page_no": params["pageNo"],
         "province": "" if province == ALL_PROVINCES else province,
         "district": "" if district == ALL_DISTRICTS else district,
+        "updated_since": str(updated_since or ""),
+        "updated_before": str(updated_before or ""),
         "raw_received_count": raw_received_count,
         "region_filtered_count": raw_received_count - len(items),
         "items": items,

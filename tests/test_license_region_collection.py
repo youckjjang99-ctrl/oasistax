@@ -108,6 +108,8 @@ class LicenseApiRegionTest(unittest.TestCase):
             service_key,
             province="서울특별시",
             district="강남구",
+            updated_since="20260723000000",
+            updated_before="20260724000000",
         )
 
         self.assertTrue(result["ok"])
@@ -123,6 +125,14 @@ class LicenseApiRegionTest(unittest.TestCase):
             mock_get.call_args.kwargs["params"]["cond[ROAD_NM_ADDR::LIKE]"],
             "서울특별시 강남구",
         )
+        self.assertEqual(
+            mock_get.call_args.kwargs["params"]["cond[DAT_UPDT_PNT::GTE]"],
+            "20260723000000",
+        )
+        self.assertEqual(
+            mock_get.call_args.kwargs["params"]["cond[DAT_UPDT_PNT::LT]"],
+            "20260724000000",
+        )
 
     @patch("licensed_business_sync.save_sync_run")
     @patch("licensed_business_sync.save_businesses", return_value=0)
@@ -131,7 +141,7 @@ class LicenseApiRegionTest(unittest.TestCase):
         self,
         mock_fetch,
         _mock_save,
-        _mock_run,
+        mock_run,
     ) -> None:
         mock_fetch.side_effect = [
             {
@@ -160,6 +170,76 @@ class LicenseApiRegionTest(unittest.TestCase):
         self.assertEqual(mock_fetch.call_count, 2)
         self.assertEqual(result["raw_received"], 1001)
         self.assertEqual(result["region_filtered"], 1001)
+        self.assertEqual(result["complete_services"], 1)
+        self.assertEqual(result["incomplete_services"], 0)
+        self.assertFalse(mock_run.call_args_list[0].kwargs["is_complete"])
+        self.assertTrue(mock_run.call_args_list[1].kwargs["is_complete"])
+
+    @patch("licensed_business_sync.save_sync_run")
+    @patch("licensed_business_sync.save_businesses", return_value=0)
+    @patch("licensed_business_sync.localdata_contact_client.fetch_business_page")
+    @patch(
+        "licensed_business_sync.latest_sync_watermark",
+        return_value="2026-07-24T00:00:00+00:00",
+    )
+    def test_incremental_sync_uses_last_successful_window(
+        self,
+        _mock_watermark,
+        mock_fetch,
+        _mock_save,
+        mock_run,
+    ) -> None:
+        mock_fetch.return_value = {
+            "ok": True,
+            "items": [],
+            "raw_received_count": 0,
+        }
+        service_key = next(iter(localdata_contact_client.SERVICES))
+
+        result = licensed_business_sync.sync_services(
+            [service_key],
+            max_pages_per_service=3,
+            rows_per_page=1000,
+            province="서울특별시",
+            district="강남구",
+            sync_mode="incremental",
+        )
+
+        fetch_kwargs = mock_fetch.call_args.kwargs
+        self.assertEqual(fetch_kwargs["updated_since"], "20260723235500")
+        self.assertRegex(fetch_kwargs["updated_before"], r"^\d{14}$")
+        self.assertEqual(result["full_fallback_services"], 0)
+        self.assertEqual(mock_run.call_args.kwargs["sync_mode"], "incremental")
+        self.assertTrue(mock_run.call_args.kwargs["window_end"])
+
+    @patch("licensed_business_sync.save_sync_run")
+    @patch("licensed_business_sync.save_businesses", return_value=0)
+    @patch("licensed_business_sync.localdata_contact_client.fetch_business_page")
+    @patch("licensed_business_sync.latest_sync_watermark", return_value="")
+    def test_incremental_sync_falls_back_to_full_without_baseline(
+        self,
+        _mock_watermark,
+        mock_fetch,
+        _mock_save,
+        mock_run,
+    ) -> None:
+        mock_fetch.return_value = {
+            "ok": True,
+            "items": [],
+            "raw_received_count": 0,
+        }
+        service_key = next(iter(localdata_contact_client.SERVICES))
+
+        result = licensed_business_sync.sync_services(
+            [service_key],
+            province="경기도",
+            district="수원시",
+            sync_mode="incremental",
+        )
+
+        self.assertEqual(result["full_fallback_services"], 1)
+        self.assertEqual(mock_fetch.call_args.kwargs["updated_since"], "")
+        self.assertEqual(mock_run.call_args.kwargs["sync_mode"], "full")
 
 
 if __name__ == "__main__":
