@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,6 +12,9 @@ import localdata_contact_client
 from cloud_db import CloudDatabase
 from korea_regions import ALL_DISTRICTS, ALL_PROVINCES
 from licensed_business_repository import save_businesses, save_sync_run
+from scheduled_employment_contact_enrichment import (
+    run_enrichment as run_employment_contact_enrichment,
+)
 from scheduled_license_phone_enrichment import run_enrichment
 
 
@@ -344,21 +348,6 @@ def run_collection(
 
 
 def main() -> int:
-    if not localdata_contact_client.is_enabled():
-        print(
-            json.dumps(
-                {
-                    "status": "disabled",
-                    "message": (
-                        "행안부 인허가 수집은 핵심 고용증가 흐름에서 "
-                        "분리되어 실행하지 않습니다."
-                    ),
-                },
-                ensure_ascii=False,
-            ),
-            flush=True,
-        )
-        return 0
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--run-key",
@@ -375,13 +364,40 @@ def main() -> int:
         default=int(os.environ.get("LICENSE_COLLECTION_MAX_PAGES", "1000")),
     )
     args = parser.parse_args()
-    collection_status = run_collection(
-        run_key=args.run_key,
-        workers=args.workers,
-        max_pages=args.max_pages,
+
+    collection_status = 0
+    if not localdata_contact_client.is_enabled():
+        print(
+            json.dumps(
+                {
+                    "status": "disabled",
+                    "message": (
+                        "행안부 인허가 수집은 핵심 고용증가 흐름에서 "
+                        "분리되어 실행하지 않습니다."
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+    else:
+        collection_status = run_collection(
+            run_key=args.run_key,
+            workers=args.workers,
+            max_pages=args.max_pages,
+        )
+        collection_status = collection_status or run_enrichment()
+
+    employment_status = run_employment_contact_enrichment(
+        workers=int(os.environ.get("EMPLOYMENT_CONTACT_WORKERS", "4")),
+        batch_size=int(
+            os.environ.get("EMPLOYMENT_CONTACT_BATCH_SIZE", "200")
+        ),
+        max_records=int(
+            os.environ.get("EMPLOYMENT_CONTACT_MAX_RECORDS", "3000")
+        ),
     )
-    enrichment_status = run_enrichment()
-    return collection_status or enrichment_status
+    return collection_status or employment_status
 
 
 if __name__ == "__main__":

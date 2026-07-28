@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -32,54 +33,71 @@ class FastGrowthCacheTest(unittest.TestCase):
         "prospect_db_repository._rest_headers",
         return_value={"Authorization": "Bearer test"},
     )
-    @patch("prospect_db_repository.requests.get")
+    @patch("prospect_db_repository.requests.post")
     def test_maps_compact_growth_row_to_prospect(
         self,
-        request_get,
+        request_post,
         _headers,
         _config,
     ) -> None:
-        request_get.side_effect = [
-            _Response(
-                [
+        request_post.return_value = _Response(
+            [
                     {
-                        "snapshot_identity": "nps-1",
-                        "current_ym": "202506",
-                        "previous_ym": "202505",
+                        "source_type": "nps_monthly",
+                        "source_record_key": "nps-1",
                         "business_no": "111111",
                         "company_name": "월간성장 주식회사",
                         "address": "서울특별시 마포구 월드컵로 1",
+                        "province_name": "서울특별시",
+                        "district_name": "마포구",
+                        "province_code": "11",
+                        "district_code": "11440",
                         "industry_code": "62010",
                         "industry_name": "컴퓨터 프로그래밍 서비스업",
                         "industry_category": "서비스업",
-                        "province_code": "11",
-                        "district_code": "11440",
-                        "district_name": "마포구",
                         "current_employee_count": 12,
                         "previous_employee_count": 8,
                         "employee_growth": 4,
-                    }
-                ]
-            ),
-            _Response(
-                [
+                        "previous_period": "202505",
+                        "current_period": "202506",
+                        "growth_frequency": "monthly",
+                        "is_new_company": False,
+                        "mobile_phone": "010-1111-2222",
+                        "landline_phone": "02-111-2222",
+                        "email": "hello@example.com",
+                        "instagram": "@monthly",
+                        "instagram_url": "https://instagram.com/monthly/",
+                        "contact_status": "matched",
+                    },
                     {
+                        "source_type": "comwel_annual",
+                        "source_record_key": "1234567890",
                         "business_no": "1234567890",
                         "company_name": "테스트 주식회사",
                         "address": "서울특별시 강남구 테헤란로 1",
-                        "province": "서울특별시",
-                        "district": "강남구",
+                        "province_name": "서울특별시",
+                        "district_name": "강남구",
+                        "province_code": "11",
+                        "district_code": "",
                         "industry_code": "58222",
                         "industry_name": "응용 소프트웨어 개발 및 공급업",
                         "industry_category": "서비스업",
-                        "workers_2024": 5,
-                        "workers_2025": 8,
-                        "growth_2024_2025": 3,
-                        "is_new_2025": False,
-                    }
-                ]
-            ),
-        ]
+                        "current_employee_count": 8,
+                        "previous_employee_count": 5,
+                        "employee_growth": 3,
+                        "previous_period": "2024",
+                        "current_period": "2025",
+                        "growth_frequency": "annual",
+                        "is_new_company": False,
+                        "mobile_phone": "",
+                        "landline_phone": "02-333-4444",
+                        "email": "",
+                        "instagram": "",
+                        "instagram_url": "",
+                        "contact_status": "matched",
+                    },
+            ]
+        )
         rows = load_fast_growth_candidates(
             "11",
             minimum_employees=1,
@@ -87,6 +105,7 @@ class FastGrowthCacheTest(unittest.TestCase):
             minimum_growth=2,
             district_name="강남구",
             industry_categories=["서비스업"],
+            contact_channels=["mobile_phone", "email"],
             limit=3,
         )
 
@@ -94,29 +113,24 @@ class FastGrowthCacheTest(unittest.TestCase):
         self.assertEqual(rows[0]["사업장명"], "월간성장 주식회사")
         self.assertEqual(rows[0]["선택고용증가"], 4)
         self.assertEqual(rows[0]["고용증가기준"], "monthly")
+        self.assertEqual(rows[0]["고용증가구분"], "전월대비 +4명")
+        self.assertEqual(rows[0]["휴대전화"], "010-1111-2222")
         self.assertEqual(rows[1]["사업자등록번호"], "1234567890")
         self.assertEqual(rows[1]["가입자수"], 8)
         self.assertEqual(rows[1]["고용증가기준"], "annual")
-        nps_params = request_get.call_args_list[0].kwargs["params"]
-        comwel_params = request_get.call_args_list[1].kwargs["params"]
-        self.assertEqual(nps_params["province_code"], "eq.11")
+        self.assertEqual(rows[1]["고용증가구분"], "전년대비 +3명")
+        payload = json.loads(request_post.call_args.kwargs["data"])
+        self.assertEqual(payload["p_province_code"], "11")
+        self.assertEqual(payload["p_province_name"], "서울특별시")
+        self.assertEqual(payload["p_district"], "강남구")
+        self.assertEqual(payload["p_min_employees"], 1)
+        self.assertEqual(payload["p_max_employees"], 30)
+        self.assertEqual(payload["p_industries"], ["서비스업"])
         self.assertEqual(
-            nps_params["and"],
-            "(current_employee_count.gte.10,current_employee_count.lte.30)",
+            payload["p_contact_channels"],
+            ["email", "mobile_phone"],
         )
-        self.assertEqual(nps_params["district_name"], "eq.강남구")
-        self.assertEqual(
-            nps_params["industry_category"],
-            "in.(서비스업)",
-        )
-        self.assertEqual(nps_params["employee_growth"], "gte.2")
-        self.assertEqual(comwel_params["province"], "eq.서울특별시")
-        self.assertEqual(comwel_params["district"], "eq.강남구")
-        self.assertEqual(
-            comwel_params["and"],
-            "(workers_2025.gte.1,workers_2025.lte.9)",
-        )
-        self.assertEqual(comwel_params["growth_2024_2025"], "gte.2")
+        self.assertEqual(payload["p_limit"], 3)
 
     @patch(
         "prospect_db_repository.get_cloud_config",
@@ -130,14 +144,14 @@ class FastGrowthCacheTest(unittest.TestCase):
         "prospect_db_repository._rest_headers",
         return_value={"Authorization": "Bearer test"},
     )
-    @patch("prospect_db_repository.requests.get")
+    @patch("prospect_db_repository.requests.post")
     def test_maps_legacy_special_province_code(
         self,
-        request_get,
+        request_post,
         _headers,
         _config,
     ) -> None:
-        request_get.return_value = _Response([])
+        request_post.return_value = _Response([])
 
         load_fast_growth_candidates(
             "42",
@@ -145,8 +159,40 @@ class FastGrowthCacheTest(unittest.TestCase):
             limit=3,
         )
 
-        params = request_get.call_args.kwargs["params"]
-        self.assertEqual(params["province_code"], "eq.51")
+        payload = json.loads(request_post.call_args.kwargs["data"])
+        self.assertEqual(payload["p_province_code"], "51")
+        self.assertEqual(payload["p_province_name"], "강원특별자치도")
+
+    @patch("prospect_collection_service.remove_existing_prospects")
+    @patch(
+        "prospect_collection_service.remove_existing_customers",
+        side_effect=lambda rows: (rows, 0),
+    )
+    @patch(
+        "prospect_collection_service.load_fast_growth_candidates",
+        return_value=[{"source_key": f"row-{index}"} for index in range(500)],
+    )
+    @patch(
+        "prospect_collection_service.existing_prospect_identities",
+        return_value=(set(), set(), set()),
+    )
+    def test_precomputed_query_supports_500_results(
+        self,
+        _identities,
+        _cached,
+        _customers,
+        remove_prospects,
+    ) -> None:
+        remove_prospects.side_effect = lambda rows, **_kwargs: (rows, 0)
+        result = collect_contactable_growth_companies(
+            "11",
+            target_count=500,
+            business_type="all",
+            contact_channels=["email"],
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["found_count"], 500)
+        self.assertEqual(result["contact_channels"], ["email"])
 
     @patch("prospect_collection_service.fetch_nps_workplaces")
     @patch(

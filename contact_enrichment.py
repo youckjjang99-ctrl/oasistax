@@ -247,6 +247,7 @@ def enrich_company(
     *,
     skip_kakao: bool = False,
     skip_localdata: bool = False,
+    bulk_mode: bool = False,
     max_website_candidates: int = 3,
     website_timeout: int = 10,
     website_max_pages: int = 4,
@@ -256,6 +257,7 @@ def enrich_company(
         (
             skip_kakao,
             skip_localdata,
+            bulk_mode,
             max_website_candidates,
             website_timeout,
             website_max_pages,
@@ -296,6 +298,7 @@ def enrich_company(
             address,
             timeout=max(2, min(website_timeout, 6)),
             display=10,
+            query_mode="bulk" if bulk_mode else "full",
         )
         naver_local_future = executor.submit(
             naver_web_search_client.search_company,
@@ -405,11 +408,19 @@ def enrich_company(
 
     website_url = ""
     website_confidence = 0
-    naver = naver_web_search_client.search_official_websites(
-        company_name,
-        address,
-        timeout=max(2, int(website_timeout)),
-        display=8,
+    naver = (
+        {
+            "status": "SKIPPED",
+            "message": "대량 보강에서는 공식 홈페이지 정밀 탐색을 생략합니다.",
+            "candidates": [],
+        }
+        if bulk_mode
+        else naver_web_search_client.search_official_websites(
+            company_name,
+            address,
+            timeout=max(2, int(website_timeout)),
+            display=8,
+        )
     )
     trace.append(
         {

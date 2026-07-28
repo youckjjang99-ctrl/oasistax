@@ -314,21 +314,21 @@ def load_fast_growth_candidates(
     district_name: str = "",
     source_mode: str = "combined",
     industry_categories: list[str] | None = None,
+    contact_channels: list[str] | None = None,
     limit: int = 200,
 ) -> list[dict[str, Any]]:
-    """사전 계산된 국민연금·근로복지공단 고용증가 후보를 즉시 조회."""
+    """연락처 캐시와 결합된 월별·연간 고용증가 후보를 즉시 조회."""
     config = get_cloud_config()
     if not config.configured:
         raise RuntimeError("Supabase 환경변수가 설정되지 않았습니다.")
 
-    row_limit = max(1, min(2000, int(limit)))
+    row_limit = max(1, min(500, int(limit)))
     minimum_count = max(1, int(minimum_employees))
     maximum_count = (
-        None
+        10000
         if maximum_employees in (None, "")
         else max(minimum_count, int(maximum_employees))
     )
-    growth_floor = max(1, int(minimum_growth))
     district = str(district_name or "").strip()
     source_mode = str(source_mode or "combined").strip().lower()
     if source_mode not in {"combined", "nps_monthly", "comwel_annual"}:
@@ -340,10 +340,13 @@ def load_fast_growth_candidates(
             if str(value or "").strip()
         }
     )
-    industry_filter = (
-        "in.(" + ",".join(selected_industries) + ")"
-        if selected_industries
-        else ""
+    selected_channels = sorted(
+        {
+            str(value or "").strip()
+            for value in (contact_channels or [])
+            if str(value or "").strip()
+            in {"mobile_phone", "landline_phone", "email", "instagram"}
+        }
     )
     normalized_region_code = re.sub(r"[^0-9]", "", str(region_code or ""))
     if normalized_region_code in {"0", "00"}:
@@ -357,187 +360,36 @@ def load_fast_growth_candidates(
         "",
     )
 
-    normalized_rows: list[dict[str, Any]] = []
-    nps_rows: list[dict[str, Any]] = []
-    nps_enabled = (
-        source_mode in {"combined", "nps_monthly"}
-        and (maximum_count is None or maximum_count >= 10)
+    payload = {
+        "p_province_code": normalized_region_code,
+        "p_province_name": province_name,
+        "p_district": district,
+        "p_min_employees": minimum_count,
+        "p_max_employees": maximum_count,
+        "p_industries": selected_industries,
+        "p_contact_channels": selected_channels,
+        "p_limit": row_limit,
+    }
+    response = requests.post(
+        f"{config.url}/rest/v1/rpc/oasis_search_employment_growth",
+        headers=_rest_headers(),
+        data=json.dumps(payload, ensure_ascii=False),
+        timeout=max(config.timeout, 60),
     )
-    if nps_enabled:
-        nps_minimum = max(10, minimum_count)
-        nps_params: dict[str, str] = {
-            "select": (
-                "snapshot_identity,current_ym,previous_ym,business_no,"
-                "company_name,address,industry_code,industry_name,"
-                "industry_category,province_code,district_code,"
-                "district_name,current_employee_count,"
-                "previous_employee_count,employee_growth"
-            ),
-            "employee_growth": f"gte.{growth_floor}",
-            "order": "employee_growth.desc,current_employee_count.desc",
-            "limit": str(row_limit),
-        }
-        if maximum_count is None:
-            nps_params["current_employee_count"] = f"gte.{nps_minimum}"
-        else:
-            nps_params["and"] = (
-                f"(current_employee_count.gte.{nps_minimum},"
-                f"current_employee_count.lte.{maximum_count})"
-            )
-        if normalized_region_code:
-            nps_params["province_code"] = f"eq.{normalized_region_code}"
-        if district:
-            nps_params["district_name"] = f"eq.{district}"
-        if industry_filter:
-            nps_params["industry_category"] = industry_filter
-        nps_response = requests.get(
-            f"{config.url}/rest/v1/{TABLE_NPS_GROWTH}",
-            headers=_rest_headers(),
-            params=nps_params,
-            timeout=max(config.timeout, 30),
+    if not response.ok:
+        raise RuntimeError(
+            "고용증가·연락처 사전 계산 후보 조회 실패 "
+            f"HTTP {response.status_code}: {response.text[:300]}"
         )
-        if not nps_response.ok:
-            raise RuntimeError(
-                "국민연금 사전 계산 고용증가 후보 조회 실패 "
-                f"HTTP {nps_response.status_code}: "
-                f"{nps_response.text[:300]}"
-            )
-        nps_rows = nps_response.json() if nps_response.text else []
-    for row in nps_rows if isinstance(nps_rows, list) else []:
-        row_province_code = str(row.get("province_code") or "")
-        normalized_rows.append(
-            {
-                "source_type": "nps_monthly",
-                "source_record_key": row.get("snapshot_identity"),
-                "business_no": row.get("business_no"),
-                "company_name": row.get("company_name"),
-                "address": row.get("address"),
-                "province_name": SUPABASE_PROVINCE_NAMES.get(
-                    row_province_code,
-                    province_name,
-                ),
-                "district_name": row.get("district_name"),
-                "province_code": row_province_code,
-                "district_code": row.get("district_code"),
-                "industry_code": row.get("industry_code"),
-                "industry_name": row.get("industry_name"),
-                "industry_category": row.get("industry_category"),
-                "current_employee_count": row.get("current_employee_count"),
-                "previous_employee_count": row.get(
-                    "previous_employee_count"
-                ),
-                "employee_growth": row.get("employee_growth"),
-                "previous_period": row.get("previous_ym"),
-                "current_period": row.get("current_ym"),
-                "growth_frequency": "monthly",
-                "is_new_company": False,
-            }
-        )
-
-    comwel_enabled = (
-        source_mode in {"combined", "comwel_annual"}
-        and (source_mode == "comwel_annual" or minimum_count <= 9)
-        and (maximum_count is None or maximum_count >= 1)
-    )
-    if comwel_enabled:
-        comwel_maximum = (
-            min(9, maximum_count or 9)
-            if source_mode == "combined"
-            else maximum_count
-        )
-        comwel_params: dict[str, str] = {
-            "select": (
-                "business_no,company_name,address,province,district,"
-                "industry_code,industry_name,industry_category,"
-                "workers_2024,workers_2025,growth_2024_2025,is_new_2025"
-            ),
-            "growth_2024_2025": f"gte.{growth_floor}",
-            "order": "growth_2024_2025.desc,workers_2025.desc",
-            "limit": str(row_limit),
-        }
-        if comwel_maximum is None:
-            comwel_params["workers_2025"] = f"gte.{minimum_count}"
-        else:
-            comwel_params["and"] = (
-                f"(workers_2025.gte.{minimum_count},"
-                f"workers_2025.lte.{comwel_maximum})"
-            )
-        if province_name:
-            comwel_params["province"] = f"eq.{province_name}"
-        if district:
-            comwel_params["district"] = f"eq.{district}"
-        if industry_filter:
-            comwel_params["industry_category"] = industry_filter
-        comwel_response = requests.get(
-            f"{config.url}/rest/v1/{TABLE_COMWEL_GROWTH}",
-            headers=_rest_headers(),
-            params=comwel_params,
-            timeout=max(config.timeout, 30),
-        )
-        if not comwel_response.ok:
-            raise RuntimeError(
-                "근로복지공단 사전 계산 고용증가 후보 조회 실패 "
-                f"HTTP {comwel_response.status_code}: "
-                f"{comwel_response.text[:300]}"
-            )
-        comwel_rows = (
-            comwel_response.json() if comwel_response.text else []
-        )
-        for row in comwel_rows if isinstance(comwel_rows, list) else []:
-            normalized_rows.append(
-                {
-                    "source_type": "comwel_annual",
-                    "source_record_key": row.get("business_no"),
-                    "business_no": row.get("business_no"),
-                    "company_name": row.get("company_name"),
-                    "address": row.get("address"),
-                    "province_name": row.get("province"),
-                    "district_name": row.get("district"),
-                    "province_code": SUPABASE_PROVINCE_CODES.get(
-                        str(row.get("province") or ""),
-                        normalized_region_code,
-                    ),
-                    "district_code": "",
-                    "industry_code": row.get("industry_code"),
-                    "industry_name": row.get("industry_name"),
-                    "industry_category": row.get("industry_category"),
-                    "current_employee_count": row.get("workers_2025"),
-                    "previous_employee_count": row.get("workers_2024"),
-                    "employee_growth": row.get("growth_2024_2025"),
-                    "previous_period": "2024",
-                    "current_period": "2025",
-                    "growth_frequency": "annual",
-                    "is_new_company": bool(row.get("is_new_2025")),
-                }
-            )
-
-    normalized_rows.sort(
-        key=lambda row: (
-            int(row.get("employee_growth") or 0),
-            int(row.get("current_employee_count") or 0),
-        ),
-        reverse=True,
-    )
-    rows: list[dict[str, Any]] = []
-    seen_candidates: set[str] = set()
-    for row in normalized_rows:
-        business_no = _business_no(row.get("business_no"))
-        business_digits = re.sub(r"[^0-9]", "", business_no)
-        identity = (
-            f"business:{business_digits}"
-            if len(business_digits) == 10
-            else _company_address_key(
-                row.get("company_name"),
-                row.get("address"),
-            )
-        )
-        if identity and identity in seen_candidates:
-            continue
-        if identity:
-            seen_candidates.add(identity)
-        rows.append(row)
-        if len(rows) >= row_limit:
-            break
+    rows = response.json() if response.text else []
+    if not isinstance(rows, list):
+        rows = []
+    if source_mode != "combined":
+        rows = [
+            row
+            for row in rows
+            if str(row.get("source_type") or "") == source_mode
+        ]
 
     results: list[dict[str, Any]] = []
     for row in rows:
@@ -549,6 +401,15 @@ def load_fast_growth_candidates(
         address = str(row.get("address") or "")
         province = str(row.get("province_name") or "")
         district = str(row.get("district_name") or "")
+        frequency = str(row.get("growth_frequency") or "")
+        mobile_phone = str(row.get("mobile_phone") or "")
+        landline_phone = str(row.get("landline_phone") or "")
+        preferred_phone = mobile_phone or landline_phone
+        growth_label = (
+            f"전월대비 +{growth:,}명"
+            if frequency == "monthly"
+            else f"전년대비 +{growth:,}명"
+        )
         results.append(
             {
                 "source": source_type,
@@ -566,12 +427,52 @@ def load_fast_growth_candidates(
                 "업종분류": str(
                     row.get("industry_category") or "기타"
                 ),
+                "휴대전화": mobile_phone,
+                "일반전화": landline_phone,
+                "대표전화": preferred_phone,
+                "전화유형": (
+                    "휴대전화"
+                    if mobile_phone
+                    else ("일반전화" if landline_phone else "")
+                ),
+                "전화출처": "사전 수집 연락처",
+                "이메일": str(row.get("email") or ""),
+                "인스타그램": str(row.get("instagram") or ""),
+                "인스타그램URL": str(row.get("instagram_url") or ""),
+                "연락처상태": str(row.get("contact_status") or ""),
+                "연락처조회일": str(row.get("contact_checked_at") or ""),
+                "영업분석": {
+                    "phone": preferred_phone,
+                    "phone_source": "employment_contact_cache",
+                    "phone_confidence": 90 if preferred_phone else 0,
+                    "email": str(row.get("email") or ""),
+                    "instagram": str(row.get("instagram") or ""),
+                    "instagram_url": str(
+                        row.get("instagram_url") or ""
+                    ),
+                    "contact_status": str(
+                        row.get("contact_status") or ""
+                    ),
+                    "public_contacts": [],
+                },
                 "가입자수": current_count,
-                "전년가입자수": previous_count,
-                "전년대비고용증가": growth,
+                "이전가입자수": previous_count,
+                "전월가입자수": (
+                    previous_count if frequency == "monthly" else ""
+                ),
+                "전년가입자수": (
+                    previous_count if frequency == "annual" else ""
+                ),
+                "전월대비고용증가": (
+                    growth if frequency == "monthly" else ""
+                ),
+                "전년대비고용증가": (
+                    growth if frequency == "annual" else ""
+                ),
                 "선택고용증가": growth,
                 "고용증가신호": growth > 0,
-                "고용증가기준": str(row.get("growth_frequency") or ""),
+                "고용증가기준": frequency,
+                "고용증가구분": growth_label,
                 "고용자료상태": "PRECOMPUTED",
                 "고용자료메시지": "Supabase 사전 계산 결과",
                 "고용증가판정": "INCREASED",
@@ -838,6 +739,7 @@ def save_search_history(
     growth_only: bool,
     growth_basis: str,
     industry_categories: list[str] | None,
+    contact_channels: list[str] | None,
     found_count: int,
     pages_scanned: int,
     elapsed_seconds: float,
@@ -872,6 +774,11 @@ def save_search_history(
                     for value in (industry_categories or [])
                     if str(value or "").strip()
                 ],
+                "contact_channels": [
+                    str(value or "").strip()
+                    for value in (contact_channels or [])
+                    if str(value or "").strip()
+                ],
                 "found_count": max(0, int(found_count)),
                 "pages_scanned": max(0, int(pages_scanned)),
                 "elapsed_seconds": max(0.0, float(elapsed_seconds)),
@@ -897,7 +804,8 @@ def list_search_history(
             "id,owner_user_id,region,region_code,district,business_type,"
             "data_source,start_page,end_page,target_count,minimum_employees,"
             "maximum_employees,minimum_growth,"
-            "growth_only,growth_basis,industry_categories,found_count,pages_scanned,"
+            "growth_only,growth_basis,industry_categories,contact_channels,"
+            "found_count,pages_scanned,"
             "elapsed_seconds,searched_at"
         ),
         order="searched_at.desc",

@@ -287,6 +287,7 @@ def search_public_phones(
     *,
     timeout: int = 5,
     display: int = 10,
+    query_mode: str = "full",
 ) -> dict[str, Any]:
     """네이버 웹 검색 결과에 공개 노출된 회사 전화만 보수적으로 수집."""
     if not key_status()["configured"]:
@@ -297,12 +298,21 @@ def search_public_phones(
             "candidates": [],
         }
     base_name = search_company_name(company_name)
-    queries = [
-        f'"{base_name}" 대표전화 {address_hint(address)}'.strip(),
-        f'"{base_name}" 문의 연락처 {address_hint(address)}'.strip(),
-        f'"{base_name}" 업무용 휴대전화 010'.strip(),
-        f'"{base_name}" 이메일 인스타그램'.strip(),
-    ]
+    if str(query_mode or "").strip().lower() == "bulk":
+        queries = [
+            (
+                f'"{base_name}" 대표전화 문의 연락처 010 '
+                f"{address_hint(address)}"
+            ).strip(),
+            f'"{base_name}" 이메일 인스타그램'.strip(),
+        ]
+    else:
+        queries = [
+            f'"{base_name}" 대표전화 {address_hint(address)}'.strip(),
+            f'"{base_name}" 문의 연락처 {address_hint(address)}'.strip(),
+            f'"{base_name}" 업무용 휴대전화 010'.strip(),
+            f'"{base_name}" 이메일 인스타그램'.strip(),
+        ]
     candidates: list[dict[str, Any]] = []
     public_contacts: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()

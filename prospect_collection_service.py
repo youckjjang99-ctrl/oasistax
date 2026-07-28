@@ -190,13 +190,14 @@ def collect_contactable_growth_companies(
     growth_only: bool = True,
     growth_basis: str = "combined",
     industry_categories: list[str] | None = None,
+    contact_channels: list[str] | None = None,
     district_name: str = "",
     data_source: str = "combined",
     sigungu_code: str = "",
     emd_code: str = "",
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
-    target_count = min(100, max(1, int(target_count)))
+    target_count = min(500, max(1, int(target_count)))
     max_pages = min(100, max(1, int(max_pages)))
     start_page = max(1, int(start_page))
     minimum_employees = max(1, int(minimum_employees))
@@ -223,6 +224,12 @@ def collect_contactable_growth_companies(
         str(value or "").strip()
         for value in (industry_categories or [])
         if str(value or "").strip()
+    }
+    selected_contact_channels = {
+        str(value or "").strip()
+        for value in (contact_channels or [])
+        if str(value or "").strip()
+        in {"mobile_phone", "landline_phone", "email", "instagram"}
     }
 
     try:
@@ -278,7 +285,8 @@ def collect_contactable_growth_companies(
                 district_name=district_name,
                 source_mode=data_source,
                 industry_categories=sorted(selected_industries),
-                limit=max(100, min(1000, target_count * 5)),
+                contact_channels=sorted(selected_contact_channels),
+                limit=target_count,
             )
             _notify(
                 progress,
@@ -318,15 +326,8 @@ def collect_contactable_growth_companies(
                 company_address_keys=saved_company_address_keys,
             )
             stats["saved_prospect_excluded"] += prospect_count
-            selected, contact_failures, checked = _find_contactable(
-                cached_items,
-                needed=target_count,
-                progress=progress,
-                run_quick=True,
-                run_full=True,
-            )
-            failures.extend(contact_failures)
-            stats["contact_checked"] = checked
+            selected = cached_items[:target_count]
+            stats["contact_checked"] = len(selected)
             stats["elapsed_seconds"] = round(
                 time.monotonic() - started_at,
                 1,
@@ -347,6 +348,7 @@ def collect_contactable_growth_companies(
                 "growth_only": True,
                 "growth_basis": "precomputed",
                 "industry_categories": sorted(selected_industries),
+                "contact_channels": sorted(selected_contact_channels),
                 "district_name": district_name,
                 "data_source": data_source,
                 "minimum_employees": minimum_employees,
@@ -355,8 +357,8 @@ def collect_contactable_growth_companies(
                 "searched_start_page": 0,
                 "searched_end_page": 0,
                 "priority_basis": (
-                    "국민연금 10명 이상 월별 증가 또는 "
-                    "근로복지공단 1~9명 연간 증가 사전 계산"
+                    "국민연금 월별 증가 또는 근로복지공단 연간 증가와 "
+                    "Supabase 사전 수집 연락처"
                 ),
             }
         except Exception as exc:
@@ -383,11 +385,12 @@ def collect_contactable_growth_companies(
                 "growth_only": True,
                 "growth_basis": "precomputed",
                 "industry_categories": sorted(selected_industries),
+                "contact_channels": sorted(selected_contact_channels),
                 "searched_start_page": 0,
                 "searched_end_page": 0,
                 "priority_basis": (
-                    "국민연금 10명 이상 월별 증가 또는 "
-                    "근로복지공단 1~9명 연간 증가 사전 계산"
+                    "국민연금 월별 증가 또는 근로복지공단 연간 증가와 "
+                    "Supabase 사전 수집 연락처"
                 ),
             }
 

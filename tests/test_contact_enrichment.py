@@ -87,6 +87,23 @@ class ContactCollectionTest(unittest.TestCase):
             {"email", "instagram"},
         )
 
+    @patch.dict(
+        "os.environ",
+        {"NAVER_CLIENT_ID": "id", "NAVER_CLIENT_SECRET": "secret"},
+    )
+    @patch("naver_web_search_client.requests.get")
+    def test_naver_bulk_mode_uses_two_queries(self, mocked_get) -> None:
+        mocked_get.side_effect = lambda *args, **kwargs: _NaverResponse(
+            kwargs["params"]["query"]
+        )
+        result = naver_web_search_client.search_public_phones(
+            "테스트기업",
+            "서울특별시 강남구",
+            query_mode="bulk",
+        )
+        self.assertEqual(len(result["queries"]), 2)
+        self.assertIn("이메일", result["queries"][1])
+
     def test_instagram_profile_rejects_post_and_keeps_profile(self) -> None:
         self.assertEqual(
             instagram_profile(
