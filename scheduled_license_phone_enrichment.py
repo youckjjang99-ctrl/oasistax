@@ -1,6 +1,3 @@
-Exit code: 0
-Wall time: 2.1 seconds
-Output:
 from __future__ import annotations
 
 import argparse
@@ -27,7 +24,7 @@ def _now() -> str:
 def _eligible_rows(limit: int, retry_days: int) -> list[dict[str, Any]]:
     """Fetch a small, index-friendly phone enrichment batch.
 
-    Pending records are processed before retries.  Keeping those queues in
+    Pending records are processed before retries. Keeping those queues in
     separate requests avoids the broad OR filter that previously made the
     database scan and sort most of the table.
     """
@@ -40,7 +37,7 @@ def _eligible_rows(limit: int, retry_days: int) -> list[dict[str, Any]]:
         headers=db.headers,
         params={
             "select": "id,source_key,company_name,address",
-            # Missing phones are stored as empty strings.  Avoiding an OR with
+            # Missing phones are stored as empty strings. Avoiding an OR with
             # phone.is.null lets PostgreSQL use the existing partial index.
             "phone": "eq.",
             "phone_enrichment_status": "eq.pending",
@@ -54,9 +51,9 @@ def _eligible_rows(limit: int, retry_days: int) -> list[dict[str, Any]]:
     )
     if not response.ok:
         raise RuntimeError(
-            "?꾪솕踰덊샇 蹂닿컯 ???議고쉶 ?ㅽ뙣 "
+            "전화번호 보강 대상 조회 실패 "
             f"HTTP {response.status_code}: {response.text[:500]}"
-    )
+        )
     data = response.json() if response.text else []
     if isinstance(data, list) and data:
         return data
@@ -99,7 +96,7 @@ def _patch_if_phone_empty(
     )
     if not response.ok:
         raise RuntimeError(
-            "?꾪솕踰덊샇 ????ㅽ뙣 "
+            "전화번호 저장 실패 "
             f"HTTP {response.status_code}: {response.text[:500]}"
         )
     rows = response.json() if response.text else []
@@ -174,7 +171,7 @@ def run_enrichment(
     max_records: int = 0,
 ) -> int:
     if not kakao_local_client.key_status()["configured"]:
-        raise RuntimeError("KAKAO_REST_API_KEY媛 ?ㅼ젙?섏? ?딆븯?듬땲??")
+        raise RuntimeError("KAKAO_REST_API_KEY가 설정되지 않았습니다.")
 
     totals = {"matched": 0, "no_match": 0, "error": 0, "skipped": 0}
     processed = 0
@@ -249,4 +246,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
