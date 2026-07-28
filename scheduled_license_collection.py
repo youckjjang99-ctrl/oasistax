@@ -64,6 +64,19 @@ def _upsert_progress(run_key: str, service_key: str, **values: Any) -> None:
     )
 
 
+def _is_retryable_failure(progress: dict[str, Any]) -> bool:
+    """Return whether a previously failed service should be retried.
+
+    Data.go.kr responds with ``Forbidden`` when the application has not been
+    approved for that specific service. Retrying those services every run only
+    wastes requests and hides the progress of approved services. All other
+    failures are retried because they can be caused by temporary upstream or
+    database errors.
+    """
+    error = str(progress.get("last_error") or "").strip().lower()
+    return "forbidden" not in error
+
+
 def _collect_service(
     run_key: str,
     service_key: str,
@@ -218,9 +231,13 @@ def run_collection(
     services = list(localdata_contact_client.SERVICES)
     existing = _progress_rows(run_key)
     targets: list[tuple[str, int]] = []
+    excluded_forbidden = 0
     for service_key in services:
         current = existing.get(service_key, {})
         if current.get("status") == "completed":
+            continue
+        if current.get("status") == "failed" and not _is_retryable_failure(current):
+            excluded_forbidden += 1
             continue
         targets.append(
             (service_key, max(1, int(current.get("next_page") or 1)))
@@ -231,15 +248,23 @@ def run_collection(
         {
             "status": "running",
             "total_services": len(services),
-            "completed_services": len(services) - len(targets),
-            "failed_services": 0,
+            "completed_services": sum(
+                1
+                for service_key in services
+                if existing.get(service_key, {}).get("status") == "completed"
+            ),
+            "failed_services": excluded_forbidden,
             "started_at": _now(),
             "completed_at": None,
             "last_error": "",
         },
     )
-    completed = len(services) - len(targets)
-    failed = 0
+    completed = sum(
+        1
+        for service_key in services
+        if existing.get(service_key, {}).get("status") == "completed"
+    )
+    failed = excluded_forbidden
     received = 0
     saved = 0
     with ThreadPoolExecutor(
@@ -296,7 +321,8 @@ def run_collection(
             )
             print(
                 f"progress {completed + failed}/{len(services)} "
-                f"completed={completed} failed={failed} saved={saved}",
+                f"completed={completed} failed={failed} "
+                f"skipped_forbidden={excluded_forbidden} saved={saved}",
                 flush=True,
             )
 
@@ -318,6 +344,21 @@ def run_collection(
 
 
 def main() -> int:
+    if not localdata_contact_client.is_enabled():
+        print(
+            json.dumps(
+                {
+                    "status": "disabled",
+                    "message": (
+                        "행안부 인허가 수집은 핵심 고용증가 흐름에서 "
+                        "분리되어 실행하지 않습니다."
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        return 0
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--run-key",

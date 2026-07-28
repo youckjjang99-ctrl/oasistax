@@ -98,7 +98,13 @@ class KoreaRegionsTest(unittest.TestCase):
 
 
 class LicenseApiRegionTest(unittest.TestCase):
-    @patch.dict(os.environ, {"DATA_GO_KR_SERVICE_KEY": "test-key"})
+    @patch.dict(
+        os.environ,
+        {
+            "DATA_GO_KR_SERVICE_KEY": "test-key",
+            "OASIS_ENABLE_LOCALDATA": "true",
+        },
+    )
     @patch("localdata_contact_client.requests.get")
     def test_api_query_and_response_region_filter(self, mock_get) -> None:
         mock_get.return_value = _Response()

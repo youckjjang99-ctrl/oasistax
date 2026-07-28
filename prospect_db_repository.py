@@ -16,6 +16,7 @@ TABLE_CUSTOMERS = "oasis_customers"
 TABLE_CONTACTS = "oasis_prospect_contacts"
 TABLE_SEARCH_HISTORY = "oasis_prospect_search_history"
 TABLE_EMPLOYEE_SNAPSHOTS = "oasis_nps_employee_snapshots"
+TABLE_FAST_EMPLOYMENT_GROWTH = "oasis_fast_employment_growth_leads"
 
 
 def _business_no(value: Any) -> str:
@@ -123,6 +124,8 @@ def _snapshot_rows(prospects: list[dict[str, Any]]) -> list[dict[str, Any]]:
         try:
             employee_count = int(prospect.get("가입자수") or 0)
         except (TypeError, ValueError):
+            continue
+        if employee_count < 10:
             continue
         row = {
             "snapshot_identity": _snapshot_identity(prospect),
@@ -272,6 +275,87 @@ def remove_existing_customers(
         if _business_no(item.get("사업자등록번호")) not in existing
     ]
     return filtered, len(prospects) - len(filtered)
+
+
+def load_fast_growth_candidates(
+    region_code: str,
+    *,
+    minimum_employees: int = 1,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """사전 계산된 국민연금·근로복지공단 고용증가 후보를 즉시 조회."""
+    config = get_cloud_config()
+    if not config.configured:
+        raise RuntimeError("Supabase 환경변수가 설정되지 않았습니다.")
+    params: dict[str, str] = {
+        "select": (
+            "source_type,source_record_key,business_no,company_name,address,"
+            "province_name,district_name,province_code,district_code,"
+            "industry_code,industry_name,current_employee_count,"
+            "previous_employee_count,employee_growth,previous_period,"
+            "current_period,growth_frequency,is_new_company"
+        ),
+        "current_employee_count": f"gte.{max(1, int(minimum_employees))}",
+        "employee_growth": "gt.0",
+        "order": "employee_growth.desc,current_employee_count.desc",
+        "limit": str(max(1, min(2000, int(limit)))),
+    }
+    normalized_region_code = re.sub(r"[^0-9]", "", str(region_code or ""))
+    if normalized_region_code and normalized_region_code not in {"0", "00"}:
+        params["province_code"] = f"eq.{normalized_region_code[:2]}"
+    response = requests.get(
+        f"{config.url}/rest/v1/{TABLE_FAST_EMPLOYMENT_GROWTH}",
+        headers=_rest_headers(),
+        params=params,
+        timeout=max(config.timeout, 30),
+    )
+    if not response.ok:
+        raise RuntimeError(
+            "사전 계산 고용증가 후보 조회 실패 "
+            f"HTTP {response.status_code}: {response.text[:300]}"
+        )
+
+    rows = response.json() if response.text else []
+    results: list[dict[str, Any]] = []
+    for row in rows if isinstance(rows, list) else []:
+        source_type = str(row.get("source_type") or "")
+        current_count = int(row.get("current_employee_count") or 0)
+        previous_count = int(row.get("previous_employee_count") or 0)
+        growth = int(row.get("employee_growth") or 0)
+        company_name = str(row.get("company_name") or "")
+        address = str(row.get("address") or "")
+        province = str(row.get("province_name") or "")
+        district = str(row.get("district_name") or "")
+        results.append(
+            {
+                "source": source_type,
+                "source_key": (
+                    f"{source_type}:{row.get('source_record_key') or ''}"
+                ),
+                "사업자등록번호": str(row.get("business_no") or ""),
+                "사업장명": company_name,
+                "주소": address,
+                "지역": " ".join(
+                    value for value in (province, district) if value
+                ),
+                "업종코드": str(row.get("industry_code") or ""),
+                "업종명": str(row.get("industry_name") or ""),
+                "가입자수": current_count,
+                "전년가입자수": previous_count,
+                "전년대비고용증가": growth,
+                "선택고용증가": growth,
+                "고용증가신호": growth > 0,
+                "고용증가기준": str(row.get("growth_frequency") or ""),
+                "고용자료상태": "PRECOMPUTED",
+                "고용자료메시지": "Supabase 사전 계산 결과",
+                "고용증가판정": "INCREASED",
+                "자료생성년월": str(row.get("current_period") or ""),
+                "전년자료생성년월": str(row.get("previous_period") or ""),
+                "신규업체": bool(row.get("is_new_company")),
+                "원본데이터": dict(row),
+            }
+        )
+    return results
 
 
 def existing_prospect_identities(

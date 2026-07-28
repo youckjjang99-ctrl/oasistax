@@ -34,17 +34,34 @@ def test_connections() -> dict[str, Any]:
     with ThreadPoolExecutor(max_workers=3) as executor:
         kakao_future = executor.submit(kakao_local_client.test_connection)
         naver_future = executor.submit(naver_web_search_client.test_connection)
-        localdata_future = executor.submit(
-            localdata_contact_client.test_services,
-            representative=True,
+        localdata_future = (
+            executor.submit(
+                localdata_contact_client.test_services,
+                representative=True,
+            )
+            if localdata_contact_client.is_enabled()
+            else None
         )
         results = {
             "kakao": kakao_future.result(),
             "naver": naver_future.result(),
-            "localdata": localdata_future.result(),
+            "localdata": (
+                localdata_future.result()
+                if localdata_future is not None
+                else localdata_contact_client.test_services(
+                    representative=True,
+                )
+            ),
         }
     return {
-        "ok": all(result.get("ok") for result in results.values()),
+        "ok": (
+            bool(results["kakao"].get("ok"))
+            and bool(results["naver"].get("ok"))
+            and (
+                bool(results["localdata"].get("ok"))
+                or results["localdata"].get("status") == "DISABLED"
+            )
+        ),
         "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "sources": results,
     }
