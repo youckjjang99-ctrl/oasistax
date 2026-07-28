@@ -246,6 +246,7 @@ def enrich_company(
     prospect: dict[str, Any],
     *,
     skip_kakao: bool = False,
+    skip_naver: bool = False,
     skip_localdata: bool = False,
     bulk_mode: bool = False,
     contact_stage: str = "all",
@@ -262,6 +263,7 @@ def enrich_company(
         prospect,
         (
             skip_kakao,
+            skip_naver,
             skip_localdata,
             bulk_mode,
             stage,
@@ -299,18 +301,22 @@ def enrich_company(
                 kakao_local_client.search_company, company_name, address
             )
         )
-        naver_phone_future = executor.submit(
-            naver_web_search_client.search_public_phones,
-            company_name,
-            address,
-            timeout=max(2, min(website_timeout, 6)),
-            display=10,
-            query_mode="bulk" if bulk_mode else "full",
-            contact_stage=stage,
+        naver_phone_future = (
+            None
+            if skip_naver
+            else executor.submit(
+                naver_web_search_client.search_public_phones,
+                company_name,
+                address,
+                timeout=max(2, min(website_timeout, 6)),
+                display=10,
+                query_mode="bulk" if bulk_mode else "full",
+                contact_stage=stage,
+            )
         )
         naver_local_future = (
             None
-            if not collect_phone
+            if skip_naver or not collect_phone
             else executor.submit(
                 naver_web_search_client.search_company,
                 company_name,
@@ -324,7 +330,16 @@ def enrich_company(
             if kakao_future is None
             else kakao_future.result()
         )
-        naver_phones = naver_phone_future.result()
+        naver_phones = (
+            {
+                "candidates": [],
+                "contacts": [],
+                "status": "SKIPPED",
+                "message": "네이버 조회 단계가 아닙니다.",
+            }
+            if naver_phone_future is None
+            else naver_phone_future.result()
+        )
         naver_local = (
             {"candidates": [], "status": "SKIPPED", "message": "디지털 연락처 단계"}
             if naver_local_future is None
@@ -432,7 +447,7 @@ def enrich_company(
             "message": "대량 보강에서는 공식 홈페이지 정밀 탐색을 생략합니다.",
             "candidates": [],
         }
-        if bulk_mode or not collect_digital
+        if skip_naver or bulk_mode or not collect_digital
         else naver_web_search_client.search_official_websites(
             company_name,
             address,
