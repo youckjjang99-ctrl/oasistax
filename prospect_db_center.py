@@ -19,7 +19,10 @@ from licensed_business_repository import table_status as license_table_status
 from licensed_business_sync import sync_services as sync_license_services
 from contact_enrichment import api_statuses, enrich_company, test_connections
 from contact_matching import is_mobile_phone, normalize_phone
-from prospect_collection_service import collect_contactable_growth_companies
+from prospect_collection_service import (
+    collect_contactable_growth_companies,
+    collect_recent_opening_companies,
+)
 from public_data_api import (
     NPS_BASE_URL,
     REGION_CODES,
@@ -104,6 +107,13 @@ CONTACT_CHANNEL_OPTIONS = {
 }
 CONTACT_CHANNEL_LABELS = {
     value: label for label, value in CONTACT_CHANNEL_OPTIONS.items()
+}
+DISCOVERY_TYPE_OPTIONS = {
+    "고용증가기업": "growth",
+    "신규개업기업": "recent_opening",
+}
+DISCOVERY_TYPE_LABELS = {
+    value: label for label, value in DISCOVERY_TYPE_OPTIONS.items()
 }
 
 
@@ -214,6 +224,9 @@ def _display_frame(items: list[dict]) -> pd.DataFrame:
             "최근월순취득": _employment_value(
                 item.get("순고용증가")
             ),
+            "신규개업구분": item.get("신규개업구분", ""),
+            "신규추정일": item.get("신규추정일", ""),
+            "신규근거": item.get("신규근거", ""),
             "고용증가구분": item.get("고용증가구분", ""),
             "고용판정": item.get("고용증가판정", ""),
             "고용자료상태": item.get("고용자료상태", ""),
@@ -254,6 +267,9 @@ def _display_frame(items: list[dict]) -> pd.DataFrame:
         "신규취득자수",
         "상실가입자수",
         "최근월순취득",
+        "신규개업구분",
+        "신규추정일",
+        "신규근거",
         "고용증가구분",
         "고용판정",
         "고용자료상태",
@@ -476,6 +492,10 @@ def _render_search_history(owner_user_id: str) -> int:
                     "검색일시": str(row.get("searched_at") or "").replace(
                         "T", " "
                     )[:19],
+                    "발굴 유형": DISCOVERY_TYPE_LABELS.get(
+                        str(row.get("discovery_type") or "growth"),
+                        "고용증가기업",
+                    ),
                     "지역": " ".join(
                         value
                         for value in (
@@ -504,7 +524,11 @@ def _render_search_history(owner_user_id: str) -> int:
                     ),
                     "고용 기준": GROWTH_BASIS_LABELS.get(
                         str(row.get("growth_basis") or "combined"),
-                        str(row.get("growth_basis") or ""),
+                        (
+                            f"최근 {int(row.get('recent_months') or 6)}개월"
+                            if row.get("discovery_type") == "recent_opening"
+                            else str(row.get("growth_basis") or "")
+                        ),
                     ),
                     "발굴": f"{int(row.get('found_count') or 0):,}건",
                     "검색시간": (
@@ -1670,12 +1694,20 @@ def _render_clean_saved_prospects(owner_user_id: str) -> None:
 def render_prospect_db_center(owner_user_id: str = "") -> None:
     st.markdown("## DB발굴")
     st.caption(
-        "국민연금 전월 대비와 근로복지공단 전년 대비 고용증가를 "
-        "구분하고, 미리 수집한 전화·이메일·인스타그램으로 조회합니다."
+        "행안부 자료는 사용하지 않습니다. 국민연금 월별 자료와 "
+        "근로복지공단 연간 자료에서 고용증가기업 또는 신규개업 "
+        "추정기업을 골라 조회합니다."
     )
     _render_search_history(owner_user_id)
 
     with st.container(border=True):
+        discovery_type_name = st.radio(
+            "발굴 유형",
+            list(DISCOVERY_TYPE_OPTIONS.keys()),
+            horizontal=True,
+            key="prospect_discovery_type_v1012",
+        )
+        discovery_type = DISCOVERY_TYPE_OPTIONS[discovery_type_name]
         col1, col2, col3, col4 = st.columns(4)
         region_name = col1.selectbox(
             "도·광역시",
@@ -1710,6 +1742,31 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                     "조회합니다. 여러 항목을 함께 선택할 수 있습니다."
                 ),
             )
+            if discovery_type == "recent_opening":
+                recent_col1, recent_col2 = st.columns(2)
+                recent_months = recent_col1.selectbox(
+                    "국민연금 신규 적용 기간",
+                    [3, 6, 12],
+                    index=1,
+                    format_func=lambda value: f"최근 {value}개월",
+                    key="prospect_recent_months_v1012",
+                )
+                include_comwel_annual = recent_col2.checkbox(
+                    "근로복지공단 2025년 신규 추정 포함",
+                    value=True,
+                    key="prospect_include_comwel_v1012",
+                    help=(
+                        "근로복지공단 자료는 정확한 개업일이 아니라 "
+                        "2025년 연간 자료에 처음 등장한 사업장입니다."
+                    ),
+                )
+                st.caption(
+                    "국민연금 사업장 적용일은 법적 개업일과 다를 수 "
+                    "있으므로 화면에는 ‘신규개업 추정’으로 표시합니다."
+                )
+            else:
+                recent_months = 6
+                include_comwel_annual = True
             filter_col1, filter_col2 = st.columns(2)
             minimum_employees = filter_col1.number_input(
                 "최소 고용인원",
@@ -1739,14 +1796,25 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 key="prospect_industry_categories_v1002",
             )
         search_clicked = st.button(
-            f"성장기업 {target_count}개 조회",
+            (
+                f"신규개업 추정기업 {target_count}개 조회"
+                if discovery_type == "recent_opening"
+                else f"성장기업 {target_count}개 조회"
+            ),
             type="primary",
             use_container_width=True,
             key="prospect_search_button_v1002",
         )
         st.caption(
-            "Supabase에 미리 저장된 국민연금 월별·근로복지공단 연간 "
-            "고용증가와 공개 연락처를 즉시 조회합니다."
+            (
+                "국민연금 사업장 적용일과 근로복지공단 연간 최초 등장 "
+                "신호를 사업자번호로 중복 제거해 조회합니다."
+                if discovery_type == "recent_opening"
+                else (
+                    "Supabase에 미리 저장된 국민연금 월별·근로복지공단 "
+                    "연간 고용증가와 공개 연락처를 즉시 조회합니다."
+                )
+            )
         )
 
     business_type = BUSINESS_TYPE_OPTIONS[business_type_name]
@@ -1756,15 +1824,21 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
     ]
     data_source = "combined"
     minimum_growth = 1
-    growth_basis = "combined"
-    effective_growth_only = True
+    growth_basis = (
+        "recent_opening"
+        if discovery_type == "recent_opening"
+        else "combined"
+    )
+    effective_growth_only = discovery_type == "growth"
     start_page = 1
     end_page = 1
     page_state_key = (
         "prospect_next_page_v1002_"
-        f"{owner_user_id}_{region_name}_{district_name}_{business_type}"
+        f"{owner_user_id}_{discovery_type}_"
+        f"{region_name}_{district_name}_{business_type}"
     )
     page_count = 1
+    result_state_key = f"prospect_result_v1012_{discovery_type}"
     if search_clicked and int(maximum_employees) < int(minimum_employees):
         st.error("최대 고용인원은 최소 고용인원보다 크거나 같아야 합니다.")
         search_clicked = False
@@ -1778,7 +1852,22 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
 
         def _progress(event: dict) -> None:
             stage = event.get("stage")
-            if stage == "precomputed":
+            if stage == "recent_opening":
+                progress_state["value"] = max(progress_state["value"], 0.25)
+                progress_bar.progress(
+                    progress_state["value"],
+                    text="Supabase 신규개업 추정기업 불러오는 중",
+                )
+            elif stage == "recent_opening_complete":
+                progress_state["value"] = max(progress_state["value"], 0.8)
+                progress_bar.progress(
+                    progress_state["value"],
+                    text=(
+                        "신규개업 추정기업 "
+                        f"{event.get('checked', 0)}개 확인 완료"
+                    ),
+                )
+            elif stage == "precomputed":
                 progress_state["value"] = max(progress_state["value"], 0.15)
                 progress_bar.progress(
                     progress_state["value"],
@@ -1860,35 +1949,62 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             )
 
         with st.spinner(
-            "기존 고객·저장 영업후보를 제외하고 성장기업을 찾고 있습니다."
-        ):
-            result = collect_contactable_growth_companies(
-                REGION_CODES[region_name],
-                target_count=int(target_count),
-                start_page=int(start_page),
-                max_pages=page_count,
-                minimum_employees=int(minimum_employees),
-                maximum_employees=int(maximum_employees),
-                minimum_growth=int(minimum_growth),
-                business_type=business_type,
-                growth_only=effective_growth_only,
-                growth_basis=growth_basis,
-                industry_categories=list(industry_categories),
-                contact_channels=contact_channels,
-                district_name=(
-                    ""
-                    if district_name == ALL_DISTRICTS
-                    else district_name
-                ),
-                data_source=data_source,
-                progress=_progress,
+            (
+                "기존 고객·저장 영업후보를 제외하고 신규개업 "
+                "추정기업을 찾고 있습니다."
+                if discovery_type == "recent_opening"
+                else (
+                    "기존 고객·저장 영업후보를 제외하고 성장기업을 "
+                    "찾고 있습니다."
+                )
             )
+        ):
+            if discovery_type == "recent_opening":
+                result = collect_recent_opening_companies(
+                    REGION_CODES[region_name],
+                    target_count=int(target_count),
+                    minimum_employees=int(minimum_employees),
+                    maximum_employees=int(maximum_employees),
+                    recent_months=int(recent_months),
+                    include_comwel_annual=bool(include_comwel_annual),
+                    business_type=business_type,
+                    industry_categories=list(industry_categories),
+                    contact_channels=contact_channels,
+                    district_name=(
+                        ""
+                        if district_name == ALL_DISTRICTS
+                        else district_name
+                    ),
+                    progress=_progress,
+                )
+            else:
+                result = collect_contactable_growth_companies(
+                    REGION_CODES[region_name],
+                    target_count=int(target_count),
+                    start_page=int(start_page),
+                    max_pages=page_count,
+                    minimum_employees=int(minimum_employees),
+                    maximum_employees=int(maximum_employees),
+                    minimum_growth=int(minimum_growth),
+                    business_type=business_type,
+                    growth_only=effective_growth_only,
+                    growth_basis=growth_basis,
+                    industry_categories=list(industry_categories),
+                    contact_channels=contact_channels,
+                    district_name=(
+                        ""
+                        if district_name == ALL_DISTRICTS
+                        else district_name
+                    ),
+                    data_source=data_source,
+                    progress=_progress,
+                )
         if result.get("ok"):
             progress_bar.progress(1.0, text="검색을 완료했습니다.")
         else:
             progress_bar.progress(
                 1.0,
-                text="Supabase 성장기업 조회에 실패했습니다.",
+                text=f"Supabase {discovery_type_name} 조회에 실패했습니다.",
             )
         status_box.empty()
         try:
@@ -1918,6 +2034,9 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 growth_basis=growth_basis,
                 industry_categories=list(industry_categories),
                 contact_channels=contact_channels,
+                discovery_type=discovery_type,
+                recent_months=int(recent_months),
+                include_comwel_annual=bool(include_comwel_annual),
                 found_count=int(result.get("found_count") or 0),
                 pages_scanned=int(result_stats.get("pages_scanned") or 0),
                 elapsed_seconds=float(
@@ -1926,34 +2045,46 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             )
         except Exception as exc:
             result["history_warning"] = str(exc)
-        st.session_state["prospect_result_v1002"] = result
+        st.session_state[result_state_key] = result
         st.session_state[page_state_key] = int(
             result.get("next_page") or int(end_page) + 1
         )
 
-    result = st.session_state.get("prospect_result_v1002")
+    result = st.session_state.get(result_state_key)
     if result:
         if not result.get("ok", True):
             st.error(
                 result.get(
                     "message",
-                    "Supabase 성장기업 조회에 실패했습니다.",
+                    f"Supabase {discovery_type_name} 조회에 실패했습니다.",
                 )
             )
             st.info(
-                "국민연금 실시간 페이지 조회로 자동 전환하지 않았습니다. "
-                "잠시 뒤 다시 시도해 주세요."
+                "외부 API 실시간 조회로 자동 전환하지 않았습니다. "
+                "Supabase 사전 저장 자료를 확인한 뒤 다시 시도해 주세요."
             )
             return
         stats = result.get("stats") or {}
+        signal_count = stats.get(
+            (
+                "recent_candidates"
+                if discovery_type == "recent_opening"
+                else "growth_candidates"
+            ),
+            0,
+        )
         metric_cols = st.columns(5)
         metric_cols[0].metric(
             "확인한 사업장",
             f"{stats.get('basic_received', 0):,}건",
         )
         metric_cols[1].metric(
-            "고용 증가 신호",
-            f"{stats.get('growth_candidates', 0):,}건",
+            (
+                "신규개업 추정"
+                if discovery_type == "recent_opening"
+                else "고용 증가 신호"
+            ),
+            f"{signal_count:,}건",
         )
         metric_cols[2].metric(
             "기존 DB 제외",
@@ -2001,9 +2132,17 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
         )
         if stats.get("source_mode") == "precomputed":
             st.info(
-                "Supabase 사전 계산 목록과 지역·고용·업종 전용 "
-                "인덱스를 사용했습니다. 모든 사용자가 저장한 기존 "
-                "영업후보는 자동 제외됩니다."
+                (
+                    "국민연금·근로복지공단 신규 신호와 사업자번호 "
+                    "중복제거 인덱스를 사용했습니다. 행안부 자료는 "
+                    "이 조회에 포함되지 않습니다."
+                    if discovery_type == "recent_opening"
+                    else (
+                        "Supabase 사전 계산 목록과 지역·고용·업종 전용 "
+                        "인덱스를 사용했습니다. 모든 사용자가 저장한 "
+                        "기존 영업후보는 자동 제외됩니다."
+                    )
+                )
             )
         else:
             st.info(
@@ -2032,9 +2171,16 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
         items = list(result.get("items") or [])
         if not items:
             st.info(
-                "선택한 지역·고용인원·업종 범위에서 고용 증가 신호와 "
-                "공개 연락처 조건을 모두 충족한 업체를 확인하지 못했습니다. "
-                "필터 범위를 넓혀 다시 조회해 주세요."
+                (
+                    "선택한 지역·기간·고용인원·업종 범위에서 신규개업 "
+                    "추정 신호와 연락처 조건을 모두 충족한 업체가 없습니다."
+                    if discovery_type == "recent_opening"
+                    else (
+                        "선택한 지역·고용인원·업종 범위에서 고용 증가 "
+                        "신호와 공개 연락처 조건을 모두 충족한 업체가 없습니다."
+                    )
+                )
+                + " 필터 범위를 넓혀 다시 조회해 주세요."
             )
         else:
             st.markdown("### 이번에 찾은 영업후보")
@@ -2063,8 +2209,8 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 ),
                 use_container_width=True,
                 key=(
-                    "prospect_result_excel_v1002_"
-                    f"{region_name}_{district_name}"
+                    "prospect_result_excel_v1012_"
+                    f"{discovery_type}_{region_name}_{district_name}"
                 ),
             )
             visible_columns = [
@@ -2083,7 +2229,11 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 "업종명",
                 "자료생성년월",
                 "가입자수",
-                "고용증가구분",
+                *(
+                    ["신규개업구분", "신규추정일", "신규근거"]
+                    if discovery_type == "recent_opening"
+                    else ["고용증가구분"]
+                ),
                 "영업주제",
                 "추천등급",
                 "초회전화스크립트",
@@ -2112,8 +2262,8 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                     "source_key": None,
                 },
                 key=(
-                    "prospect_editor_v1002_"
-                    f"{region_name}_{district_name}"
+                    "prospect_editor_v1012_"
+                    f"{discovery_type}_{region_name}_{district_name}"
                 ),
             )
             selected_keys = set(
@@ -2134,7 +2284,7 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 type="primary",
                 use_container_width=True,
                 disabled=not selected_items,
-                key="save_prospects_v1002",
+                key=f"save_prospects_v1012_{discovery_type}",
             ):
                 try:
                     saved_count = save_prospects(
