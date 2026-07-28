@@ -1,5 +1,5 @@
 Exit code: 0
-Wall time: 2.4 seconds
+Wall time: 2.1 seconds
 Output:
 from __future__ import annotations
 
