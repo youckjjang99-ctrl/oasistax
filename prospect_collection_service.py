@@ -249,11 +249,22 @@ def collect_contactable_growth_companies(
     }
 
     if growth_only:
+        _notify(
+            progress,
+            stage="precomputed",
+            found=0,
+        )
         try:
             cached_items = load_fast_growth_candidates(
                 region_code,
                 minimum_employees=minimum_employees,
                 limit=max(100, min(1000, target_count * 5)),
+            )
+            _notify(
+                progress,
+                stage="precomputed_complete",
+                checked=len(cached_items),
+                found=0,
             )
             if business_type != "all":
                 cached_items = [
@@ -323,10 +334,36 @@ def collect_contactable_growth_companies(
                 ),
             }
         except Exception as exc:
-            snapshot_warning = (
-                "사전 계산 목록을 읽지 못해 실시간 국민연금 조회로 "
-                f"전환했습니다: {exc}"
+            stats["elapsed_seconds"] = round(
+                time.monotonic() - started_at,
+                1,
             )
+            stats["source_mode"] = "precomputed_error"
+            return {
+                "ok": False,
+                "message": (
+                    "Supabase에 저장된 고용증가 업체를 불러오지 "
+                    f"못했습니다: {exc}"
+                ),
+                "items": [],
+                "target_count": target_count,
+                "found_count": 0,
+                "next_page": start_page,
+                "stats": stats,
+                "failures": failures,
+                "duplicate_warning": duplicate_warning,
+                "snapshot_warning": "",
+                "business_type": business_type,
+                "growth_only": True,
+                "growth_basis": "precomputed",
+                "industry_categories": sorted(selected_industries),
+                "searched_start_page": 0,
+                "searched_end_page": 0,
+                "priority_basis": (
+                    "국민연금 10명 이상 월별 증가 또는 "
+                    "근로복지공단 1~9명 연간 증가 사전 계산"
+                ),
+            }
 
     for offset in range(max_pages):
         if len(selected) >= target_count:

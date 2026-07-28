@@ -1614,8 +1614,9 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 "고용 증가 신호 사업장만 표시",
                 value=True,
                 help=(
-                    "전년 동월 가입자 증가가 확인됐거나 최근 월 순취득이 "
-                    "1명 이상인 사업장만 연락처 검색 대상으로 사용합니다."
+                    "Supabase에 미리 계산해 둔 국민연금 월별 증가 및 "
+                    "근로복지공단 연간 증가 업체만 연락처 검색 대상으로 "
+                    "사용합니다."
                 ),
                 key="prospect_growth_only_v984",
             )
@@ -1634,13 +1635,22 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             f"연락 가능한 성장기업 {target_count}개 찾기",
             type="primary",
             use_container_width=True,
-            disabled=not service_key_status()["configured"],
+            disabled=(
+                not growth_only
+                and not service_key_status()["configured"]
+            ),
         )
-        st.caption(
-            "목표 업체 수를 채우거나 지정한 종료 페이지에 도달할 때까지 "
-            "검색합니다. 최근 월 고용 신호를 먼저 확인하므로 이전 버전보다 "
-            "불필요한 과거 사업장 조회가 줄어듭니다."
-        )
+        if growth_only:
+            st.caption(
+                "Supabase의 사전 계산 성장기업을 즉시 불러온 뒤 "
+                "카카오·네이버에서 공개 연락처를 확인합니다. 이 방식에서는 "
+                "시작·종료 페이지를 사용하지 않습니다."
+            )
+        else:
+            st.caption(
+                "고용 증가 필터를 해제한 경우에만 지정한 국민연금 "
+                "시작·종료 페이지를 조회합니다."
+            )
 
     business_type = BUSINESS_TYPE_OPTIONS[business_type_name]
     growth_basis = "combined"
@@ -1649,10 +1659,10 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
         f"prospect_next_page_v984_{owner_user_id}_{region_name}_{business_type}"
     )
     page_count = int(end_page) - int(start_page) + 1
-    if search_clicked and page_count <= 0:
+    if search_clicked and not effective_growth_only and page_count <= 0:
         st.error("종료 페이지는 시작 페이지보다 크거나 같아야 합니다.")
         search_clicked = False
-    if search_clicked and page_count > 100:
+    if search_clicked and not effective_growth_only and page_count > 100:
         st.error("한 번에 조회할 수 있는 범위는 최대 100페이지입니다.")
         search_clicked = False
     if search_clicked:
@@ -1665,7 +1675,22 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
 
         def _progress(event: dict) -> None:
             stage = event.get("stage")
-            if stage == "nps":
+            if stage == "precomputed":
+                progress_state["value"] = max(progress_state["value"], 0.15)
+                progress_bar.progress(
+                    progress_state["value"],
+                    text="Supabase 저장 성장기업 불러오는 중",
+                )
+            elif stage == "precomputed_complete":
+                progress_state["value"] = max(progress_state["value"], 0.35)
+                progress_bar.progress(
+                    progress_state["value"],
+                    text=(
+                        "Supabase 성장기업 "
+                        f"{event.get('checked', 0)}개 확인 완료"
+                    ),
+                )
+            elif stage == "nps":
                 current = int(event.get("pages_scanned") or 0)
                 ratio = min(
                     0.55,
@@ -1714,7 +1739,7 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 progress_bar.progress(
                     progress_state["value"],
                     text=(
-                        "카카오·네이버 공개검색·인허가 대표전화 확인 "
+                        "카카오·네이버 공개 장소·웹 검색 "
                         f"{event.get('checked', 0)}건"
                     ),
                 )
@@ -1746,7 +1771,13 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 industry_categories=list(industry_categories),
                 progress=_progress,
             )
-        progress_bar.progress(1.0, text="검색을 완료했습니다.")
+        if result.get("ok"):
+            progress_bar.progress(1.0, text="검색을 완료했습니다.")
+        else:
+            progress_bar.progress(
+                1.0,
+                text="Supabase 성장기업 조회에 실패했습니다.",
+            )
         status_box.empty()
         try:
             result_stats = result.get("stats") or {}
@@ -1781,6 +1812,18 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
 
     result = st.session_state.get("prospect_result_v984")
     if result:
+        if not result.get("ok", True):
+            st.error(
+                result.get(
+                    "message",
+                    "Supabase 성장기업 조회에 실패했습니다.",
+                )
+            )
+            st.info(
+                "국민연금 실시간 페이지 조회로 자동 전환하지 않았습니다. "
+                "잠시 뒤 다시 시도해 주세요."
+            )
+            return
         stats = result.get("stats") or {}
         metric_cols = st.columns(5)
         metric_cols[0].metric(
@@ -1799,14 +1842,22 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             "전화 확인",
             f"{result.get('found_count', 0):,}건",
         )
-        metric_cols[4].metric(
-            "다음 검색 페이지",
-            f"{result.get('next_page', 1):,}",
-        )
+        if stats.get("source_mode") == "precomputed":
+            metric_cols[4].metric("조회 방식", "사전 계산")
+            search_range_text = "Supabase 사전목록"
+        else:
+            metric_cols[4].metric(
+                "다음 검색 페이지",
+                f"{result.get('next_page', 1):,}",
+            )
+            search_range_text = (
+                f"조회 페이지 "
+                f"{result.get('searched_start_page', start_page)}"
+                f"~{result.get('searched_end_page', end_page)}"
+            )
         st.caption(
             f"우선순위: {result.get('priority_basis', '')} · "
-            f"조회 페이지 {result.get('searched_start_page', start_page)}"
-            f"~{result.get('searched_end_page', end_page)} · "
+            f"{search_range_text} · "
             f"상세조회 대상 {stats.get('detail_targets', 0):,}건 · "
             f"고용자료 확인 {stats.get('employment_checked', 0):,}건 · "
             f"고용자료 확인 불가 "
@@ -1815,11 +1866,17 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             f"업종 제외 {stats.get('industry_excluded', 0):,}건 · "
             f"검색시간 {stats.get('elapsed_seconds', 0):,.1f}초"
         )
-        st.info(
-            f"다음 검색 권장 시작 페이지는 "
-            f"{result.get('next_page', int(end_page) + 1):,}입니다. "
-            "모든 사용자가 저장한 기존 영업후보는 자동 제외됩니다."
-        )
+        if stats.get("source_mode") == "precomputed":
+            st.info(
+                "Supabase 사전 계산 목록을 사용했습니다. 모든 사용자가 "
+                "저장한 기존 영업후보는 자동 제외됩니다."
+            )
+        else:
+            st.info(
+                f"다음 검색 권장 시작 페이지는 "
+                f"{result.get('next_page', int(end_page) + 1):,}입니다. "
+                "모든 사용자가 저장한 기존 영업후보는 자동 제외됩니다."
+            )
         if result.get("duplicate_warning"):
             st.warning(
                 "기존 DB 중복확인 일부를 완료하지 못했습니다: "

@@ -16,7 +16,35 @@ TABLE_CUSTOMERS = "oasis_customers"
 TABLE_CONTACTS = "oasis_prospect_contacts"
 TABLE_SEARCH_HISTORY = "oasis_prospect_search_history"
 TABLE_EMPLOYEE_SNAPSHOTS = "oasis_nps_employee_snapshots"
-TABLE_FAST_EMPLOYMENT_GROWTH = "oasis_fast_employment_growth_leads"
+TABLE_NPS_GROWTH = "oasis_nps_growth_leads"
+TABLE_COMWEL_GROWTH = "oasis_comwel_annual_growth"
+
+SUPABASE_PROVINCE_NAMES = {
+    "11": "서울특별시",
+    "26": "부산광역시",
+    "27": "대구광역시",
+    "28": "인천광역시",
+    "29": "광주광역시",
+    "30": "대전광역시",
+    "31": "울산광역시",
+    "36": "세종특별자치시",
+    "41": "경기도",
+    "51": "강원특별자치도",
+    "43": "충청북도",
+    "44": "충청남도",
+    "52": "전북특별자치도",
+    "46": "전라남도",
+    "47": "경상북도",
+    "48": "경상남도",
+    "50": "제주특별자치도",
+}
+SUPABASE_PROVINCE_CODE_ALIASES = {
+    "42": "51",
+    "45": "52",
+}
+SUPABASE_PROVINCE_CODES = {
+    name: code for code, name in SUPABASE_PROVINCE_NAMES.items()
+}
 
 
 def _business_no(value: Any) -> str:
@@ -287,37 +315,168 @@ def load_fast_growth_candidates(
     config = get_cloud_config()
     if not config.configured:
         raise RuntimeError("Supabase 환경변수가 설정되지 않았습니다.")
-    params: dict[str, str] = {
+
+    row_limit = max(1, min(2000, int(limit)))
+    minimum_count = max(1, int(minimum_employees))
+    normalized_region_code = re.sub(r"[^0-9]", "", str(region_code or ""))
+    if normalized_region_code in {"0", "00"}:
+        normalized_region_code = ""
+    normalized_region_code = SUPABASE_PROVINCE_CODE_ALIASES.get(
+        normalized_region_code[:2],
+        normalized_region_code[:2],
+    )
+    province_name = SUPABASE_PROVINCE_NAMES.get(
+        normalized_region_code,
+        "",
+    )
+
+    nps_params: dict[str, str] = {
         "select": (
-            "source_type,source_record_key,business_no,company_name,address,"
-            "province_name,district_name,province_code,district_code,"
-            "industry_code,industry_name,current_employee_count,"
-            "previous_employee_count,employee_growth,previous_period,"
-            "current_period,growth_frequency,is_new_company"
+            "snapshot_identity,current_ym,previous_ym,business_no,"
+            "company_name,address,industry_code,industry_name,"
+            "province_code,district_code,current_employee_count,"
+            "previous_employee_count,employee_growth"
         ),
-        "current_employee_count": f"gte.{max(1, int(minimum_employees))}",
+        "current_employee_count": f"gte.{max(10, minimum_count)}",
         "employee_growth": "gt.0",
         "order": "employee_growth.desc,current_employee_count.desc",
-        "limit": str(max(1, min(2000, int(limit)))),
+        "limit": str(row_limit),
     }
-    normalized_region_code = re.sub(r"[^0-9]", "", str(region_code or ""))
-    if normalized_region_code and normalized_region_code not in {"0", "00"}:
-        params["province_code"] = f"eq.{normalized_region_code[:2]}"
-    response = requests.get(
-        f"{config.url}/rest/v1/{TABLE_FAST_EMPLOYMENT_GROWTH}",
+    if normalized_region_code:
+        nps_params["province_code"] = f"eq.{normalized_region_code}"
+    nps_response = requests.get(
+        f"{config.url}/rest/v1/{TABLE_NPS_GROWTH}",
         headers=_rest_headers(),
-        params=params,
+        params=nps_params,
         timeout=max(config.timeout, 30),
     )
-    if not response.ok:
+    if not nps_response.ok:
         raise RuntimeError(
-            "사전 계산 고용증가 후보 조회 실패 "
-            f"HTTP {response.status_code}: {response.text[:300]}"
+            "국민연금 사전 계산 고용증가 후보 조회 실패 "
+            f"HTTP {nps_response.status_code}: {nps_response.text[:300]}"
         )
 
-    rows = response.json() if response.text else []
+    normalized_rows: list[dict[str, Any]] = []
+    nps_rows = nps_response.json() if nps_response.text else []
+    for row in nps_rows if isinstance(nps_rows, list) else []:
+        row_province_code = str(row.get("province_code") or "")
+        normalized_rows.append(
+            {
+                "source_type": "nps_monthly",
+                "source_record_key": row.get("snapshot_identity"),
+                "business_no": row.get("business_no"),
+                "company_name": row.get("company_name"),
+                "address": row.get("address"),
+                "province_name": SUPABASE_PROVINCE_NAMES.get(
+                    row_province_code,
+                    province_name,
+                ),
+                "district_name": "",
+                "province_code": row_province_code,
+                "district_code": row.get("district_code"),
+                "industry_code": row.get("industry_code"),
+                "industry_name": row.get("industry_name"),
+                "current_employee_count": row.get("current_employee_count"),
+                "previous_employee_count": row.get(
+                    "previous_employee_count"
+                ),
+                "employee_growth": row.get("employee_growth"),
+                "previous_period": row.get("previous_ym"),
+                "current_period": row.get("current_ym"),
+                "growth_frequency": "monthly",
+                "is_new_company": False,
+            }
+        )
+
+    if minimum_count <= 9:
+        comwel_params: dict[str, str] = {
+            "select": (
+                "business_no,company_name,address,province,district,"
+                "industry_code,industry_name,workers_2024,workers_2025,"
+                "growth_2024_2025,is_new_2025"
+            ),
+            "and": (
+                f"(workers_2025.gte.{minimum_count},"
+                "workers_2025.lte.9)"
+            ),
+            "growth_2024_2025": "gt.0",
+            "order": "growth_2024_2025.desc,workers_2025.desc",
+            "limit": str(row_limit),
+        }
+        if province_name:
+            comwel_params["province"] = f"eq.{province_name}"
+        comwel_response = requests.get(
+            f"{config.url}/rest/v1/{TABLE_COMWEL_GROWTH}",
+            headers=_rest_headers(),
+            params=comwel_params,
+            timeout=max(config.timeout, 30),
+        )
+        if not comwel_response.ok:
+            raise RuntimeError(
+                "근로복지공단 사전 계산 고용증가 후보 조회 실패 "
+                f"HTTP {comwel_response.status_code}: "
+                f"{comwel_response.text[:300]}"
+            )
+        comwel_rows = (
+            comwel_response.json() if comwel_response.text else []
+        )
+        for row in comwel_rows if isinstance(comwel_rows, list) else []:
+            normalized_rows.append(
+                {
+                    "source_type": "comwel_annual",
+                    "source_record_key": row.get("business_no"),
+                    "business_no": row.get("business_no"),
+                    "company_name": row.get("company_name"),
+                    "address": row.get("address"),
+                    "province_name": row.get("province"),
+                    "district_name": row.get("district"),
+                    "province_code": SUPABASE_PROVINCE_CODES.get(
+                        str(row.get("province") or ""),
+                        normalized_region_code,
+                    ),
+                    "district_code": "",
+                    "industry_code": row.get("industry_code"),
+                    "industry_name": row.get("industry_name"),
+                    "current_employee_count": row.get("workers_2025"),
+                    "previous_employee_count": row.get("workers_2024"),
+                    "employee_growth": row.get("growth_2024_2025"),
+                    "previous_period": "2024",
+                    "current_period": "2025",
+                    "growth_frequency": "annual",
+                    "is_new_company": bool(row.get("is_new_2025")),
+                }
+            )
+
+    normalized_rows.sort(
+        key=lambda row: (
+            int(row.get("employee_growth") or 0),
+            int(row.get("current_employee_count") or 0),
+        ),
+        reverse=True,
+    )
+    rows: list[dict[str, Any]] = []
+    seen_candidates: set[str] = set()
+    for row in normalized_rows:
+        business_no = _business_no(row.get("business_no"))
+        business_digits = re.sub(r"[^0-9]", "", business_no)
+        identity = (
+            f"business:{business_digits}"
+            if len(business_digits) == 10
+            else _company_address_key(
+                row.get("company_name"),
+                row.get("address"),
+            )
+        )
+        if identity and identity in seen_candidates:
+            continue
+        if identity:
+            seen_candidates.add(identity)
+        rows.append(row)
+        if len(rows) >= row_limit:
+            break
+
     results: list[dict[str, Any]] = []
-    for row in rows if isinstance(rows, list) else []:
+    for row in rows:
         source_type = str(row.get("source_type") or "")
         current_count = int(row.get("current_employee_count") or 0)
         previous_count = int(row.get("previous_employee_count") or 0)
