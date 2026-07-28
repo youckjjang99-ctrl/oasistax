@@ -544,7 +544,11 @@ def _render_prospect_db_center_legacy(owner_user_id: str = "") -> None:
         (
             f"{contact_api_status['localdata']['service_count']}종"
             if contact_api_status["localdata"]["configured"]
-            else "미등록"
+            else (
+                "사용 안 함"
+                if contact_api_status["localdata"].get("disabled")
+                else "미등록"
+            )
         ),
     )
     with st.expander("외부 데이터 연결 설정"):
@@ -558,9 +562,9 @@ def _render_prospect_db_center_legacy(owner_user_id: str = "") -> None:
         contact_test_clicked = st.button(
             "외부 데이터 연결 점검",
             use_container_width=True,
-            disabled=not all(
-                row.get("configured")
-                for row in contact_api_status.values()
+            disabled=not (
+                contact_api_status["kakao"].get("configured")
+                and contact_api_status["naver"].get("configured")
             ),
             key="contact_api_connection_test_v970",
         )
@@ -646,7 +650,7 @@ def _render_prospect_db_center_legacy(owner_user_id: str = "") -> None:
             "최소 가입자 수",
             min_value=0,
             max_value=10000,
-            value=3,
+            value=1,
             step=1,
         )
         sigungu_code = filter_col2.text_input(
@@ -1580,7 +1584,7 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             "최소 가입자 수",
             min_value=1,
             max_value=300,
-            value=3,
+            value=1,
             step=1,
             key="prospect_min_employee_v984",
         )
@@ -1981,7 +1985,11 @@ def render_prospect_admin_settings() -> None:
         (
             f"{contact_status['localdata'].get('service_count', 0)}종"
             if contact_status["localdata"]["configured"]
-            else "미등록"
+            else (
+                "사용 안 함"
+                if contact_status["localdata"].get("disabled")
+                else "미등록"
+            )
         ),
     )
 
@@ -1995,8 +2003,9 @@ def render_prospect_admin_settings() -> None:
     contact_test = test_col2.button(
         "연락처 API 연결 점검",
         use_container_width=True,
-        disabled=not all(
-            row.get("configured") for row in contact_status.values()
+        disabled=not (
+            contact_status["kakao"].get("configured")
+            and contact_status["naver"].get("configured")
         ),
         key="admin_contact_test_v980",
     )

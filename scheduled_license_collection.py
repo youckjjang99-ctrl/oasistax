@@ -344,6 +344,21 @@ def run_collection(
 
 
 def main() -> int:
+    if not localdata_contact_client.is_enabled():
+        print(
+            json.dumps(
+                {
+                    "status": "disabled",
+                    "message": (
+                        "행안부 인허가 수집은 핵심 고용증가 흐름에서 "
+                        "분리되어 실행하지 않습니다."
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        return 0
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--run-key",

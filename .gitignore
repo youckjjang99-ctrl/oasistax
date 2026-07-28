@@ -12,6 +12,8 @@ backup_before_v*/
 
 # OASIS runtime and generated files
 data/system_precheck_report.json
+data/nps/
+data/comwel/
 _applied_update_packages/
 _legacy_patch_archive/
 update_package/

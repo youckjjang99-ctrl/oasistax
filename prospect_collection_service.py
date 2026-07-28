@@ -8,6 +8,7 @@ from contact_matching import normalize_phone
 from prospect_db_repository import (
     _snapshot_identity,
     existing_prospect_identities,
+    load_fast_growth_candidates,
     load_prior_employee_snapshots,
     remove_existing_customers,
     remove_existing_prospects,
@@ -40,6 +41,23 @@ def _growth_sort_key(item: dict[str, Any]) -> tuple[int, int, int]:
         selected_growth if selected_growth is not None else -1000000,
         recent_new if recent_new is not None else -1000000,
         int(item.get("가입자수") or 0),
+    )
+
+
+def _looks_like_stock_company(company_name: Any) -> bool:
+    normalized = str(company_name or "").replace(" ", "").lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "(주)",
+            "㈜",
+            "주식회사",
+            "유한회사",
+            "유한책임회사",
+            "법인",
+            "co.,ltd",
+            "corporation",
+        )
     )
 
 
@@ -165,7 +183,7 @@ def collect_contactable_growth_companies(
     target_count: int = 30,
     start_page: int = 1,
     max_pages: int = 10,
-    minimum_employees: int = 3,
+    minimum_employees: int = 1,
     business_type: str = "stock",
     growth_only: bool = True,
     growth_basis: str = "combined",
@@ -229,6 +247,86 @@ def collect_contactable_growth_companies(
         "elapsed_seconds": 0.0,
         "growth_only": bool(growth_only),
     }
+
+    if growth_only:
+        try:
+            cached_items = load_fast_growth_candidates(
+                region_code,
+                minimum_employees=minimum_employees,
+                limit=max(100, min(1000, target_count * 5)),
+            )
+            if business_type != "all":
+                cached_items = [
+                    item
+                    for item in cached_items
+                    if (
+                        _looks_like_stock_company(item.get("사업장명"))
+                        if business_type == "stock"
+                        else not _looks_like_stock_company(
+                            item.get("사업장명")
+                        )
+                    )
+                ]
+            if selected_industries:
+                cached_items = [
+                    item
+                    for item in cached_items
+                    if industry_category(item.get("업종명"))
+                    in selected_industries
+                ]
+            stats["basic_received"] = len(cached_items)
+            stats["growth_candidates"] = len(cached_items)
+            cached_items, customer_count = remove_existing_customers(
+                cached_items
+            )
+            stats["existing_customer_excluded"] += customer_count
+            cached_items, prospect_count = remove_existing_prospects(
+                cached_items,
+                source_keys=saved_source_keys,
+                business_nos=saved_business_nos,
+                company_address_keys=saved_company_address_keys,
+            )
+            stats["saved_prospect_excluded"] += prospect_count
+            selected, contact_failures, checked = _find_contactable(
+                cached_items,
+                needed=target_count,
+                progress=progress,
+                run_quick=True,
+                run_full=True,
+            )
+            failures.extend(contact_failures)
+            stats["contact_checked"] = checked
+            stats["elapsed_seconds"] = round(
+                time.monotonic() - started_at,
+                1,
+            )
+            stats["source_mode"] = "precomputed"
+            return {
+                "ok": True,
+                "items": selected,
+                "target_count": target_count,
+                "found_count": len(selected),
+                "next_page": start_page,
+                "stats": stats,
+                "failures": failures,
+                "duplicate_warning": duplicate_warning,
+                "snapshot_warning": "",
+                "business_type": business_type,
+                "growth_only": True,
+                "growth_basis": "precomputed",
+                "industry_categories": sorted(selected_industries),
+                "searched_start_page": 0,
+                "searched_end_page": 0,
+                "priority_basis": (
+                    "국민연금 10명 이상 월별 증가 또는 "
+                    "근로복지공단 1~9명 연간 증가 사전 계산"
+                ),
+            }
+        except Exception as exc:
+            snapshot_warning = (
+                "사전 계산 목록을 읽지 못해 실시간 국민연금 조회로 "
+                f"전환했습니다: {exc}"
+            )
 
     for offset in range(max_pages):
         if len(selected) >= target_count:

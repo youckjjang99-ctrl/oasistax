@@ -162,14 +162,6 @@ def _best_phone(
                 address,
                 timeout=10,
             ),
-            "localdata": executor.submit(
-                localdata_contact_client.search_company,
-                company_name,
-                address,
-                industry_name,
-                timeout=12,
-                max_services=6,
-            ),
             "naver": executor.submit(
                 naver_web_search_client.search_public_phones,
                 company_name,
@@ -177,6 +169,15 @@ def _best_phone(
                 timeout=10,
             ),
         }
+        if localdata_contact_client.is_enabled():
+            futures["localdata"] = executor.submit(
+                localdata_contact_client.search_company,
+                company_name,
+                address,
+                industry_name,
+                timeout=12,
+                max_services=6,
+            )
         source_results: dict[str, dict[str, Any]] = {}
         trace: list[dict[str, Any]] = []
         for source_name, future in futures.items():

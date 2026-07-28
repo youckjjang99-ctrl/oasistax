@@ -27,6 +27,7 @@ from korea_regions import (
 
 
 SERVICE_KEY_ENV = "DATA_GO_KR_SERVICE_KEY"
+ENABLED_ENV = "OASIS_ENABLE_LOCALDATA"
 DATA_GO_BASE = "https://apis.data.go.kr/1741000"
 CATALOG_PATH = Path(__file__).resolve().parent / "data" / "localdata_api_catalog.json"
 CATALOG_NOTICE_URL = (
@@ -119,10 +120,23 @@ def _service_key() -> str:
     return unquote(os.environ.get(SERVICE_KEY_ENV, "").strip())
 
 
+def is_enabled() -> bool:
+    return os.environ.get(ENABLED_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def key_status() -> dict[str, Any]:
     key = _service_key()
+    enabled = is_enabled()
     return {
-        "configured": bool(key),
+        "configured": bool(key) and enabled,
+        "key_present": bool(key),
+        "enabled": enabled,
+        "disabled": not enabled,
         "env_name": SERVICE_KEY_ENV,
         "masked": f"{key[:4]}{'*' * 12}" if key else "미등록",
         "service_count": len(SERVICES),
@@ -350,6 +364,15 @@ def fetch_business_page(
     updated_before: str = "",
 ) -> dict[str, Any]:
     """업종별 인허가 원천 데이터를 공통 업체 형식으로 반환."""
+    if not is_enabled():
+        return {
+            "ok": False,
+            "status": "DISABLED",
+            "message": (
+                "행안부 인허가 원천은 핵심 고용증가 흐름에서 분리되어 있습니다."
+            ),
+            "items": [],
+        }
     if service_key not in SERVICES:
         return {
             "ok": False,
@@ -539,6 +562,17 @@ def search_company(
     timeout: int = 5,
     max_services: int | None = 12,
 ) -> dict[str, Any]:
+    if not is_enabled():
+        return {
+            "ok": False,
+            "status": "DISABLED",
+            "message": (
+                "행안부 인허가 조회는 비활성화되어 국민연금·근로복지공단 "
+                "고용 데이터와 공개 장소검색을 사용합니다."
+            ),
+            "candidates": [],
+            "services": [],
+        }
     if not key_status()["configured"]:
         return {
             "ok": False,
@@ -588,6 +622,14 @@ def test_services(
     representative: bool = False,
 ) -> dict[str, Any]:
     checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if not is_enabled():
+        return {
+            "ok": True,
+            "status": "DISABLED",
+            "message": "행안부 인허가 원천 연결은 사용하지 않도록 설정되었습니다.",
+            "checked_at": checked_at,
+            "services": [],
+        }
     if not key_status()["configured"]:
         return {
             "ok": False,
