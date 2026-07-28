@@ -1,3 +1,6 @@
+Exit code: 0
+Wall time: 2.4 seconds
+Output:
 from __future__ import annotations
 
 import argparse
@@ -22,6 +25,12 @@ def _now() -> str:
 
 
 def _eligible_rows(limit: int, retry_days: int) -> list[dict[str, Any]]:
+    """Fetch a small, index-friendly phone enrichment batch.
+
+    Pending records are processed before retries.  Keeping those queues in
+    separate requests avoids the broad OR filter that previously made the
+    database scan and sort most of the table.
+    """
     db = CloudDatabase()
     retry_before = (
         datetime.now(timezone.utc) - timedelta(days=max(1, retry_days))
@@ -31,23 +40,45 @@ def _eligible_rows(limit: int, retry_days: int) -> list[dict[str, Any]]:
         headers=db.headers,
         params={
             "select": "id,source_key,company_name,address",
-            "and": (
-                "(or(phone.eq.,phone.is.null),"
-                "or(phone_enrichment_status.eq.pending,"
-                f"phone_checked_at.lt.{retry_before}))"
-            ),
+            # Missing phones are stored as empty strings.  Avoiding an OR with
+            # phone.is.null lets PostgreSQL use the existing partial index.
+            "phone": "eq.",
+            "phone_enrichment_status": "eq.pending",
+            "phone_checked_at": "is.null",
             "company_name": "neq.",
             "address": "neq.",
-            "order": "phone_checked_at.asc.nullsfirst,created_at.asc",
+            "order": "created_at.asc,id.asc",
             "limit": str(max(1, min(1000, limit))),
         },
         timeout=db.config.timeout,
     )
     if not response.ok:
         raise RuntimeError(
-            "전화번호 보강 대상 조회 실패 "
+            "?꾪솕踰덊샇 蹂닿컯 ???議고쉶 ?ㅽ뙣 "
             f"HTTP {response.status_code}: {response.text[:500]}"
-        )
+    )
+    data = response.json() if response.text else []
+    if isinstance(data, list) and data:
+        return data
+
+    # Revisit only old no-match/error rows once the new-record queue is empty.
+    # This request aligns with the phone-enrichment partial index as well.
+    response = requests.get(
+        db._url(TABLE_LICENSED_BUSINESSES),
+        headers=db.headers,
+        params={
+            "select": "id,source_key,company_name,address",
+            "phone": "eq.",
+            "phone_enrichment_status": "in.(no_match,error)",
+            "phone_checked_at": f"lt.{retry_before}",
+            "company_name": "neq.",
+            "address": "neq.",
+            "order": "phone_checked_at.asc",
+            "limit": str(max(1, min(1000, limit))),
+        },
+        timeout=db.config.timeout,
+    )
+    response.raise_for_status()
     data = response.json() if response.text else []
     return data if isinstance(data, list) else []
 
@@ -68,7 +99,7 @@ def _patch_if_phone_empty(
     )
     if not response.ok:
         raise RuntimeError(
-            "전화번호 저장 실패 "
+            "?꾪솕踰덊샇 ????ㅽ뙣 "
             f"HTTP {response.status_code}: {response.text[:500]}"
         )
     rows = response.json() if response.text else []
@@ -143,7 +174,7 @@ def run_enrichment(
     max_records: int = 0,
 ) -> int:
     if not kakao_local_client.key_status()["configured"]:
-        raise RuntimeError("KAKAO_REST_API_KEY가 설정되지 않았습니다.")
+        raise RuntimeError("KAKAO_REST_API_KEY媛 ?ㅼ젙?섏? ?딆븯?듬땲??")
 
     totals = {"matched": 0, "no_match": 0, "error": 0, "skipped": 0}
     processed = 0
@@ -218,3 +249,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
