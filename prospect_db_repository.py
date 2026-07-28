@@ -485,6 +485,188 @@ def load_fast_growth_candidates(
     return results
 
 
+def load_recent_opening_candidates(
+    region_code: str,
+    *,
+    minimum_employees: int = 1,
+    maximum_employees: int | None = None,
+    recent_months: int = 6,
+    include_comwel_annual: bool = True,
+    district_name: str = "",
+    industry_categories: list[str] | None = None,
+    contact_channels: list[str] | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """국민연금·근로복지공단의 신규개업 추정 후보를 즉시 조회."""
+    config = get_cloud_config()
+    if not config.configured:
+        raise RuntimeError("Supabase 환경변수가 설정되지 않았습니다.")
+
+    row_limit = max(1, min(500, int(limit)))
+    minimum_count = max(1, int(minimum_employees))
+    maximum_count = (
+        10000
+        if maximum_employees in (None, "")
+        else max(minimum_count, int(maximum_employees))
+    )
+    period_months = int(recent_months)
+    if period_months not in {3, 6, 12}:
+        period_months = 6
+    district = str(district_name or "").strip()
+    selected_industries = sorted(
+        {
+            str(value or "").strip()
+            for value in (industry_categories or [])
+            if str(value or "").strip()
+        }
+    )
+    selected_channels = sorted(
+        {
+            str(value or "").strip()
+            for value in (contact_channels or [])
+            if str(value or "").strip()
+            in {"mobile_phone", "landline_phone", "email", "instagram"}
+        }
+    )
+    normalized_region_code = re.sub(r"[^0-9]", "", str(region_code or ""))
+    if normalized_region_code in {"0", "00"}:
+        normalized_region_code = ""
+    normalized_region_code = SUPABASE_PROVINCE_CODE_ALIASES.get(
+        normalized_region_code[:2],
+        normalized_region_code[:2],
+    )
+    province_name = SUPABASE_PROVINCE_NAMES.get(
+        normalized_region_code,
+        "",
+    )
+    payload = {
+        "p_province_code": normalized_region_code,
+        "p_province_name": province_name,
+        "p_district": district,
+        "p_min_employees": minimum_count,
+        "p_max_employees": maximum_count,
+        "p_industries": selected_industries,
+        "p_contact_channels": selected_channels,
+        "p_recent_months": period_months,
+        "p_include_comwel_annual": bool(include_comwel_annual),
+        "p_limit": row_limit,
+    }
+    response = requests.post(
+        f"{config.url}/rest/v1/rpc/oasis_search_recent_openings",
+        headers=_rest_headers(),
+        data=json.dumps(payload, ensure_ascii=False),
+        timeout=max(config.timeout, 60),
+    )
+    if not response.ok:
+        raise RuntimeError(
+            "신규개업 추정·연락처 후보 조회 실패 "
+            f"HTTP {response.status_code}: {response.text[:300]}"
+        )
+    rows = response.json() if response.text else []
+    if not isinstance(rows, list):
+        rows = []
+
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        business_no = re.sub(
+            r"[^0-9]",
+            "",
+            str(row.get("business_no") or ""),
+        )
+        if len(business_no) != 10:
+            continue
+        source_type = str(row.get("source_type") or "")
+        company_name = str(row.get("company_name") or "")
+        address = str(row.get("address") or "")
+        province = str(row.get("province_name") or "")
+        district = str(row.get("district_name") or "")
+        mobile_phone = str(row.get("mobile_phone") or "")
+        landline_phone = str(row.get("landline_phone") or "")
+        preferred_phone = mobile_phone or landline_phone
+        opening_date = str(row.get("opening_signal_date") or "")
+        opening_year = int(row.get("opening_signal_year") or 0)
+        if source_type == "nps_monthly":
+            opening_label = (
+                f"국민연금 적용일 {opening_date}"
+                if opening_date
+                else "국민연금 신규 적용"
+            )
+            opening_basis = "국민연금 사업장 적용일"
+        else:
+            opening_label = f"{opening_year or 2025}년 신규 추정"
+            opening_basis = "근로복지공단 연간 자료 최초 등장"
+        current_count = int(row.get("current_employee_count") or 0)
+        results.append(
+            {
+                "source": source_type,
+                "source_key": f"recent_opening:{business_no}",
+                "사업자등록번호": business_no,
+                "사업장명": company_name,
+                "주소": address,
+                "지역": " ".join(
+                    value for value in (province, district) if value
+                ),
+                "업종코드": str(row.get("industry_code") or ""),
+                "업종명": str(row.get("industry_name") or ""),
+                "업종분류": str(
+                    row.get("industry_category") or "기타"
+                ),
+                "휴대전화": mobile_phone,
+                "일반전화": landline_phone,
+                "대표전화": preferred_phone,
+                "전화유형": (
+                    "휴대전화"
+                    if mobile_phone
+                    else ("일반전화" if landline_phone else "")
+                ),
+                "전화출처": "사전 수집 연락처",
+                "이메일": str(row.get("email") or ""),
+                "인스타그램": str(row.get("instagram") or ""),
+                "인스타그램URL": str(row.get("instagram_url") or ""),
+                "연락처상태": str(row.get("contact_status") or ""),
+                "연락처조회일": str(row.get("contact_checked_at") or ""),
+                "영업분석": {
+                    "phone": preferred_phone,
+                    "phone_source": "employment_contact_cache",
+                    "phone_confidence": 90 if preferred_phone else 0,
+                    "email": str(row.get("email") or ""),
+                    "instagram": str(row.get("instagram") or ""),
+                    "instagram_url": str(
+                        row.get("instagram_url") or ""
+                    ),
+                    "contact_status": str(
+                        row.get("contact_status") or ""
+                    ),
+                    "public_contacts": [],
+                },
+                "가입자수": current_count,
+                "이전가입자수": "",
+                "전월가입자수": "",
+                "전년가입자수": "",
+                "전월대비고용증가": "",
+                "전년대비고용증가": "",
+                "선택고용증가": "",
+                "고용증가신호": False,
+                "고용증가기준": "recent_opening",
+                "고용증가구분": "",
+                "고용자료상태": "PRECOMPUTED",
+                "고용자료메시지": "Supabase 신규개업 추정 결과",
+                "고용증가판정": "",
+                "자료생성년월": str(row.get("source_period") or ""),
+                "신규업체": True,
+                "신규개업구분": opening_label,
+                "신규추정일": opening_date,
+                "신규추정연도": opening_year,
+                "신규근거": opening_basis,
+                "신규정밀도": str(
+                    row.get("opening_signal_precision") or ""
+                ),
+                "원본데이터": dict(row),
+            }
+        )
+    return results
+
+
 def existing_prospect_identities(
     limit: int = 10000,
 ) -> tuple[set[str], set[str], set[str]]:
@@ -740,6 +922,9 @@ def save_search_history(
     growth_basis: str,
     industry_categories: list[str] | None,
     contact_channels: list[str] | None,
+    discovery_type: str,
+    recent_months: int,
+    include_comwel_annual: bool,
     found_count: int,
     pages_scanned: int,
     elapsed_seconds: float,
@@ -779,6 +964,17 @@ def save_search_history(
                     for value in (contact_channels or [])
                     if str(value or "").strip()
                 ],
+                "discovery_type": (
+                    "recent_opening"
+                    if str(discovery_type or "") == "recent_opening"
+                    else "growth"
+                ),
+                "recent_months": (
+                    int(recent_months)
+                    if int(recent_months) in {3, 6, 12}
+                    else 6
+                ),
+                "include_comwel_annual": bool(include_comwel_annual),
                 "found_count": max(0, int(found_count)),
                 "pages_scanned": max(0, int(pages_scanned)),
                 "elapsed_seconds": max(0.0, float(elapsed_seconds)),
@@ -805,6 +1001,7 @@ def list_search_history(
             "data_source,start_page,end_page,target_count,minimum_employees,"
             "maximum_employees,minimum_growth,"
             "growth_only,growth_basis,industry_categories,contact_channels,"
+            "discovery_type,recent_months,include_comwel_annual,"
             "found_count,pages_scanned,"
             "elapsed_seconds,searched_at"
         ),

@@ -10,6 +10,7 @@ from prospect_db_repository import (
     existing_prospect_identities,
     load_fast_growth_candidates,
     load_prior_employee_snapshots,
+    load_recent_opening_candidates,
     remove_existing_customers,
     remove_existing_prospects,
     save_employee_snapshots,
@@ -175,6 +176,193 @@ def _find_contactable(
     selected.sort(key=_growth_sort_key, reverse=True)
     checked = (len(ordered) if run_quick else 0) + full_checked
     return selected[:needed], failures, checked
+
+
+def collect_recent_opening_companies(
+    region_code: str,
+    *,
+    target_count: int = 100,
+    minimum_employees: int = 1,
+    maximum_employees: int = 300,
+    recent_months: int = 6,
+    include_comwel_annual: bool = True,
+    business_type: str = "stock",
+    industry_categories: list[str] | None = None,
+    contact_channels: list[str] | None = None,
+    district_name: str = "",
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """사전 저장된 국민연금·근로복지공단 신규 추정 기업을 조회."""
+    target_count = min(500, max(1, int(target_count)))
+    minimum_employees = max(1, int(minimum_employees))
+    maximum_employees = max(1, int(maximum_employees))
+    if maximum_employees < minimum_employees:
+        raise ValueError(
+            "최대 고용인원은 최소 고용인원보다 크거나 같아야 합니다."
+        )
+    recent_months = int(recent_months)
+    if recent_months not in {3, 6, 12}:
+        recent_months = 6
+    business_type = str(business_type or "stock").strip().lower()
+    if business_type not in {"stock", "individual", "all"}:
+        business_type = "stock"
+    district_name = str(district_name or "").strip()
+    selected_industries = sorted(
+        {
+            str(value or "").strip()
+            for value in (industry_categories or [])
+            if str(value or "").strip()
+        }
+    )
+    selected_contact_channels = sorted(
+        {
+            str(value or "").strip()
+            for value in (contact_channels or [])
+            if str(value or "").strip()
+            in {"mobile_phone", "landline_phone", "email", "instagram"}
+        }
+    )
+    started_at = time.monotonic()
+    try:
+        saved_source_keys, saved_business_nos, saved_company_address_keys = (
+            existing_prospect_identities()
+        )
+        duplicate_warning = ""
+    except Exception as exc:
+        saved_source_keys, saved_business_nos = set(), set()
+        saved_company_address_keys = set()
+        duplicate_warning = str(exc)
+
+    stats = {
+        "basic_received": 0,
+        "recent_candidates": 0,
+        "growth_candidates": 0,
+        "existing_customer_excluded": 0,
+        "saved_prospect_excluded": 0,
+        "contact_checked": 0,
+        "pages_scanned": 0,
+        "elapsed_seconds": 0.0,
+        "source_mode": "precomputed",
+        "discovery_type": "recent_opening",
+    }
+    _notify(progress, stage="recent_opening", found=0)
+    try:
+        candidates = load_recent_opening_candidates(
+            region_code,
+            minimum_employees=minimum_employees,
+            maximum_employees=maximum_employees,
+            recent_months=recent_months,
+            include_comwel_annual=include_comwel_annual,
+            district_name=district_name,
+            industry_categories=selected_industries,
+            contact_channels=selected_contact_channels,
+            limit=min(500, max(target_count, target_count * 3)),
+        )
+        _notify(
+            progress,
+            stage="recent_opening_complete",
+            checked=len(candidates),
+            found=0,
+        )
+        if business_type != "all":
+            candidates = [
+                item
+                for item in candidates
+                if (
+                    _looks_like_stock_company(item.get("사업장명"))
+                    if business_type == "stock"
+                    else not _looks_like_stock_company(
+                        item.get("사업장명")
+                    )
+                )
+            ]
+        stats["basic_received"] = len(candidates)
+        stats["recent_candidates"] = len(candidates)
+        candidates, customer_count = remove_existing_customers(candidates)
+        stats["existing_customer_excluded"] = customer_count
+        candidates, prospect_count = remove_existing_prospects(
+            candidates,
+            source_keys=saved_source_keys,
+            business_nos=saved_business_nos,
+            company_address_keys=saved_company_address_keys,
+        )
+        stats["saved_prospect_excluded"] = prospect_count
+        selected = candidates[:target_count]
+        stats["contact_checked"] = len(selected)
+        stats["elapsed_seconds"] = round(
+            time.monotonic() - started_at,
+            1,
+        )
+        return {
+            "ok": True,
+            "items": selected,
+            "target_count": target_count,
+            "found_count": len(selected),
+            "next_page": 1,
+            "stats": stats,
+            "failures": [],
+            "duplicate_warning": duplicate_warning,
+            "snapshot_warning": "",
+            "business_type": business_type,
+            "growth_only": False,
+            "growth_basis": "recent_opening",
+            "industry_categories": selected_industries,
+            "contact_channels": selected_contact_channels,
+            "district_name": district_name,
+            "data_source": "nps_comwel",
+            "minimum_employees": minimum_employees,
+            "maximum_employees": maximum_employees,
+            "minimum_growth": 0,
+            "recent_months": recent_months,
+            "include_comwel_annual": bool(include_comwel_annual),
+            "searched_start_page": 0,
+            "searched_end_page": 0,
+            "priority_basis": (
+                f"국민연금 최근 {recent_months}개월 사업장 적용일"
+                + (
+                    " · 근로복지공단 2025년 최초 등장"
+                    if include_comwel_annual
+                    else ""
+                )
+                + " · 사전 수집 연락처"
+            ),
+        }
+    except Exception as exc:
+        stats["elapsed_seconds"] = round(
+            time.monotonic() - started_at,
+            1,
+        )
+        stats["source_mode"] = "precomputed_error"
+        return {
+            "ok": False,
+            "message": (
+                "Supabase의 신규개업 추정 업체를 불러오지 "
+                f"못했습니다. {exc}"
+            ),
+            "items": [],
+            "target_count": target_count,
+            "found_count": 0,
+            "next_page": 1,
+            "stats": stats,
+            "failures": [],
+            "duplicate_warning": duplicate_warning,
+            "snapshot_warning": "",
+            "business_type": business_type,
+            "growth_only": False,
+            "growth_basis": "recent_opening",
+            "industry_categories": selected_industries,
+            "contact_channels": selected_contact_channels,
+            "district_name": district_name,
+            "data_source": "nps_comwel",
+            "minimum_employees": minimum_employees,
+            "maximum_employees": maximum_employees,
+            "minimum_growth": 0,
+            "recent_months": recent_months,
+            "include_comwel_annual": bool(include_comwel_annual),
+            "searched_start_page": 0,
+            "searched_end_page": 0,
+            "priority_basis": "국민연금·근로복지공단 신규개업 추정",
+        }
 
 
 def collect_contactable_growth_companies(
