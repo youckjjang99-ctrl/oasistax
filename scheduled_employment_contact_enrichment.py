@@ -134,11 +134,14 @@ def _eligible_rows(
     selected: list[dict[str, Any]] = []
     seen: set[str] = set()
 
+    # The initial provider pass is the overwhelmingly common queue. Selecting
+    # it first also lets Postgres use the small provider-specific pending index
+    # instead of checking the full contact table before work can begin.
     queues = (
-        ("matched", due_before, None),
+        ("pending", None, None),
         ("error", due_before, None),
         ("processing", None, stale_processing_before),
-        ("pending", None, None),
+        ("matched", due_before, None),
         ("no_match", due_before, None),
     )
     for status, due, updated in queues:
@@ -506,6 +509,17 @@ def run_enrichment(
     phone_provider = str(phone_provider or "auto").strip().lower()
     if phone_provider not in PHONE_PROVIDERS:
         raise ValueError("phone_provider must be auto, kakao, or naver")
+    print(
+        json.dumps(
+            {
+                "job": f"employment-{stage}-enrichment",
+                "status": "selecting_provider",
+                "requested_provider": phone_provider,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
     if stage == "phone" and phone_provider == "auto":
         phone_provider = (
             "kakao"
@@ -553,6 +567,20 @@ def run_enrichment(
         else 25000
     )
     max_records = max(1, min(provider_cap, int(max_records)))
+    print(
+        json.dumps(
+            {
+                "job": f"employment-{stage}-enrichment",
+                "status": "started",
+                "provider": phone_provider if stage == "phone" else "",
+                "workers": workers,
+                "batch_size": batch_size,
+                "max_records": max_records,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
     totals = {
         "matched": 0,
         "fallback": 0,
