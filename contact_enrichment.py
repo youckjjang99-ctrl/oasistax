@@ -101,7 +101,13 @@ def _phone_contact(candidate: dict[str, Any]) -> dict[str, Any] | None:
     public_business_source = bool(
         candidate.get("public_business_source")
         or phone_type == "public_business_mobile"
-        or source_type in {"official_website", "kakao_local", "naver_web_snippet"}
+        or source_type
+        in {
+            "official_website",
+            "kakao_local",
+            "naver_local",
+            "naver_web_snippet",
+        }
     )
     # A phone displayed on a page that contains the company name can still be
     # useful for a manual call check even when the address is not written there.
@@ -145,8 +151,9 @@ def _phone_contact(candidate: dict[str, Any]) -> dict[str, Any] | None:
 
 def _deduplicate(contacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     source_priority = {
-        "official_website": 4,
-        "kakao_local": 3,
+        "official_website": 5,
+        "kakao_local": 4,
+        "naver_local": 3,
         "localdata": 2,
         "naver_web_snippet": 1,
     }
@@ -175,12 +182,32 @@ def _deduplicate(contacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if new_rank > current_rank:
             selected[key] = contact
     ordered = list(selected.values())
+
+    def _contact_order(row: dict[str, Any]) -> tuple[int, int]:
+        contact_type = str(row.get("contact_type") or "")
+        if contact_type == "phone":
+            type_rank = (
+                0
+                if is_mobile_phone(row.get("contact_value", ""))
+                else 1
+            )
+        else:
+            type_rank = {
+                "email": 2,
+                "instagram": 3,
+                "website": 4,
+            }.get(contact_type, 5)
+        return type_rank, -int(row.get("confidence") or 0)
+
     ordered.sort(
-        key=lambda row: (
-            row.get("contact_type") != "phone",
-            -int(row.get("confidence") or 0),
-        )
+        key=_contact_order
     )
+    primary_phone_selected = False
+    for row in ordered:
+        if row.get("contact_type") != "phone":
+            continue
+        row["is_primary"] = not primary_phone_selected
+        primary_phone_selected = True
     return ordered
 
 
@@ -255,7 +282,7 @@ def enrich_company(
     contacts: list[dict[str, Any]] = []
     trace: list[dict[str, Any]] = []
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         kakao_future = (
             None
             if skip_kakao
@@ -270,12 +297,20 @@ def enrich_company(
             timeout=max(2, min(website_timeout, 6)),
             display=10,
         )
+        naver_local_future = executor.submit(
+            naver_web_search_client.search_company,
+            company_name,
+            address,
+            timeout=max(2, min(website_timeout, 6)),
+            display=5,
+        )
         kakao = (
             {"candidates": [], "status": "SKIPPED", "message": "빠른 조회에서 확인 완료"}
             if kakao_future is None
             else kakao_future.result()
         )
         naver_phones = naver_phone_future.result()
+        naver_local = naver_local_future.result()
     trace.append(
         {
             "stage": "kakao",
@@ -297,6 +332,17 @@ def enrich_company(
             contacts.append(contact)
     trace.append(
         {
+            "stage": "naver_local",
+            "status": naver_local.get("status"),
+            "message": naver_local.get("message"),
+        }
+    )
+    for candidate in naver_local.get("candidates", []):
+        contact = _phone_contact(candidate)
+        if contact:
+            contacts.append(contact)
+    trace.append(
+        {
             "stage": "naver_phone",
             "status": naver_phones.get("status"),
             "message": naver_phones.get("message"),
@@ -306,6 +352,8 @@ def enrich_company(
         contact = _phone_contact(candidate)
         if contact:
             contacts.append(contact)
+    for public_contact in naver_phones.get("contacts", []):
+        contacts.append(dict(public_contact))
 
     phone_types = {
         str((row.get("metadata") or {}).get("phone_type") or "")

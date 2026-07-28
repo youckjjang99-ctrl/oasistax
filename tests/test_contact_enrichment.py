@@ -5,7 +5,8 @@ from unittest.mock import patch
 
 import contact_enrichment
 import naver_web_search_client
-from website_contact_parser import extract_public_contacts
+import sales_intelligence
+from website_contact_parser import extract_public_contacts, instagram_profile
 
 
 class _NaverResponse:
@@ -17,6 +18,20 @@ class _NaverResponse:
         self.query = query
 
     def json(self) -> dict:
+        if "이메일" in self.query:
+            return {
+                "items": [
+                    {
+                        "title": "테스트기업",
+                        "description": (
+                            "서울특별시 강남구 contact@example.com"
+                        ),
+                        "link": (
+                            "https://www.instagram.com/test_company/"
+                        ),
+                    }
+                ]
+            }
         phone = (
             "010-1234-5678"
             if "휴대전화" in self.query
@@ -65,21 +80,48 @@ class ContactCollectionTest(unittest.TestCase):
         self.assertIn("company_main", phone_types)
         self.assertIn("public_business_mobile", phone_types)
         self.assertEqual(len(result["queries"]), 4)
+        self.assertEqual(
+            {
+                row["contact_type"] for row in result["contacts"]
+            },
+            {"email", "instagram"},
+        )
+
+    def test_instagram_profile_rejects_post_and_keeps_profile(self) -> None:
+        self.assertEqual(
+            instagram_profile(
+                "https://www.instagram.com/oasis.crm/?hl=ko"
+            )[0],
+            "@oasis.crm",
+        )
+        self.assertEqual(
+            instagram_profile(
+                "https://www.instagram.com/p/ABC123/"
+            ),
+            ("", ""),
+        )
 
     @patch("contact_enrichment.inspect_website")
     @patch("contact_enrichment.naver_web_search_client.search_official_websites")
     @patch("contact_enrichment.localdata_contact_client.search_company")
     @patch("contact_enrichment.naver_web_search_client.search_public_phones")
+    @patch("contact_enrichment.naver_web_search_client.search_company")
     @patch("contact_enrichment.kakao_local_client.search_company")
     def test_enrichment_labels_public_business_mobile_and_caches(
         self,
         kakao,
+        naver_local,
         naver_phone,
         localdata,
         websites,
         inspect,
     ) -> None:
         kakao.return_value = {
+            "status": "SUCCESS",
+            "message": "",
+            "candidates": [],
+        }
+        naver_local.return_value = {
             "status": "SUCCESS",
             "message": "",
             "candidates": [],
@@ -127,7 +169,60 @@ class ContactCollectionTest(unittest.TestCase):
         self.assertFalse(first["cache_hit"])
         self.assertTrue(second["cache_hit"])
         self.assertEqual(kakao.call_count, 1)
+        self.assertEqual(naver_local.call_count, 1)
         self.assertEqual(naver_phone.call_count, 1)
+
+    @patch(
+        "sales_intelligence.localdata_contact_client.is_enabled",
+        return_value=False,
+    )
+    @patch("sales_intelligence.naver_web_search_client.search_company")
+    @patch("sales_intelligence.naver_web_search_client.search_public_phones")
+    @patch("sales_intelligence.kakao_local_client.search_company")
+    def test_mobile_is_selected_before_higher_score_landline(
+        self,
+        kakao,
+        naver_phone,
+        naver_local,
+        _localdata_enabled,
+    ) -> None:
+        kakao.return_value = {
+            "status": "SUCCESS",
+            "message": "",
+            "candidates": [
+                {
+                    "phone": "02-1234-5678",
+                    "source_type": "kakao_local",
+                    "confidence": 100,
+                }
+            ],
+        }
+        naver_phone.return_value = {
+            "status": "SUCCESS",
+            "message": "",
+            "contacts": [],
+            "candidates": [
+                {
+                    "phone": "010-1234-5678",
+                    "source_type": "naver_web_snippet",
+                    "confidence": 70,
+                }
+            ],
+        }
+        naver_local.return_value = {
+            "status": "SUCCESS",
+            "message": "",
+            "candidates": [],
+        }
+
+        result = sales_intelligence._best_phone(
+            "테스트기업",
+            "서울특별시 강남구",
+            "서비스업",
+            allow_extended=False,
+        )
+
+        self.assertEqual(result["phone"], "010-1234-5678")
 
 
 if __name__ == "__main__":

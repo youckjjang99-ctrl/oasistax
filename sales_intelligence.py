@@ -54,13 +54,44 @@ def _phone_result(
     *,
     status: str = "FOUND",
     trace: list[dict[str, Any]] | None = None,
+    public_contacts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     normalized_phone = normalize_phone(phone)
+    contacts = list(public_contacts or [])
+    email_contact = next(
+        (
+            row
+            for row in contacts
+            if row.get("contact_type") == "email"
+            and str(row.get("contact_value") or "").strip()
+        ),
+        {},
+    )
+    instagram_contact = next(
+        (
+            row
+            for row in contacts
+            if row.get("contact_type") == "instagram"
+            and str(row.get("contact_value") or "").strip()
+        ),
+        {},
+    )
     return {
         "phone": normalized_phone,
         "phone_source": source,
         "phone_confidence": confidence,
         "phone_review_required": is_mobile_phone(normalized_phone),
+        "email": str(email_contact.get("contact_value") or ""),
+        "email_source": _source_label(
+            str(email_contact.get("source_type") or "")
+        ),
+        "instagram": str(
+            instagram_contact.get("contact_value") or ""
+        ),
+        "instagram_url": str(
+            instagram_contact.get("source_url") or ""
+        ),
+        "public_contacts": contacts,
         "contact_status": status if normalized_phone else (
             status if status in {"ERROR", "NOT_FOUND"} else "NOT_FOUND"
         ),
@@ -74,6 +105,8 @@ def _source_label(source_type: str) -> str:
         return "공식 홈페이지"
     if source_type == "kakao_local":
         return "카카오 로컬"
+    if source_type == "naver_local":
+        return "네이버 지도"
     if source_type == "naver_web_snippet":
         return "네이버 공개검색"
     if source_type.startswith("localdata:"):
@@ -121,11 +154,18 @@ def _extended_phone(
         and str(row.get("contact_value") or "").strip()
         and str(row.get("verification_status") or "") != "rejected"
     ]
+    public_contacts = [
+        row
+        for row in enriched.get("contacts", [])
+        if row.get("contact_type") in {"email", "instagram"}
+        and str(row.get("contact_value") or "").strip()
+        and str(row.get("verification_status") or "") != "rejected"
+    ]
     if phone_contacts:
         phone_contacts.sort(
             key=lambda row: (
+                not is_mobile_phone(row.get("contact_value", "")),
                 row.get("verification_status") != "auto_verified",
-                is_mobile_phone(row.get("contact_value", "")),
                 -int(row.get("confidence") or 0),
             )
         )
@@ -135,6 +175,7 @@ def _extended_phone(
             _source_label(str(best.get("source_type") or "")),
             int(best.get("confidence") or 0),
             trace=list(enriched.get("trace") or []),
+            public_contacts=public_contacts,
         )
     return _phone_result(
         "",
@@ -142,6 +183,7 @@ def _extended_phone(
         0,
         status="NOT_FOUND",
         trace=list(enriched.get("trace") or []),
+        public_contacts=public_contacts,
     )
 
 
@@ -154,7 +196,7 @@ def _best_phone(
 ) -> dict[str, Any]:
     # 서로 독립적인 무료 공개 소스를 병렬 조회한다. 기존 순차 방식은
     # 업체 한 곳마다 타임아웃이 누적되어 전체 검색이 수분 이상 지연됐다.
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {
             "kakao": executor.submit(
                 kakao_local_client.search_company,
@@ -164,6 +206,12 @@ def _best_phone(
             ),
             "naver": executor.submit(
                 naver_web_search_client.search_public_phones,
+                company_name,
+                address,
+                timeout=10,
+            ),
+            "naver_local": executor.submit(
+                naver_web_search_client.search_company,
                 company_name,
                 address,
                 timeout=10,
@@ -206,14 +254,19 @@ def _best_phone(
             if row.get("phone")
             and int(row.get("confidence") or 0) >= REVIEW_SCORE
         )
+    public_contacts = list(
+        source_results.get("naver", {}).get("contacts", [])
+    )
     if candidates:
         source_priority = {
-            "kakao_local": 3,
+            "kakao_local": 4,
+            "naver_local": 3,
             "localdata": 2,
             "naver_web_snippet": 1,
         }
         candidates.sort(
             key=lambda row: (
+                is_mobile_phone(row.get("phone", "")),
                 int(row.get("confidence") or 0),
                 source_priority.get(
                     str(row.get("source_type") or "").split(":", 1)[0],
@@ -228,16 +281,32 @@ def _best_phone(
             _source_label(str(best.get("source_type") or "")),
             int(best.get("confidence") or 0),
             trace=trace,
+            public_contacts=public_contacts,
         )
 
     if allow_extended:
-        return _extended_phone(company_name, address, industry_name)
+        extended = _extended_phone(company_name, address, industry_name)
+        if not extended.get("public_contacts") and public_contacts:
+            extended.update(
+                _phone_result(
+                    str(extended.get("phone") or ""),
+                    str(extended.get("phone_source") or ""),
+                    int(extended.get("phone_confidence") or 0),
+                    status=str(
+                        extended.get("contact_status") or "NOT_FOUND"
+                    ),
+                    trace=list(extended.get("contact_trace") or trace),
+                    public_contacts=public_contacts,
+                )
+            )
+        return extended
     return _phone_result(
         "",
         "",
         0,
         status="NOT_FOUND",
         trace=trace,
+        public_contacts=public_contacts,
     )
 
 
@@ -423,6 +492,11 @@ def analyze_sales_candidate(
             "phone_review_required",
             False,
         ),
+        "email": phone_result.get("email", ""),
+        "email_source": phone_result.get("email_source", ""),
+        "instagram": phone_result.get("instagram", ""),
+        "instagram_url": phone_result.get("instagram_url", ""),
+        "public_contacts": phone_result.get("public_contacts", []),
         "contact_status": phone_result.get("contact_status", ""),
         "contact_trace": phone_result.get("contact_trace", []),
         "employee_count": employee_count,
@@ -461,6 +535,15 @@ def merge_analysis(
     merged["영업분석"] = analysis
     merged["대표전화"] = analysis.get("phone", "")
     merged["전화출처"] = analysis.get("phone_source", "")
+    merged["전화유형"] = (
+        "휴대전화"
+        if is_mobile_phone(analysis.get("phone", ""))
+        else ("대표번호" if analysis.get("phone") else "")
+    )
+    merged["이메일"] = analysis.get("email", "")
+    merged["이메일출처"] = analysis.get("email_source", "")
+    merged["인스타그램"] = analysis.get("instagram", "")
+    merged["인스타그램URL"] = analysis.get("instagram_url", "")
     merged["연락처상태"] = analysis.get("contact_status", "")
     merged["연락처조회이력"] = analysis.get("contact_trace", [])
     if analysis.get("net_hiring") is not None:
