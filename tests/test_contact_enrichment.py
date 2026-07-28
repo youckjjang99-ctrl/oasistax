@@ -230,6 +230,53 @@ class ContactCollectionTest(unittest.TestCase):
         self.assertEqual(naver_local.call_count, 1)
         self.assertEqual(naver_phone.call_count, 1)
 
+    @patch("contact_enrichment.localdata_contact_client.search_company")
+    @patch("contact_enrichment.naver_web_search_client.search_public_phones")
+    @patch("contact_enrichment.naver_web_search_client.search_company")
+    @patch("contact_enrichment.kakao_local_client.search_company")
+    def test_kakao_only_stage_does_not_call_naver(
+        self,
+        kakao,
+        naver_local,
+        naver_phone,
+        localdata,
+    ) -> None:
+        kakao.return_value = {
+            "status": "SUCCESS",
+            "message": "",
+            "candidates": [
+                {
+                    "company_name": "테스트기업",
+                    "address": "서울특별시 강남구",
+                    "phone": "02-1234-5678",
+                    "source_type": "kakao_local",
+                    "source_url": "https://place.map.kakao.com/1",
+                    "confidence": 95,
+                }
+            ],
+        }
+
+        result = contact_enrichment.enrich_company(
+            {
+                "company_name": "테스트기업",
+                "address": "서울특별시 강남구",
+            },
+            skip_naver=True,
+            skip_localdata=True,
+            bulk_mode=True,
+            contact_stage="phone",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            result["contacts"][0]["contact_value"],
+            "02-1234-5678",
+        )
+        kakao.assert_called_once()
+        naver_local.assert_not_called()
+        naver_phone.assert_not_called()
+        localdata.assert_not_called()
+
     @patch(
         "sales_intelligence.localdata_contact_client.is_enabled",
         return_value=False,

@@ -7,6 +7,44 @@ import scheduled_employment_contact_enrichment as job
 
 
 class EmploymentContactEnrichmentTest(unittest.TestCase):
+    @patch.object(
+        job.naver_web_search_client,
+        "key_status",
+        return_value={"configured": True},
+    )
+    @patch.object(
+        job.kakao_local_client,
+        "key_status",
+        return_value={"configured": True},
+    )
+    @patch.object(job, "_eligible_rows")
+    def test_auto_provider_finishes_kakao_queue_before_naver(
+        self,
+        eligible,
+        _kakao_key,
+        _naver_key,
+    ) -> None:
+        eligible.side_effect = [
+            [{"contact_key": "kakao:pending"}],
+            [],
+        ]
+
+        result = job.run_enrichment(
+            stage="phone",
+            phone_provider="auto",
+            max_records=1,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            eligible.call_args_list[0].args,
+            (1, "phone", "kakao"),
+        )
+        self.assertEqual(
+            eligible.call_args_list[1].args,
+            (1, "phone", "kakao"),
+        )
+
     @patch.object(job, "_patch", return_value=True)
     @patch.object(job, "enrich_company")
     def test_phone_stage_saves_only_phone_contacts(
@@ -64,7 +102,9 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
                 "company_name": "테스트기업",
                 "address": "서울특별시 강남구",
                 "industry_name": "서비스업",
-            }
+            },
+            "phone",
+            "kakao",
         )
 
         self.assertEqual(result["status"], "matched")
@@ -81,6 +121,9 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
             enrich.call_args.kwargs["contact_stage"],
             "phone",
         )
+        self.assertFalse(enrich.call_args.kwargs["skip_kakao"])
+        self.assertTrue(enrich.call_args.kwargs["skip_naver"])
+        self.assertEqual(saved["phone_provider_stage"], "complete")
 
     @patch.object(job, "_patch", return_value=True)
     @patch.object(job, "enrich_company")
@@ -146,9 +189,9 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
         "enrich_company",
         return_value={"ok": True, "contacts": []},
     )
-    def test_no_match_is_checked_again_after_ninety_days(
+    def test_kakao_no_match_moves_to_naver_queue(
         self,
-        _enrich,
+        enrich,
         patch_row,
     ) -> None:
         result = job._enrich_one(
@@ -158,14 +201,50 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
                 "attempt_count": 2,
                 "company_name": "미확인기업",
                 "address": "경기도 수원시",
-            }
+            },
+            "phone",
+            "kakao",
+        )
+        self.assertEqual(result["status"], "fallback")
+        saved = patch_row.call_args_list[-1].args[1]
+        self.assertEqual(saved["status"], "pending")
+        self.assertEqual(saved["phone_status"], "pending")
+        self.assertEqual(saved["phone_provider_stage"], "naver")
+        self.assertEqual(saved["attempt_count"], 3)
+        self.assertIn("phone_next_check_at", saved)
+        self.assertFalse(enrich.call_args.kwargs["skip_kakao"])
+        self.assertTrue(enrich.call_args.kwargs["skip_naver"])
+
+    @patch.object(job, "_patch", return_value=True)
+    @patch.object(
+        job,
+        "enrich_company",
+        return_value={"ok": True, "contacts": []},
+    )
+    def test_naver_no_match_completes_phone_pipeline(
+        self,
+        enrich,
+        patch_row,
+    ) -> None:
+        result = job._enrich_one(
+            {
+                "contact_key": "place:test",
+                "status": "pending",
+                "phone_status": "pending",
+                "phone_provider_stage": "naver",
+                "company_name": "테스트기업",
+                "address": "경기도 수원시",
+            },
+            "phone",
+            "naver",
         )
         self.assertEqual(result["status"], "no_match")
         saved = patch_row.call_args_list[-1].args[1]
         self.assertEqual(saved["status"], "no_match")
         self.assertEqual(saved["phone_status"], "no_match")
-        self.assertEqual(saved["attempt_count"], 3)
-        self.assertIn("phone_next_check_at", saved)
+        self.assertEqual(saved["phone_provider_stage"], "complete")
+        self.assertTrue(enrich.call_args.kwargs["skip_kakao"])
+        self.assertFalse(enrich.call_args.kwargs["skip_naver"])
 
     @patch.object(job, "_patch", return_value=True)
     @patch.object(
@@ -193,7 +272,9 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
                 "phone_status": "pending",
                 "company_name": "테스트기업",
                 "address": "서울특별시 강남구",
-            }
+            },
+            "phone",
+            "naver",
         )
         self.assertEqual(result["status"], "error")
         self.assertTrue(result["halt"])

@@ -21,6 +21,10 @@ from contact_matching import is_mobile_phone, normalize_phone
 TABLE_CONTACTS = "oasis_employment_contacts"
 CONTACT_TYPES = {"phone", "email", "instagram"}
 CONTACT_STAGES = {"phone", "digital"}
+PHONE_PROVIDERS = {"auto", "kakao", "naver"}
+PHONE_PROVIDER_FIELD = "phone_provider_stage"
+KAKAO_DAILY_SAFE_RECORDS = 90000
+NAVER_DAILY_SAFE_RECORDS = 12000
 STAGE_FIELDS = {
     "phone": {
         "status": "phone_status",
@@ -65,6 +69,7 @@ def _select_rows(
     limit: int,
     due_before: str | None = None,
     updated_before: str | None = None,
+    phone_provider: str | None = None,
 ) -> list[dict[str, Any]]:
     fields = STAGE_FIELDS[stage]
     status_field = fields["status"]
@@ -77,12 +82,15 @@ def _select_rows(
             "mobile_phone,landline_phone,email,instagram_id,instagram_url,"
             "contact_sources,phone_status,phone_checked_at,"
             "phone_next_check_at,phone_attempt_count,phone_last_error,"
+            "phone_provider_stage,"
             "digital_status,digital_checked_at,digital_next_check_at,"
             "digital_attempt_count,digital_last_error"
         ),
         status_field: f"eq.{status}",
         "limit": str(max(1, min(5000, int(limit)))),
     }
+    if stage == "phone" and phone_provider:
+        params[PHONE_PROVIDER_FIELD] = f"eq.{phone_provider}"
     if due_before:
         params[next_check_field] = f"lte.{due_before}"
         params["order"] = f"{next_check_field}.asc,updated_at.asc"
@@ -106,10 +114,19 @@ def _select_rows(
     return rows if isinstance(rows, list) else []
 
 
-def _eligible_rows(limit: int, stage: str = "phone") -> list[dict[str, Any]]:
+def _eligible_rows(
+    limit: int,
+    stage: str = "phone",
+    phone_provider: str | None = None,
+) -> list[dict[str, Any]]:
     """단계별 재검증 대상을 처리한 뒤 신규 대상을 채운다."""
     if stage not in CONTACT_STAGES:
         raise ValueError("stage must be phone or digital")
+    if (
+        stage == "phone"
+        and phone_provider not in {"kakao", "naver"}
+    ):
+        raise ValueError("phone_provider must be kakao or naver")
     limit = max(1, min(5000, int(limit)))
     now = _now()
     due_before = _iso(now)
@@ -134,6 +151,7 @@ def _eligible_rows(limit: int, stage: str = "phone") -> list[dict[str, Any]]:
             limit=remaining,
             due_before=due,
             updated_before=updated,
+            phone_provider=phone_provider,
         ):
             contact_key = str(row.get("contact_key") or "")
             if not contact_key or contact_key in seen:
@@ -260,9 +278,12 @@ def _best(
 def _enrich_one(
     row: dict[str, Any],
     stage: str = "phone",
+    phone_provider: str | None = None,
 ) -> dict[str, Any]:
     if stage not in CONTACT_STAGES:
         raise ValueError("stage must be phone or digital")
+    if stage == "phone" and phone_provider not in {"kakao", "naver"}:
+        raise ValueError("phone_provider must be kakao or naver")
     fields = STAGE_FIELDS[stage]
     status_field = fields["status"]
     contact_key = str(row.get("contact_key") or "")
@@ -280,6 +301,8 @@ def _enrich_one(
                 "business_no": row.get("business_no"),
                 "industry_name": row.get("industry_name"),
             },
+            skip_kakao=stage == "phone" and phone_provider == "naver",
+            skip_naver=stage == "phone" and phone_provider == "kakao",
             skip_localdata=True,
             bulk_mode=stage == "phone",
             contact_stage=stage,
@@ -331,6 +354,11 @@ def _enrich_one(
             if stage == "phone"
             else any((email_value, instagram_id, instagram_url))
         )
+        kakao_fallback = (
+            stage == "phone"
+            and phone_provider == "kakao"
+            and not phase_matched
+        )
         overall_matched = any(
             (
                 mobile_phone,
@@ -340,8 +368,12 @@ def _enrich_one(
                 instagram_url,
             )
         )
-        next_check = checked_at + timedelta(
-            days=30 if phase_matched else 90
+        next_check = (
+            checked_at
+            if kakao_fallback
+            else checked_at + timedelta(
+                days=30 if phase_matched else 90
+            )
         )
         source_rows = dict(row.get("contact_sources") or {})
         source_rows.update({
@@ -365,17 +397,35 @@ def _enrich_one(
             "instagram_id": instagram_id,
             "instagram_url": instagram_url,
             "contact_sources": source_rows,
-            "status": "matched" if overall_matched else "no_match",
+            "status": (
+                "matched"
+                if overall_matched
+                else "pending"
+                if kakao_fallback
+                else "no_match"
+            ),
             "checked_at": _iso(checked_at),
             "next_check_at": _iso(next_check),
             "attempt_count": attempt_count,
             "last_error": "",
-            status_field: "matched" if phase_matched else "no_match",
+            status_field: (
+                "matched"
+                if phase_matched
+                else "pending"
+                if kakao_fallback
+                else "no_match"
+            ),
             fields["checked_at"]: _iso(checked_at),
             fields["next_check_at"]: _iso(next_check),
             fields["attempt_count"]: stage_attempt_count,
             fields["last_error"]: "",
         }
+        if stage == "phone":
+            values[PHONE_PROVIDER_FIELD] = (
+                "complete"
+                if phase_matched or phone_provider == "naver"
+                else "naver"
+            )
         _patch(
             contact_key,
             values,
@@ -383,9 +433,16 @@ def _enrich_one(
             status_field=status_field,
         )
         return {
-            "status": "matched" if phase_matched else "no_match",
+            "status": (
+                "matched"
+                if phase_matched
+                else "fallback"
+                if kakao_fallback
+                else "no_match"
+            ),
             "contact_key": contact_key,
             "stage": stage,
+            "provider": phone_provider if stage == "phone" else "",
         }
     except Exception as exc:
         is_limit = isinstance(exc, UpstreamLimitError)
@@ -418,6 +475,11 @@ def _enrich_one(
                 fields["last_error"]: (
                     f"{type(exc).__name__}: {exc}"[:1000]
                 ),
+                **(
+                    {PHONE_PROVIDER_FIELD: phone_provider}
+                    if stage == "phone"
+                    else {}
+                ),
             },
             expected_status="processing",
             status_field=status_field,
@@ -426,6 +488,7 @@ def _enrich_one(
             "status": "error",
             "contact_key": contact_key,
             "stage": stage,
+            "provider": phone_provider if stage == "phone" else "",
             "halt": is_limit,
         }
 
@@ -433,28 +496,66 @@ def _enrich_one(
 def run_enrichment(
     *,
     stage: str = "phone",
-    workers: int = 12,
+    phone_provider: str = "auto",
+    workers: int = 0,
     batch_size: int = 200,
-    max_records: int = 12000,
+    max_records: int = 0,
 ) -> int:
     if stage not in CONTACT_STAGES:
         raise ValueError("stage must be phone or digital")
+    phone_provider = str(phone_provider or "auto").strip().lower()
+    if phone_provider not in PHONE_PROVIDERS:
+        raise ValueError("phone_provider must be auto, kakao, or naver")
+    if stage == "phone" and phone_provider == "auto":
+        phone_provider = (
+            "kakao"
+            if _eligible_rows(1, "phone", "kakao")
+            else "naver"
+        )
+    if stage == "digital":
+        phone_provider = "auto"
     kakao_configured = kakao_local_client.key_status()["configured"]
     naver_configured = naver_web_search_client.key_status()["configured"]
-    if stage == "phone" and not (kakao_configured or naver_configured):
+    if (
+        stage == "phone"
+        and phone_provider == "kakao"
+        and not kakao_configured
+    ):
         raise RuntimeError(
-            "KAKAO_REST_API_KEY 또는 네이버 검색 API 키가 필요합니다."
+            "카카오 전화번호 선조회에는 KAKAO_REST_API_KEY가 필요합니다."
+        )
+    if (
+        stage == "phone"
+        and phone_provider == "naver"
+        and not naver_configured
+    ):
+        raise RuntimeError(
+            "네이버 전화번호 후조회에는 네이버 검색 API 키가 필요합니다."
         )
     if stage == "digital" and not naver_configured:
         raise RuntimeError(
             "이메일·인스타그램 수집에는 네이버 검색 API 키가 필요합니다."
         )
 
-    workers = max(1, min(16, int(workers)))
+    if int(workers) <= 0:
+        workers = 16 if phone_provider == "kakao" else 12
+    workers = max(1, min(20, int(workers)))
     batch_size = max(1, min(1000, int(batch_size)))
-    max_records = max(1, min(25000, int(max_records)))
+    if int(max_records) <= 0:
+        max_records = (
+            KAKAO_DAILY_SAFE_RECORDS
+            if phone_provider == "kakao"
+            else NAVER_DAILY_SAFE_RECORDS
+        )
+    provider_cap = (
+        KAKAO_DAILY_SAFE_RECORDS
+        if phone_provider == "kakao"
+        else 25000
+    )
+    max_records = max(1, min(provider_cap, int(max_records)))
     totals = {
         "matched": 0,
+        "fallback": 0,
         "no_match": 0,
         "error": 0,
         "skipped": 0,
@@ -465,12 +566,19 @@ def run_enrichment(
         rows = _eligible_rows(
             min(batch_size, max_records - processed),
             stage,
+            phone_provider if stage == "phone" else None,
         )
         if not rows:
             break
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = [
-                executor.submit(_enrich_one, row, stage) for row in rows
+                executor.submit(
+                    _enrich_one,
+                    row,
+                    stage,
+                    phone_provider if stage == "phone" else None,
+                )
+                for row in rows
             ]
             for future in as_completed(futures):
                 result = future.result()
@@ -483,6 +591,9 @@ def run_enrichment(
                 {
                     "job": f"employment-{stage}-enrichment",
                     "stage": stage,
+                    "provider": (
+                        phone_provider if stage == "phone" else ""
+                    ),
                     "processed": processed,
                     "halted": halted,
                     **totals,
@@ -496,6 +607,9 @@ def run_enrichment(
                 json.dumps(
                     {
                         "job": f"employment-{stage}-enrichment",
+                        "provider": (
+                            phone_provider if stage == "phone" else ""
+                        ),
                         "status": "paused_by_provider_limit",
                         "processed": processed,
                     },
@@ -516,9 +630,17 @@ def main() -> int:
         default=os.environ.get("EMPLOYMENT_CONTACT_STAGE", "phone"),
     )
     parser.add_argument(
+        "--phone-provider",
+        choices=sorted(PHONE_PROVIDERS),
+        default=os.environ.get(
+            "EMPLOYMENT_PHONE_PROVIDER",
+            "auto",
+        ),
+    )
+    parser.add_argument(
         "--workers",
         type=int,
-        default=int(os.environ.get("EMPLOYMENT_CONTACT_WORKERS", "12")),
+        default=int(os.environ.get("EMPLOYMENT_CONTACT_WORKERS", "0")),
     )
     parser.add_argument(
         "--batch-size",
@@ -531,12 +653,13 @@ def main() -> int:
         "--max-records",
         type=int,
         default=int(
-            os.environ.get("EMPLOYMENT_CONTACT_MAX_RECORDS", "12000")
+            os.environ.get("EMPLOYMENT_CONTACT_MAX_RECORDS", "0")
         ),
     )
     args = parser.parse_args()
     return run_enrichment(
         stage=args.stage,
+        phone_provider=args.phone_provider,
         workers=args.workers,
         batch_size=args.batch_size,
         max_records=args.max_records,
