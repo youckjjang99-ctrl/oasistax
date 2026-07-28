@@ -184,10 +184,14 @@ def collect_contactable_growth_companies(
     start_page: int = 1,
     max_pages: int = 10,
     minimum_employees: int = 1,
+    maximum_employees: int = 300,
+    minimum_growth: int = 1,
     business_type: str = "stock",
     growth_only: bool = True,
     growth_basis: str = "combined",
     industry_categories: list[str] | None = None,
+    district_name: str = "",
+    data_source: str = "combined",
     sigungu_code: str = "",
     emd_code: str = "",
     progress: ProgressCallback | None = None,
@@ -195,6 +199,17 @@ def collect_contactable_growth_companies(
     target_count = min(100, max(1, int(target_count)))
     max_pages = min(100, max(1, int(max_pages)))
     start_page = max(1, int(start_page))
+    minimum_employees = max(1, int(minimum_employees))
+    maximum_employees = max(1, int(maximum_employees))
+    if maximum_employees < minimum_employees:
+        raise ValueError(
+            "최대 고용인원은 최소 고용인원보다 크거나 같아야 합니다."
+        )
+    minimum_growth = max(1, int(minimum_growth))
+    district_name = str(district_name or "").strip()
+    data_source = str(data_source or "combined").strip().lower()
+    if data_source not in {"combined", "nps_monthly", "comwel_annual"}:
+        data_source = "combined"
     started_at = time.monotonic()
     business_type = str(business_type or "stock").strip().lower()
     if business_type not in {"stock", "individual", "all"}:
@@ -258,6 +273,11 @@ def collect_contactable_growth_companies(
             cached_items = load_fast_growth_candidates(
                 region_code,
                 minimum_employees=minimum_employees,
+                maximum_employees=maximum_employees,
+                minimum_growth=minimum_growth,
+                district_name=district_name,
+                source_mode=data_source,
+                industry_categories=sorted(selected_industries),
                 limit=max(100, min(1000, target_count * 5)),
             )
             _notify(
@@ -312,6 +332,7 @@ def collect_contactable_growth_companies(
                 1,
             )
             stats["source_mode"] = "precomputed"
+            stats["data_source"] = data_source
             return {
                 "ok": True,
                 "items": selected,
@@ -326,6 +347,11 @@ def collect_contactable_growth_companies(
                 "growth_only": True,
                 "growth_basis": "precomputed",
                 "industry_categories": sorted(selected_industries),
+                "district_name": district_name,
+                "data_source": data_source,
+                "minimum_employees": minimum_employees,
+                "maximum_employees": maximum_employees,
+                "minimum_growth": minimum_growth,
                 "searched_start_page": 0,
                 "searched_end_page": 0,
                 "priority_basis": (

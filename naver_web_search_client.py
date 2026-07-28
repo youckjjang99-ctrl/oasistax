@@ -12,8 +12,10 @@ import requests
 
 from contact_matching import (
     address_hint,
+    company_score,
     contact_match_score,
     is_mobile_phone,
+    normalize_email,
     normalize_phone,
     search_company_name,
 )
@@ -22,6 +24,19 @@ from contact_matching import (
 NAVER_ID_ENV = "NAVER_CLIENT_ID"
 NAVER_SECRET_ENV = "NAVER_CLIENT_SECRET"
 NAVER_WEB_URL = "https://openapi.naver.com/v1/search/webkr.json"
+NAVER_LOCAL_URL = "https://openapi.naver.com/v1/search/local.json"
+INSTAGRAM_RESERVED_PATHS = {
+    "accounts",
+    "about",
+    "developer",
+    "directory",
+    "explore",
+    "legal",
+    "p",
+    "reel",
+    "reels",
+    "stories",
+}
 BLOCKED_DOMAINS = {
     "naver.com",
     "blog.naver.com",
@@ -88,6 +103,184 @@ def _phones_from_text(value: Any) -> list[str]:
     )
 
 
+def _instagram_profile(value: Any) -> tuple[str, str]:
+    url = html.unescape(str(value or "")).strip()
+    match = re.search(
+        r"https?://(?:www\.)?instagram\.com/([A-Za-z0-9._]+)",
+        url,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return "", ""
+    username = match.group(1).strip(".").lower()
+    if not username or username in INSTAGRAM_RESERVED_PATHS:
+        return "", ""
+    return f"@{username}", f"https://www.instagram.com/{username}/"
+
+
+def _public_contacts_from_item(
+    company_name: str,
+    address: str,
+    item: dict[str, Any],
+) -> list[dict[str, Any]]:
+    title = _plain(item.get("title"))
+    description = _plain(item.get("description"))
+    url = str(item.get("link") or "").strip()
+    score = contact_match_score(
+        company_name,
+        address,
+        title,
+        description,
+        active=True,
+    )
+    if score < 65:
+        return []
+    contacts: list[dict[str, Any]] = []
+    combined = f"{title} {description}"
+    email_pattern = (
+        r"(?<![\w.+-])[\w.%+\-]+@[\w.\-]+\.[A-Za-z]{2,}"
+        r"(?![\w.-])"
+    )
+    for raw_email in re.findall(email_pattern, combined):
+        email = normalize_email(raw_email)
+        if not email:
+            continue
+        contacts.append(
+            {
+                "contact_type": "email",
+                "contact_value": email,
+                "contact_label": "네이버 공개검색 이메일",
+                "source_type": "naver_web_snippet",
+                "source_url": url,
+                "confidence": score,
+                "verification_status": "review_required",
+                "is_primary": False,
+                "metadata": {"matched_company_name": title},
+            }
+        )
+    instagram, instagram_url = _instagram_profile(
+        f"{url} {combined}"
+    )
+    if instagram:
+        contacts.append(
+            {
+                "contact_type": "instagram",
+                "contact_value": instagram,
+                "contact_label": "공개 인스타그램",
+                "source_type": "naver_web_snippet",
+                "source_url": instagram_url,
+                "confidence": score,
+                "verification_status": "review_required",
+                "is_primary": False,
+                "metadata": {"matched_company_name": title},
+            }
+        )
+    return contacts
+
+
+def search_company(
+    company_name: str,
+    address: str,
+    *,
+    timeout: int = 5,
+    display: int = 5,
+) -> dict[str, Any]:
+    """네이버 지역검색으로 업체명·주소·장소 링크를 교차 확인한다."""
+    if not key_status()["configured"]:
+        return {
+            "ok": False,
+            "status": "KEY_MISSING",
+            "message": "네이버 검색 API 키가 없습니다.",
+            "candidates": [],
+        }
+    query = f"{search_company_name(company_name)} {address_hint(address)}".strip()
+    try:
+        response = requests.get(
+            NAVER_LOCAL_URL,
+            headers=_headers(),
+            params={
+                "query": query,
+                "display": min(5, max(1, int(display))),
+                "start": 1,
+                "sort": "random",
+            },
+            timeout=max(2, int(timeout)),
+        )
+    except requests.Timeout:
+        return {
+            "ok": False,
+            "status": "TIMEOUT",
+            "message": "네이버 지도 검색 시간이 초과되었습니다.",
+            "candidates": [],
+        }
+    except requests.RequestException as exc:
+        return {
+            "ok": False,
+            "status": "NETWORK_ERROR",
+            "message": f"네이버 지도 검색 실패: {type(exc).__name__}",
+            "candidates": [],
+        }
+    if not response.ok:
+        return {
+            "ok": False,
+            "status": f"HTTP_{response.status_code}",
+            "message": response.text[:200],
+            "candidates": [],
+        }
+    try:
+        payload = response.json()
+    except ValueError:
+        return {
+            "ok": False,
+            "status": "INVALID_JSON",
+            "message": "네이버 지도 응답을 해석하지 못했습니다.",
+            "candidates": [],
+        }
+    candidates: list[dict[str, Any]] = []
+    for item in payload.get("items", []) if isinstance(payload, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        title = _plain(item.get("title"))
+        candidate_address = str(
+            item.get("roadAddress") or item.get("address") or ""
+        ).strip()
+        phone = normalize_phone(item.get("telephone"))
+        score = contact_match_score(
+            company_name,
+            address,
+            title,
+            candidate_address,
+            has_phone=bool(phone),
+            active=True,
+        )
+        if score < 65:
+            continue
+        candidates.append(
+            {
+                "company_name": title,
+                "address": candidate_address,
+                "phone": phone,
+                "phone_type": (
+                    "public_business_mobile"
+                    if is_mobile_phone(phone)
+                    else "company_main"
+                ),
+                "source_type": "naver_local",
+                "source_url": str(item.get("link") or "").strip(),
+                "confidence": score,
+                "raw": item,
+            }
+        )
+    candidates.sort(key=lambda row: int(row["confidence"]), reverse=True)
+    return {
+        "ok": True,
+        "status": "SUCCESS",
+        "message": f"네이버 지도 후보 {len(candidates)}건",
+        "query": query,
+        "candidates": candidates,
+    }
+
+
 def search_public_phones(
     company_name: str,
     address: str,
@@ -108,10 +301,12 @@ def search_public_phones(
         f'"{base_name}" 대표전화 {address_hint(address)}'.strip(),
         f'"{base_name}" 문의 연락처 {address_hint(address)}'.strip(),
         f'"{base_name}" 업무용 휴대전화 010'.strip(),
-        f'"{base_name}" 전화번호'.strip(),
+        f'"{base_name}" 이메일 인스타그램'.strip(),
     ]
     candidates: list[dict[str, Any]] = []
+    public_contacts: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
+    seen_contacts: set[tuple[str, str]] = set()
     checked_queries: list[str] = []
     def _search_query(query: str) -> tuple[str, list[dict[str, Any]]]:
         try:
@@ -156,6 +351,19 @@ def search_public_phones(
             title = _plain(item.get("title"))
             description = _plain(item.get("description"))
             combined = f"{title} {description}"
+            for contact in _public_contacts_from_item(
+                company_name,
+                address,
+                item,
+            ):
+                contact_key = (
+                    str(contact.get("contact_type") or ""),
+                    str(contact.get("contact_value") or ""),
+                )
+                if contact_key in seen_contacts:
+                    continue
+                seen_contacts.add(contact_key)
+                public_contacts.append(contact)
             for phone in _phones_from_text(combined):
                 score = contact_match_score(
                     company_name,
@@ -200,6 +408,7 @@ def search_public_phones(
         "message": f"네이버 공개 업무전화 {len(candidates)}건",
         "queries": checked_queries,
         "candidates": candidates,
+        "contacts": public_contacts,
     }
 
 

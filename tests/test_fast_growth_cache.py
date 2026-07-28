@@ -51,8 +51,10 @@ class FastGrowthCacheTest(unittest.TestCase):
                         "address": "서울특별시 마포구 월드컵로 1",
                         "industry_code": "62010",
                         "industry_name": "컴퓨터 프로그래밍 서비스업",
+                        "industry_category": "서비스업",
                         "province_code": "11",
                         "district_code": "11440",
+                        "district_name": "마포구",
                         "current_employee_count": 12,
                         "previous_employee_count": 8,
                         "employee_growth": 4,
@@ -69,6 +71,7 @@ class FastGrowthCacheTest(unittest.TestCase):
                         "district": "강남구",
                         "industry_code": "58222",
                         "industry_name": "응용 소프트웨어 개발 및 공급업",
+                        "industry_category": "서비스업",
                         "workers_2024": 5,
                         "workers_2025": 8,
                         "growth_2024_2025": 3,
@@ -80,6 +83,10 @@ class FastGrowthCacheTest(unittest.TestCase):
         rows = load_fast_growth_candidates(
             "11",
             minimum_employees=1,
+            maximum_employees=30,
+            minimum_growth=2,
+            district_name="강남구",
+            industry_categories=["서비스업"],
             limit=3,
         )
 
@@ -93,12 +100,23 @@ class FastGrowthCacheTest(unittest.TestCase):
         nps_params = request_get.call_args_list[0].kwargs["params"]
         comwel_params = request_get.call_args_list[1].kwargs["params"]
         self.assertEqual(nps_params["province_code"], "eq.11")
-        self.assertEqual(nps_params["current_employee_count"], "gte.10")
+        self.assertEqual(
+            nps_params["and"],
+            "(current_employee_count.gte.10,current_employee_count.lte.30)",
+        )
+        self.assertEqual(nps_params["district_name"], "eq.강남구")
+        self.assertEqual(
+            nps_params["industry_category"],
+            "in.(서비스업)",
+        )
+        self.assertEqual(nps_params["employee_growth"], "gte.2")
         self.assertEqual(comwel_params["province"], "eq.서울특별시")
+        self.assertEqual(comwel_params["district"], "eq.강남구")
         self.assertEqual(
             comwel_params["and"],
             "(workers_2025.gte.1,workers_2025.lte.9)",
         )
+        self.assertEqual(comwel_params["growth_2024_2025"], "gte.2")
 
     @patch(
         "prospect_db_repository.get_cloud_config",

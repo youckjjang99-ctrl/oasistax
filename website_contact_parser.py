@@ -34,6 +34,18 @@ CONTACT_WORDS = (
     "오시는길",
     "찾아오시는길",
 )
+INSTAGRAM_RESERVED_PATHS = {
+    "accounts",
+    "about",
+    "developer",
+    "directory",
+    "explore",
+    "legal",
+    "p",
+    "reel",
+    "reels",
+    "stories",
+}
 
 
 class _PageParser(HTMLParser):
@@ -169,6 +181,24 @@ def extract_public_contacts(text: str) -> tuple[list[str], list[str]]:
     return phones, emails
 
 
+def instagram_profile(value: Any, base_url: str = "") -> tuple[str, str]:
+    candidate = urljoin(base_url, html.unescape(str(value or "")).strip())
+    parsed = urlparse(candidate)
+    host = (parsed.hostname or "").lower()
+    if host not in {"instagram.com", "www.instagram.com"}:
+        return "", ""
+    parts = [part for part in parsed.path.split("/") if part]
+    if not parts:
+        return "", ""
+    username = parts[0].strip(".").lower()
+    if (
+        not re.fullmatch(r"[a-z0-9._]+", username)
+        or username in INSTAGRAM_RESERVED_PATHS
+    ):
+        return "", ""
+    return f"@{username}", f"https://www.instagram.com/{username}/"
+
+
 def _official_score(
     company_name: str,
     address: str,
@@ -263,6 +293,11 @@ def inspect_website(
                 "text": text,
                 "phones": phones,
                 "emails": emails,
+                "instagram_profiles": [
+                    profile
+                    for href, _label in parser.links
+                    if (profile := instagram_profile(href, final_url))[0]
+                ],
             }
         )
         all_text.append(text)
@@ -321,6 +356,22 @@ def inspect_website(
                     "source_url": page["url"],
                     "confidence": min(100, confidence + (10 if domain_match else 0)),
                     "metadata": {"domain_match": domain_match},
+                }
+            )
+        for username, profile_url in page["instagram_profiles"]:
+            key = ("instagram", username)
+            if key in seen:
+                continue
+            seen.add(key)
+            contacts.append(
+                {
+                    "contact_type": "instagram",
+                    "contact_value": username,
+                    "contact_label": "공식 홈페이지 공개 인스타그램",
+                    "source_type": "official_website",
+                    "source_url": profile_url,
+                    "confidence": confidence,
+                    "metadata": {"profile_url": profile_url},
                 }
             )
     return {
