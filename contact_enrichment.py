@@ -248,16 +248,23 @@ def enrich_company(
     skip_kakao: bool = False,
     skip_localdata: bool = False,
     bulk_mode: bool = False,
+    contact_stage: str = "all",
     max_website_candidates: int = 3,
     website_timeout: int = 10,
     website_max_pages: int = 4,
 ) -> dict[str, Any]:
+    stage = str(contact_stage or "all").strip().lower()
+    if stage not in {"all", "phone", "digital"}:
+        raise ValueError("contact_stage must be all, phone, or digital")
+    collect_phone = stage in {"all", "phone"}
+    collect_digital = stage in {"all", "digital"}
     cache_key = _cache_key(
         prospect,
         (
             skip_kakao,
             skip_localdata,
             bulk_mode,
+            stage,
             max_website_candidates,
             website_timeout,
             website_max_pages,
@@ -287,7 +294,7 @@ def enrich_company(
     with ThreadPoolExecutor(max_workers=3) as executor:
         kakao_future = (
             None
-            if skip_kakao
+            if skip_kakao or not collect_phone
             else executor.submit(
                 kakao_local_client.search_company, company_name, address
             )
@@ -299,13 +306,18 @@ def enrich_company(
             timeout=max(2, min(website_timeout, 6)),
             display=10,
             query_mode="bulk" if bulk_mode else "full",
+            contact_stage=stage,
         )
-        naver_local_future = executor.submit(
-            naver_web_search_client.search_company,
-            company_name,
-            address,
-            timeout=max(2, min(website_timeout, 6)),
-            display=5,
+        naver_local_future = (
+            None
+            if not collect_phone
+            else executor.submit(
+                naver_web_search_client.search_company,
+                company_name,
+                address,
+                timeout=max(2, min(website_timeout, 6)),
+                display=5,
+            )
         )
         kakao = (
             {"candidates": [], "status": "SKIPPED", "message": "빠른 조회에서 확인 완료"}
@@ -313,7 +325,11 @@ def enrich_company(
             else kakao_future.result()
         )
         naver_phones = naver_phone_future.result()
-        naver_local = naver_local_future.result()
+        naver_local = (
+            {"candidates": [], "status": "SKIPPED", "message": "디지털 연락처 단계"}
+            if naver_local_future is None
+            else naver_local_future.result()
+        )
     trace.append(
         {
             "stage": "kakao",
@@ -367,7 +383,7 @@ def enrich_company(
         "company_main",
         "public_business_mobile",
     }.issubset(phone_types)
-    if not has_both_phone_types and not skip_localdata:
+    if collect_phone and not has_both_phone_types and not skip_localdata:
         localdata = localdata_contact_client.search_company(
             company_name,
             address,
@@ -401,6 +417,8 @@ def enrich_company(
                 "message": (
                     "빠른 조회에서 확인 완료"
                     if skip_localdata
+                    else "전화번호 수집 단계가 아닙니다."
+                    if not collect_phone
                     else "대표번호와 공개 업무용 휴대전화를 모두 확인했습니다."
                 ),
             }
@@ -414,7 +432,7 @@ def enrich_company(
             "message": "대량 보강에서는 공식 홈페이지 정밀 탐색을 생략합니다.",
             "candidates": [],
         }
-        if bulk_mode
+        if bulk_mode or not collect_digital
         else naver_web_search_client.search_official_websites(
             company_name,
             address,
@@ -538,6 +556,16 @@ def enrich_company(
             }
         )
 
+    if stage == "phone":
+        contacts = [
+            row for row in contacts if row.get("contact_type") == "phone"
+        ]
+    elif stage == "digital":
+        contacts = [
+            row
+            for row in contacts
+            if row.get("contact_type") in {"email", "instagram"}
+        ]
     contacts = _deduplicate(contacts)
     status = "not_found"
     if any(row.get("verification_status") == "auto_verified" for row in contacts):

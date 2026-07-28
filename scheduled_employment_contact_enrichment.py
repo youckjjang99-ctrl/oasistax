@@ -20,6 +20,34 @@ from contact_matching import is_mobile_phone, normalize_phone
 
 TABLE_CONTACTS = "oasis_employment_contacts"
 CONTACT_TYPES = {"phone", "email", "instagram"}
+CONTACT_STAGES = {"phone", "digital"}
+STAGE_FIELDS = {
+    "phone": {
+        "status": "phone_status",
+        "checked_at": "phone_checked_at",
+        "next_check_at": "phone_next_check_at",
+        "attempt_count": "phone_attempt_count",
+        "last_error": "phone_last_error",
+    },
+    "digital": {
+        "status": "digital_status",
+        "checked_at": "digital_checked_at",
+        "next_check_at": "digital_next_check_at",
+        "attempt_count": "digital_attempt_count",
+        "last_error": "digital_last_error",
+    },
+}
+RATE_LIMIT_MARKERS = {
+    "HTTP_403",
+    "HTTP_429",
+    "QUOTA_EXCEEDED",
+    "RATE_LIMIT",
+    "RATE_LIMITED",
+}
+
+
+class UpstreamLimitError(RuntimeError):
+    """Raised when a contact provider reports a quota or rate limit."""
 
 
 def _now() -> datetime:
@@ -32,24 +60,32 @@ def _iso(value: datetime) -> str:
 
 def _select_rows(
     *,
+    stage: str,
     status: str,
     limit: int,
     due_before: str | None = None,
     updated_before: str | None = None,
 ) -> list[dict[str, Any]]:
+    fields = STAGE_FIELDS[stage]
+    status_field = fields["status"]
+    next_check_field = fields["next_check_at"]
     db = CloudDatabase()
     params: dict[str, str] = {
         "select": (
             "contact_key,source_type,source_record_key,business_no,"
             "company_name,address,industry_name,status,attempt_count,"
-            "mobile_phone,landline_phone,email,instagram_id,instagram_url"
+            "mobile_phone,landline_phone,email,instagram_id,instagram_url,"
+            "contact_sources,phone_status,phone_checked_at,"
+            "phone_next_check_at,phone_attempt_count,phone_last_error,"
+            "digital_status,digital_checked_at,digital_next_check_at,"
+            "digital_attempt_count,digital_last_error"
         ),
-        "status": f"eq.{status}",
+        status_field: f"eq.{status}",
         "limit": str(max(1, min(5000, int(limit)))),
     }
     if due_before:
-        params["next_check_at"] = f"lte.{due_before}"
-        params["order"] = "next_check_at.asc,updated_at.asc"
+        params[next_check_field] = f"lte.{due_before}"
+        params["order"] = f"{next_check_field}.asc,updated_at.asc"
     elif updated_before:
         params["updated_at"] = f"lt.{updated_before}"
         params["order"] = "updated_at.asc"
@@ -70,8 +106,10 @@ def _select_rows(
     return rows if isinstance(rows, list) else []
 
 
-def _eligible_rows(limit: int) -> list[dict[str, Any]]:
-    """월간 재검증 대상을 먼저 처리한 뒤 신규 대상을 채운다."""
+def _eligible_rows(limit: int, stage: str = "phone") -> list[dict[str, Any]]:
+    """단계별 재검증 대상을 처리한 뒤 신규 대상을 채운다."""
+    if stage not in CONTACT_STAGES:
+        raise ValueError("stage must be phone or digital")
     limit = max(1, min(5000, int(limit)))
     now = _now()
     due_before = _iso(now)
@@ -91,6 +129,7 @@ def _eligible_rows(limit: int) -> list[dict[str, Any]]:
         if remaining <= 0:
             break
         for row in _select_rows(
+            stage=stage,
             status=status,
             limit=remaining,
             due_before=due,
@@ -111,13 +150,14 @@ def _patch(
     values: dict[str, Any],
     *,
     expected_status: str | None = None,
+    status_field: str = "status",
 ) -> bool:
     db = CloudDatabase()
     headers = dict(db.headers)
     headers["Prefer"] = "return=representation"
     params = {"contact_key": f"eq.{contact_key}"}
     if expected_status:
-        params["status"] = f"eq.{expected_status}"
+        params[status_field] = f"eq.{expected_status}"
     response = requests.patch(
         db._url(TABLE_CONTACTS),
         headers=headers,
@@ -134,25 +174,37 @@ def _patch(
     return bool(rows)
 
 
-def _claim(row: dict[str, Any]) -> bool:
-    status = str(row.get("status") or "pending")
+def _claim(row: dict[str, Any], stage: str) -> bool:
+    fields = STAGE_FIELDS[stage]
+    status_field = fields["status"]
+    status = str(row.get(status_field) or "pending")
     return _patch(
         str(row.get("contact_key") or ""),
         {
-            "status": "processing",
-            "last_error": "",
+            status_field: "processing",
+            fields["last_error"]: "",
             "updated_at": _iso(_now()),
         },
         expected_status=status,
+        status_field=status_field,
     )
 
 
-def _accepted_contacts(result: dict[str, Any]) -> list[dict[str, Any]]:
+def _accepted_contacts(
+    result: dict[str, Any],
+    stage: str = "phone",
+) -> list[dict[str, Any]]:
     accepted: list[dict[str, Any]] = []
+    allowed_types = (
+        {"phone"} if stage == "phone" else {"email", "instagram"}
+    )
     for raw in result.get("contacts") or []:
         row = dict(raw)
         contact_type = str(row.get("contact_type") or "")
-        if contact_type not in CONTACT_TYPES:
+        if (
+            contact_type not in CONTACT_TYPES
+            or contact_type not in allowed_types
+        ):
             continue
         confidence = int(row.get("confidence") or 0)
         verification = str(row.get("verification_status") or "")
@@ -168,6 +220,15 @@ def _accepted_contacts(result: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         accepted.append(row)
     return accepted
+
+
+def _provider_limit_message(result: dict[str, Any]) -> str:
+    for row in result.get("trace") or []:
+        status = str((row or {}).get("status") or "").upper()
+        if any(marker in status for marker in RATE_LIMIT_MARKERS):
+            stage = str((row or {}).get("stage") or "provider")
+            return f"{stage}:{status}"
+    return ""
 
 
 def _best(
@@ -196,13 +257,21 @@ def _best(
     return candidates[0] if candidates else None
 
 
-def _enrich_one(row: dict[str, Any]) -> dict[str, Any]:
+def _enrich_one(
+    row: dict[str, Any],
+    stage: str = "phone",
+) -> dict[str, Any]:
+    if stage not in CONTACT_STAGES:
+        raise ValueError("stage must be phone or digital")
+    fields = STAGE_FIELDS[stage]
+    status_field = fields["status"]
     contact_key = str(row.get("contact_key") or "")
-    if not _claim(row):
+    if not _claim(row, stage):
         return {"status": "skipped", "contact_key": contact_key}
 
     checked_at = _now()
     attempt_count = int(row.get("attempt_count") or 0) + 1
+    stage_attempt_count = int(row.get(fields["attempt_count"]) or 0) + 1
     try:
         result = enrich_company(
             {
@@ -212,21 +281,70 @@ def _enrich_one(row: dict[str, Any]) -> dict[str, Any]:
                 "industry_name": row.get("industry_name"),
             },
             skip_localdata=True,
-            bulk_mode=True,
-            website_timeout=6,
+            bulk_mode=stage == "phone",
+            contact_stage=stage,
+            website_timeout=6 if stage == "phone" else 8,
+            max_website_candidates=2,
+            website_max_pages=2,
         )
         if not result.get("ok"):
             raise RuntimeError(
                 str(result.get("message") or result.get("status") or "")
             )
-        accepted = _accepted_contacts(result)
+        accepted = _accepted_contacts(result, stage)
+        provider_limit = _provider_limit_message(result)
+        if provider_limit and not accepted:
+            raise UpstreamLimitError(provider_limit)
+
         mobile = _best(accepted, "phone", mobile=True)
         landline = _best(accepted, "phone", mobile=False)
         email = _best(accepted, "email")
         instagram = _best(accepted, "instagram")
-        matched = any((mobile, landline, email, instagram))
-        next_check = checked_at + timedelta(days=30 if matched else 90)
-        source_rows = {
+
+        mobile_phone = (
+            normalize_phone(mobile.get("contact_value"))
+            if mobile
+            else normalize_phone(row.get("mobile_phone"))
+        )
+        landline_phone = (
+            normalize_phone(landline.get("contact_value"))
+            if landline
+            else normalize_phone(row.get("landline_phone"))
+        )
+        email_value = str(
+            email.get("contact_value")
+            if email
+            else row.get("email") or ""
+        )
+        instagram_id = str(
+            instagram.get("contact_value")
+            if instagram
+            else row.get("instagram_id") or ""
+        )
+        instagram_url = str(
+            instagram.get("source_url")
+            if instagram
+            else row.get("instagram_url") or ""
+        )
+        phase_matched = (
+            any((mobile_phone, landline_phone))
+            if stage == "phone"
+            else any((email_value, instagram_id, instagram_url))
+        )
+        overall_matched = any(
+            (
+                mobile_phone,
+                landline_phone,
+                email_value,
+                instagram_id,
+                instagram_url,
+            )
+        )
+        next_check = checked_at + timedelta(
+            days=30 if phase_matched else 90
+        )
+        source_rows = dict(row.get("contact_sources") or {})
+        source_rows.update({
             key: {
                 "source_type": value.get("source_type"),
                 "source_url": value.get("source_url"),
@@ -239,74 +357,102 @@ def _enrich_one(row: dict[str, Any]) -> dict[str, Any]:
                 "instagram": instagram,
             }.items()
             if value
+        })
+        values = {
+            "mobile_phone": mobile_phone,
+            "landline_phone": landline_phone,
+            "email": email_value,
+            "instagram_id": instagram_id,
+            "instagram_url": instagram_url,
+            "contact_sources": source_rows,
+            "status": "matched" if overall_matched else "no_match",
+            "checked_at": _iso(checked_at),
+            "next_check_at": _iso(next_check),
+            "attempt_count": attempt_count,
+            "last_error": "",
+            status_field: "matched" if phase_matched else "no_match",
+            fields["checked_at"]: _iso(checked_at),
+            fields["next_check_at"]: _iso(next_check),
+            fields["attempt_count"]: stage_attempt_count,
+            fields["last_error"]: "",
         }
         _patch(
             contact_key,
-            {
-                "mobile_phone": (
-                    normalize_phone(mobile.get("contact_value"))
-                    if mobile
-                    else ""
-                ),
-                "landline_phone": (
-                    normalize_phone(landline.get("contact_value"))
-                    if landline
-                    else ""
-                ),
-                "email": str(
-                    email.get("contact_value") if email else ""
-                ),
-                "instagram_id": str(
-                    instagram.get("contact_value") if instagram else ""
-                ),
-                "instagram_url": str(
-                    instagram.get("source_url") if instagram else ""
-                ),
-                "contact_sources": source_rows,
-                "status": "matched" if matched else "no_match",
-                "checked_at": _iso(checked_at),
-                "next_check_at": _iso(next_check),
-                "attempt_count": attempt_count,
-                "last_error": "",
-            },
+            values,
             expected_status="processing",
+            status_field=status_field,
         )
         return {
-            "status": "matched" if matched else "no_match",
+            "status": "matched" if phase_matched else "no_match",
             "contact_key": contact_key,
+            "stage": stage,
         }
     except Exception as exc:
+        is_limit = isinstance(exc, UpstreamLimitError)
         _patch(
             contact_key,
             {
-                "status": "error",
+                "status": (
+                    "matched"
+                    if any(
+                        (
+                            row.get("mobile_phone"),
+                            row.get("landline_phone"),
+                            row.get("email"),
+                            row.get("instagram_id"),
+                            row.get("instagram_url"),
+                        )
+                    )
+                    else "error"
+                ),
                 "checked_at": _iso(checked_at),
                 "next_check_at": _iso(checked_at + timedelta(days=1)),
                 "attempt_count": attempt_count,
                 "last_error": f"{type(exc).__name__}: {exc}"[:1000],
+                status_field: "error",
+                fields["checked_at"]: _iso(checked_at),
+                fields["next_check_at"]: _iso(
+                    checked_at + timedelta(days=1)
+                ),
+                fields["attempt_count"]: stage_attempt_count,
+                fields["last_error"]: (
+                    f"{type(exc).__name__}: {exc}"[:1000]
+                ),
             },
             expected_status="processing",
+            status_field=status_field,
         )
-        return {"status": "error", "contact_key": contact_key}
+        return {
+            "status": "error",
+            "contact_key": contact_key,
+            "stage": stage,
+            "halt": is_limit,
+        }
 
 
 def run_enrichment(
     *,
-    workers: int = 4,
+    stage: str = "phone",
+    workers: int = 12,
     batch_size: int = 200,
-    max_records: int = 3000,
+    max_records: int = 12000,
 ) -> int:
-    if not (
-        kakao_local_client.key_status()["configured"]
-        or naver_web_search_client.key_status()["configured"]
-    ):
+    if stage not in CONTACT_STAGES:
+        raise ValueError("stage must be phone or digital")
+    kakao_configured = kakao_local_client.key_status()["configured"]
+    naver_configured = naver_web_search_client.key_status()["configured"]
+    if stage == "phone" and not (kakao_configured or naver_configured):
         raise RuntimeError(
             "KAKAO_REST_API_KEY 또는 네이버 검색 API 키가 필요합니다."
         )
+    if stage == "digital" and not naver_configured:
+        raise RuntimeError(
+            "이메일·인스타그램 수집에는 네이버 검색 API 키가 필요합니다."
+        )
 
-    workers = max(1, min(6, int(workers)))
+    workers = max(1, min(16, int(workers)))
     batch_size = max(1, min(1000, int(batch_size)))
-    max_records = max(1, min(20000, int(max_records)))
+    max_records = max(1, min(25000, int(max_records)))
     totals = {
         "matched": 0,
         "no_match": 0,
@@ -314,28 +460,50 @@ def run_enrichment(
         "skipped": 0,
     }
     processed = 0
+    halted = False
     while processed < max_records:
-        rows = _eligible_rows(min(batch_size, max_records - processed))
+        rows = _eligible_rows(
+            min(batch_size, max_records - processed),
+            stage,
+        )
         if not rows:
             break
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = [executor.submit(_enrich_one, row) for row in rows]
+            futures = [
+                executor.submit(_enrich_one, row, stage) for row in rows
+            ]
             for future in as_completed(futures):
                 result = future.result()
                 status = str(result.get("status") or "error")
                 totals[status] = totals.get(status, 0) + 1
+                halted = halted or bool(result.get("halt"))
                 processed += 1
         print(
             json.dumps(
                 {
-                    "job": "employment-contact-enrichment",
+                    "job": f"employment-{stage}-enrichment",
+                    "stage": stage,
                     "processed": processed,
+                    "halted": halted,
                     **totals,
                 },
                 ensure_ascii=False,
             ),
             flush=True,
         )
+        if halted:
+            print(
+                json.dumps(
+                    {
+                        "job": f"employment-{stage}-enrichment",
+                        "status": "paused_by_provider_limit",
+                        "processed": processed,
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            break
         time.sleep(0.2)
     return 0
 
@@ -343,9 +511,14 @@ def run_enrichment(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "--stage",
+        choices=sorted(CONTACT_STAGES),
+        default=os.environ.get("EMPLOYMENT_CONTACT_STAGE", "phone"),
+    )
+    parser.add_argument(
         "--workers",
         type=int,
-        default=int(os.environ.get("EMPLOYMENT_CONTACT_WORKERS", "4")),
+        default=int(os.environ.get("EMPLOYMENT_CONTACT_WORKERS", "12")),
     )
     parser.add_argument(
         "--batch-size",
@@ -358,11 +531,12 @@ def main() -> int:
         "--max-records",
         type=int,
         default=int(
-            os.environ.get("EMPLOYMENT_CONTACT_MAX_RECORDS", "3000")
+            os.environ.get("EMPLOYMENT_CONTACT_MAX_RECORDS", "12000")
         ),
     )
     args = parser.parse_args()
     return run_enrichment(
+        stage=args.stage,
         workers=args.workers,
         batch_size=args.batch_size,
         max_records=args.max_records,

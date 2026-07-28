@@ -288,6 +288,7 @@ def search_public_phones(
     timeout: int = 5,
     display: int = 10,
     query_mode: str = "full",
+    contact_stage: str = "all",
 ) -> dict[str, Any]:
     """네이버 웹 검색 결과에 공개 노출된 회사 전화만 보수적으로 수집."""
     if not key_status()["configured"]:
@@ -297,22 +298,36 @@ def search_public_phones(
             "message": "네이버 검색 API 키가 없습니다.",
             "candidates": [],
         }
+    stage = str(contact_stage or "all").strip().lower()
+    if stage not in {"all", "phone", "digital"}:
+        raise ValueError("contact_stage must be all, phone, or digital")
     base_name = search_company_name(company_name)
     if str(query_mode or "").strip().lower() == "bulk":
-        queries = [
+        phone_queries = [
             (
                 f'"{base_name}" 대표전화 문의 연락처 010 '
                 f"{address_hint(address)}"
             ).strip(),
+        ]
+        digital_queries = [
             f'"{base_name}" 이메일 인스타그램'.strip(),
         ]
     else:
-        queries = [
+        phone_queries = [
             f'"{base_name}" 대표전화 {address_hint(address)}'.strip(),
             f'"{base_name}" 문의 연락처 {address_hint(address)}'.strip(),
             f'"{base_name}" 업무용 휴대전화 010'.strip(),
+        ]
+        digital_queries = [
             f'"{base_name}" 이메일 인스타그램'.strip(),
         ]
+    queries = (
+        phone_queries
+        if stage == "phone"
+        else digital_queries
+        if stage == "digital"
+        else phone_queries + digital_queries
+    )
     candidates: list[dict[str, Any]] = []
     public_contacts: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
@@ -361,10 +376,14 @@ def search_public_phones(
             title = _plain(item.get("title"))
             description = _plain(item.get("description"))
             combined = f"{title} {description}"
-            for contact in _public_contacts_from_item(
-                company_name,
-                address,
-                item,
+            for contact in (
+                _public_contacts_from_item(
+                    company_name,
+                    address,
+                    item,
+                )
+                if stage in {"all", "digital"}
+                else []
             ):
                 contact_key = (
                     str(contact.get("contact_type") or ""),
@@ -374,7 +393,11 @@ def search_public_phones(
                     continue
                 seen_contacts.add(contact_key)
                 public_contacts.append(contact)
-            for phone in _phones_from_text(combined):
+            for phone in (
+                _phones_from_text(combined)
+                if stage in {"all", "phone"}
+                else []
+            ):
                 score = contact_match_score(
                     company_name,
                     address,
