@@ -104,6 +104,47 @@ class ContactCollectionTest(unittest.TestCase):
         self.assertEqual(len(result["queries"]), 2)
         self.assertIn("이메일", result["queries"][1])
 
+    @patch.dict(
+        "os.environ",
+        {"NAVER_CLIENT_ID": "id", "NAVER_CLIENT_SECRET": "secret"},
+    )
+    @patch("naver_web_search_client.requests.get")
+    def test_naver_phone_stage_skips_digital_query(self, mocked_get) -> None:
+        mocked_get.side_effect = lambda *args, **kwargs: _NaverResponse(
+            kwargs["params"]["query"]
+        )
+        result = naver_web_search_client.search_public_phones(
+            "테스트기업",
+            "서울특별시 강남구",
+            query_mode="bulk",
+            contact_stage="phone",
+        )
+        self.assertEqual(len(result["queries"]), 1)
+        self.assertNotIn("이메일", result["queries"][0])
+        self.assertEqual(result["contacts"], [])
+
+    @patch.dict(
+        "os.environ",
+        {"NAVER_CLIENT_ID": "id", "NAVER_CLIENT_SECRET": "secret"},
+    )
+    @patch("naver_web_search_client.requests.get")
+    def test_naver_digital_stage_skips_phone_queries(
+        self,
+        mocked_get,
+    ) -> None:
+        mocked_get.side_effect = lambda *args, **kwargs: _NaverResponse(
+            kwargs["params"]["query"]
+        )
+        result = naver_web_search_client.search_public_phones(
+            "테스트기업",
+            "서울특별시 강남구",
+            query_mode="bulk",
+            contact_stage="digital",
+        )
+        self.assertEqual(len(result["queries"]), 1)
+        self.assertIn("이메일", result["queries"][0])
+        self.assertEqual(result["candidates"], [])
+
     def test_instagram_profile_rejects_post_and_keeps_profile(self) -> None:
         self.assertEqual(
             instagram_profile(

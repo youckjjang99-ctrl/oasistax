@@ -389,12 +389,13 @@ def main() -> int:
         collection_status = collection_status or run_enrichment()
 
     employment_status = run_employment_contact_enrichment(
-        workers=int(os.environ.get("EMPLOYMENT_CONTACT_WORKERS", "4")),
+        stage=os.environ.get("EMPLOYMENT_CONTACT_STAGE", "phone"),
+        workers=int(os.environ.get("EMPLOYMENT_CONTACT_WORKERS", "12")),
         batch_size=int(
             os.environ.get("EMPLOYMENT_CONTACT_BATCH_SIZE", "200")
         ),
         max_records=int(
-            os.environ.get("EMPLOYMENT_CONTACT_MAX_RECORDS", "3000")
+            os.environ.get("EMPLOYMENT_CONTACT_MAX_RECORDS", "12000")
         ),
     )
     return collection_status or employment_status
