@@ -215,6 +215,110 @@ button[data-baseweb="tab"] {
 
 /* 모바일에서는 여러 열을 세로 흐름으로 전환하고 조작 영역을 넓힌다. */
 @media (max-width: 768px) {
+    [data-testid="stSidebar"] {
+        width: min(82vw, 300px) !important;
+        min-width: min(82vw, 300px) !important;
+        max-width: min(82vw, 300px) !important;
+    }
+    [data-testid="stSidebar"] > div:first-child {
+        width: 100% !important;
+        padding: 0.8rem 0.75rem 1rem 0.75rem !important;
+        overflow-x: hidden !important;
+    }
+    [data-testid="stSidebar"] img {
+        width: 142px !important;
+        margin: 0 auto 0.15rem auto !important;
+    }
+    .sidebar-brand {
+        margin-bottom: 0.65rem !important;
+    }
+    .sidebar-brand-title {
+        font-size: 21px !important;
+        letter-spacing: -0.4px !important;
+    }
+    .sidebar-brand-sub {
+        font-size: 10px !important;
+        margin-top: 4px !important;
+        letter-spacing: 0.55px !important;
+    }
+    .sidebar-user-card {
+        border-radius: 13px !important;
+        padding: 10px 12px !important;
+    }
+    .sidebar-user-card .name {
+        font-size: 16px !important;
+    }
+    .sidebar-user-card .role {
+        font-size: 12px !important;
+    }
+    .sidebar-section-label {
+        font-size: 10px !important;
+        margin: 11px 0 6px 3px !important;
+        letter-spacing: 0.8px !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stButtonGroup"] {
+        width: 100% !important;
+        margin-bottom: 0.45rem !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stButtonGroup"]
+    [role="radiogroup"] {
+        display: grid !important;
+        grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
+        width: 100% !important;
+        gap: 5px !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stButtonGroup"]
+    [data-variant="pills"] {
+        width: 100% !important;
+        min-width: 0 !important;
+        min-height: 36px !important;
+        padding: 6px 4px !important;
+        justify-content: center !important;
+        border: 1px solid rgba(255,255,255,0.24) !important;
+        border-radius: 10px !important;
+        background: rgba(255,255,255,0.08) !important;
+        color: rgba(255,255,255,0.88) !important;
+        font-size: 11px !important;
+        font-weight: 800 !important;
+        white-space: nowrap !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stButtonGroup"]
+    [data-variant="pills"][data-selected="true"],
+    [data-testid="stSidebar"] [data-testid="stButtonGroup"]
+    [data-variant="pills"][aria-pressed="true"] {
+        background: #ffffff !important;
+        border-color: #ffffff !important;
+        color: var(--oasis-blue-text) !important;
+        box-shadow: 0 7px 18px rgba(0,0,0,0.15) !important;
+    }
+    [data-testid="stSidebar"] div[role="radiogroup"] label {
+        width: 100% !important;
+        min-height: 42px !important;
+        margin-bottom: 5px !important;
+        padding: 9px 11px !important;
+        border-radius: 12px !important;
+        box-sizing: border-box !important;
+    }
+    [data-testid="stSidebar"] div[role="radiogroup"] label > div:first-child {
+        display: none !important;
+    }
+    [data-testid="stSidebar"] div[role="radiogroup"] label p {
+        width: 100% !important;
+        font-size: 14px !important;
+        letter-spacing: -0.25px !important;
+        white-space: nowrap !important;
+    }
+    [data-testid="stSidebar"] div[role="radiogroup"] label:hover {
+        transform: none !important;
+    }
+    [data-testid="stSidebar"] hr {
+        margin: 0.8rem 0 !important;
+        border-color: rgba(255,255,255,0.15) !important;
+    }
+    [data-testid="stSidebar"] .stButton > button {
+        min-height: 40px !important;
+        font-size: 13px !important;
+    }
     .block-container {
         padding: 0.7rem 0.75rem 5rem 0.75rem !important;
         max-width: 100% !important;
