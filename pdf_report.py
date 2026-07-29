@@ -962,6 +962,109 @@ def build_representative_pdf(
         )
         story += [tax_table, Spacer(1, 7 * mm)]
 
+    temporary_advance = analysis.get("temporary_advance") or {}
+    if temporary_advance:
+        advance_inputs = temporary_advance.get("inputs", {}) or {}
+        advance_representative = (
+            temporary_advance.get("representative", {}) or {}
+        )
+        advance_company = temporary_advance.get("company", {}) or {}
+        story += [
+            _pdf_section_title("06. 가지급금 세무/4대보험 사전진단", styles),
+            Spacer(1, 5 * mm),
+        ]
+        advance_rows = [
+            ["관점", "항목", "추정금액", "판단 기준"],
+            [
+                "공통",
+                "가지급금 잔액",
+                _money(advance_inputs.get("balance")),
+                (
+                    f"인정이자율 "
+                    f"{float(advance_inputs.get('recognized_interest_rate_pct', 0) or 0):.2f}%"
+                ),
+            ],
+            [
+                "대표자",
+                "상여처분 소득",
+                _money(advance_representative.get("bonus_disposition")),
+                "미회수 인정이자 상여 가정",
+            ],
+            [
+                "대표자",
+                "세금/보험 합계",
+                _money(advance_representative.get("total_burden")),
+                "누진소득세/지방소득세/선택 보험",
+            ],
+            [
+                "법인",
+                "연간 인정이자",
+                _money(advance_company.get("recognized_interest")),
+                "회사에 귀속되어야 할 이자",
+            ],
+            [
+                "법인",
+                "지급이자 손금불산입",
+                _money(advance_company.get("disallowed_interest")),
+                "차입금/지급이자 단순 적수 가정",
+            ],
+            [
+                "법인",
+                "세금/보험 합계",
+                _money(advance_company.get("tax_and_insurance_burden")),
+                "추가 세금 + 회사 부담 보험료",
+            ],
+        ]
+        advance_header = ParagraphStyle(
+            "v861_advance_header",
+            parent=body_small,
+            fontName=FONT_BOLD,
+            textColor=colors.white,
+        )
+        advance_rendered = [
+            [
+                Paragraph(
+                    _clean(value),
+                    advance_header if row_index == 0 else body_small,
+                )
+                for value in row
+            ]
+            for row_index, row in enumerate(advance_rows)
+        ]
+        advance_table = Table(
+            advance_rendered,
+            colWidths=[23 * mm, 48 * mm, 38 * mm, 65 * mm],
+            repeatRows=1,
+        )
+        advance_table.setStyle(
+            TableStyle(
+                [
+                    ("FONTNAME", (0, 0), (-1, 0), FONT_BOLD),
+                    ("FONTNAME", (0, 1), (-1, -1), FONT_NORMAL),
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#7048C8")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("GRID", (0, 0), (-1, -1), 0.35, MID),
+                    ("ALIGN", (2, 1), (2, -1), "RIGHT"),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("TOPPADDING", (0, 0), (-1, -1), 6),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                ]
+            )
+        )
+        story += [
+            advance_table,
+            Spacer(1, 3 * mm),
+            Paragraph(
+                "※ 가지급금 원금 자체를 대표자 소득으로 단정하지 않습니다. "
+                "인정이자율은 원칙적으로 가중평균차입이자율이며, 상여처분/보수반영/"
+                "고용산재 피보험자격은 계정별원장과 계약서 및 공단 확인 후 확정해야 합니다.",
+                body_small,
+            ),
+            Spacer(1, 7 * mm),
+        ]
+
     story += [
         Spacer(1, 4 * mm),
         Paragraph(

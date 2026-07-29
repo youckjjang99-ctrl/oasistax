@@ -248,6 +248,56 @@ def save_policy_recommendations(
     return record
 
 
+def save_temporary_advance_calculation(
+    user_id: str,
+    business_no: Any,
+    company_name: str,
+    calculation: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist the customer calculator result in the existing preference JSON.
+
+    The matching-preferences table is already owner/business scoped and stores
+    extensible JSON, so no public table or RLS change is needed.
+    """
+    key = normalize_business_no(business_no)
+    if len(re.sub(r"[^0-9]", "", key)) != 10:
+        raise ValueError(
+            "사업자등록번호가 확인되어야 가지급금 계산결과를 저장할 수 있습니다."
+        )
+    if not isinstance(calculation, dict):
+        raise ValueError("저장할 가지급금 계산결과가 올바르지 않습니다.")
+
+    data = _load_all(user_id)
+    current = data.get(key, {})
+    if not isinstance(current, dict):
+        current = {}
+
+    record = dict(current)
+    record.update(
+        {
+            "사업자등록번호": key,
+            "업체명": _safe_text(
+                company_name or current.get("업체명", ""),
+                120,
+            ),
+            "가지급금계산": calculation,
+            "가지급금계산_저장일시": datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+            "수정일시": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
+    data[key] = record
+    _save_all(user_id, data)
+
+    try:
+        sync_matching_preferences(user_id, key, record)
+    except Exception as sync_error:
+        record["_cloud_sync_warning"] = str(sync_error)
+
+    return record
+
+
 def preference_summary(preferences: dict[str, Any]) -> str:
     parts = []
 

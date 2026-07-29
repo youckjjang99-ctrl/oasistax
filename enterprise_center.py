@@ -54,6 +54,7 @@ from matching_preferences import (
 )
 from multi_source_policy import render_multi_source_match
 from stock_valuation import render_stock_valuation_page
+from temporary_advance_ui import render_temporary_advance_calculator
 from registered_policy_match import (
     build_customer_labels,
     load_registered_customers,
@@ -581,6 +582,7 @@ def render_enterprise_management_center(
         tab_articles,
         tab_history,
         tab_employees,
+        tab_temporary_advance,
     ) = st.tabs(
         [
             "기업정보",
@@ -590,6 +592,7 @@ def render_enterprise_management_center(
             "정관검토",
             "기업히스토리",
             "직원현황",
+            "가지급금 계산기",
         ]
     )
 
@@ -1108,4 +1111,16 @@ def render_enterprise_management_center(
             business_no=business_no,
             company_name=company_name,
             company_address=company_address,
+        )
+
+    with tab_temporary_advance:
+        render_temporary_advance_calculator(
+            user_id=user_id,
+            user_name=user_name,
+            business_no=business_no,
+            company_name=company_name,
+            selected_row=selected_row,
+            financial=financial,
+            preferences=preferences,
+            is_individual=is_individual,
         )

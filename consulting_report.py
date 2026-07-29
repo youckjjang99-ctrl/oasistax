@@ -38,6 +38,11 @@ from comprehensive_financial_diagnosis import (
 )
 from data_completeness_engine import build_data_completeness
 from company_health_engine import build_company_health
+from temporary_advance_calculator import (
+    calculate_temporary_advance,
+    default_temporary_advance_inputs,
+    extract_temporary_advance_balance,
+)
 
 
 
@@ -821,6 +826,43 @@ def build_consulting_analysis(
         "기업전체주식가치": stock_result.get("total_equity_value"),
     }
 
+    saved_temporary_advance = preferences.get("가지급금계산", {}) or {}
+    if isinstance(saved_temporary_advance, dict) and saved_temporary_advance:
+        temporary_advance = saved_temporary_advance
+    else:
+        advance_balance, _advance_source = extract_temporary_advance_balance(
+            customer,
+            financial,
+        )
+        temporary_advance = (
+            calculate_temporary_advance(
+                default_temporary_advance_inputs(advance_balance)
+            )
+            if advance_balance > 0
+            else {}
+        )
+
+    if temporary_advance:
+        advance_inputs = temporary_advance.get("inputs", {}) or {}
+        advance_company = temporary_advance.get("company", {}) or {}
+        advance_representative = (
+            temporary_advance.get("representative", {}) or {}
+        )
+        advance_balance = _number(advance_inputs.get("balance")) or 0
+        if advance_balance > 0:
+            cautions.append(
+                f"가지급금·임원대여금 {_format_money(advance_balance)}이 "
+                "확인되어 인정이자와 업무무관 대여금 세무조정 검토가 필요합니다."
+            )
+            strategy.append(
+                "가지급금 사전진단: 연간 인정이자 "
+                f"{_format_money(advance_company.get('recognized_interest'))}, "
+                "대표자 세금·보험 추정 "
+                f"{_format_money(advance_representative.get('total_burden'))}, "
+                "법인 세금·보험 추정 "
+                f"{_format_money(advance_company.get('tax_and_insurance_burden'))}."
+            )
+
     completeness_result = build_data_completeness(
         business_no=business_no, industry=industry, address=address,
         establishment=establishment, financial=financial, registry=registry,
@@ -872,6 +914,7 @@ def build_consulting_analysis(
         "preferences": preferences,
         "registry": registry,
         "stock_summary": stock_summary,
+        "temporary_advance": temporary_advance,
         "consultation_context": consultation_context,
         "data_sources": {
             "cretop": bool(len(customer.index)),
@@ -883,6 +926,7 @@ def build_consulting_analysis(
             "employee_status": employee_source_available,
             "articles_review": bool(articles_review),
             "matching_preferences": has_preferences,
+            "temporary_advance": bool(temporary_advance),
         },
         "completeness": completeness,
         "completeness_status": completeness_status,
@@ -1024,6 +1068,30 @@ def build_consulting_excel_report(analysis: dict[str, Any]) -> bytes:
     for row in financial_rows:
         financial.append(row)
     _style_sheet(financial)
+
+    temporary_advance = analysis.get("temporary_advance", {}) or {}
+    if temporary_advance:
+        advance_sheet = workbook.create_sheet("가지급금사전진단")
+        advance_sheet.append(["관점", "항목", "추정금액", "설명"])
+        representative = temporary_advance.get("representative", {}) or {}
+        company = temporary_advance.get("company", {}) or {}
+        advance_rows = [
+            ["대표자", "상여처분 소득", representative.get("bonus_disposition", 0), "미회수 인정이자 상여 가정"],
+            ["대표자", "종합소득세", representative.get("income_tax", 0), "기존 과세표준 포함 누진세율"],
+            ["대표자", "개인지방소득세", representative.get("local_income_tax", 0), "종합소득세의 10%"],
+            ["대표자", "4대보험", representative.get("insurance_total", 0), "선택한 피보험자격 기준"],
+            ["대표자", "합계", representative.get("total_burden", 0), "세금 + 보험료"],
+            ["법인", "연간 인정이자", company.get("recognized_interest", 0), "회사에 귀속되어야 할 이자"],
+            ["법인", "지급이자 손금불산입", company.get("disallowed_interest", 0), "차입금·지급이자 단순 적수 가정"],
+            ["법인", "법인세·지방소득세", company.get("tax_total", 0), "세무조정으로 증가한 추정세액"],
+            ["법인", "회사 부담 4대보험", company.get("employer_insurance_total", 0), "상여 보수반영 가정"],
+            ["법인", "세금·보험 합계", company.get("tax_and_insurance_burden", 0), "추가 현금부담"],
+        ]
+        for row in advance_rows:
+            advance_sheet.append(row)
+        for cell in advance_sheet["C"][1:]:
+            cell.number_format = '#,##0"원"'
+        _style_sheet(advance_sheet)
 
     diagnosis = workbook.create_sheet("컨설팅진단")
     diagnosis.append(["구분", "내용"])
@@ -1528,6 +1596,70 @@ def render_ai_consulting_report_page(
     for column, (label, value, note, tone) in zip(ratio_columns, ratio_items):
         with column:
             st.markdown(_metric_card(label, value, note, tone), unsafe_allow_html=True)
+
+    temporary_advance = analysis.get("temporary_advance", {}) or {}
+    if temporary_advance:
+        advance_inputs = temporary_advance.get("inputs", {}) or {}
+        advance_representative = (
+            temporary_advance.get("representative", {}) or {}
+        )
+        advance_company = temporary_advance.get("company", {}) or {}
+        st.markdown("### 가지급금 세무·4대보험 사전진단")
+        a1, a2, a3 = st.columns(3)
+        a1.metric(
+            "가지급금 잔액",
+            _format_money(advance_inputs.get("balance")),
+        )
+        a2.metric(
+            "대표자 세금·보험",
+            _format_money(advance_representative.get("total_burden")),
+            "상여처분 시나리오",
+        )
+        a3.metric(
+            "법인 세금·보험",
+            _format_money(
+                advance_company.get("tax_and_insurance_burden")
+            ),
+            "추가 현금부담",
+        )
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "관점": "대표자",
+                        "항목": "상여처분 소득",
+                        "추정금액": _format_money(
+                            advance_representative.get(
+                                "bonus_disposition"
+                            )
+                        ),
+                    },
+                    {
+                        "관점": "대표자",
+                        "항목": "종합소득세·지방소득세",
+                        "추정금액": _format_money(
+                            advance_representative.get("tax_total")
+                        ),
+                    },
+                    {
+                        "관점": "법인",
+                        "항목": "연간 인정이자",
+                        "추정금액": _format_money(
+                            advance_company.get("recognized_interest")
+                        ),
+                    },
+                    {
+                        "관점": "법인",
+                        "항목": "지급이자 손금불산입",
+                        "추정금액": _format_money(
+                            advance_company.get("disallowed_interest")
+                        ),
+                    },
+                ]
+            ),
+            hide_index=True,
+            use_container_width=True,
+        )
 
     c1, c2, c3 = st.columns(3)
     with c1:
