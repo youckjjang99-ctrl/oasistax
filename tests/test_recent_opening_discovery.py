@@ -123,6 +123,7 @@ class RecentOpeningDiscoveryTest(unittest.TestCase):
             maximum_employees=30,
             recent_months=12,
             include_comwel_annual=True,
+            business_type="stock",
             district_name="마포구",
             industry_categories=["서비스업"],
             contact_channels=["mobile_phone"],
@@ -151,6 +152,11 @@ class RecentOpeningDiscoveryTest(unittest.TestCase):
             "recent_opening:nps_monthly:nps-without-business-no",
         )
         payload = json.loads(request_post.call_args.kwargs["data"])
+        self.assertTrue(
+            request_post.call_args.args[0].endswith(
+                "/rpc/oasis_search_recent_openings_v2"
+            )
+        )
         self.assertEqual(payload["p_province_code"], "11")
         self.assertEqual(payload["p_province_name"], "서울특별시")
         self.assertEqual(payload["p_recent_months"], 12)
@@ -158,6 +164,7 @@ class RecentOpeningDiscoveryTest(unittest.TestCase):
         self.assertEqual(payload["p_district"], "마포구")
         self.assertEqual(payload["p_industries"], ["서비스업"])
         self.assertEqual(payload["p_contact_channels"], ["mobile_phone"])
+        self.assertEqual(payload["p_business_type"], "stock")
 
     @patch("prospect_collection_service.remove_existing_prospects")
     @patch(
@@ -210,6 +217,10 @@ class RecentOpeningDiscoveryTest(unittest.TestCase):
         )
         self.assertFalse(
             loader.call_args.kwargs["include_comwel_annual"]
+        )
+        self.assertEqual(
+            loader.call_args.kwargs["business_type"],
+            "all",
         )
 
     def test_missing_business_number_uses_source_and_place_deduplication(

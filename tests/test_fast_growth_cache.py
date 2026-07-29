@@ -103,6 +103,7 @@ class FastGrowthCacheTest(unittest.TestCase):
             minimum_employees=1,
             maximum_employees=30,
             minimum_growth=2,
+            business_type="stock",
             district_name="강남구",
             industry_categories=["서비스업"],
             contact_channels=["mobile_phone", "email"],
@@ -120,6 +121,11 @@ class FastGrowthCacheTest(unittest.TestCase):
         self.assertEqual(rows[1]["고용증가기준"], "annual")
         self.assertEqual(rows[1]["고용증가구분"], "전년대비 +3명")
         payload = json.loads(request_post.call_args.kwargs["data"])
+        self.assertTrue(
+            request_post.call_args.args[0].endswith(
+                "/rpc/oasis_search_employment_growth_v2"
+            )
+        )
         self.assertEqual(payload["p_province_code"], "11")
         self.assertEqual(payload["p_province_name"], "서울특별시")
         self.assertEqual(payload["p_district"], "강남구")
@@ -130,6 +136,7 @@ class FastGrowthCacheTest(unittest.TestCase):
             payload["p_contact_channels"],
             ["email", "mobile_phone"],
         )
+        self.assertEqual(payload["p_business_type"], "stock")
         self.assertEqual(payload["p_limit"], 3)
 
     @patch(
@@ -179,7 +186,7 @@ class FastGrowthCacheTest(unittest.TestCase):
     def test_precomputed_query_supports_500_results(
         self,
         _identities,
-        _cached,
+        cached,
         _customers,
         remove_prospects,
     ) -> None:
@@ -193,6 +200,11 @@ class FastGrowthCacheTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["found_count"], 500)
         self.assertEqual(result["contact_channels"], ["email"])
+        self.assertEqual(
+            cached.call_args.kwargs["business_type"],
+            "all",
+        )
+        self.assertEqual(cached.call_args.kwargs["limit"], 500)
 
     @patch("prospect_collection_service.fetch_nps_workplaces")
     @patch(
