@@ -42,7 +42,7 @@ def apply_oasis_ui():
     margin: 0 0 0.35rem 0 !important;
     overflow: hidden !important;
 }
-[data-testid="stSidebar"] img {
+[data-testid="stSidebar"] .sidebar-logo img {
     width: 560px !important;
     max-width: none !important;
     height: auto !important;
@@ -54,6 +54,9 @@ def apply_oasis_ui():
     margin: 0 !important;
     filter: brightness(0) invert(1) drop-shadow(0 14px 26px rgba(0,0,0,0.18)) !important;
     opacity: 1 !important;
+}
+[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
+    gap: 0.65rem !important;
 }
 
 .sidebar-brand {
@@ -250,6 +253,9 @@ button[data-baseweb="tab"] {
         padding: 0.35rem 0.7rem 0.7rem 0.7rem !important;
         overflow-x: hidden !important;
     }
+    [data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
+        gap: 0.4rem !important;
+    }
     [data-testid="stSidebarHeader"] {
         position: sticky !important;
         top: 0 !important;
@@ -326,11 +332,11 @@ button[data-baseweb="tab"] {
         fill: #ffffff !important;
     }
     .sidebar-logo {
-        height: 98px !important;
+        height: 110px !important;
         margin: -0.15rem 0 0.25rem 0 !important;
     }
     [data-testid="stSidebar"] .sidebar-logo img {
-        width: 500px !important;
+        width: 480px !important;
         max-width: none !important;
         left: 50% !important;
         top: 50% !important;
