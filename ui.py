@@ -225,6 +225,84 @@ button[data-baseweb="tab"] {
         padding: 0.8rem 0.75rem 1rem 0.75rem !important;
         overflow-x: hidden !important;
     }
+    [data-testid="stSidebarHeader"] {
+        position: sticky !important;
+        top: 0 !important;
+        z-index: 1002 !important;
+        height: 48px !important;
+        min-height: 48px !important;
+        margin: -0.15rem 0 0.25rem 0 !important;
+        justify-content: flex-end !important;
+        pointer-events: none !important;
+    }
+    [data-testid="stSidebarCollapseButton"] {
+        display: inline-flex !important;
+        visibility: visible !important;
+        opacity: 1 !important;
+        pointer-events: auto !important;
+        color: var(--oasis-blue-text) !important;
+    }
+    [data-testid="stSidebarCollapseButton"] button {
+        display: inline-flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        gap: 3px !important;
+        width: auto !important;
+        min-width: 70px !important;
+        height: 40px !important;
+        padding: 0 10px !important;
+        border: 1px solid rgba(255,255,255,0.72) !important;
+        border-radius: 12px !important;
+        background: rgba(255,255,255,0.96) !important;
+        color: var(--oasis-blue-text) !important;
+        box-shadow: 0 8px 22px rgba(0,0,0,0.18) !important;
+    }
+    [data-testid="stSidebarCollapseButton"] button::after {
+        content: "닫기" !important;
+        color: var(--oasis-blue-text) !important;
+        font-size: 12px !important;
+        font-weight: 850 !important;
+        line-height: 1 !important;
+    }
+    [data-testid="stSidebarCollapseButton"] svg {
+        color: var(--oasis-blue-text) !important;
+        fill: var(--oasis-blue-text) !important;
+    }
+    [data-testid="stExpandSidebarButton"] {
+        display: inline-flex !important;
+        visibility: visible !important;
+        opacity: 1 !important;
+        position: fixed !important;
+        top: 10px !important;
+        left: 10px !important;
+        z-index: 1003 !important;
+    }
+    [data-testid="stExpandSidebarButton"] button {
+        display: inline-flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        gap: 4px !important;
+        width: auto !important;
+        min-width: 76px !important;
+        height: 42px !important;
+        padding: 0 11px !important;
+        border: 1px solid rgba(255,255,255,0.92) !important;
+        border-radius: 12px !important;
+        background: #0b5bd3 !important;
+        color: #ffffff !important;
+        box-shadow: 0 8px 24px rgba(8,72,166,0.28) !important;
+    }
+    [data-testid="stExpandSidebarButton"] button::after {
+        content: "메뉴" !important;
+        color: #ffffff !important;
+        font-size: 13px !important;
+        font-weight: 850 !important;
+        line-height: 1 !important;
+    }
+    [data-testid="stExpandSidebarButton"] svg {
+        color: #ffffff !important;
+        fill: #ffffff !important;
+    }
     [data-testid="stSidebar"] img {
         width: 142px !important;
         margin: 0 auto 0.15rem auto !important;
@@ -283,6 +361,10 @@ button[data-baseweb="tab"] {
         white-space: nowrap !important;
     }
     [data-testid="stSidebar"] [data-testid="stButtonGroup"]
+    [data-variant="pills"] * {
+        color: inherit !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stButtonGroup"]
     [data-variant="pills"][data-selected="true"],
     [data-testid="stSidebar"] [data-testid="stButtonGroup"]
     [data-variant="pills"][aria-pressed="true"] {
@@ -299,7 +381,12 @@ button[data-baseweb="tab"] {
         border-radius: 12px !important;
         box-sizing: border-box !important;
     }
-    [data-testid="stSidebar"] div[role="radiogroup"] label > div:first-child {
+    [data-testid="stSidebar"] [data-testid="stRadio"],
+    [data-testid="stSidebar"] [data-testid="stRadioGroup"] {
+        width: 100% !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stRadioOption"]
+    > div > div:first-child > div:first-child {
         display: none !important;
     }
     [data-testid="stSidebar"] div[role="radiogroup"] label p {
