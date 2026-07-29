@@ -253,6 +253,7 @@ def collect_recent_opening_companies(
             maximum_employees=maximum_employees,
             recent_months=recent_months,
             include_comwel_annual=include_comwel_annual,
+            business_type=business_type,
             district_name=district_name,
             industry_categories=selected_industries,
             contact_channels=selected_contact_channels,
@@ -470,11 +471,12 @@ def collect_contactable_growth_companies(
                 minimum_employees=minimum_employees,
                 maximum_employees=maximum_employees,
                 minimum_growth=minimum_growth,
+                business_type=business_type,
                 district_name=district_name,
                 source_mode=data_source,
                 industry_categories=sorted(selected_industries),
                 contact_channels=sorted(selected_contact_channels),
-                limit=target_count,
+                limit=min(500, max(target_count, target_count * 3)),
             )
             _notify(
                 progress,

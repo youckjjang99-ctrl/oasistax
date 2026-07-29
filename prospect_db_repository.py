@@ -337,6 +337,7 @@ def load_fast_growth_candidates(
     minimum_employees: int = 1,
     maximum_employees: int | None = None,
     minimum_growth: int = 1,
+    business_type: str = "all",
     district_name: str = "",
     source_mode: str = "combined",
     industry_categories: list[str] | None = None,
@@ -359,6 +360,11 @@ def load_fast_growth_candidates(
     source_mode = str(source_mode or "combined").strip().lower()
     if source_mode not in {"combined", "nps_monthly", "comwel_annual"}:
         source_mode = "combined"
+    normalized_business_type = str(
+        business_type or "all"
+    ).strip().lower()
+    if normalized_business_type not in {"stock", "individual", "all"}:
+        normalized_business_type = "all"
     selected_industries = sorted(
         {
             str(value or "").strip()
@@ -395,9 +401,10 @@ def load_fast_growth_candidates(
         "p_industries": selected_industries,
         "p_contact_channels": selected_channels,
         "p_limit": row_limit,
+        "p_business_type": normalized_business_type,
     }
     response = requests.post(
-        f"{config.url}/rest/v1/rpc/oasis_search_employment_growth",
+        f"{config.url}/rest/v1/rpc/oasis_search_employment_growth_v2",
         headers=_rest_headers(),
         data=json.dumps(payload, ensure_ascii=False),
         timeout=max(config.timeout, 60),
@@ -518,6 +525,7 @@ def load_recent_opening_candidates(
     maximum_employees: int | None = None,
     recent_months: int = 6,
     include_comwel_annual: bool = True,
+    business_type: str = "all",
     district_name: str = "",
     industry_categories: list[str] | None = None,
     contact_channels: list[str] | None = None,
@@ -539,6 +547,11 @@ def load_recent_opening_candidates(
     if period_months not in {3, 6, 12}:
         period_months = 6
     district = str(district_name or "").strip()
+    normalized_business_type = str(
+        business_type or "all"
+    ).strip().lower()
+    if normalized_business_type not in {"stock", "individual", "all"}:
+        normalized_business_type = "all"
     selected_industries = sorted(
         {
             str(value or "").strip()
@@ -576,9 +589,10 @@ def load_recent_opening_candidates(
         "p_recent_months": period_months,
         "p_include_comwel_annual": bool(include_comwel_annual),
         "p_limit": row_limit,
+        "p_business_type": normalized_business_type,
     }
     response = requests.post(
-        f"{config.url}/rest/v1/rpc/oasis_search_recent_openings",
+        f"{config.url}/rest/v1/rpc/oasis_search_recent_openings_v2",
         headers=_rest_headers(),
         data=json.dumps(payload, ensure_ascii=False),
         timeout=max(config.timeout, 60),
