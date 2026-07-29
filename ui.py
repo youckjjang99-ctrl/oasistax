@@ -28,16 +28,30 @@ def apply_oasis_ui():
 }
 
 [data-testid="stSidebar"] > div:first-child {
-    padding: 1rem 0.9rem 1.1rem 0.9rem !important;
+    padding: 0.65rem 0.9rem 0.85rem 0.9rem !important;
 }
 
-/* 사이드바 로고: 파란 배경에서 선명하게 보이도록 흰색화 + 확대 */
+/*
+ * 원본 로고는 투명 캔버스 여백이 크다. 고정 높이 창 안에서 이미지를
+ * 확대·중앙 정렬해 실제 심볼과 워드마크만 보이도록 한다.
+ */
+.sidebar-logo {
+    position: relative !important;
+    width: 100% !important;
+    height: 118px !important;
+    margin: 0 0 0.35rem 0 !important;
+    overflow: hidden !important;
+}
 [data-testid="stSidebar"] img {
-    width: 220px !important;
-    max-width: 96% !important;
+    width: 560px !important;
+    max-width: none !important;
     height: auto !important;
     display: block !important;
-    margin: 0.2rem auto 0.35rem auto !important;
+    position: absolute !important;
+    left: 50% !important;
+    top: 50% !important;
+    transform: translate(-50%, -50%) !important;
+    margin: 0 !important;
     filter: brightness(0) invert(1) drop-shadow(0 14px 26px rgba(0,0,0,0.18)) !important;
     opacity: 1 !important;
 }
@@ -67,7 +81,8 @@ def apply_oasis_ui():
     background: rgba(255,255,255,0.13) !important;
     border: 1px solid rgba(255,255,255,0.20) !important;
     border-radius: 16px !important;
-    padding: 12px 14px !important;
+    padding: 10px 13px !important;
+    margin: 0 0 0.55rem 0 !important;
     color: #fff !important;
 }
 .sidebar-user-card .name {
@@ -81,7 +96,7 @@ def apply_oasis_ui():
     color: rgba(255,255,255,0.65) !important;
     font-size: 12px !important;
     font-weight: 900 !important;
-    margin: 14px 0 8px 6px !important;
+    margin: 8px 0 6px 4px !important;
     letter-spacing: 1.1px !important;
 }
 
@@ -91,10 +106,10 @@ def apply_oasis_ui():
     display: flex !important;
     align-items: center !important;
     gap: 0 !important;
-    min-height: 44px !important;
-    padding: 10px 14px !important;
-    margin: 0 0 7px 0 !important;
-    border-radius: 14px !important;
+    min-height: 40px !important;
+    padding: 8px 13px !important;
+    margin: 0 0 5px 0 !important;
+    border-radius: 12px !important;
     border: 1px solid rgba(255,255,255,0.12) !important;
     background: rgba(255,255,255,0.055) !important;
     box-shadow: none !important;
@@ -123,7 +138,7 @@ def apply_oasis_ui():
 
 
 [data-testid="stSidebar"] div[role="radiogroup"] label p {
-    font-size: 16px !important;
+    font-size: 15px !important;
     font-weight: 880 !important;
     letter-spacing: -0.35px !important;
     color: var(--oasis-menu-text) !important;
@@ -232,16 +247,16 @@ button[data-baseweb="tab"] {
     }
     [data-testid="stSidebar"] > div:first-child {
         width: 100% !important;
-        padding: 0.8rem 0.75rem 1rem 0.75rem !important;
+        padding: 0.35rem 0.7rem 0.7rem 0.7rem !important;
         overflow-x: hidden !important;
     }
     [data-testid="stSidebarHeader"] {
         position: sticky !important;
         top: 0 !important;
         z-index: 1002 !important;
-        height: 48px !important;
-        min-height: 48px !important;
-        margin: -0.15rem 0 0.25rem 0 !important;
+        height: 42px !important;
+        min-height: 42px !important;
+        margin: 0 0 -0.1rem 0 !important;
         justify-content: flex-end !important;
         pointer-events: none !important;
     }
@@ -258,9 +273,9 @@ button[data-baseweb="tab"] {
         justify-content: center !important;
         gap: 3px !important;
         width: auto !important;
-        min-width: 70px !important;
-        height: 40px !important;
-        padding: 0 10px !important;
+        min-width: 66px !important;
+        height: 36px !important;
+        padding: 0 9px !important;
         border: 1px solid rgba(255,255,255,0.72) !important;
         border-radius: 12px !important;
         background: rgba(255,255,255,0.96) !important;
@@ -310,9 +325,17 @@ button[data-baseweb="tab"] {
         color: #ffffff !important;
         fill: #ffffff !important;
     }
-    [data-testid="stSidebar"] img {
-        width: 142px !important;
-        margin: 0 auto 0.15rem auto !important;
+    .sidebar-logo {
+        height: 98px !important;
+        margin: -0.15rem 0 0.25rem 0 !important;
+    }
+    [data-testid="stSidebar"] .sidebar-logo img {
+        width: 500px !important;
+        max-width: none !important;
+        left: 50% !important;
+        top: 50% !important;
+        transform: translate(-50%, -50%) !important;
+        margin: 0 !important;
     }
     .sidebar-brand {
         margin-bottom: 0.65rem !important;
@@ -327,8 +350,9 @@ button[data-baseweb="tab"] {
         letter-spacing: 0.55px !important;
     }
     .sidebar-user-card {
-        border-radius: 13px !important;
-        padding: 10px 12px !important;
+        border-radius: 12px !important;
+        padding: 8px 11px !important;
+        margin: 0 0 0.35rem 0 !important;
     }
     .sidebar-user-card .name {
         font-size: 16px !important;
@@ -338,12 +362,12 @@ button[data-baseweb="tab"] {
     }
     .sidebar-section-label {
         font-size: 10px !important;
-        margin: 11px 0 6px 3px !important;
+        margin: 7px 0 5px 3px !important;
         letter-spacing: 0.8px !important;
     }
     [data-testid="stSidebar"] [data-testid="stButtonGroup"] {
         width: 100% !important;
-        margin-bottom: 0.45rem !important;
+        margin-bottom: 0.25rem !important;
     }
     [data-testid="stSidebar"] [data-testid="stButtonGroup"]
     [role="radiogroup"] {
@@ -356,8 +380,8 @@ button[data-baseweb="tab"] {
     [data-variant="pills"] {
         width: 100% !important;
         min-width: 0 !important;
-        min-height: 36px !important;
-        padding: 6px 4px !important;
+        min-height: 34px !important;
+        padding: 5px 3px !important;
         justify-content: center !important;
         border: 1px solid rgba(255,255,255,0.24) !important;
         border-radius: 10px !important;
@@ -382,10 +406,10 @@ button[data-baseweb="tab"] {
     }
     [data-testid="stSidebar"] div[role="radiogroup"] label {
         width: 100% !important;
-        min-height: 42px !important;
-        margin-bottom: 5px !important;
-        padding: 9px 11px !important;
-        border-radius: 12px !important;
+        min-height: 38px !important;
+        margin-bottom: 4px !important;
+        padding: 7px 10px !important;
+        border-radius: 10px !important;
         box-sizing: border-box !important;
     }
     [data-testid="stSidebar"] [data-testid="stRadio"],
@@ -406,8 +430,15 @@ button[data-baseweb="tab"] {
         transform: none !important;
     }
     [data-testid="stSidebar"] hr {
-        margin: 0.8rem 0 !important;
+        margin: 0.5rem 0 !important;
         border-color: rgba(255,255,255,0.15) !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stExpander"] {
+        margin-bottom: 0.4rem !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stExpander"] details summary {
+        min-height: 38px !important;
+        padding: 7px 10px !important;
     }
     [data-testid="stSidebar"] .stButton > button {
         min-height: 40px !important;
