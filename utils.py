@@ -1,6 +1,7 @@
 import os
 import glob
 import base64
+import re
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
@@ -51,7 +52,17 @@ def logo_html(width=240):
 
 def make_upload_filename(original_name):
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_name = original_name.replace(" ", "_").replace("(", "").replace(")", "")
+    source_name = Path(str(original_name or "file")).name
+    source_path = Path(source_name)
+    safe_stem = re.sub(
+        r"[^0-9A-Za-z가-힣._-]+",
+        "_",
+        source_path.stem,
+    ).strip("._")[:100] or "file"
+    safe_suffix = source_path.suffix.lower()
+    if not re.fullmatch(r"\.[a-z0-9]{1,10}", safe_suffix):
+        safe_suffix = ""
+    safe_name = f"{safe_stem}{safe_suffix}"
     return f"업로드고객DB_{ts}_{safe_name}"
 
 

@@ -15,7 +15,7 @@ from openpyxl.utils import get_column_letter
 # 0. 기본 설정
 # =========================================================
 
-API_KEY = os.getenv("BIZINFO_API_KEY", "EScWvJ")
+API_KEY = os.getenv("BIZINFO_API_KEY", "").strip()
 
 CUSTOMER_FILE = "고객DB.xlsx"
 NOW = datetime.now().strftime("%Y%m%d_%H%M%S")

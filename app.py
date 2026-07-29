@@ -3,6 +3,7 @@ import subprocess
 import sys
 import os
 import glob
+import html
 import shutil
 import pandas as pd
 from pathlib import Path
@@ -73,7 +74,8 @@ from crm import (
 
 from auth import (
     apply_env_secrets, check_login, login_form, logout_button,
-    is_admin, list_pending_users, list_all_users_for_admin,
+    is_admin, can_view_mobile_numbers,
+    list_pending_users, list_all_users_for_admin,
     approve_user, reject_user, render_password_change
 )
 from history import append_run_history, read_run_history, get_manager_stats
@@ -1711,6 +1713,10 @@ if not check_login():
 CURRENT_USER_ID = st.session_state.get("current_user_id", "")
 CURRENT_USER_NAME = st.session_state.get("current_user_name", "")
 CURRENT_USER_IS_ADMIN = is_admin(CURRENT_USER_ID)
+CURRENT_USER_CAN_VIEW_MOBILE = can_view_mobile_numbers(CURRENT_USER_ID)
+SAFE_CURRENT_USER_NAME = html.escape(
+    str(CURRENT_USER_NAME or CURRENT_USER_ID)
+)
 USER_DIRS = get_user_dirs(CURRENT_USER_ID)
 USER_UPLOAD_DIR = USER_DIRS["uploads"]
 USER_RESULT_DIR = USER_DIRS["results"]
@@ -1743,7 +1749,7 @@ with st.sidebar:
         role_badge = "관리자" if CURRENT_USER_IS_ADMIN else "회원"
         st.markdown(f"""
         <div class="sidebar-user-card">
-            <div class="name">{CURRENT_USER_NAME}님</div>
+            <div class="name">{SAFE_CURRENT_USER_NAME}님</div>
             <div class="role">{role_badge} 계정으로 로그인 중</div>
         </div>
         """, unsafe_allow_html=True)
@@ -1863,7 +1869,7 @@ st.markdown(f"""
     <div>
         <div class="oasis-topbar-title">{selected_menu_label}</div>
         <div class="oasis-topbar-sub">
-            OASIS WORKSPACE · {CURRENT_USER_NAME or CURRENT_USER_ID}
+            OASIS WORKSPACE · {SAFE_CURRENT_USER_NAME}
         </div>
     </div>
 </div>
@@ -1908,7 +1914,11 @@ elif active_tab == "내 누적 고객DB":
     render_cumulative_db_page(CURRENT_USER_ID)
 
 elif active_tab == "DB발굴":
-    render_prospect_db_center(CURRENT_USER_ID)
+    render_prospect_db_center(
+        CURRENT_USER_ID,
+        can_view_mobile=CURRENT_USER_CAN_VIEW_MOBILE,
+        is_admin_user=CURRENT_USER_IS_ADMIN,
+    )
 
 elif active_tab == "통합 정책자금 매칭":
     st.markdown("### 등록 고객 통합 정책자금 AI 매칭")
@@ -2989,7 +2999,7 @@ elif CURRENT_USER_IS_ADMIN and active_tab == "회원 승인 관리":
     st.markdown("### 🔐 회원 승인 관리")
     st.caption("회원가입 신청자는 관리자 승인 전까지 매칭 시스템에 로그인할 수 없습니다.")
 
-    pending_users = list_pending_users()
+    pending_users = list_pending_users(CURRENT_USER_ID)
 
     st.markdown("#### 승인 대기 회원")
     if not pending_users:
@@ -3019,7 +3029,7 @@ elif CURRENT_USER_IS_ADMIN and active_tab == "회원 승인 관리":
                             st.error(msg)
 
     st.markdown("#### 전체 회원 현황")
-    all_users = list_all_users_for_admin()
+    all_users = list_all_users_for_admin(CURRENT_USER_ID)
     if all_users:
         st.dataframe(pd.DataFrame(all_users), width='stretch', hide_index=True)
     else:
@@ -3031,7 +3041,7 @@ elif CURRENT_USER_IS_ADMIN and active_tab == "시스템 관리":
         current_user_id=CURRENT_USER_ID,
     )
     st.divider()
-    render_prospect_admin_settings()
+    render_prospect_admin_settings(CURRENT_USER_ID)
 
 elif CURRENT_USER_IS_ADMIN and active_tab == "AI 사용량":
     render_ai_usage_page(

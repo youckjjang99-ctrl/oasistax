@@ -68,6 +68,7 @@ create table if not exists public.oasis_migration_runs (
 create or replace function public.set_oasis_updated_at()
 returns trigger
 language plpgsql
+set search_path = public, pg_temp
 as $$
 begin
     new.updated_at = now();
