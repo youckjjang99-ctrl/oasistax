@@ -423,6 +423,25 @@ button[data-baseweb="tab"] {
         font-size: 11px !important;
         margin-top: 3px !important;
     }
+    .login-wrap {
+        padding-top: 4px !important;
+    }
+    .login-panel {
+        padding: 24px 20px 22px 20px !important;
+        border-radius: 18px !important;
+    }
+    .login-title {
+        font-size: 24px !important;
+        line-height: 1.3 !important;
+        letter-spacing: -0.7px !important;
+        word-break: keep-all !important;
+        overflow-wrap: normal !important;
+    }
+    .login-desc {
+        font-size: 14px !important;
+        line-height: 1.65 !important;
+        word-break: keep-all !important;
+    }
     .hero {
         padding: 24px 20px !important;
         border-radius: 18px !important;
