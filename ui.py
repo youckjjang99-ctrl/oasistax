@@ -270,30 +270,27 @@ button[data-baseweb="tab"] {
     }
     [data-testid="stExpandSidebarButton"] {
         display: inline-flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        gap: 5px !important;
         visibility: visible !important;
         opacity: 1 !important;
         position: fixed !important;
         top: 10px !important;
         left: 10px !important;
         z-index: 1003 !important;
-    }
-    [data-testid="stExpandSidebarButton"] button {
-        display: inline-flex !important;
-        align-items: center !important;
-        justify-content: center !important;
-        gap: 4px !important;
         width: auto !important;
-        min-width: 76px !important;
+        min-width: 168px !important;
         height: 42px !important;
-        padding: 0 11px !important;
+        padding: 0 13px !important;
         border: 1px solid rgba(255,255,255,0.92) !important;
         border-radius: 12px !important;
         background: #0b5bd3 !important;
         color: #ffffff !important;
         box-shadow: 0 8px 24px rgba(8,72,166,0.28) !important;
     }
-    [data-testid="stExpandSidebarButton"] button::after {
-        content: "메뉴" !important;
+    [data-testid="stExpandSidebarButton"]::after {
+        content: "사이드메뉴 열기" !important;
         color: #ffffff !important;
         font-size: 13px !important;
         font-weight: 850 !important;
@@ -407,15 +404,20 @@ button[data-baseweb="tab"] {
         font-size: 13px !important;
     }
     .block-container {
-        padding: 0.7rem 0.75rem 5rem 0.75rem !important;
+        padding: 1.1rem 0.75rem 5rem 0.75rem !important;
         max-width: 100% !important;
     }
     .oasis-topbar-compact {
-        min-height: 50px !important;
+        min-height: 62px !important;
+        padding: 12px 14px 14px 14px !important;
+        margin-top: 10px !important;
         margin-bottom: 10px !important;
+        overflow: visible !important;
     }
     .oasis-topbar-compact .oasis-topbar-title {
         font-size: 19px !important;
+        line-height: 1.3 !important;
+        overflow: visible !important;
     }
     .oasis-topbar-compact .oasis-topbar-sub {
         font-size: 11px !important;
