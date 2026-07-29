@@ -215,6 +215,16 @@ button[data-baseweb="tab"] {
 
 /* 모바일에서는 여러 열을 세로 흐름으로 전환하고 조작 영역을 넓힌다. */
 @media (max-width: 768px) {
+    [data-testid="stHeader"] {
+        height: 0 !important;
+        min-height: 0 !important;
+        background: transparent !important;
+        overflow: visible !important;
+    }
+    [data-testid="stHeader"] > div {
+        height: 0 !important;
+        min-height: 0 !important;
+    }
     [data-testid="stSidebar"] {
         width: min(82vw, 300px) !important;
         min-width: min(82vw, 300px) !important;
@@ -404,7 +414,7 @@ button[data-baseweb="tab"] {
         font-size: 13px !important;
     }
     .block-container {
-        padding: 1.1rem 0.75rem 5rem 0.75rem !important;
+        padding: 0 0.75rem 5rem 0.75rem !important;
         max-width: 100% !important;
     }
     .oasis-topbar-compact {
@@ -424,7 +434,28 @@ button[data-baseweb="tab"] {
         margin-top: 3px !important;
     }
     .login-wrap {
-        padding-top: 4px !important;
+        padding-top: 0 !important;
+    }
+    .login-logo {
+        width: 100% !important;
+        height: 96px !important;
+        margin: 0 auto 14px auto !important;
+        padding: 0 !important;
+        overflow: hidden !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        text-align: center !important;
+        box-sizing: border-box !important;
+    }
+    .login-logo img {
+        display: block !important;
+        width: min(96vw, 360px) !important;
+        max-width: none !important;
+        height: auto !important;
+        margin: 0 auto !important;
+        flex: 0 0 auto !important;
+        object-position: center center !important;
     }
     .login-panel {
         padding: 24px 20px 22px 20px !important;
