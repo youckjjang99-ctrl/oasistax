@@ -25,6 +25,8 @@ PHONE_PROVIDERS = {"auto", "kakao", "naver"}
 PHONE_PROVIDER_FIELD = "phone_provider_stage"
 KAKAO_DAILY_SAFE_RECORDS = 90000
 NAVER_DAILY_SAFE_RECORDS = 12000
+DB_PATCH_RETRY_ATTEMPTS = 4
+DB_PATCH_RETRY_DELAYS = (0.4, 1.0, 2.0)
 STAGE_FIELDS = {
     "phone": {
         "status": "phone_status",
@@ -166,7 +168,7 @@ def _eligible_rows(
     return selected
 
 
-def _patch(
+def _patch_legacy(
     contact_key: str,
     values: dict[str, Any],
     *,
@@ -176,7 +178,10 @@ def _patch(
     db = CloudDatabase()
     headers = dict(db.headers)
     headers["Prefer"] = "return=representation"
-    params = {"contact_key": f"eq.{contact_key}"}
+    params = {
+        "contact_key": f"eq.{contact_key}",
+        "select": "contact_key",
+    }
     if expected_status:
         params[status_field] = f"eq.{expected_status}"
     response = requests.patch(
@@ -193,6 +198,60 @@ def _patch(
         )
     rows = response.json() if response.text else []
     return bool(rows)
+
+
+def _patch(
+    contact_key: str,
+    values: dict[str, Any],
+    *,
+    expected_status: str | None = None,
+    status_field: str = "status",
+) -> bool:
+    db = CloudDatabase()
+    headers = dict(db.headers)
+    headers["Prefer"] = "return=representation"
+    params = {
+        "contact_key": f"eq.{contact_key}",
+        "select": "contact_key",
+    }
+    if expected_status:
+        params[status_field] = f"eq.{expected_status}"
+
+    last_error = ""
+    for attempt in range(DB_PATCH_RETRY_ATTEMPTS):
+        try:
+            response = requests.patch(
+                db._url(TABLE_CONTACTS),
+                headers=headers,
+                params=params,
+                data=json.dumps(values, ensure_ascii=False, default=str),
+                timeout=max(30, db.config.timeout),
+            )
+            if response.ok:
+                rows = response.json() if response.text else []
+                return bool(rows)
+            last_error = (
+                f"HTTP {response.status_code}: {response.text[:500]}"
+            )
+            retryable = (
+                response.status_code in {429, 500, 502, 503, 504}
+                or "57014" in response.text
+                or "statement timeout" in response.text.lower()
+            )
+        except requests.RequestException as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            retryable = True
+        if not retryable or attempt + 1 >= DB_PATCH_RETRY_ATTEMPTS:
+            break
+        time.sleep(
+            DB_PATCH_RETRY_DELAYS[
+                min(attempt, len(DB_PATCH_RETRY_DELAYS) - 1)
+            ]
+        )
+    raise RuntimeError(
+        "employment contact update failed "
+        f"{last_error}"
+    )
 
 
 def _claim(row: dict[str, Any], stage: str) -> bool:
@@ -552,7 +611,7 @@ def run_enrichment(
         )
 
     if int(workers) <= 0:
-        workers = 16 if phone_provider == "kakao" else 12
+        workers = 12
     workers = max(1, min(20, int(workers)))
     batch_size = max(1, min(1000, int(batch_size)))
     if int(max_records) <= 0:
@@ -609,7 +668,31 @@ def run_enrichment(
                 for row in rows
             ]
             for future in as_completed(futures):
-                result = future.result()
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    totals["error"] += 1
+                    processed += 1
+                    print(
+                        json.dumps(
+                            {
+                                "job": f"employment-{stage}-enrichment",
+                                "stage": stage,
+                                "provider": (
+                                    phone_provider
+                                    if stage == "phone"
+                                    else ""
+                                ),
+                                "status": "row_error",
+                                "error": (
+                                    f"{type(exc).__name__}: {exc}"[:500]
+                                ),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
+                    continue
                 status = str(result.get("status") or "error")
                 totals[status] = totals.get(status, 0) + 1
                 halted = halted or bool(result.get("halt"))

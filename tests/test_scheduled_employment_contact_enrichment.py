@@ -1,12 +1,85 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import scheduled_employment_contact_enrichment as job
 
 
 class EmploymentContactEnrichmentTest(unittest.TestCase):
+    @patch.object(job.time, "sleep")
+    @patch.object(job.requests, "patch")
+    @patch.object(job, "CloudDatabase")
+    def test_patch_retries_statement_timeout_and_returns_compact_row(
+        self,
+        cloud_database,
+        request_patch,
+        _sleep,
+    ) -> None:
+        db = Mock()
+        db.headers = {}
+        db.config.timeout = 20
+        db._url.return_value = "https://example.supabase.co/rest/v1/contacts"
+        cloud_database.return_value = db
+        timed_out = Mock(
+            ok=False,
+            status_code=500,
+            text='{"code":"57014","message":"statement timeout"}',
+        )
+        succeeded = Mock(
+            ok=True,
+            status_code=200,
+            text='[{"contact_key":"place:test"}]',
+        )
+        succeeded.json.return_value = [{"contact_key": "place:test"}]
+        request_patch.side_effect = [timed_out, succeeded]
+
+        claimed = job._patch(
+            "place:test",
+            {"phone_status": "processing"},
+            expected_status="pending",
+            status_field="phone_status",
+        )
+
+        self.assertTrue(claimed)
+        self.assertEqual(request_patch.call_count, 2)
+        self.assertEqual(
+            request_patch.call_args.kwargs["params"]["select"],
+            "contact_key",
+        )
+
+    @patch.object(
+        job.naver_web_search_client,
+        "key_status",
+        return_value={"configured": True},
+    )
+    @patch.object(
+        job.kakao_local_client,
+        "key_status",
+        return_value={"configured": True},
+    )
+    @patch.object(job, "_enrich_one", side_effect=RuntimeError("db timeout"))
+    @patch.object(job, "_eligible_rows")
+    def test_single_row_failure_does_not_abort_daily_run(
+        self,
+        eligible,
+        _enrich_one,
+        _kakao_key,
+        _naver_key,
+    ) -> None:
+        eligible.side_effect = [
+            [{"contact_key": "place:test"}],
+            [{"contact_key": "place:test"}],
+        ]
+
+        result = job.run_enrichment(
+            stage="phone",
+            phone_provider="auto",
+            max_records=1,
+        )
+
+        self.assertEqual(result, 0)
+
     @patch.object(
         job.naver_web_search_client,
         "key_status",
