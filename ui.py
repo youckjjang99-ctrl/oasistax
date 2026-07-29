@@ -28,12 +28,12 @@ def apply_oasis_ui():
 }
 
 [data-testid="stSidebar"] > div:first-child {
-    padding: 1.35rem 1.05rem 1.3rem 1.05rem !important;
+    padding: 1rem 0.9rem 1.1rem 0.9rem !important;
 }
 
 /* 사이드바 로고: 파란 배경에서 선명하게 보이도록 흰색화 + 확대 */
 [data-testid="stSidebar"] img {
-    width: 275px !important;
+    width: 220px !important;
     max-width: 96% !important;
     height: auto !important;
     display: block !important;
@@ -45,10 +45,10 @@ def apply_oasis_ui():
 .sidebar-brand {
     text-align: center !important;
     color: #fff !important;
-    margin: 0 0 1.3rem 0 !important;
+    margin: 0 0 0.9rem 0 !important;
 }
 .sidebar-brand-title {
-    font-size: 30px !important;
+    font-size: 25px !important;
     font-weight: 950 !important;
     color: #fff !important;
     letter-spacing: -0.7px !important;
@@ -66,8 +66,8 @@ def apply_oasis_ui():
 .sidebar-user-card {
     background: rgba(255,255,255,0.13) !important;
     border: 1px solid rgba(255,255,255,0.20) !important;
-    border-radius: 20px !important;
-    padding: 16px 18px !important;
+    border-radius: 16px !important;
+    padding: 12px 14px !important;
     color: #fff !important;
 }
 .sidebar-user-card .name {
@@ -81,7 +81,7 @@ def apply_oasis_ui():
     color: rgba(255,255,255,0.65) !important;
     font-size: 12px !important;
     font-weight: 900 !important;
-    margin: 18px 0 10px 6px !important;
+    margin: 14px 0 8px 6px !important;
     letter-spacing: 1.1px !important;
 }
 
@@ -91,10 +91,10 @@ def apply_oasis_ui():
     display: flex !important;
     align-items: center !important;
     gap: 0 !important;
-    min-height: 52px !important;
-    padding: 13px 18px !important;
-    margin: 0 0 10px 0 !important;
-    border-radius: 18px !important;
+    min-height: 44px !important;
+    padding: 10px 14px !important;
+    margin: 0 0 7px 0 !important;
+    border-radius: 14px !important;
     border: 1px solid rgba(255,255,255,0.12) !important;
     background: rgba(255,255,255,0.055) !important;
     box-shadow: none !important;
@@ -123,7 +123,7 @@ def apply_oasis_ui():
 
 
 [data-testid="stSidebar"] div[role="radiogroup"] label p {
-    font-size: 19px !important;
+    font-size: 16px !important;
     font-weight: 880 !important;
     letter-spacing: -0.35px !important;
     color: var(--oasis-menu-text) !important;
@@ -144,11 +144,11 @@ def apply_oasis_ui():
 
 /* 홈 카드: 더 업무 시스템처럼 차분한 카드감 */
 .hero {
-    border-radius: 30px !important;
+    border-radius: 22px !important;
     box-shadow: 0 24px 58px rgba(7, 59, 145, 0.27) !important;
 }
 .point-card, .metric-card, .oasis-card, .preview-box {
-    border-radius: 24px !important;
+    border-radius: 16px !important;
     box-shadow: 0 16px 38px rgba(15,55,125,0.075) !important;
 }
 .point-icon {
@@ -173,6 +173,95 @@ def apply_oasis_ui():
 .stDeployButton {
     display: none !important;
     visibility: hidden !important;
+}
+
+/* 단계형 업무 화면과 공통 컴포넌트 */
+.oasis-topbar-compact {
+    justify-content: flex-start !important;
+    min-height: 64px !important;
+    padding: 8px 2px 12px 2px !important;
+    border-bottom: 1px solid #e2e8f0 !important;
+    margin-bottom: 18px !important;
+}
+.oasis-topbar-compact .oasis-topbar-title {
+    font-size: 22px !important;
+}
+
+[data-testid="stMetric"] {
+    background: #ffffff !important;
+    border: 1px solid #e2e8f0 !important;
+    border-radius: 14px !important;
+    padding: 14px 16px !important;
+    box-shadow: 0 6px 18px rgba(15, 55, 125, 0.055) !important;
+}
+
+div[data-baseweb="tab-list"] {
+    gap: 6px !important;
+    overflow-x: auto !important;
+    scrollbar-width: thin !important;
+}
+button[data-baseweb="tab"] {
+    min-width: max-content !important;
+    min-height: 44px !important;
+}
+
+[data-testid="stButton"] button,
+[data-testid="stDownloadButton"] button,
+[data-testid="stFormSubmitButton"] button {
+    min-height: 44px !important;
+    border-radius: 12px !important;
+    font-weight: 750 !important;
+}
+
+/* 모바일에서는 여러 열을 세로 흐름으로 전환하고 조작 영역을 넓힌다. */
+@media (max-width: 768px) {
+    .block-container {
+        padding: 0.7rem 0.75rem 5rem 0.75rem !important;
+        max-width: 100% !important;
+    }
+    .oasis-topbar-compact {
+        min-height: 50px !important;
+        margin-bottom: 10px !important;
+    }
+    .oasis-topbar-compact .oasis-topbar-title {
+        font-size: 19px !important;
+    }
+    .oasis-topbar-compact .oasis-topbar-sub {
+        font-size: 11px !important;
+        margin-top: 3px !important;
+    }
+    .hero {
+        padding: 24px 20px !important;
+        border-radius: 18px !important;
+    }
+    .hero-title {
+        font-size: 1.8rem !important;
+        line-height: 1.25 !important;
+    }
+    [data-testid="stHorizontalBlock"] {
+        flex-wrap: wrap !important;
+        gap: 0.65rem !important;
+    }
+    [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+        flex: 1 1 100% !important;
+        width: 100% !important;
+        min-width: 0 !important;
+    }
+    [data-testid="stMetric"] {
+        padding: 12px 14px !important;
+    }
+    div[data-baseweb="tab-list"] {
+        flex-wrap: nowrap !important;
+        padding-bottom: 4px !important;
+    }
+    button[data-baseweb="tab"] {
+        padding-left: 13px !important;
+        padding-right: 13px !important;
+    }
+    [data-testid="stDataFrame"],
+    [data-testid="stDataEditor"] {
+        overflow-x: auto !important;
+    }
 }
 
 </style>

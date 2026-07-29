@@ -1714,9 +1714,37 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
         "근로복지공단 연간 자료에서 고용증가기업 또는 신규개업 "
         "추정기업을 골라 조회합니다."
     )
-    _render_search_history(owner_user_id)
+    pending_workflow_step = st.session_state.pop(
+        "_prospect_workflow_step_pending_v1020",
+        None,
+    )
+    if pending_workflow_step in {
+        "① 조건 설정",
+        "② 검색 결과",
+        "③ 저장된 영업후보",
+    }:
+        st.session_state["prospect_workflow_step_v1020"] = (
+            pending_workflow_step
+        )
+    if "prospect_workflow_step_v1020" not in st.session_state:
+        st.session_state["prospect_workflow_step_v1020"] = "① 조건 설정"
+    workflow_step = st.pills(
+        "DB발굴 작업 단계",
+        ["① 조건 설정", "② 검색 결과", "③ 저장된 영업후보"],
+        key="prospect_workflow_step_v1020",
+        label_visibility="collapsed",
+    )
+    workflow_step = workflow_step or "① 조건 설정"
+    if workflow_step == "③ 저장된 영업후보":
+        _render_clean_saved_prospects(owner_user_id)
+        return
+    if workflow_step == "① 조건 설정":
+        _render_search_history(owner_user_id)
 
-    with st.container(border=True):
+    with st.expander(
+        "조회 조건",
+        expanded=workflow_step == "① 조건 설정",
+    ):
         discovery_type_name = st.radio(
             "발굴 유형",
             list(DISCOVERY_TYPE_OPTIONS.keys()),
@@ -2065,20 +2093,39 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
         st.session_state[page_state_key] = int(
             result.get("next_page") or int(end_page) + 1
         )
+        st.session_state["_prospect_workflow_step_pending_v1020"] = (
+            "② 검색 결과"
+        )
+        st.rerun()
 
+    if workflow_step != "② 검색 결과":
+        st.info(
+            "조건을 선택해 조회하면 결과가 ‘② 검색 결과’ 단계에 "
+            "표시됩니다. 저장한 업체는 ‘③ 저장된 영업후보’에서 "
+            "관리할 수 있습니다."
+        )
+        return
     result = st.session_state.get(result_state_key)
+    if not result:
+        st.info(
+            "아직 표시할 검색 결과가 없습니다. ‘① 조건 설정’에서 "
+            "조회 조건을 선택하고 검색을 실행해 주세요."
+        )
+        return
     if result:
         if not result.get("ok", True):
-            st.error(
-                result.get(
-                    "message",
-                    f"Supabase {discovery_type_name} 조회에 실패했습니다.",
-                )
-            )
+            st.error("검색 자료를 불러오지 못했습니다.")
             st.info(
-                "외부 API 실시간 조회로 자동 전환하지 않았습니다. "
-                "Supabase 사전 저장 자료를 확인한 뒤 다시 시도해 주세요."
+                "잠시 후 다시 조회해 주세요. 같은 문제가 계속되면 "
+                "관리자에게 데이터 연결 상태 확인을 요청해 주세요."
             )
+            with st.expander("오류 상세", expanded=False):
+                st.caption(
+                    result.get(
+                        "message",
+                        f"{discovery_type_name} 저장자료 조회 실패",
+                    )
+                )
             return
         stats = result.get("stats") or {}
         signal_count = stats.get(
@@ -2181,10 +2228,11 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             )
         if result.get("history_warning"):
             st.warning(
-                "검색 결과는 정상입니다. 페이지 이력은 저장하지 "
-                "못했습니다. 관리자 설정에서 v9.8.4 SQL 실행 여부를 "
-                f"확인해 주세요: {result['history_warning']}"
+                "검색 결과는 정상이며 검색이력 저장만 완료되지 "
+                "않았습니다."
             )
+            with st.expander("관리자용 오류 상세", expanded=False):
+                st.caption(result["history_warning"])
 
         items = list(result.get("items") or [])
         if not items:
@@ -2232,31 +2280,24 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 ),
             )
             visible_columns = [
-                "선택",
-                "사업장명",
-                "사업자유형",
-                "사업자번호상태",
-                "휴대전화",
-                "일반전화",
-                "이메일",
-                "인스타그램",
-                "인스타그램URL",
-                "연락처조회일",
-                "지역",
-                "주소",
-                "업종분류",
-                "업종명",
-                "자료생성년월",
-                "가입자수",
-                *(
-                    ["신규개업구분", "신규추정일", "신규근거"]
-                    if discovery_type == "recent_opening"
-                    else ["고용증가구분"]
-                ),
-                "영업주제",
-                "추천등급",
-                "초회전화스크립트",
-                "source_key",
+                column
+                for column in [
+                    "선택",
+                    "사업장명",
+                    "휴대전화",
+                    "일반전화",
+                    "지역",
+                    "가입자수",
+                    *(
+                        ["신규개업구분", "신규추정일"]
+                        if discovery_type == "recent_opening"
+                        else ["고용증가구분"]
+                    ),
+                    "업종분류",
+                    "추천등급",
+                    "source_key",
+                ]
+                if column in display.columns
             ]
             edited = st.data_editor(
                 display[visible_columns],
@@ -2288,6 +2329,43 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             selected_keys = set(
                 edited.loc[edited["선택"] == True, "source_key"].tolist()
             )
+            if selected_keys:
+                with st.expander(
+                    f"선택 업체 {len(selected_keys):,}개의 상세정보",
+                    expanded=False,
+                ):
+                    detail_columns = [
+                        column
+                        for column in [
+                            "사업장명",
+                            "사업자유형",
+                            "사업자번호상태",
+                            "이메일",
+                            "인스타그램",
+                            "인스타그램URL",
+                            "주소",
+                            "업종명",
+                            "자료생성년월",
+                            "신규근거",
+                            "영업주제",
+                            "초회전화스크립트",
+                        ]
+                        if column in display.columns
+                    ]
+                    selected_detail = display[
+                        display["source_key"].isin(selected_keys)
+                    ]
+                    detail_column_config = {}
+                    if "인스타그램URL" in detail_columns:
+                        detail_column_config["인스타그램URL"] = (
+                            st.column_config.LinkColumn("인스타그램 링크")
+                        )
+                    st.dataframe(
+                        selected_detail[detail_columns],
+                        hide_index=True,
+                        use_container_width=True,
+                        column_config=detail_column_config,
+                    )
             selected_items = [
                 item
                 for item in items
@@ -2324,10 +2402,6 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                     use_container_width=True,
                     hide_index=True,
                 )
-
-    st.divider()
-    _render_clean_saved_prospects(owner_user_id)
-
 
 def render_prospect_admin_settings() -> None:
     st.markdown("## 영업후보 데이터 연결 관리")

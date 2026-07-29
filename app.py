@@ -668,42 +668,106 @@ def read_current_user_customer_df(user_id):
         return pd.DataFrame(), path
 
 
-def render_home_page():
+def render_home_page(user_id, user_name=""):
+    customer_df, _ = read_current_user_customer_df(user_id)
+    customer_count = len(customer_df)
+    crm_summary = get_crm_summary(user_id)
+    due_summary = get_due_action_summary(user_id)
+    today_count = len(due_summary.get("today", []))
+    overdue_count = len(due_summary.get("overdue", []))
+    week_count = len(due_summary.get("week", []))
+
     st.markdown("""
     <div class="hero">
-        <div class="badge">OASIS TAX & ACCOUNTING · v3.2.2</div>
-        <div class="hero-title">오아시스 내부 CRM +<br>지원사업 컨설팅 플랫폼</div>
+        <div class="badge">TODAY'S OASIS WORKSPACE</div>
+        <div class="hero-title">오늘의 영업과 컨설팅을<br>한 화면에서 시작하세요.</div>
         <div class="hero-sub">
-            고객DB, 기업등록, 정책자금 매칭, 실행이력 관리를 하나의 내부 업무 시스템으로 통합합니다.
+            고객 발굴부터 상담관리, 정책자금 진단까지 필요한 업무를 순서대로 이어갑니다.
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.markdown("""
-        <div class="point-card">
-            <div class="point-icon">👥</div>
-            <div class="point-title">고객관리</div>
-            <div class="point-desc">회원별 누적 고객DB를 검색하고 업체별 상세정보를 빠르게 확인합니다.</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with c2:
-        st.markdown("""
-        <div class="point-card">
-            <div class="point-icon">📄</div>
-            <div class="point-title">기업등록</div>
-            <div class="point-desc">크레탑 PDF에서 추출 가능한 정보를 고객DB에 자동으로 누적합니다.</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with c3:
-        st.markdown("""
-        <div class="point-card">
-            <div class="point-icon">📌</div>
-            <div class="point-title">정책자금 매칭</div>
-            <div class="point-desc">업체별 추천사업과 상담 포인트를 결과 엑셀로 생성합니다.</div>
-        </div>
-        """, unsafe_allow_html=True)
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("등록 고객", f"{customer_count:,}개")
+    metric_cols[1].metric("오늘 후속조치", f"{today_count:,}건")
+    metric_cols[2].metric("기한 경과", f"{overdue_count:,}건")
+    metric_cols[3].metric("향후 7일 예정", f"{week_count:,}건")
+
+    st.markdown("### 빠른 시작")
+    quick_cols = st.columns(3)
+    if quick_cols[0].button(
+        "연락 가능한 기업 찾기",
+        type="primary",
+        use_container_width=True,
+        key="home_open_prospect_v1020",
+    ):
+        st.session_state["_oasis_pending_main_menu"] = "DB발굴"
+        st.rerun()
+    if quick_cols[1].button(
+        "새 기업 등록",
+        use_container_width=True,
+        key="home_open_registration_v1020",
+    ):
+        st.session_state["_oasis_pending_main_menu"] = "기업등록"
+        st.rerun()
+    if quick_cols[2].button(
+        "기업 컨설팅 열기",
+        use_container_width=True,
+        key="home_open_consulting_v1020",
+    ):
+        st.session_state["_oasis_pending_main_menu"] = "기업 컨설팅"
+        st.rerun()
+
+    st.markdown("### 오늘의 후속관리")
+    due_items = [
+        {**item, "구분": "기한 경과"}
+        for item in due_summary.get("overdue", [])
+    ] + [
+        {**item, "구분": "오늘"}
+        for item in due_summary.get("today", [])
+    ] + [
+        {**item, "구분": "향후 7일"}
+        for item in due_summary.get("week", [])
+    ]
+    if due_items:
+        due_frame = pd.DataFrame(due_items)
+        display_columns = [
+            column
+            for column in [
+                "구분",
+                "company_name",
+                "next_action",
+                "next_date",
+                "status",
+            ]
+            if column in due_frame.columns
+        ]
+        due_frame = due_frame[display_columns].rename(
+            columns={
+                "company_name": "업체명",
+                "next_action": "다음 액션",
+                "next_date": "예정일",
+                "status": "고객 상태",
+            }
+        )
+        st.dataframe(
+            due_frame.head(12),
+            hide_index=True,
+            use_container_width=True,
+        )
+    else:
+        st.success(
+            f"{user_name or '담당자'}님의 오늘 예정 후속조치가 없습니다."
+        )
+
+    active_count = sum(
+        int(crm_summary.get(status, 0) or 0)
+        for status in ["상담중", "자료요청", "제안서 발송", "신청준비"]
+    )
+    st.caption(
+        f"현재 진행 중인 고객 {active_count:,}건 · "
+        "후속조치 예정일은 기업 컨설팅의 CRM에서 관리할 수 있습니다."
+    )
 
 
 def format_customer_display_value(value, number=False):
@@ -1684,52 +1748,103 @@ with st.sidebar:
         </div>
         """, unsafe_allow_html=True)
 
-    st.markdown('<div class="sidebar-section-label">MAIN</div>', unsafe_allow_html=True)
-    menu_label_map = {
-        "홈": "홈",
-        "DB발굴": "DB발굴",
-        "기업등록": "기업등록",
-        "기업 컨설팅": "기업관리센터",
-        "AI 코파일럿": "AI 코파일럿",
-        "내 누적 고객DB": "내 누적 고객DB",
-        "실행이력": "실행이력",
-        "담당자 통계": "담당자 통계",
+    menu_groups = {
+        "주요업무": {
+            "홈": "홈",
+            "DB발굴": "DB발굴",
+            "기업등록": "기업등록",
+            "기업 컨설팅": "기업관리센터",
+            "AI 코파일럿": "AI 코파일럿",
+        },
+        "고객관리": {
+            "내 누적 고객DB": "내 누적 고객DB",
+            "실행이력": "실행이력",
+            "담당자 통계": "담당자 통계",
+            "휴지통": "휴지통",
+        },
     }
     if CURRENT_USER_IS_ADMIN:
-        menu_label_map["회원 승인 관리"] = "회원 승인 관리"
-        menu_label_map["시스템 관리"] = "시스템 관리"
-        menu_label_map["클라우드 DB 관리"] = "클라우드 DB 관리"
-        menu_label_map["AI 사용량"] = "AI 사용량"
-
-    # 휴지통은 좌측 메뉴의 가장 마지막 항목으로 유지
-    menu_label_map["휴지통"] = "휴지통"
+        menu_groups["관리자"] = {
+            "회원 승인 관리": "회원 승인 관리",
+            "시스템 관리": "시스템 관리",
+            "클라우드 DB 관리": "클라우드 DB 관리",
+            "AI 사용량": "AI 사용량",
+        }
+    menu_label_map = {
+        label: target
+        for group_items in menu_groups.values()
+        for label, target in group_items.items()
+    }
 
     pending_menu = st.session_state.pop(
         "_oasis_pending_main_menu",
         None,
     )
     if pending_menu in menu_label_map:
-        st.session_state["active_main_menu_v311"] = pending_menu
+        st.session_state["active_main_menu_v1020"] = pending_menu
 
     current_sidebar_value = st.session_state.get(
-        "active_main_menu_v311"
+        "active_main_menu_v1020",
+        st.session_state.get("active_main_menu_v311"),
     )
     if current_sidebar_value == "크레탑 자동등록":
-        st.session_state["active_main_menu_v311"] = "기업등록"
+        st.session_state["active_main_menu_v1020"] = "기업등록"
         current_sidebar_value = "기업등록"
     if current_sidebar_value == "영업후보DB":
-        st.session_state["active_main_menu_v311"] = "DB발굴"
+        st.session_state["active_main_menu_v1020"] = "DB발굴"
         current_sidebar_value = "DB발굴"
     if current_sidebar_value not in menu_label_map:
-        st.session_state["active_main_menu_v311"] = "기업 컨설팅"
+        current_sidebar_value = "홈"
+        st.session_state["active_main_menu_v1020"] = current_sidebar_value
 
+    current_group = next(
+        group_name
+        for group_name, group_items in menu_groups.items()
+        if current_sidebar_value in group_items
+    )
+    if st.session_state.get("sidebar_menu_group_v1020") not in menu_groups:
+        st.session_state["sidebar_menu_group_v1020"] = current_group
+    if pending_menu in menu_label_map:
+        st.session_state["sidebar_menu_group_v1020"] = current_group
+
+    st.markdown(
+        '<div class="sidebar-section-label">업무 영역</div>',
+        unsafe_allow_html=True,
+    )
+    selected_group = st.pills(
+        "업무 영역",
+        list(menu_groups.keys()),
+        key="sidebar_menu_group_v1020",
+        label_visibility="collapsed",
+    )
+    selected_group = selected_group or current_group
+    if current_sidebar_value not in menu_groups[selected_group]:
+        current_sidebar_value = next(iter(menu_groups[selected_group]))
+        st.session_state["active_main_menu_v1020"] = current_sidebar_value
+
+    menu_icons = {
+        "홈": "🏠 홈",
+        "DB발굴": "🔎 DB발굴",
+        "기업등록": "➕ 기업등록",
+        "기업 컨설팅": "📊 기업 컨설팅",
+        "AI 코파일럿": "✨ AI 코파일럿",
+        "내 누적 고객DB": "👥 내 고객DB",
+        "실행이력": "🕘 실행이력",
+        "담당자 통계": "📈 담당자 통계",
+        "휴지통": "🗑️ 휴지통",
+        "회원 승인 관리": "🔐 회원 승인",
+        "시스템 관리": "⚙️ 시스템 관리",
+        "클라우드 DB 관리": "☁️ 클라우드 DB",
+        "AI 사용량": "🤖 AI 사용량",
+    }
     selected_menu_label = st.radio(
         "메뉴",
-        list(menu_label_map.keys()),
-        key="active_main_menu_v311",
-        label_visibility="collapsed"
+        list(menu_groups[selected_group].keys()),
+        key="active_main_menu_v1020",
+        format_func=lambda value: menu_icons.get(value, value),
+        label_visibility="collapsed",
     )
-    active_tab = menu_label_map[selected_menu_label]
+    active_tab = menu_groups[selected_group][selected_menu_label]
 
     # v5.0 호환 처리: 이전 세션의 고객관리 메뉴는 통합 화면으로 이동
     if active_tab in {
@@ -1744,11 +1859,12 @@ with st.sidebar:
     logout_button()
 
 st.markdown(f"""
-<div class="oasis-topbar">
-    <div class="oasis-topbar-logo">{logo_html(365)}</div>
-    <div style="margin-left:22px;">
-        <div class="oasis-topbar-title">오아시스 내부 업무 시스템</div>
-        <div class="oasis-topbar-sub">기업 컨설팅 · 기업등록 · AI 코파일럿</div>
+<div class="oasis-topbar oasis-topbar-compact">
+    <div>
+        <div class="oasis-topbar-title">{selected_menu_label}</div>
+        <div class="oasis-topbar-sub">
+            OASIS WORKSPACE · {CURRENT_USER_NAME or CURRENT_USER_ID}
+        </div>
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -1768,7 +1884,7 @@ if active_tab == "홈":
     if crm_restore_notice.get("restored", 0) > 0:
         st.success(crm_restore_notice.get("message", ""))
 
-    render_home_page()
+    render_home_page(CURRENT_USER_ID, CURRENT_USER_NAME)
 
 elif active_tab == "기업관리센터":
     render_enterprise_management_center(
