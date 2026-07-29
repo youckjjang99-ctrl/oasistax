@@ -170,6 +170,21 @@ def _display_frame(items: list[dict]) -> pd.DataFrame:
                 or _business_type_label(item.get("사업장명"))
             ),
             "사업자등록번호": item.get("사업자등록번호", ""),
+            "사업자번호상태": (
+                item.get("사업자번호상태")
+                or (
+                    "확인"
+                    if len(
+                        re.sub(
+                            r"[^0-9]",
+                            "",
+                            str(item.get("사업자등록번호") or ""),
+                        )
+                    )
+                    == 10
+                    else "미확인"
+                )
+            ),
             "지역": item.get("지역", ""),
             "주소": item.get("주소", ""),
             "대표전화": item.get("대표전화", ""),
@@ -243,6 +258,7 @@ def _display_frame(items: list[dict]) -> pd.DataFrame:
         "사업장명",
         "사업자유형",
         "사업자등록번호",
+        "사업자번호상태",
         "지역",
         "주소",
         "대표전화",
@@ -2134,7 +2150,9 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             st.info(
                 (
                     "국민연금·근로복지공단 신규 신호와 사업자번호 "
-                    "중복제거 인덱스를 사용했습니다. 행안부 자료는 "
+                    "중복제거 인덱스를 사용했습니다. 사업자번호가 "
+                    "없는 국민연금 사업장은 공단 사업장 식별키와 "
+                    "상호·주소로 중복을 방지합니다. 행안부 자료는 "
                     "이 조회에 포함되지 않습니다."
                     if discovery_type == "recent_opening"
                     else (
@@ -2217,6 +2235,7 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 "선택",
                 "사업장명",
                 "사업자유형",
+                "사업자번호상태",
                 "휴대전화",
                 "일반전화",
                 "이메일",
