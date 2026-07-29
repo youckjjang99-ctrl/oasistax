@@ -25,6 +25,11 @@ from reportlab.platypus import (
     TableStyle,
 )
 
+from temporary_advance_calculator import (
+    company_burden_text,
+    representative_burden_text,
+)
+
 NAVY = colors.HexColor("#0B2B5B")
 BLUE = colors.HexColor("#1E5BD7")
 GREEN = colors.HexColor("#16835F")
@@ -969,52 +974,73 @@ def build_representative_pdf(
             temporary_advance.get("representative", {}) or {}
         )
         advance_company = temporary_advance.get("company", {}) or {}
+        advance_estimation = temporary_advance.get("estimation", {}) or {}
         story += [
             _pdf_section_title("06. 가지급금 세무/4대보험 사전진단", styles),
             Spacer(1, 5 * mm),
         ]
-        advance_rows = [
-            ["관점", "항목", "추정금액", "판단 기준"],
-            [
-                "공통",
-                "가지급금 잔액",
-                _money(advance_inputs.get("balance")),
-                (
-                    f"인정이자율 "
-                    f"{float(advance_inputs.get('recognized_interest_rate_pct', 0) or 0):.2f}%"
-                ),
-            ],
-            [
-                "대표자",
-                "상여처분 소득",
-                _money(advance_representative.get("bonus_disposition")),
-                "미회수 인정이자 상여 가정",
-            ],
-            [
-                "대표자",
-                "세금/보험 합계",
-                _money(advance_representative.get("total_burden")),
-                "누진소득세/지방소득세/선택 보험",
-            ],
-            [
-                "법인",
-                "연간 인정이자",
-                _money(advance_company.get("recognized_interest")),
-                "회사에 귀속되어야 할 이자",
-            ],
-            [
-                "법인",
-                "지급이자 손금불산입",
-                _money(advance_company.get("disallowed_interest")),
-                "차입금/지급이자 단순 적수 가정",
-            ],
-            [
-                "법인",
-                "세금/보험 합계",
-                _money(advance_company.get("tax_and_insurance_burden")),
-                "추가 세금 + 회사 부담 보험료",
-            ],
-        ]
+        if not advance_estimation.get("balance_confirmed", False):
+            advance_rows = [
+                ["관점", "항목", "추정금액", "판단 기준"],
+                [
+                    "확인 필요",
+                    "가지급금/대여금 후보계정",
+                    _money(advance_inputs.get("balance")),
+                    "대표자/특수관계인 관련 거래인지 계정별원장 확인 필요",
+                ],
+            ]
+        else:
+            advance_rows = [
+                ["관점", "항목", "추정금액", "판단 기준"],
+                [
+                    "공통",
+                    "가지급금 잔액",
+                    _money(advance_inputs.get("balance")),
+                    (
+                        f"인정이자율 "
+                        f"{float(advance_inputs.get('recognized_interest_rate_pct', 0) or 0):.2f}%"
+                    ),
+                ],
+                [
+                    "대표자",
+                    "상여처분 소득",
+                    _money(advance_representative.get("bonus_disposition")),
+                    "미회수 인정이자 상여 가정",
+                ],
+                [
+                    "대표자",
+                    "예상 부담",
+                    representative_burden_text(temporary_advance),
+                    "세금 + 확인된 보험료",
+                ],
+                [
+                    "법인",
+                    "연간 인정이자",
+                    _money(advance_company.get("recognized_interest")),
+                    "회사에 귀속되어야 할 이자",
+                ],
+                [
+                    "법인",
+                    "지급이자 손금불산입",
+                    _money(advance_company.get("disallowed_interest")),
+                    "차입금/지급이자 단순 적수 가정",
+                ],
+                [
+                    "법인",
+                    "추가 세금/보험",
+                    company_burden_text(temporary_advance),
+                    "미회수 인정이자 제외",
+                ],
+                [
+                    "법인",
+                    "총 재무 노출",
+                    company_burden_text(
+                        temporary_advance,
+                        include_uncollected_interest=True,
+                    ),
+                    "회수가능 채권 포함/확정손실 아님",
+                ],
+            ]
         advance_header = ParagraphStyle(
             "v861_advance_header",
             parent=body_small,
@@ -1059,7 +1085,8 @@ def build_representative_pdf(
             Paragraph(
                 "※ 가지급금 원금 자체를 대표자 소득으로 단정하지 않습니다. "
                 "인정이자율은 원칙적으로 가중평균차입이자율이며, 상여처분/보수반영/"
-                "고용산재 피보험자격은 계정별원장과 계약서 및 공단 확인 후 확정해야 합니다.",
+                "고용산재 피보험자격은 계정별원장과 계약서 및 공단 확인 후 확정해야 합니다. "
+                "과세표준 미확인 세금은 범위로, 보수정보 미확인 보험료는 별도로 표시합니다.",
                 body_small,
             ),
             Spacer(1, 7 * mm),
