@@ -129,6 +129,74 @@ def _non_negative(value: Any) -> float:
     return max(0.0, _number(value))
 
 
+def format_estimate_range(
+    minimum: Any,
+    maximum: Any,
+    *,
+    pending_insurance: bool = False,
+) -> str:
+    low = int(round(_non_negative(minimum)))
+    high = int(round(max(low, _non_negative(maximum))))
+    value = (
+        f"{low:,}원"
+        if low == high
+        else f"{low:,}~{high:,}원"
+    )
+    if pending_insurance:
+        value += " + 보험료 미확인"
+    return value
+
+
+def representative_burden_text(result: Mapping[str, Any]) -> str:
+    representative = result.get("representative", {}) or {}
+    return format_estimate_range(
+        representative.get(
+            "total_burden_min",
+            representative.get("total_burden", 0),
+        ),
+        representative.get(
+            "total_burden_max",
+            representative.get("total_burden", 0),
+        ),
+        pending_insurance=bool(
+            representative.get("insurance_pending", False)
+        ),
+    )
+
+
+def company_burden_text(
+    result: Mapping[str, Any],
+    *,
+    include_uncollected_interest: bool = False,
+) -> str:
+    company = result.get("company", {}) or {}
+    if include_uncollected_interest:
+        low = company.get(
+            "cash_exposure_min",
+            company.get("cash_exposure_including_uncollected_interest", 0),
+        )
+        high = company.get(
+            "cash_exposure_max",
+            company.get("cash_exposure_including_uncollected_interest", 0),
+        )
+    else:
+        low = company.get(
+            "tax_and_insurance_burden_min",
+            company.get("tax_and_insurance_burden", 0),
+        )
+        high = company.get(
+            "tax_and_insurance_burden_max",
+            company.get("tax_and_insurance_burden", 0),
+        )
+    return format_estimate_range(
+        low,
+        high,
+        pending_insurance=bool(
+            company.get("insurance_pending", False)
+        ),
+    )
+
+
 def _mapping_get(source: Any, key: str) -> Any:
     if source is None:
         return None
@@ -210,6 +278,8 @@ def calculate_temporary_advance(inputs: Mapping[str, Any]) -> dict[str, Any]:
     social-insurance scenarios. A balance alone is never treated as income.
     """
     balance = _non_negative(inputs.get("balance"))
+    ui_mode = str(inputs.get("ui_mode", "간편 진단") or "간편 진단")
+    balance_confirmed = bool(inputs.get("balance_confirmed", False))
     days = min(366, max(0, int(_number(inputs.get("days"), 365))))
     interest_rate_pct = max(
         0.0,
@@ -250,20 +320,59 @@ def calculate_temporary_advance(inputs: Mapping[str, Any]) -> dict[str, Any]:
     representative_tax_base = _non_negative(
         inputs.get("representative_tax_base")
     )
+    representative_tax_base_known = (
+        bool(inputs.get("representative_tax_base_known"))
+        if "representative_tax_base_known" in inputs
+        else True
+    )
     personal_income_tax = incremental_progressive_tax(
         representative_tax_base,
         bonus_disposition,
         PERSONAL_INCOME_TAX_BRACKETS,
     )
     personal_local_income_tax = personal_income_tax * LOCAL_INCOME_TAX_RATIO
+    personal_tax_min = incremental_progressive_tax(
+        0,
+        bonus_disposition,
+        PERSONAL_INCOME_TAX_BRACKETS,
+    )
+    personal_tax_max = bonus_disposition * 0.45
+    personal_tax_total_min = personal_tax_min * (
+        1 + LOCAL_INCOME_TAX_RATIO
+    )
+    personal_tax_total_max = personal_tax_max * (
+        1 + LOCAL_INCOME_TAX_RATIO
+    )
+    if representative_tax_base_known:
+        personal_tax_total_min = (
+            personal_income_tax + personal_local_income_tax
+        )
+        personal_tax_total_max = personal_tax_total_min
 
-    nps_health_covered = bool(inputs.get("nps_health_covered", True))
+    raw_insurance_status = str(inputs.get("insurance_status", "") or "")
+    if raw_insurance_status in {"미확인", "직장가입", "미가입"}:
+        insurance_status = raw_insurance_status
+        current_monthly_income_known = bool(
+            inputs.get("current_monthly_standard_income_known", False)
+        )
+    else:
+        nps_health_legacy = bool(inputs.get("nps_health_covered", True))
+        insurance_status = "직장가입" if nps_health_legacy else "미가입"
+        current_monthly_income_known = True
+    nps_health_covered = insurance_status == "직장가입"
     employment_covered = bool(inputs.get("employment_covered", False))
     industrial_accident_covered = bool(
         inputs.get("industrial_accident_covered", False)
     )
     current_monthly_standard_income = _non_negative(
         inputs.get("current_monthly_standard_income")
+    )
+    insurance_pending = bool(
+        insurance_status == "미확인"
+        or (
+            insurance_status == "직장가입"
+            and not current_monthly_income_known
+        )
     )
     employment_stability_rate = max(
         0.0,
@@ -279,7 +388,7 @@ def calculate_temporary_advance(inputs: Mapping[str, Any]) -> dict[str, Any]:
             current_monthly_standard_income,
             bonus_disposition,
         )
-        if nps_health_covered
+        if nps_health_covered and current_monthly_income_known
         else 0.0
     )
     health_ltc_total = (
@@ -327,6 +436,11 @@ def calculate_temporary_advance(inputs: Mapping[str, Any]) -> dict[str, Any]:
         )
 
     corporate_tax_base = _non_negative(inputs.get("corporate_tax_base"))
+    corporate_tax_base_known = (
+        bool(inputs.get("corporate_tax_base_known"))
+        if "corporate_tax_base_known" in inputs
+        else True
+    )
     corporate_taxable_increment = (
         tax_adjustment_interest + disallowed_interest
     )
@@ -338,6 +452,23 @@ def calculate_temporary_advance(inputs: Mapping[str, Any]) -> dict[str, Any]:
     corporate_local_income_tax = (
         corporate_income_tax * LOCAL_INCOME_TAX_RATIO
     )
+    corporate_tax_min = incremental_progressive_tax(
+        0,
+        corporate_taxable_increment,
+        CORPORATE_TAX_BRACKETS_2026,
+    )
+    corporate_tax_max = corporate_taxable_increment * 0.25
+    corporate_tax_total_min = corporate_tax_min * (
+        1 + LOCAL_INCOME_TAX_RATIO
+    )
+    corporate_tax_total_max = corporate_tax_max * (
+        1 + LOCAL_INCOME_TAX_RATIO
+    )
+    if corporate_tax_base_known:
+        corporate_tax_total_min = (
+            corporate_income_tax + corporate_local_income_tax
+        )
+        corporate_tax_total_max = corporate_tax_total_min
 
     representative_tax_total = (
         personal_income_tax + personal_local_income_tax
@@ -346,6 +477,12 @@ def calculate_temporary_advance(inputs: Mapping[str, Any]) -> dict[str, Any]:
     company_tax_total = corporate_income_tax + corporate_local_income_tax
     company_tax_and_insurance = company_tax_total + employer_insurance
     company_cash_exposure = company_tax_and_insurance + interest_shortfall
+    representative_total_min = personal_tax_total_min + employee_insurance
+    representative_total_max = personal_tax_total_max + employee_insurance
+    company_total_min = corporate_tax_total_min + employer_insurance
+    company_total_max = corporate_tax_total_max + employer_insurance
+    company_exposure_min = company_total_min + interest_shortfall
+    company_exposure_max = company_total_max + interest_shortfall
 
     insurance_rows = [
         {
@@ -353,20 +490,35 @@ def calculate_temporary_advance(inputs: Mapping[str, Any]) -> dict[str, Any]:
             "대표자 부담": pension_total / 2,
             "법인 부담": pension_total / 2,
             "적용": nps_health_covered,
-            "기준": "2026년 9.5%, 노사 1/2·월 상하한 반영",
+            "미확인": insurance_pending,
+            "기준": (
+                "직장가입 여부 확인 필요"
+                if insurance_status == "미확인"
+                else (
+                    "월 기준소득 확인 필요"
+                    if not current_monthly_income_known
+                    else "2026년 9.5%, 노사 1/2·월 상하한 반영"
+                )
+            ),
         },
         {
             "구분": "건강·장기요양",
             "대표자 부담": health_ltc_total / 2,
             "법인 부담": health_ltc_total / 2,
             "적용": nps_health_covered,
-            "기준": "2026년 보수 대비 합계 8.1348%, 노사 1/2",
+            "미확인": insurance_status == "미확인",
+            "기준": (
+                "직장가입 여부 확인 필요"
+                if insurance_status == "미확인"
+                else "2026년 보수 대비 합계 8.1348%, 노사 1/2"
+            ),
         },
         {
             "구분": "고용보험",
             "대표자 부담": employment_worker,
             "법인 부담": employment_employer,
             "적용": employment_covered,
+            "미확인": False,
             "기준": "실업급여 각 0.9% + 법인 고용안정요율",
         },
         {
@@ -374,6 +526,7 @@ def calculate_temporary_advance(inputs: Mapping[str, Any]) -> dict[str, Any]:
             "대표자 부담": 0.0,
             "법인 부담": industrial_accident_employer,
             "적용": industrial_accident_covered,
+            "미확인": False,
             "기준": f"입력 업종요율 {industrial_accident_rate * 100:.3f}%",
         },
     ]
@@ -383,6 +536,10 @@ def calculate_temporary_advance(inputs: Mapping[str, Any]) -> dict[str, Any]:
         warnings.append(
             "가지급금 잔액이 0원입니다. 크레탑 계정 또는 직접 입력액을 확인하세요."
         )
+    if balance > 0 and not balance_confirmed:
+        warnings.append(
+            "해당 계정이 대표자·특수관계인 관련 가지급금인지 확인 전인 사전탐지 상태입니다."
+        )
     if interest_rate_pct == DEFAULT_RECOGNIZED_INTEREST_RATE:
         warnings.append(
             "4.6%는 당좌대출이자율 가정입니다. 원칙인 회사의 가중평균차입이자율을 먼저 확인해야 합니다."
@@ -390,6 +547,18 @@ def calculate_temporary_advance(inputs: Mapping[str, Any]) -> dict[str, Any]:
     if bonus_disposition > 0:
         warnings.append(
             "대표자 세액은 상여처분액 전액이 과세표준에 더해지는 보수적 추정치입니다. 근로소득공제·세액공제·다른 소득에 따라 실제 세액이 달라집니다."
+        )
+    if bonus_disposition > 0 and not representative_tax_base_known:
+        warnings.append(
+            "대표자 과세표준이 미확인되어 종합소득세·지방소득세는 최저~최고 세율 범위로 표시합니다."
+        )
+    if corporate_taxable_increment > 0 and not corporate_tax_base_known:
+        warnings.append(
+            "법인 과세표준이 미확인되어 법인세·지방소득세는 최저~최고 세율 범위로 표시합니다."
+        )
+    if insurance_pending and bonus_disposition > 0:
+        warnings.append(
+            "대표자 직장가입 여부 또는 월 기준소득이 미확인되어 4대보험 최종 합계는 별도 확인이 필요합니다."
         )
     if nps_health_covered and bonus_disposition > 0:
         warnings.append(
@@ -407,16 +576,24 @@ def calculate_temporary_advance(inputs: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "calculated_at": datetime.now().isoformat(timespec="seconds"),
         "inputs": {
+            "ui_mode": ui_mode,
             "balance": balance,
+            "balance_confirmed": balance_confirmed,
             "days": days,
             "recognized_interest_rate_pct": interest_rate_pct,
             "received_interest": received_interest,
             "disposition_mode": disposition_mode,
             "representative_tax_base": representative_tax_base,
+            "representative_tax_base_known": representative_tax_base_known,
             "corporate_tax_base": corporate_tax_base,
+            "corporate_tax_base_known": corporate_tax_base_known,
             "total_borrowings": total_borrowings,
             "annual_interest_expense": annual_interest_expense,
             "current_monthly_standard_income": current_monthly_standard_income,
+            "current_monthly_standard_income_known": (
+                current_monthly_income_known
+            ),
+            "insurance_status": insurance_status,
             "nps_health_covered": nps_health_covered,
             "employment_covered": employment_covered,
             "industrial_accident_covered": industrial_accident_covered,
@@ -428,8 +605,14 @@ def calculate_temporary_advance(inputs: Mapping[str, Any]) -> dict[str, Any]:
             "income_tax": personal_income_tax,
             "local_income_tax": personal_local_income_tax,
             "tax_total": representative_tax_total,
+            "tax_total_min": personal_tax_total_min,
+            "tax_total_max": personal_tax_total_max,
+            "tax_base_known": representative_tax_base_known,
             "insurance_total": employee_insurance,
+            "insurance_pending": insurance_pending,
             "total_burden": representative_total,
+            "total_burden_min": representative_total_min,
+            "total_burden_max": representative_total_max,
         },
         "company": {
             "recognized_interest": recognized_interest,
@@ -443,9 +626,32 @@ def calculate_temporary_advance(inputs: Mapping[str, Any]) -> dict[str, Any]:
             "corporate_income_tax": corporate_income_tax,
             "local_income_tax": corporate_local_income_tax,
             "tax_total": company_tax_total,
+            "tax_total_min": corporate_tax_total_min,
+            "tax_total_max": corporate_tax_total_max,
+            "tax_base_known": corporate_tax_base_known,
             "employer_insurance_total": employer_insurance,
+            "insurance_pending": insurance_pending,
             "tax_and_insurance_burden": company_tax_and_insurance,
+            "tax_and_insurance_burden_min": company_total_min,
+            "tax_and_insurance_burden_max": company_total_max,
             "cash_exposure_including_uncollected_interest": company_cash_exposure,
+            "cash_exposure_min": company_exposure_min,
+            "cash_exposure_max": company_exposure_max,
+        },
+        "estimation": {
+            "balance_confirmed": balance_confirmed,
+            "representative_tax_base_known": (
+                representative_tax_base_known
+            ),
+            "corporate_tax_base_known": corporate_tax_base_known,
+            "insurance_status": insurance_status,
+            "insurance_pending": insurance_pending,
+            "has_unknowns": bool(
+                not balance_confirmed
+                or not representative_tax_base_known
+                or not corporate_tax_base_known
+                or insurance_pending
+            ),
         },
         "insurance_rows": insurance_rows,
         "combined_tax_and_insurance_burden": (
@@ -458,17 +664,23 @@ def calculate_temporary_advance(inputs: Mapping[str, Any]) -> dict[str, Any]:
 
 def default_temporary_advance_inputs(balance: Any = 0) -> dict[str, Any]:
     return {
+        "ui_mode": "간편 진단",
         "balance": _non_negative(balance),
+        "balance_confirmed": False,
         "days": 365,
         "recognized_interest_rate_pct": DEFAULT_RECOGNIZED_INTEREST_RATE,
         "received_interest": 0,
         "disposition_mode": "미회수·대표자 상여처분 가정",
         "representative_tax_base": 0,
+        "representative_tax_base_known": False,
         "corporate_tax_base": 0,
+        "corporate_tax_base_known": False,
         "total_borrowings": 0,
         "annual_interest_expense": 0,
         "current_monthly_standard_income": 0,
-        "nps_health_covered": True,
+        "current_monthly_standard_income_known": False,
+        "insurance_status": "미확인",
+        "nps_health_covered": False,
         "employment_covered": False,
         "industrial_accident_covered": False,
         "employment_stability_rate_pct": 0.25,

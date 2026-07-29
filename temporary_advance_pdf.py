@@ -20,6 +20,12 @@ from reportlab.platypus import (
     TableStyle,
 )
 
+from temporary_advance_calculator import (
+    company_burden_text,
+    format_estimate_range,
+    representative_burden_text,
+)
+
 
 NAVY = colors.HexColor("#0B2B5B")
 BLUE = colors.HexColor("#1E5BD7")
@@ -147,13 +153,19 @@ def build_temporary_advance_pdf(
     inputs = result.get("inputs", {}) or {}
     representative = result.get("representative", {}) or {}
     company = result.get("company", {}) or {}
+    estimation = result.get("estimation", {}) or {}
+    diagnosis_status = (
+        "확인값 반영"
+        if not estimation.get("has_unknowns")
+        else "일부 입력 미확인/범위 표시"
+    )
 
     story = [
         Paragraph("가지급금 세무/4대보험 사전진단", title),
         Paragraph(
             f"{company_name or '-'} / 사업자번호 {business_no or '-'} / "
             f"작성일 {datetime.now().strftime('%Y-%m-%d')} / "
-            f"담당 {consultant_name or '-'}",
+            f"담당 {consultant_name or '-'} / {diagnosis_status}",
             subtitle,
         ),
         Spacer(1, 4 * mm),
@@ -172,9 +184,23 @@ def build_temporary_advance_pdf(
         ],
         [
             Paragraph("대표자 기존 과세표준", body_bold),
-            Paragraph(_money(inputs.get("representative_tax_base")), body),
+            Paragraph(
+                (
+                    _money(inputs.get("representative_tax_base"))
+                    if inputs.get("representative_tax_base_known")
+                    else "미확인(범위 표시)"
+                ),
+                body,
+            ),
             Paragraph("법인 기존 과세표준", body_bold),
-            Paragraph(_money(inputs.get("corporate_tax_base")), body),
+            Paragraph(
+                (
+                    _money(inputs.get("corporate_tax_base"))
+                    if inputs.get("corporate_tax_base_known")
+                    else "미확인(범위 표시)"
+                ),
+                body,
+            ),
         ],
         [
             Paragraph("실제 회수 이자", body_bold),
@@ -209,12 +235,9 @@ def build_temporary_advance_pdf(
             Paragraph("연간 인정이자", body_bold),
             Paragraph(_money(company.get("recognized_interest")), body_bold),
             Paragraph("대표자 세금/보험", body_bold),
-            Paragraph(_money(representative.get("total_burden")), body_bold),
+            Paragraph(representative_burden_text(result), body_bold),
             Paragraph("법인 세금/보험", body_bold),
-            Paragraph(
-                _money(company.get("tax_and_insurance_burden")),
-                body_bold,
-            ),
+            Paragraph(company_burden_text(result), body_bold),
         ]
     ]
     kpi_table = Table(kpi_data, colWidths=[29 * mm, 30 * mm] * 3)
@@ -250,24 +273,36 @@ def build_temporary_advance_pdf(
             "미회수 인정이자를 대표자 근로소득으로 처분하는 가정",
         ],
         [
-            "종합소득세",
-            _money(representative.get("income_tax")),
-            "기존 종합소득 과세표준을 포함한 누진세율 차액",
-        ],
-        [
-            "개인지방소득세",
-            _money(representative.get("local_income_tax")),
-            "종합소득세 추정액의 10%",
+            "소득세/지방소득세",
+            format_estimate_range(
+                representative.get(
+                    "tax_total_min",
+                    representative.get("tax_total", 0),
+                ),
+                representative.get(
+                    "tax_total_max",
+                    representative.get("tax_total", 0),
+                ),
+            ),
+            (
+                "과세표준 확인값"
+                if representative.get("tax_base_known")
+                else "과세표준 미확인/최저~최고 세율 범위"
+            ),
         ],
         [
             "대표자 4대보험",
-            _money(representative.get("insurance_total")),
-            "선택한 피보험자격과 2026년 요율을 적용",
+            (
+                "미확인"
+                if representative.get("insurance_pending")
+                else _money(representative.get("insurance_total"))
+            ),
+            "직장가입/월 보수와 피보험자격 기준",
         ],
         [
-            "대표자 합계",
-            _money(representative.get("total_burden")),
-            "세금 + 대표자 부담 보험료",
+            "대표자 예상 부담",
+            representative_burden_text(result),
+            "세금 + 확인된 대표자 부담 보험료",
         ],
     ]
     company_rows = [
@@ -284,23 +319,43 @@ def build_temporary_advance_pdf(
         ],
         [
             "법인세/지방소득세",
-            _money(company.get("tax_total")),
-            "인정이자 세무조정 + 손금불산입으로 증가한 추정세액",
+            format_estimate_range(
+                company.get(
+                    "tax_total_min",
+                    company.get("tax_total", 0),
+                ),
+                company.get(
+                    "tax_total_max",
+                    company.get("tax_total", 0),
+                ),
+            ),
+            (
+                "과세표준 확인값"
+                if company.get("tax_base_known")
+                else "과세표준 미확인/최저~최고 세율 범위"
+            ),
         ],
         [
             "법인 부담 4대보험",
-            _money(company.get("employer_insurance_total")),
-            "상여가 보수에 반영되는 경우의 회사 부담분",
+            (
+                "미확인"
+                if company.get("insurance_pending")
+                else _money(company.get("employer_insurance_total"))
+            ),
+            "상여의 보수반영과 피보험자격 기준",
         ],
         [
-            "법인 세금/보험 합계",
-            _money(company.get("tax_and_insurance_burden")),
-            "추가 세금 + 회사 부담 보험료",
+            "법인 추가 세금/보험",
+            company_burden_text(result),
+            "미회수 인정이자 제외",
         ],
         [
-            "미회수이자 포함 노출",
-            _money(company.get("cash_exposure_including_uncollected_interest")),
-            "세금/보험과 아직 받지 못한 인정이자의 합계",
+            "법인 총 재무 노출",
+            company_burden_text(
+                result,
+                include_uncollected_interest=True,
+            ),
+            "회수 가능한 채권을 포함/확정 손실 아님",
         ],
     ]
 
@@ -361,11 +416,19 @@ def build_temporary_advance_pdf(
         insurance_rows.append(
             [
                 str(row.get("구분", "")),
-                _money(row.get("대표자 부담")),
-                _money(row.get("법인 부담")),
+                (
+                    "미확인"
+                    if row.get("미확인")
+                    else _money(row.get("대표자 부담"))
+                ),
+                (
+                    "미확인"
+                    if row.get("미확인")
+                    else _money(row.get("법인 부담"))
+                ),
                 (
                     str(row.get("기준", ""))
-                    if row.get("적용")
+                    if row.get("적용") or row.get("미확인")
                     else "미적용 - 피보험자격 선택 안 함"
                 ),
             ]
@@ -408,6 +471,7 @@ def build_temporary_advance_pdf(
         "가지급금 원금 자체를 대표자 소득으로 단정하지 않으며, 인정이자 미회수/상여처분 시나리오를 계산한 사전진단입니다.",
         "인정이자율은 원칙적으로 가중평균차입이자율이며 4.6%는 법정 당좌대출이자율을 선택/적용할 수 있는 경우의 가정입니다.",
         "대표자 세액은 상여처분액 전액이 과세표준에 더해지는 보수적 추정입니다. 근로소득공제/세액공제와 실제 보수 신고를 반영하면 달라집니다.",
+        "과세표준이 미확인된 경우 세금은 최저~최고 세율 범위이며, 보수정보 미확인 보험료는 합계와 분리해 표시합니다.",
         "대표이사는 통상 고용/산재보험 근로자성이 인정되지 않으므로 실제 피보험자격을 확인해야 합니다.",
         "최종 신고 전 세무대리인과 공단에 계정별원장, 금전소비대차계약, 이자수취, 차입금 적수 및 보수총액을 확인하세요.",
     ]
