@@ -224,6 +224,11 @@ def render_ai_usage_page(
     current_user_id: str,
     current_user_name: str,
 ) -> None:
+    from auth import is_admin
+
+    if not is_admin(current_user_id):
+        st.error("관리자 권한이 필요합니다.")
+        return
     st.markdown("## AI 사용량 및 예상비용")
     st.caption(
         "녹취·상담일지 API 호출과 캐시 절감량을 보여줍니다. "

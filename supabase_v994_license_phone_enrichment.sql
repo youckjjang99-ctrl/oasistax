@@ -22,6 +22,7 @@ create index if not exists oasis_licensed_businesses_phone_enrichment_idx
 create or replace function public.oasis_preserve_enriched_phone()
 returns trigger
 language plpgsql
+set search_path = public, pg_temp
 as $$
 begin
     if old.phone <> '' and coalesce(new.phone, '') = '' then

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
@@ -117,6 +118,106 @@ DISCOVERY_TYPE_LABELS = {
     value: label for label, value in DISCOVERY_TYPE_OPTIONS.items()
 }
 
+MOBILE_PHONE_PATTERN = re.compile(
+    r"(?<!\d)(?:(?:\+?82)[\s.\-]?(?:\(0\)[\s.\-]?)?|0)"
+    r"(?:10|11|16|17|18|19)[\s.\-]?\d{3,4}[\s.\-]?\d{4}(?!\d)"
+)
+
+
+def _redact_mobile_candidate(
+    item: dict,
+    can_view_mobile: bool,
+) -> dict:
+    copied = deepcopy(item)
+    if can_view_mobile:
+        return copied
+
+    phone_value_keys = {
+        "대표전화",
+        "휴대전화",
+        "일반전화",
+        "phone",
+        "mobile_phone",
+        "landline_phone",
+        "contact_value",
+    }
+    mobile_only_keys = {"휴대전화", "mobile_phone"}
+
+    def _redact(value, key: str = ""):
+        if isinstance(value, dict):
+            return {
+                str(child_key): _redact(child_value, str(child_key))
+                for child_key, child_value in value.items()
+            }
+        if isinstance(value, list):
+            return [_redact(child, key) for child in value]
+        if isinstance(value, tuple):
+            return tuple(_redact(child, key) for child in value)
+        if key in mobile_only_keys:
+            return ""
+        if key in phone_value_keys and is_mobile_phone(value):
+            return ""
+        if isinstance(value, str):
+            return MOBILE_PHONE_PATTERN.sub("[휴대전화 비공개]", value)
+        return value
+
+    redacted = _redact(copied)
+    landline = normalize_phone(
+        redacted.get("일반전화")
+        or redacted.get("landline_phone")
+        or ""
+    )
+    if is_mobile_phone(landline):
+        landline = ""
+    representative = normalize_phone(redacted.get("대표전화") or "")
+    if is_mobile_phone(representative):
+        representative = landline
+    representative = representative or landline
+
+    redacted["휴대전화"] = ""
+    redacted["일반전화"] = landline
+    redacted["대표전화"] = representative
+    if "mobile_phone" in redacted:
+        redacted["mobile_phone"] = ""
+    if "landline_phone" in redacted:
+        redacted["landline_phone"] = landline
+    if redacted.get("전화유형") == "휴대전화":
+        redacted["전화유형"] = "대표번호" if representative else ""
+    return redacted
+
+
+def _sanitize_search_result(
+    result: dict,
+    can_view_mobile: bool,
+) -> dict:
+    sanitized = deepcopy(result or {})
+    if can_view_mobile:
+        return sanitized
+
+    items = [
+        _redact_mobile_candidate(item, False)
+        for item in list(sanitized.get("items") or [])
+        if isinstance(item, dict)
+    ]
+    accessible_items = [
+        item
+        for item in items
+        if (
+            normalize_phone(item.get("일반전화"))
+            or str(item.get("이메일") or "").strip()
+            or str(item.get("인스타그램") or "").strip()
+            or str(item.get("인스타그램URL") or "").strip()
+        )
+    ]
+    sanitized["items"] = accessible_items
+    sanitized["failures"] = [
+        _redact_mobile_candidate(row, False)
+        for row in list(sanitized.get("failures") or [])
+        if isinstance(row, dict)
+    ]
+    sanitized["found_count"] = len(accessible_items)
+    return sanitized
+
 
 def _is_stock_company(value: object) -> bool:
     name = str(value or "").replace(" ", "")
@@ -160,9 +261,13 @@ def _employment_value(value: object) -> int | str:
         return "확인 불가"
 
 
-def _display_frame(items: list[dict]) -> pd.DataFrame:
+def _display_frame(
+    items: list[dict],
+    can_view_mobile: bool = False,
+) -> pd.DataFrame:
     rows = []
-    for item in items:
+    for raw_item in items:
+        item = _redact_mobile_candidate(raw_item, can_view_mobile)
         row = {
             "선택": bool(item.get("선택", True)),
             "사업장명": item.get("사업장명", ""),
@@ -347,6 +452,7 @@ def _saved_sales_analysis(row: dict) -> dict:
 def _saved_candidate_frame(
     rows: list[dict],
     contacts: list[dict],
+    can_view_mobile: bool = False,
 ) -> pd.DataFrame:
     phones_by_id: dict[str, list[dict]] = {}
     email_by_id: dict[str, str] = {}
@@ -355,7 +461,13 @@ def _saved_candidate_frame(
         prospect_id = str(contact.get("prospect_id") or "")
         if contact.get("do_not_contact"):
             continue
-        if contact.get("contact_type") == "phone":
+        if (
+            contact.get("contact_type") == "phone"
+            and (
+                can_view_mobile
+                or not is_mobile_phone(contact.get("contact_value", ""))
+            )
+        ):
             phones_by_id.setdefault(prospect_id, []).append(contact)
         if (
             contact.get("contact_type") == "email"
@@ -400,12 +512,28 @@ def _saved_candidate_frame(
             else ""
         )
         analysis_phone = str(analysis.get("phone") or "")
+        if not can_view_mobile and is_mobile_phone(analysis_phone):
+            analysis_phone = ""
         preferred_phone = (
             saved_phone
-            if is_mobile_phone(saved_phone)
+            if (
+                can_view_mobile
+                and is_mobile_phone(saved_phone)
+            )
             or not is_mobile_phone(analysis_phone)
             else analysis_phone
         ) or analysis_phone
+        preferred_phone = normalize_phone(preferred_phone)
+        mobile_phone = (
+            preferred_phone
+            if can_view_mobile and is_mobile_phone(preferred_phone)
+            else ""
+        )
+        landline_phone = (
+            preferred_phone
+            if preferred_phone and not is_mobile_phone(preferred_phone)
+            else ""
+        )
         instagram, instagram_url = instagram_by_id.get(
             prospect_id,
             (
@@ -420,9 +548,9 @@ def _saved_candidate_frame(
                     source_data.get("business_type")
                 )
                 or _business_type_label(row.get("company_name")),
-                "대표전화": (
-                    preferred_phone
-                ),
+                "대표전화": preferred_phone,
+                "휴대전화": mobile_phone,
+                "일반전화": landline_phone,
                 "전화유형": (
                     "휴대전화"
                     if is_mobile_phone(preferred_phone)
@@ -1318,6 +1446,9 @@ def _render_prospect_db_center_legacy(owner_user_id: str = "") -> None:
         use_container_width=True,
         hide_index=True,
         column_config={
+            "인스타그램URL": st.column_config.LinkColumn(
+                "인스타그램 링크"
+            ),
             "초회전화스크립트": st.column_config.TextColumn(
                 "초회 전화 스크립트",
                 width="large",
@@ -1583,12 +1714,20 @@ def _render_prospect_db_center_legacy(owner_user_id: str = "") -> None:
         )
 
 
-def _render_clean_saved_prospects(owner_user_id: str) -> None:
+def _render_clean_saved_prospects(
+    owner_user_id: str,
+    can_view_mobile: bool = False,
+) -> None:
     st.markdown("### 저장된 영업후보")
     st.caption(
         "내가 저장한 영업후보만 표시합니다. 다른 사용자가 저장한 업체는 "
-        "보이지 않지만, 전사 중복 제외 기준에는 계속 반영됩니다. 대표전화 "
-        "또는 휴대전화가 확인된 업체를 고용 증가 기준 순으로 표시합니다."
+        "보이지 않지만, 전사 중복 제외 기준에는 계속 반영됩니다. "
+        + (
+            "휴대전화·일반전화·이메일·인스타그램이 확인된 업체를 "
+            if can_view_mobile
+            else "일반전화·이메일·인스타그램이 확인된 업체를 "
+        )
+        + "고용 증가 기준 순으로 표시합니다."
     )
     try:
         rows = list_prospects(owner_user_id, limit=1000)
@@ -1608,23 +1747,48 @@ def _render_clean_saved_prospects(owner_user_id: str) -> None:
     except Exception:
         contacts = []
 
-    frame = _saved_candidate_frame(rows, contacts)
+    frame = _saved_candidate_frame(
+        rows,
+        contacts,
+        can_view_mobile=can_view_mobile,
+    )
     if not frame.empty:
         frame["대표전화"] = frame["대표전화"].map(normalize_phone)
-        frame = frame[frame["대표전화"] != ""].reset_index(drop=True)
+        frame["휴대전화"] = frame["휴대전화"].map(normalize_phone)
+        frame["일반전화"] = frame["일반전화"].map(normalize_phone)
+        accessible = (
+            (frame["일반전화"] != "")
+            | (frame["이메일"].fillna("").astype(str).str.strip() != "")
+            | (frame["인스타그램"].fillna("").astype(str).str.strip() != "")
+            | (
+                frame["인스타그램URL"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                != ""
+            )
+        )
+        if can_view_mobile:
+            accessible = accessible | (frame["휴대전화"] != "")
+        frame = frame[accessible].reset_index(drop=True)
         frame = frame.sort_values(
             by=["_고용정렬", "가입자"],
             ascending=[False, False],
             kind="stable",
         ).reset_index(drop=True)
     if frame.empty:
-        st.info("내 저장 업체 중 유효한 대표전화가 확인된 업체가 없습니다.")
+        st.info("내 저장 업체 중 표시 가능한 공개 연락처가 없습니다.")
         return
 
     export_frame = frame.drop(
         columns=["_prospect_id", "_고용정렬"],
         errors="ignore",
     )
+    if not can_view_mobile:
+        export_frame = export_frame.drop(
+            columns=["대표전화", "휴대전화"],
+            errors="ignore",
+        )
     st.download_button(
         "저장된 영업후보 엑셀 다운로드",
         data=_excel_bytes(export_frame, "저장된 영업후보"),
@@ -1639,10 +1803,13 @@ def _render_clean_saved_prospects(owner_user_id: str) -> None:
     visible_columns = [
         "업체명",
         "사업자유형",
-        "대표전화",
+        *(["휴대전화"] if can_view_mobile else []),
+        "일반전화",
         "전화출처",
         "연락처상태",
         "이메일",
+        "인스타그램",
+        "인스타그램URL",
         "업종분류",
         "업종명",
         "가입자",
@@ -1708,7 +1875,12 @@ def _render_clean_saved_prospects(owner_user_id: str) -> None:
             )
 
 
-def render_prospect_db_center(owner_user_id: str = "") -> None:
+def render_prospect_db_center(
+    owner_user_id: str = "",
+    *,
+    can_view_mobile: bool = False,
+    is_admin_user: bool = False,
+) -> None:
     st.markdown("## DB발굴")
     st.caption(
         "행안부 자료는 사용하지 않습니다. 국민연금 월별 자료와 "
@@ -1737,7 +1909,10 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
     )
     workflow_step = workflow_step or "① 조건 설정"
     if workflow_step == "③ 저장된 영업후보":
-        _render_clean_saved_prospects(owner_user_id)
+        _render_clean_saved_prospects(
+            owner_user_id,
+            can_view_mobile=can_view_mobile,
+        )
         return
     if workflow_step == "① 조건 설정":
         _render_search_history(owner_user_id)
@@ -1776,12 +1951,25 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             key="prospect_target_v1002",
         )
         with st.expander("검색 범위 조정", expanded=True):
+            contact_channel_options = {
+                label: value
+                for label, value in CONTACT_CHANNEL_OPTIONS.items()
+                if can_view_mobile or value != "mobile_phone"
+            }
+            default_contact_labels = (
+                ["휴대전화", "일반전화"]
+                if can_view_mobile
+                else ["일반전화", "이메일", "인스타그램"]
+            )
             selected_contact_labels = st.pills(
                 "연락처 필터",
-                list(CONTACT_CHANNEL_OPTIONS.keys()),
-                default=["휴대전화", "일반전화"],
+                list(contact_channel_options.keys()),
+                default=default_contact_labels,
                 selection_mode="multi",
-                key="prospect_contact_channels_v1002",
+                key=(
+                    "prospect_contact_channels_v1021_"
+                    + ("owner" if can_view_mobile else "member")
+                ),
                 help=(
                     "선택한 연락수단 중 하나라도 저장된 업체만 "
                     "조회합니다. 여러 항목을 함께 선택할 수 있습니다."
@@ -1864,8 +2052,9 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
 
     business_type = BUSINESS_TYPE_OPTIONS[business_type_name]
     contact_channels = [
-        CONTACT_CHANNEL_OPTIONS[label]
+        contact_channel_options[label]
         for label in (selected_contact_labels or [])
+        if label in contact_channel_options
     ]
     data_source = "combined"
     minimum_growth = 1
@@ -2044,6 +2233,7 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                     data_source=data_source,
                     progress=_progress,
                 )
+        result = _sanitize_search_result(result, can_view_mobile)
         if result.get("ok"):
             progress_bar.progress(1.0, text="검색을 완료했습니다.")
         else:
@@ -2106,7 +2296,11 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             "관리할 수 있습니다."
         )
         return
-    result = st.session_state.get(result_state_key)
+    result = _sanitize_search_result(
+        st.session_state.get(result_state_key) or {},
+        can_view_mobile,
+    )
+    st.session_state[result_state_key] = result
     if not result:
         st.info(
             "아직 표시할 검색 결과가 없습니다. ‘① 조건 설정’에서 "
@@ -2232,8 +2426,9 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 "검색 결과는 정상이며 검색이력 저장만 완료되지 "
                 "않았습니다."
             )
-            with st.expander("관리자용 오류 상세", expanded=False):
-                st.caption(result["history_warning"])
+            if is_admin_user:
+                with st.expander("관리자용 오류 상세", expanded=False):
+                    st.caption(result["history_warning"])
 
         items = list(result.get("items") or [])
         if not items:
@@ -2251,7 +2446,10 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
             )
         else:
             st.markdown("### 이번에 찾은 영업후보")
-            display = _display_frame(items)
+            display = _display_frame(
+                items,
+                can_view_mobile=can_view_mobile,
+            )
             display["대표전화"] = display["대표전화"].map(normalize_phone)
             display["휴대전화"] = display["휴대전화"].map(normalize_phone)
             display["일반전화"] = display["일반전화"].map(normalize_phone)
@@ -2259,6 +2457,10 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 column
                 for column in display.columns
                 if column not in {"선택", "source_key"}
+                and (
+                    can_view_mobile
+                    or column not in {"대표전화", "휴대전화"}
+                )
             ]
             st.download_button(
                 "이번 발굴결과 엑셀 다운로드",
@@ -2285,8 +2487,10 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 for column in [
                     "선택",
                     "사업장명",
-                    "휴대전화",
+                    *(["휴대전화"] if can_view_mobile else []),
                     "일반전화",
+                    "이메일",
+                    "인스타그램URL",
                     "지역",
                     "가입자수",
                     *(
@@ -2311,7 +2515,15 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                 ],
                 column_config={
                     "선택": st.column_config.CheckboxColumn("저장"),
-                    "휴대전화": st.column_config.TextColumn("휴대전화"),
+                    **(
+                        {
+                            "휴대전화": st.column_config.TextColumn(
+                                "휴대전화"
+                            )
+                        }
+                        if can_view_mobile
+                        else {}
+                    ),
                     "일반전화": st.column_config.TextColumn("일반전화"),
                     "인스타그램URL": st.column_config.LinkColumn(
                         "인스타그램 링크"
@@ -2404,7 +2616,12 @@ def render_prospect_db_center(owner_user_id: str = "") -> None:
                     hide_index=True,
                 )
 
-def render_prospect_admin_settings() -> None:
+def render_prospect_admin_settings(current_user_id: str = "") -> None:
+    from auth import is_admin
+
+    if not is_admin(current_user_id):
+        st.error("관리자 권한이 필요합니다.")
+        return
     st.markdown("## 영업후보 데이터 연결 관리")
     st.caption(
         "국민연금·카카오·네이버·인허가 API와 Supabase 테이블을 "

@@ -206,6 +206,11 @@ def render_system_management_page(
     project_root: Path,
     current_user_id: str,
 ) -> None:
+    from auth import is_admin
+
+    if not is_admin(current_user_id):
+        st.error("관리자 권한이 필요합니다.")
+        return
     st.markdown("### 시스템 관리")
     st.caption("관리자 전용 버전·백업·복원·프로젝트 점검 화면입니다.")
 
