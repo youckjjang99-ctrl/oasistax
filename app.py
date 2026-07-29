@@ -1737,13 +1737,10 @@ if not st.session_state.get(crm_restore_session_key):
 
 # v3.0.0: 상단 탭/가로 메뉴 대신 사이드바 기반 메뉴로 전환
 with st.sidebar:
-    st.markdown(logo_html(360), unsafe_allow_html=True)
-    st.markdown("""
-    <div class="sidebar-brand">
-        <div class="sidebar-brand-title">오아시스 세무회계</div>
-        <div class="sidebar-brand-sub">OASIS TAX & ACCOUNTING</div>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="sidebar-logo">{logo_html(520)}</div>',
+        unsafe_allow_html=True,
+    )
 
     if CURRENT_USER_NAME:
         role_badge = "관리자" if CURRENT_USER_IS_ADMIN else "회원"
@@ -1828,26 +1825,26 @@ with st.sidebar:
         current_sidebar_value = next(iter(menu_groups[selected_group]))
         st.session_state["active_main_menu_v1020"] = current_sidebar_value
 
-    menu_icons = {
-        "홈": "🏠 홈",
-        "DB발굴": "🔎 DB발굴",
-        "기업등록": "➕ 기업등록",
-        "기업 컨설팅": "📊 기업 컨설팅",
-        "AI 코파일럿": "✨ AI 코파일럿",
-        "내 누적 고객DB": "👥 내 고객DB",
-        "실행이력": "🕘 실행이력",
-        "담당자 통계": "📈 담당자 통계",
-        "휴지통": "🗑️ 휴지통",
-        "회원 승인 관리": "🔐 회원 승인",
-        "시스템 관리": "⚙️ 시스템 관리",
-        "클라우드 DB 관리": "☁️ 클라우드 DB",
-        "AI 사용량": "🤖 AI 사용량",
+    menu_labels = {
+        "홈": "홈",
+        "DB발굴": "DB발굴",
+        "기업등록": "기업등록",
+        "기업 컨설팅": "기업 컨설팅",
+        "AI 코파일럿": "AI 코파일럿",
+        "내 누적 고객DB": "내 고객DB",
+        "실행이력": "실행이력",
+        "담당자 통계": "담당자 통계",
+        "휴지통": "휴지통",
+        "회원 승인 관리": "회원 승인",
+        "시스템 관리": "시스템 관리",
+        "클라우드 DB 관리": "클라우드 DB",
+        "AI 사용량": "AI 사용량",
     }
     selected_menu_label = st.radio(
         "메뉴",
         list(menu_groups[selected_group].keys()),
         key="active_main_menu_v1020",
-        format_func=lambda value: menu_icons.get(value, value),
+        format_func=lambda value: menu_labels.get(value, value),
         label_visibility="collapsed",
     )
     active_tab = menu_groups[selected_group][selected_menu_label]
