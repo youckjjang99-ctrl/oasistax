@@ -6,7 +6,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from prospect_collection_service import collect_recent_opening_companies
-from prospect_db_repository import load_recent_opening_candidates
+from prospect_db_repository import (
+    load_recent_opening_candidates,
+    remove_existing_prospects,
+)
 
 
 class _Response:
@@ -88,6 +91,29 @@ class RecentOpeningDiscoveryTest(unittest.TestCase):
                     "instagram_url": "",
                     "contact_status": "matched",
                 },
+                {
+                    "source_type": "nps_monthly",
+                    "source_record_key": "nps-without-business-no",
+                    "business_no": "",
+                    "company_name": "번호없는 새봄상점",
+                    "address": "서울특별시 마포구 성산로 2",
+                    "province_name": "서울특별시",
+                    "district_name": "마포구",
+                    "industry_code": "56111",
+                    "industry_name": "한식 일반 음식점업",
+                    "industry_category": "외식업",
+                    "current_employee_count": 4,
+                    "opening_signal_date": "2026-06-11",
+                    "opening_signal_year": 2026,
+                    "opening_signal_precision": "day",
+                    "source_period": "202606",
+                    "mobile_phone": "",
+                    "landline_phone": "02-555-7777",
+                    "email": "",
+                    "instagram": "",
+                    "instagram_url": "",
+                    "contact_status": "matched",
+                },
             ]
         )
 
@@ -103,7 +129,7 @@ class RecentOpeningDiscoveryTest(unittest.TestCase):
             limit=50,
         )
 
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 3)
         self.assertEqual(rows[0]["source_key"], "recent_opening:1234567890")
         self.assertEqual(rows[0]["신규추정일"], "2026-05-03")
         self.assertEqual(
@@ -117,6 +143,12 @@ class RecentOpeningDiscoveryTest(unittest.TestCase):
         self.assertEqual(
             rows[1]["신규근거"],
             "근로복지공단 연간 자료 최초 등장",
+        )
+        self.assertEqual(rows[2]["사업자등록번호"], "")
+        self.assertEqual(rows[2]["사업자번호상태"], "미확인")
+        self.assertEqual(
+            rows[2]["source_key"],
+            "recent_opening:nps_monthly:nps-without-business-no",
         )
         payload = json.loads(request_post.call_args.kwargs["data"])
         self.assertEqual(payload["p_province_code"], "11")
@@ -179,6 +211,34 @@ class RecentOpeningDiscoveryTest(unittest.TestCase):
         self.assertFalse(
             loader.call_args.kwargs["include_comwel_annual"]
         )
+
+    def test_missing_business_number_uses_source_and_place_deduplication(
+        self,
+    ) -> None:
+        rows = [
+            {
+                "source_key": "recent_opening:nps_monthly:nps-1",
+                "사업자등록번호": "",
+                "사업장명": "번호없는 상점",
+                "주소": "서울특별시 마포구 성산로 2",
+            },
+            {
+                "source_key": "recent_opening:nps_monthly:nps-2",
+                "사업자등록번호": "",
+                "사업장명": "다른 상점",
+                "주소": "서울특별시 마포구 월드컵로 3",
+            },
+        ]
+
+        filtered, excluded = remove_existing_prospects(
+            rows,
+            source_keys={"recent_opening:nps_monthly:nps-1"},
+            business_nos=set(),
+            company_address_keys={"다른상점|서울특별시마포구월드컵로3"},
+        )
+
+        self.assertEqual(filtered, [])
+        self.assertEqual(excluded, 2)
 
 
 if __name__ == "__main__":

@@ -63,6 +63,32 @@ def _company_address_key(company_name: Any, address: Any) -> str:
     return f"{name}|{place}"
 
 
+def _recent_opening_source_key(row: dict[str, Any]) -> str:
+    """사업자번호가 없어도 중복되지 않는 신규개업 후보 키를 만든다."""
+    business_no = re.sub(
+        r"[^0-9]",
+        "",
+        str(row.get("business_no") or ""),
+    )
+    if len(business_no) == 10:
+        # 이미 저장된 후보와의 호환성을 위해 기존 키 형식을 유지한다.
+        return f"recent_opening:{business_no}"
+
+    source_type = str(row.get("source_type") or "nps_monthly").strip()
+    source_record_key = str(row.get("source_record_key") or "").strip()
+    if source_record_key:
+        return f"recent_opening:{source_type}:{source_record_key}"
+
+    place_key = _company_address_key(
+        row.get("company_name"),
+        row.get("address"),
+    )
+    if not place_key:
+        return ""
+    place_hash = hashlib.sha256(place_key.encode("utf-8")).hexdigest()
+    return f"recent_opening:{source_type}:place:{place_hash}"
+
+
 def _snapshot_identity(prospect: dict[str, Any]) -> str:
     """동일 사업장을 월별로 비교할 안정적인 식별값을 만든다.
 
@@ -574,6 +600,9 @@ def load_recent_opening_candidates(
             str(row.get("business_no") or ""),
         )
         if len(business_no) != 10:
+            business_no = ""
+        source_key = _recent_opening_source_key(row)
+        if not source_key:
             continue
         source_type = str(row.get("source_type") or "")
         company_name = str(row.get("company_name") or "")
@@ -599,8 +628,11 @@ def load_recent_opening_candidates(
         results.append(
             {
                 "source": source_type,
-                "source_key": f"recent_opening:{business_no}",
+                "source_key": source_key,
                 "사업자등록번호": business_no,
+                "사업자번호상태": (
+                    "확인" if business_no else "미확인"
+                ),
                 "사업장명": company_name,
                 "주소": address,
                 "지역": " ".join(
