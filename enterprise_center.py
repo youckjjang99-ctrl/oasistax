@@ -447,7 +447,7 @@ def render_enterprise_management_center(
     if current_selected not in labels:
         st.session_state.pop("enterprise_center_customer", None)
 
-    select_col, delete_col = st.columns([12, 0.65], vertical_alignment="bottom")
+    select_col, delete_col = st.columns([10, 1.4], vertical_alignment="bottom")
     with select_col:
         selected_label = st.selectbox(
             "관리할 기업 선택",
@@ -458,8 +458,8 @@ def render_enterprise_management_center(
     selected_row = customers.loc[row_map[selected_label]]
     with delete_col:
         if st.button(
-            "×",
-            help="선택 회사 삭제",
+            "기업 삭제",
+            help="선택한 기업을 휴지통으로 이동합니다.",
             key=f"enterprise_delete_x_v720_{selected_label}",
             use_container_width=True,
         ):
@@ -575,26 +575,30 @@ def render_enterprise_management_center(
     )
 
     (
-        tab_overview,
+        tab_diagnosis_group,
         tab_crm,
-        tab_policy,
-        tab_stock,
-        tab_articles,
-        tab_history,
-        tab_employees,
-        tab_temporary_advance,
+        tab_consulting_group,
+        tab_documents_group,
     ) = st.tabs(
         [
-            "기업정보",
-            "CRM",
-            "정책자금",
-            "주가평가·등기",
-            "정관검토",
-            "기업히스토리",
-            "직원현황",
-            "가지급금 계산기",
+            "기업진단",
+            "영업관리",
+            "컨설팅",
+            "전문분석",
         ]
     )
+    with tab_diagnosis_group:
+        tab_overview, tab_history = st.tabs(
+            ["기업정보", "기업히스토리"]
+        )
+    with tab_consulting_group:
+        tab_policy, tab_employees, tab_temporary_advance = st.tabs(
+            ["정책자금", "직원현황", "가지급금"]
+        )
+    with tab_documents_group:
+        tab_stock, tab_articles = st.tabs(
+            ["주가평가·등기", "정관검토"]
+        )
 
     with tab_overview:
         left, right = st.columns(2)
