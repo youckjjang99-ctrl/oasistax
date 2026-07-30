@@ -5,6 +5,7 @@ import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from claim_correction_catalog import document_plan
@@ -13,6 +14,13 @@ from tilko_claim_client import CollectedClaimDocument
 
 
 CLAIM_STORAGE_BUCKET = "oasis-claim-documents"
+_CONTENT_TYPE_EXTENSIONS = {
+    "application/pdf": ".pdf",
+    "application/json": ".json",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.ms-excel": ".xls",
+    "text/csv": ".csv",
+}
 
 
 class ClaimRepositoryError(RuntimeError):
@@ -408,9 +416,32 @@ class ClaimRepository:
         owner_folder = hashlib.sha256(
             self.owner_user_id.encode("utf-8")
         ).hexdigest()[:24]
-        storage_path = (
-            f"{owner_folder}/{case_id}/{document_id}.pdf"
+        requested_extension = Path(
+            str(document.file_name or "")
+        ).suffix.lower()
+        expected_extension = _CONTENT_TYPE_EXTENSIONS.get(
+            str(document.content_type or "").lower(),
+            "",
         )
+        if (
+            requested_extension
+            and expected_extension
+            and requested_extension != expected_extension
+        ):
+            raise ClaimRepositoryError(
+                "서류 파일 형식과 콘텐츠 형식이 일치하지 않습니다."
+            )
+        extension = (
+            requested_extension
+            if requested_extension
+            in set(_CONTENT_TYPE_EXTENSIONS.values())
+            else expected_extension
+        )
+        if not extension:
+            raise ClaimRepositoryError(
+                "저장할 서류 파일 형식을 확인할 수 없습니다."
+            )
+        storage_path = f"{owner_folder}/{case_id}/{document_id}{extension}"
         content_sha256 = hashlib.sha256(document.content).hexdigest()
         retention_days = max(
             1,
@@ -434,6 +465,10 @@ class ClaimRepository:
             for key, value in dict(document.facts or {}).items()
             if key not in {"identity_number", "birth_date", "cellphone"}
         }
+        facts["download_file_name"] = (
+            str(document.file_name or "").strip()
+            or f"{document_code}{extension}"
+        )
         if provider_reference_hash:
             facts["provider_reference_sha256"] = provider_reference_hash
 
@@ -542,13 +577,25 @@ class ClaimRepository:
                 "다운로드 가능한 서류를 찾지 못했습니다."
             )
         try:
+            facts = target.get("facts")
+            download_name = ""
+            if isinstance(facts, dict):
+                download_name = str(
+                    facts.get("download_file_name", "") or ""
+                ).strip()
+            if not download_name:
+                extension = Path(
+                    str(target.get("storage_path", "") or "")
+                ).suffix
+                download_name = (
+                    f"{target.get('document_code') or 'claim-document'}"
+                    f"{extension or '.bin'}"
+                )
             return self.database.create_private_signed_url(
                 str(target["storage_bucket"]),
                 str(target["storage_path"]),
                 expires_in=60,
-                download_name=(
-                    f"{target.get('document_code') or 'claim-document'}.pdf"
-                ),
+                download_name=download_name,
             )
         except Exception as exc:
             raise _safe_storage_error(exc) from exc
