@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import html
 import json
 import re
@@ -59,6 +60,7 @@ AUTH_MEDIUM_POLL_WINDOW_SECONDS = 90.0
 TRANSIENT_AUTH_RETRY_SECONDS = 3.0
 COMWEL_DISPATCH_DELAY_SECONDS = 1.0
 _CLAIM_JOB_CIPHER = Fernet(Fernet.generate_key())
+_CLAIM_BUSINESS_TOKEN_KEY = Fernet.generate_key()
 _CLAIM_JOB_LOCK = threading.RLock()
 _CLAIM_JOBS: dict[str, dict[str, Any]] = {}
 _CLAIM_JOB_EXECUTOR = ThreadPoolExecutor(
@@ -368,6 +370,174 @@ def _ensure_claim_operation_active(
         )
 
 
+def _masked_business_no(value: Any) -> str:
+    digits = _digits(value)
+    if len(digits) != 10:
+        return ""
+    return f"{digits[:3]}-**-*****"
+
+
+def _masked_business_choice_no(value: Any) -> str:
+    digits = _digits(value)
+    if len(digits) != 10:
+        return ""
+    return f"{digits[:3]}-**-***{digits[-2:]}"
+
+
+def _business_candidate_token(case_id: str, business_number: str) -> str:
+    payload = (
+        f"{str(case_id or '').strip()}|{_digits(business_number)}"
+    ).encode("utf-8")
+    return hmac.new(
+        _CLAIM_BUSINESS_TOKEN_KEY,
+        payload,
+        hashlib.sha256,
+    ).hexdigest()[:24]
+
+
+def _discover_hometax_business_number(
+    repository: ClaimRepository,
+    client: TilkoClaimClient,
+    *,
+    case_id: str,
+    birth_date: str,
+    representative: str,
+    cellphone: str,
+    session: dict[str, str],
+    transient: dict[str, Any],
+    on_progress: Any | None = None,
+    should_continue: Any | None = None,
+) -> dict[str, Any]:
+    documents = [
+        document
+        for document in repository.list_documents(case_id)
+        if str(document.get("source", "")) == "hometax"
+        and str(document.get("document_code", ""))
+        == "hometax_business_registration_list"
+    ]
+    if not documents:
+        return {
+            "target": 0,
+            "ready": 0,
+            "failed": 0,
+            "errors": [],
+            "business_number": _digits(transient.get("business_number")),
+            "candidates": [],
+            "selection_required": False,
+        }
+
+    existing_ready = any(
+        str(document.get("status", "")) == "ready" for document in documents
+    )
+    raw_candidates = transient.get("business_candidates")
+    candidates = (
+        [dict(candidate) for candidate in raw_candidates]
+        if isinstance(raw_candidates, list)
+        else []
+    )
+    errors: list[dict[str, str]] = []
+    ready_count = 1 if existing_ready else 0
+    failed_count = 0
+
+    if not candidates:
+        if on_progress:
+            on_progress(0, 1, "hometax_business_registration_list")
+        try:
+            _ensure_claim_operation_active(should_continue)
+            discovery = client.discover_hometax_businesses(
+                birth_date=birth_date,
+                user_name=representative,
+                cellphone=cellphone,
+                session=session,
+            )
+            _ensure_claim_operation_active(should_continue)
+            candidates = [
+                {
+                    "business_number": _digits(candidate.business_number),
+                    "business_name": _clean(candidate.business_name),
+                    "business_status": _clean(candidate.business_status),
+                }
+                for candidate in discovery.candidates
+                if _is_valid_business_no(candidate.business_number)
+            ]
+            transient["business_candidates"] = candidates
+            if not existing_ready:
+                repository.store_collected_document(
+                    case_id,
+                    document_code="hometax_business_registration_list",
+                    document=discovery.document,
+                )
+                ready_count = 1
+        except (ClaimProviderError, ClaimRepositoryError) as exc:
+            if isinstance(exc, ClaimProviderError) and (
+                _is_transient_auth_error(exc)
+                or _provider_error_code(exc) == "AUTH_SESSION_EXPIRED"
+            ):
+                raise
+            # A previous successful, downloadable snapshot must not be
+            # downgraded just because the short-lived auth session had to
+            # rediscover the raw number and that retry failed.
+            failed_count = 0 if existing_ready else 1
+            ready_count = 1 if existing_ready else 0
+            safe_error_code = _safe_provider_error_code(
+                exc,
+                "HOMETAX_BUSINESS_DISCOVERY",
+            )
+            errors.append(
+                {
+                    "document_code": "hometax_business_registration_list",
+                    "safe_error_code": safe_error_code,
+                    "message": str(exc)[:240],
+                }
+            )
+            if not existing_ready:
+                try:
+                    repository.fail_document(
+                        case_id,
+                        document_code="hometax_business_registration_list",
+                        safe_error_code=safe_error_code,
+                    )
+                except ClaimRepositoryError:
+                    pass
+        if on_progress:
+            on_progress(1, 1, "hometax_business_registration_list")
+
+    allowed_numbers = {
+        _digits(candidate.get("business_number"))
+        for candidate in candidates
+        if _is_valid_business_no(candidate.get("business_number"))
+    }
+    requested_number = _digits(
+        transient.get("selected_business_number")
+        or transient.get("business_number")
+    )
+    business_number = (
+        requested_number
+        if _is_valid_business_no(requested_number)
+        and (
+            not allowed_numbers
+            or requested_number in allowed_numbers
+        )
+        else next(iter(allowed_numbers))
+        if len(allowed_numbers) == 1
+        else ""
+    )
+    if business_number:
+        transient["business_number"] = business_number
+
+    return {
+        "target": 1,
+        "ready": ready_count,
+        "failed": failed_count,
+        "errors": errors,
+        "business_number": business_number,
+        "candidates": candidates,
+        "selection_required": bool(
+            len(allowed_numbers) > 1 and not business_number
+        ),
+    }
+
+
 def _collect_supported_hometax_documents(
     repository: ClaimRepository,
     client: TilkoClaimClient,
@@ -395,6 +565,7 @@ def _collect_supported_hometax_documents(
     }
     jobs: list[tuple[str, Any]] = []
     supported_codes = {
+        "hometax_business_registration_list",
         "hometax_business_registration_certificate",
         "hometax_tax_payment_certificate",
     }
@@ -684,7 +855,7 @@ def _collect_supported_comwel_documents(
                 identity_number=identity_number,
                 user_name=representative,
                 cellphone=cellphone,
-                business_number="",
+                business_number=business_number,
                 management_number=management_number,
                 session=session,
             ),
@@ -747,7 +918,47 @@ def _collect_case_documents(
 ) -> dict[str, Any]:
     _ensure_claim_operation_active(should_continue)
     planned_documents = repository.list_documents(case_id)
-    business_number = str(transient.get("business_number", ""))
+    estimated_target = max(
+        1,
+        sum(
+            1
+            for document in planned_documents
+            if str(document.get("document_code", ""))
+            in {
+                "hometax_business_registration_list",
+                "hometax_business_registration_certificate",
+                "hometax_tax_payment_certificate",
+                "comwel_total_remuneration",
+                "comwel_management_number_list",
+                "comwel_workplace_rate",
+            }
+        ),
+    )
+
+    def discovery_progress(
+        processed: int,
+        _total: int,
+        document_code: str,
+    ) -> None:
+        if on_progress:
+            on_progress(processed, estimated_target, document_code)
+
+    business_discovery = _discover_hometax_business_number(
+        repository,
+        client,
+        case_id=case_id,
+        birth_date=birth_date,
+        representative=representative,
+        cellphone=cellphone,
+        session=transient["hometax"],
+        transient=transient,
+        on_progress=discovery_progress,
+        should_continue=should_continue,
+    )
+    business_number = _digits(business_discovery.get("business_number"))
+    if business_number:
+        transient["business_number"] = business_number
+    discovery_target = int(business_discovery.get("target", 0) or 0)
     hometax_target = 1 + int(_is_valid_business_no(business_number))
     comwel_target = sum(
         1
@@ -760,14 +971,20 @@ def _collect_case_documents(
         == "comwel_management_number_list"
         for document in planned_documents
     )
-    if _is_valid_business_no(business_number) and has_management_plan:
+    business_valid = _is_valid_business_no(business_number)
+    if business_valid and has_management_plan:
         comwel_target += 1 + sum(
             1
             for document in planned_documents
             if str(document.get("document_code", ""))
             == "comwel_workplace_rate"
         )
-    planned_target = max(1, hometax_target + comwel_target)
+    elif not business_valid:
+        comwel_target = 0
+    planned_target = max(
+        1,
+        discovery_target + hometax_target + comwel_target,
+    )
 
     def hometax_progress(
         processed: int,
@@ -775,7 +992,11 @@ def _collect_case_documents(
         document_code: str,
     ) -> None:
         if on_progress:
-            on_progress(processed, planned_target, document_code)
+            on_progress(
+                discovery_target + processed,
+                planned_target,
+                document_code,
+            )
 
     def comwel_progress(
         processed: int,
@@ -784,7 +1005,7 @@ def _collect_case_documents(
     ) -> None:
         if on_progress:
             on_progress(
-                hometax_target + processed,
+                discovery_target + hometax_target + processed,
                 planned_target,
                 document_code,
             )
@@ -819,34 +1040,84 @@ def _collect_case_documents(
         should_continue=should_continue,
     )
     _ensure_claim_operation_active(should_continue)
-    comwel_summary = _collect_supported_comwel_documents(
-        repository,
-        client,
-        case_id=case_id,
-        identity_number=identity_number,
-        representative=representative,
-        cellphone=cellphone,
-        business_number=business_number,
-        session=transient["comwel"],
-        selected_management_number=str(
-            transient.get("selected_management_number", "")
-        ),
-        on_progress=comwel_progress,
-        should_continue=should_continue,
+    business_selection_required = bool(
+        business_discovery.get("selection_required")
     )
+    business_number_missing = bool(
+        not business_valid
+        and any(
+            str(document.get("source", "")) == "comwel"
+            and str(document.get("document_code", ""))
+            in {
+                "comwel_total_remuneration",
+                "comwel_management_number_list",
+                "comwel_workplace_rate",
+            }
+            for document in planned_documents
+        )
+        and not business_selection_required
+    )
+    business_blocked_count = (
+        sum(
+            1
+            for document in planned_documents
+            if str(document.get("source", "")) == "comwel"
+            and str(document.get("document_code", ""))
+            in {
+                "comwel_total_remuneration",
+                "comwel_management_number_list",
+                "comwel_workplace_rate",
+            }
+        )
+        if business_number_missing
+        else 0
+    )
+    if business_valid:
+        comwel_summary = _collect_supported_comwel_documents(
+            repository,
+            client,
+            case_id=case_id,
+            identity_number=identity_number,
+            representative=representative,
+            cellphone=cellphone,
+            business_number=business_number,
+            session=transient["comwel"],
+            selected_management_number=str(
+                transient.get("selected_management_number", "")
+            ),
+            on_progress=comwel_progress,
+            should_continue=should_continue,
+        )
+    else:
+        comwel_summary = {
+            "target": 0,
+            "ready": 0,
+            "failed": 0,
+            "skipped": [
+                "comwel_documents:business_number_discovery_required"
+            ],
+            "errors": [],
+            "management_numbers": [],
+            "selection_required": False,
+        }
     _ensure_claim_operation_active(should_continue)
     summary = {
-        "target": int(hometax_summary["target"])
+        "target": discovery_target
+        + int(hometax_summary["target"])
         + int(comwel_summary["target"]),
-        "ready": int(hometax_summary["ready"])
+        "ready": int(business_discovery.get("ready", 0) or 0)
+        + int(hometax_summary["ready"])
         + int(comwel_summary["ready"]),
-        "failed": int(hometax_summary["failed"])
+        "failed": int(business_discovery.get("failed", 0) or 0)
+        + int(hometax_summary["failed"])
         + int(comwel_summary["failed"]),
         "skipped": list(hometax_summary["skipped"])
         + list(comwel_summary["skipped"]),
-        "errors": list(hometax_summary["errors"])
+        "errors": list(business_discovery.get("errors", []))
+        + list(hometax_summary["errors"])
         + list(comwel_summary["errors"]),
         "sources": {
+            "hometax_business_discovery": business_discovery,
             "hometax": hometax_summary,
             "comwel": comwel_summary,
         },
@@ -856,15 +1127,50 @@ def _collect_case_documents(
         "selection_required": bool(
             comwel_summary.get("selection_required")
         ),
+        "business_candidates": list(
+            business_discovery.get("candidates", [])
+        ),
+        "business_selection_required": business_selection_required,
+        "business_number_missing": business_number_missing,
+        "business_blocked_count": business_blocked_count,
     }
+    if business_number_missing:
+        summary["errors"].append(
+            {
+                "document_code": "hometax_business_registration_list",
+                "safe_error_code": "BUSINESS_NUMBER_NOT_FOUND",
+                "message": "홈택스에서 유효한 사업자등록번호를 확인하지 못했습니다.",
+            }
+        )
     collection_complete = bool(
         summary["target"] > 0
         and summary["ready"] == summary["target"]
         and summary["failed"] == 0
         and not summary["selection_required"]
+        and not business_selection_required
+        and not business_number_missing
     )
     summary["complete"] = collection_complete
     _ensure_claim_operation_active(should_continue)
+    if summary["business_selection_required"]:
+        repository.update_case_status(
+            case_id,
+            overall_status="auth_complete_collection_pending",
+            last_safe_error_code=None,
+        )
+        repository.append_audit_event(
+            case_id=case_id,
+            action="business_number_selection_required",
+            source="hometax",
+            outcome="pending",
+            metadata={
+                "business_candidate_count": len(
+                    summary["business_candidates"]
+                ),
+                "ready_document_count": summary["ready"],
+            },
+        )
+        return summary
     if summary["selection_required"]:
         repository.update_case_status(
             case_id,
@@ -1123,7 +1429,9 @@ def _advance_personal_case(
         should_continue=should_continue,
     )
     event = (
-        "management_selection_required"
+        "business_selection_required"
+        if summary.get("business_selection_required")
+        else "management_selection_required"
         if summary.get("selection_required")
         else "collection_complete"
         if summary["complete"]
@@ -1275,6 +1583,7 @@ def _expire_claim_job(
                 if previous_status
                 in {
                     "collection_partial",
+                    "awaiting_business_selection",
                     "awaiting_management_selection",
                 }
                 else ""
@@ -1517,6 +1826,65 @@ def _run_background_claim_job(
             updated_case = repository.get_case(case_id) or case
             percentage, progress_text = _claim_progress(updated_case)
 
+            if event == "business_selection_required":
+                summary = dict(result.get("summary") or {})
+                business_choices = []
+                for candidate in summary.get("business_candidates", []):
+                    if not isinstance(candidate, dict):
+                        continue
+                    business_number = _digits(
+                        candidate.get("business_number")
+                    )
+                    if not _is_valid_business_no(business_number):
+                        continue
+                    business_name = _clean(
+                        candidate.get("business_name")
+                    )
+                    business_status = _clean(
+                        candidate.get("business_status")
+                    )
+                    label_parts = [
+                        part
+                        for part in (
+                            business_name,
+                            _masked_business_choice_no(business_number),
+                            business_status,
+                        )
+                        if part
+                    ]
+                    business_choices.append(
+                        {
+                            "token": _business_candidate_token(
+                                case_id,
+                                business_number,
+                            ),
+                            "label": " · ".join(label_parts),
+                        }
+                    )
+                updated = _update_claim_job(
+                    case_id,
+                    owner_ref,
+                    sealed_payload=_seal_claim_job_payload(transient),
+                    expires_at=float(
+                        transient.get("expires_at", time.time())
+                        or time.time()
+                    ),
+                    status="awaiting_business_selection",
+                    progress=max(80, percentage),
+                    safe_message=(
+                        "홈택스에서 여러 사업자가 확인됐습니다. "
+                        "자료를 수집할 사업자를 선택해 주세요."
+                    ),
+                    summary={
+                        "ready": int(summary.get("ready", 0) or 0),
+                        "failed": int(summary.get("failed", 0) or 0),
+                        "business_choices": business_choices,
+                    },
+                )
+                if not updated:
+                    transient.clear()
+                    context.clear()
+                return
             if event == "management_selection_required":
                 summary = dict(result.get("summary") or {})
                 management_numbers = [
@@ -1576,6 +1944,22 @@ def _run_background_claim_job(
                 return
             if event == "collection_partial":
                 summary = dict(result.get("summary") or {})
+                business_number_missing = bool(
+                    summary.get("business_number_missing")
+                )
+                blocked_count = int(
+                    summary.get("business_blocked_count", 0) or 0
+                )
+                safe_message = (
+                    "홈택스에서 사업자등록번호를 확인하지 못해 "
+                    f"근로복지공단 서류 {blocked_count}건 수집을 "
+                    "시작하지 못했습니다. 새 인증 요청이 필요합니다."
+                    if business_number_missing
+                    else (
+                        f"서류 {int(summary.get('ready', 0) or 0)}건 저장, "
+                        f"{int(summary.get('failed', 0) or 0)}건 실패"
+                    )
+                )
                 updated = _update_claim_job(
                     case_id,
                     owner_ref,
@@ -1585,14 +1969,13 @@ def _run_background_claim_job(
                     ),
                     status="collection_partial",
                     progress=percentage,
-                    safe_message=(
-                        f"서류 {int(summary.get('ready', 0) or 0)}건 저장, "
-                        f"{int(summary.get('failed', 0) or 0)}건 실패"
-                    ),
+                    safe_message=safe_message,
                     summary={
                         "ready": int(summary.get("ready", 0) or 0),
                         "failed": int(summary.get("failed", 0) or 0),
                         "skipped_count": len(summary.get("skipped", [])),
+                        "blocked_count": blocked_count,
+                        "business_number_missing": business_number_missing,
                     },
                 )
                 if not updated:
@@ -1939,8 +2322,14 @@ def _retry_authenticated_claim_collection(
             if isinstance(wake_event, threading.Event):
                 wake_event.set()
             return True, "자료수집이 이미 진행 중입니다."
-        elif previous_status == "awaiting_management_selection":
-            return False, "사업장관리번호를 먼저 선택해야 자료수집을 계속할 수 있습니다."
+        elif previous_status in {
+            "awaiting_business_selection",
+            "awaiting_management_selection",
+        }:
+            return (
+                False,
+                "화면에 표시된 사업장 선택을 먼저 완료해야 자료수집을 계속할 수 있습니다.",
+            )
         elif previous_status not in {"paused", "collection_partial"}:
             return False, "현재 상태에서는 자료 재수집을 시작할 수 없습니다."
         else:
@@ -2087,7 +2476,10 @@ def _claim_collection_retry_state(
     job_status = str(job_snapshot.get("status", "") or "")
     if job_status in {"running", "queued"}:
         return "running"
-    if job_status == "awaiting_management_selection":
+    if job_status in {
+        "awaiting_business_selection",
+        "awaiting_management_selection",
+    }:
         return "selection_required"
     if job_status == "complete":
         return "complete"
@@ -2154,6 +2546,87 @@ def _render_claim_collection_retry_action(
             "고객에게 새 인증 요청을 보내 주세요."
         )
     return state
+
+
+def _select_claim_business_number(
+    user_id: str,
+    case_id: str,
+    selection_token: str,
+) -> bool:
+    owner_ref = _claim_job_owner_ref(user_id)
+    requested_token = str(selection_token or "").strip()
+    expired_after_unseal = False
+    with _CLAIM_JOB_LOCK:
+        job = _CLAIM_JOBS.get(case_id)
+        if (
+            not job
+            or job.get("owner_ref") != owner_ref
+            or job.get("status") != "awaiting_business_selection"
+            or float(job.get("expires_at", 0) or 0) <= time.time()
+            or not job.get("sealed_payload")
+        ):
+            return False
+        transient = _unseal_claim_job_payload(job["sealed_payload"])
+        raw_candidates = transient.get("business_candidates")
+        candidates = (
+            raw_candidates if isinstance(raw_candidates, list) else []
+        )
+        selected_number = next(
+            (
+                _digits(candidate.get("business_number"))
+                for candidate in candidates
+                if isinstance(candidate, dict)
+                and _is_valid_business_no(candidate.get("business_number"))
+                and hmac.compare_digest(
+                    _business_candidate_token(
+                        case_id,
+                        _digits(candidate.get("business_number")),
+                    ),
+                    requested_token,
+                )
+            ),
+            "",
+        )
+        if not selected_number:
+            transient.clear()
+            return False
+        transient["selected_business_number"] = selected_number
+        transient["business_number"] = selected_number
+        _set_claim_expiry(transient, COLLECTION_TTL_SECONDS)
+        if transient["expires_at"] <= time.time():
+            job["sealed_payload"] = b""
+            job["status"] = "expired"
+            job["safe_message"] = (
+                "인증 유효시간이 지나 임시 인증정보를 삭제했습니다. "
+                "새 인증 요청을 시작해 주세요."
+            )
+            job["updated_at"] = time.time()
+            transient.clear()
+            expired_after_unseal = True
+        else:
+            job["sealed_payload"] = _seal_claim_job_payload(transient)
+            job["expires_at"] = transient["expires_at"]
+            job["status"] = "queued"
+            job["progress"] = max(80, int(job.get("progress", 0) or 0))
+            job["safe_message"] = (
+                "선택한 사업자번호로 근로복지공단 자료수집을 준비합니다."
+            )
+            job["summary"] = {}
+            job["updated_at"] = time.time()
+    if expired_after_unseal:
+        _sync_interrupted_claim_case(
+            user_id,
+            case_id,
+            active_action="collect",
+            safe_error_code="AUTH_SESSION_EXPIRED",
+            outcome="expired",
+        )
+        return False
+    return _activate_background_claim_job(
+        user_id,
+        case_id,
+        initial_delay=0,
+    )
 
 
 def _select_claim_management_number(
@@ -2843,6 +3316,55 @@ def _render_auto_claim_monitor(
     if job_snapshot:
         job_status = str(job_snapshot.get("status", "") or "")
         summary = dict(job_snapshot.get("summary") or {})
+        if job_status == "awaiting_business_selection":
+            business_choices = [
+                dict(choice)
+                for choice in summary.get("business_choices", [])
+                if isinstance(choice, dict)
+                and _clean(choice.get("token"))
+                and _clean(choice.get("label"))
+            ]
+            st.info(
+                "홈택스에서 여러 사업자가 확인됐습니다. "
+                "근로복지공단 자료를 수집할 사업자를 선택해 주세요."
+            )
+            if not business_choices:
+                st.warning(
+                    "선택 가능한 사업자정보를 확인하지 못했습니다. "
+                    "새 인증 요청을 시작해 주세요."
+                )
+                return
+            labels = {
+                str(choice["token"]): str(choice["label"])
+                for choice in business_choices
+            }
+            selected_business_token = st.selectbox(
+                "사업자 선택",
+                list(labels),
+                format_func=lambda token: labels.get(token, "사업자"),
+                key=f"claim_business_number_{case_id}",
+            )
+            if st.button(
+                "선택 사업자로 자료수집 계속",
+                type="primary",
+                use_container_width=True,
+                key=f"claim_business_number_continue_{case_id}",
+            ):
+                if _select_claim_business_number(
+                    user_id,
+                    case_id,
+                    selected_business_token,
+                ):
+                    st.toast(
+                        "선택한 사업자로 근로복지공단 자료수집을 시작합니다."
+                    )
+                    st.rerun(scope="app")
+                else:
+                    st.warning(
+                        "임시 인증정보가 만료됐습니다. "
+                        "새 인증 요청을 시작해 주세요."
+                    )
+            return
         if job_status == "awaiting_management_selection":
             management_numbers = [
                 str(number)
@@ -3219,7 +3741,7 @@ def _render_results_tab(
                     if document_code == "comwel_workplace_rate"
                     and status == "integration_required"
                     and multiple_management_numbers
-                    else "사업자번호 필요"
+                    else "홈택스 사업자번호 확인 필요"
                     if document_code
                     in {
                         "comwel_management_number_list",

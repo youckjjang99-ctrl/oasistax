@@ -36,7 +36,7 @@ DOCUMENT_SPECS: tuple[ClaimDocumentSpec, ...] = (
         name="사업장등록번호명세서",
         source="홈택스",
         period="현재",
-        endpoint_hint="계약 API 확정 필요",
+        endpoint_hint="MyBizInfo",
         description="홈택스에 연결된 사업장 등록번호 목록",
     ),
     ClaimDocumentSpec(

@@ -24,6 +24,7 @@ HOMETAX_SIMPLE_AUTH_REQUEST = (
     "/api/v2.0/HometaxSimpleAuth/SimpleAuthRequest"
 )
 HOMETAX_SIMPLE_AUTH_CHECK = "/api/v2.0/HometaxSimpleAuth/LoginCheck"
+HOMETAX_BUSINESS_INFO = "/api/v2.0/HometaxSimpleAuth/MyBizInfo"
 HOMETAX_TAX_PAYMENT_CERTIFICATE = (
     "/api/v2.0/HometaxSimpleAuth/UTERDAAA04"
 )
@@ -96,6 +97,157 @@ class CollectedClaimDocument:
     content_type: str
     provider_reference: str
     facts: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class HometaxBusinessCandidate:
+    business_number: str
+    business_name: str = ""
+    business_status: str = ""
+
+
+@dataclass(frozen=True)
+class HometaxBusinessDiscovery:
+    document: CollectedClaimDocument
+    candidates: tuple[HometaxBusinessCandidate, ...]
+
+
+_HOMETAX_BUSINESS_NUMBER_FIELDS = (
+    "txprDscmNo",
+    "BusinessNumber",
+)
+_HOMETAX_BUSINESS_NAME_FIELDS = (
+    "txprNm",
+    "bmanNm",
+    "sanghoNm",
+    "BusinessName",
+    "TradeName",
+)
+_HOMETAX_BUSINESS_STATUS_FIELDS = (
+    "txprStatNm",
+    "bmanSttsNm",
+    "BusinessStatus",
+    "StatusName",
+)
+
+
+def _hometax_business_number(value: Any) -> str:
+    if isinstance(value, (bool, dict, list, tuple, set)):
+        return ""
+    compact = (
+        str(value or "")
+        .strip()
+        .replace("-", "")
+        .replace(" ", "")
+    )
+    if len(compact) != 10 or not compact.isascii() or not compact.isdigit():
+        return ""
+    return compact
+
+
+def _safe_hometax_business_metadata(value: Any) -> str:
+    if isinstance(value, (dict, list, tuple, set)):
+        return ""
+    text = " ".join(
+        "".join(
+            character if character.isprintable() else " "
+            for character in str(value or "")
+        ).split()
+    )
+    if not text or _looks_like_private_identifier(text):
+        return ""
+    return text[:120]
+
+
+def _first_exact_mapping_value(
+    mapping: dict[str, Any],
+    field_names: Iterable[str],
+) -> str:
+    for field_name in field_names:
+        if field_name not in mapping:
+            continue
+        value = _safe_hometax_business_metadata(mapping[field_name])
+        if value:
+            return value
+    return ""
+
+
+def _hometax_business_candidates(
+    response_data: dict[str, Any],
+) -> tuple[HometaxBusinessCandidate, ...]:
+    result = response_data.get("Result")
+    if not isinstance(result, (dict, list)):
+        result = response_data.get("ResultData")
+    if not isinstance(result, (dict, list)):
+        raise ClaimProviderError(
+            "홈택스 사업자정보 응답에 결과 데이터가 없습니다."
+        )
+
+    candidates_by_number: dict[str, HometaxBusinessCandidate] = {}
+    for mapping in _iter_response_mappings(result):
+        business_number = ""
+        for field_name in _HOMETAX_BUSINESS_NUMBER_FIELDS:
+            if field_name not in mapping:
+                continue
+            business_number = _hometax_business_number(mapping[field_name])
+            if business_number:
+                break
+        if not business_number:
+            continue
+
+        business_name = _first_exact_mapping_value(
+            mapping,
+            _HOMETAX_BUSINESS_NAME_FIELDS,
+        )
+        business_status = _first_exact_mapping_value(
+            mapping,
+            _HOMETAX_BUSINESS_STATUS_FIELDS,
+        )
+        existing = candidates_by_number.get(business_number)
+        if existing is not None:
+            business_name = existing.business_name or business_name
+            business_status = existing.business_status or business_status
+        candidates_by_number[business_number] = HometaxBusinessCandidate(
+            business_number=business_number,
+            business_name=business_name,
+            business_status=business_status,
+        )
+    return tuple(candidates_by_number.values())
+
+
+def _masked_hometax_business_number(business_number: str) -> str:
+    return f"{business_number[:3]}-**-*****"
+
+
+def _hometax_business_discovery_document(
+    response_data: dict[str, Any],
+    candidates: tuple[HometaxBusinessCandidate, ...],
+) -> CollectedClaimDocument:
+    safe_businesses = [
+        {
+            "business_number_masked": _masked_hometax_business_number(
+                candidate.business_number
+            ),
+            "business_name": candidate.business_name,
+            "business_status": candidate.business_status,
+        }
+        for candidate in candidates
+    ]
+    content = json.dumps(
+        {"businesses": safe_businesses},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return CollectedClaimDocument(
+        content=content,
+        file_name="hometax-business-registration-list.json",
+        content_type="application/json",
+        provider_reference=str(
+            response_data.get("ApiTxKey", "") or ""
+        ).strip(),
+        facts={"record_count": len(candidates)},
+    )
 
 
 def _safe_document_name(
@@ -1024,6 +1176,43 @@ class TilkoClaimClient:
             "UserCellphoneNumber": cellphone,
             **{key: session.get(key, "") for key in SESSION_FIELDS},
         }
+
+    def discover_hometax_businesses(
+        self,
+        *,
+        birth_date: str,
+        user_name: str,
+        cellphone: str,
+        session: dict[str, str],
+    ) -> HometaxBusinessDiscovery:
+        response = self._post(
+            self.config.hometax_host,
+            HOMETAX_BUSINESS_INFO,
+            {
+                "Auth": self._hometax_auth(
+                    birth_date=birth_date,
+                    user_name=user_name,
+                    cellphone=cellphone,
+                    session=session,
+                )
+            },
+            tuple(
+                f"Auth.{key}"
+                for key in (
+                    "BirthDate",
+                    "UserName",
+                    "UserCellphoneNumber",
+                )
+            ),
+        )
+        candidates = _hometax_business_candidates(response)
+        return HometaxBusinessDiscovery(
+            document=_hometax_business_discovery_document(
+                response,
+                candidates,
+            ),
+            candidates=candidates,
+        )
 
     def collect_hometax_business_registration_certificate(
         self,
