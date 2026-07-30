@@ -168,7 +168,9 @@ st.set_page_config(
     initial_sidebar_state="auto"
 )
 
-st.markdown("""
+# 이전 버전의 스타일은 배포 호환을 위한 참고용으로만 남긴다.
+# 실제 전역 스타일은 ui.apply_oasis_ui() 한 곳에서만 적용한다.
+_LEGACY_UI_CSS = """
 <style>
 .stApp {
     background: linear-gradient(135deg, #f6f9ff 0%, #ffffff 44%, #edf4ff 100%);
@@ -574,17 +576,17 @@ div[data-testid="stStatusWidget"] {
 }
 
 </style>
-""", unsafe_allow_html=True)
+"""
 
 
-# v3.1.1: 사이드바 로고/메뉴 디자인 최종 보정
+# 공통 디자인 시스템 적용
 apply_oasis_ui()
 
 def show_company_preview(result_file):
     previews = extract_company_previews(result_file)
 
     st.markdown("<div class='preview-box'>", unsafe_allow_html=True)
-    st.markdown("### 👀 업체별 TOP3 미리보기")
+    st.markdown("### 업체별 TOP3 미리보기")
 
     if not previews:
         st.info("미리보기 데이터를 찾지 못했습니다. 결과 엑셀을 다운로드해 확인해주세요.")
@@ -681,8 +683,8 @@ def render_home_page(user_id, user_name=""):
 
     st.markdown("""
     <div class="hero">
-        <div class="badge">TODAY'S OASIS WORKSPACE</div>
-        <div class="hero-title">오늘의 영업과 컨설팅을<br>한 화면에서 시작하세요.</div>
+        <div class="badge">오늘의 업무</div>
+        <div class="hero-title">오늘의 영업과 컨설팅을 한 화면에서 시작하세요.</div>
         <div class="hero-sub">
             고객 발굴부터 상담관리, 정책자금 진단까지 필요한 업무를 순서대로 이어갑니다.
         </div>
@@ -758,7 +760,7 @@ def render_home_page(user_id, user_name=""):
             use_container_width=True,
         )
     else:
-        st.success(
+        st.info(
             f"{user_name or '담당자'}님의 오늘 예정 후속조치가 없습니다."
         )
 
@@ -1465,7 +1467,6 @@ def render_customer_management_page(user_id):
                     st.write(item.get("detail"))
 
 def render_cumulative_db_page(user_id):
-    st.markdown("### 📥 내 누적 고객DB")
     st.caption("회원별로 누적된 고객DB를 기존 고객DB 양식 그대로 다운로드합니다.")
 
     cumulative_db_path = get_user_cumulative_db_path(user_id)
@@ -1477,7 +1478,7 @@ def render_cumulative_db_page(user_id):
     address_repair = repair_user_customer_addresses(user_id)
     if address_repair.get("updated_rows", 0) > 0:
         st.success(address_repair.get("message", ""))
-    st.success(f"현재 누적 고객 수: {total_count}건")
+    st.metric("현재 누적 고객 수", f"{total_count:,}건")
     with open(cumulative_db_path, "rb") as f:
         st.download_button(
             label="내 누적 고객DB 다운로드",
@@ -1489,7 +1490,7 @@ def render_cumulative_db_page(user_id):
 
 
 def render_personal_business_registration(user_id, user_name, upload_dir):
-    st.markdown("### 👤 종합소득세 신고서로 개인사업자 등록")
+    st.markdown("### 종합소득세 신고서로 개인사업자 등록")
     st.caption(
         "사업소득명세서를 사업자등록번호별로 분리합니다. "
         "여러 사업장이 있으면 원하는 사업장만 선택해 등록할 수 있습니다."
@@ -2456,7 +2457,6 @@ elif active_tab == "주가평가":
     )
 
 elif active_tab == "기업등록":
-    st.markdown("### 🏢 기업등록")
     registration_type = st.radio(
         "등록할 사업자 유형",
         ["법인사업자 - 크레탑 PDF", "개인사업자 - 종합소득세 신고서"],
@@ -2471,7 +2471,7 @@ elif active_tab == "기업등록":
         )
         st.stop()
 
-    st.markdown("### 📄 크레탑 PDF로 법인사업자 자동등록")
+    st.markdown("### 크레탑 PDF로 법인사업자 자동등록")
     st.caption("크레탑 기업종합보고서 PDF를 업로드하면 추출 가능한 항목을 읽어 내 누적 고객DB에 1행으로 추가합니다.")
 
     # v2.3.4: 저장 직후에는 앱을 한 번 재실행하여 상단 다운로드 버튼까지 최신 파일을 읽도록 한다.
@@ -2959,8 +2959,6 @@ elif active_tab == "기업등록":
                             )
 
 elif active_tab == "실행이력":
-    st.markdown("### 📚 실행이력")
-
     history_df = read_run_history(CURRENT_USER_ID)
 
     if history_df.empty:
@@ -2982,8 +2980,6 @@ elif active_tab == "실행이력":
                 )
 
 elif active_tab == "담당자 통계":
-    st.markdown("### 👤 담당자별 실행횟수")
-
     stats_df = get_manager_stats(CURRENT_USER_ID)
 
     if stats_df.empty:
@@ -2993,7 +2989,6 @@ elif active_tab == "담당자 통계":
 
 
 elif CURRENT_USER_IS_ADMIN and active_tab == "회원 승인 관리":
-    st.markdown("### 🔐 회원 승인 관리")
     st.caption("회원가입 신청자는 관리자 승인 전까지 매칭 시스템에 로그인할 수 없습니다.")
 
     pending_users = list_pending_users(CURRENT_USER_ID)
@@ -3033,12 +3028,16 @@ elif CURRENT_USER_IS_ADMIN and active_tab == "회원 승인 관리":
         st.info("등록된 회원이 없습니다.")
 
 elif CURRENT_USER_IS_ADMIN and active_tab == "시스템 관리":
-    render_system_management_page(
-        project_root=ROOT_DIR,
-        current_user_id=CURRENT_USER_ID,
+    system_status_tab, data_connection_tab = st.tabs(
+        ["운영 상태·백업", "데이터·API 연결"]
     )
-    st.divider()
-    render_prospect_admin_settings(CURRENT_USER_ID)
+    with system_status_tab:
+        render_system_management_page(
+            project_root=ROOT_DIR,
+            current_user_id=CURRENT_USER_ID,
+        )
+    with data_connection_tab:
+        render_prospect_admin_settings(CURRENT_USER_ID)
 
 elif CURRENT_USER_IS_ADMIN and active_tab == "AI 사용량":
     render_ai_usage_page(
