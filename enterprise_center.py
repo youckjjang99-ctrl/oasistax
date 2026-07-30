@@ -581,30 +581,26 @@ def render_enterprise_management_center(
     )
 
     (
-        tab_diagnosis_group,
+        tab_overview,
         tab_crm,
-        tab_consulting_group,
-        tab_documents_group,
+        tab_policy,
+        tab_stock,
+        tab_articles,
+        tab_history,
+        tab_employees,
+        tab_temporary_advance,
     ) = st.tabs(
         [
-            "기업진단",
-            "영업관리",
-            "컨설팅",
-            "전문분석",
+            "기업정보",
+            "CRM",
+            "정책자금",
+            "주가평가·등기",
+            "정관검토",
+            "기업히스토리",
+            "직원현황",
+            "가지급금 계산기",
         ]
     )
-    with tab_diagnosis_group:
-        tab_overview, tab_history = st.tabs(
-            ["기업정보", "기업히스토리"]
-        )
-    with tab_consulting_group:
-        tab_policy, tab_employees, tab_temporary_advance = st.tabs(
-            ["정책자금", "직원현황", "가지급금"]
-        )
-    with tab_documents_group:
-        tab_stock, tab_articles = st.tabs(
-            ["주가평가·등기", "정관검토"]
-        )
 
     with tab_overview:
         left, right = st.columns(2)
