@@ -1887,6 +1887,275 @@ def _retry_or_wake_claim_job(user_id: str, case_id: str) -> bool:
     )
 
 
+def _retry_authenticated_claim_collection(
+    user_id: str,
+    case_id: str,
+) -> tuple[bool, str]:
+    owner_user_id = str(user_id or "").strip().lower()
+    normalized_case_id = str(case_id or "").strip()
+    if not owner_user_id or not normalized_case_id:
+        return False, "재수집할 요청을 확인하지 못했습니다."
+    if not bool(provider_readiness().get("simple_auth_ready")):
+        return False, "자료수집 API 설정을 먼저 확인해 주세요."
+
+    try:
+        repository = ClaimRepository(owner_user_id)
+        case = repository.get_case(normalized_case_id)
+    except ClaimRepositoryError:
+        return False, "저장된 요청 상태를 확인하지 못했습니다."
+    if not case:
+        return False, "재수집할 요청을 찾지 못했습니다."
+    if (
+        str(case.get("hometax_status", "") or "") != "auth_complete"
+        or str(case.get("comwel_status", "") or "") != "auth_complete"
+    ):
+        return False, "홈택스와 근로복지공단 인증을 모두 완료해야 재수집할 수 있습니다."
+
+    owner_ref = _claim_job_owner_ref(owner_user_id)
+    previous_status = ""
+    should_expire = False
+    now = time.time()
+    with _CLAIM_JOB_LOCK:
+        job = _CLAIM_JOBS.get(normalized_case_id)
+        if not job or job.get("owner_ref") != owner_ref:
+            return (
+                False,
+                "보안상 임시 인증정보가 남아 있지 않아 새 인증 요청이 필요합니다.",
+            )
+        previous_status = str(job.get("status", "") or "")
+        sealed_payload = job.get("sealed_payload")
+        expires_at = float(job.get("expires_at", 0) or 0)
+        if previous_status == "complete":
+            return False, "현재 연결된 자료수집이 이미 완료되었습니다."
+        if (
+            previous_status == "expired"
+            or expires_at <= now
+            or not isinstance(sealed_payload, bytes)
+            or not sealed_payload
+        ):
+            should_expire = True
+        elif previous_status in {"running", "queued"}:
+            wake_event = job.get("wake_event")
+            if isinstance(wake_event, threading.Event):
+                wake_event.set()
+            return True, "자료수집이 이미 진행 중입니다."
+        elif previous_status == "awaiting_management_selection":
+            return False, "사업장관리번호를 먼저 선택해야 자료수집을 계속할 수 있습니다."
+        elif previous_status not in {"paused", "collection_partial"}:
+            return False, "현재 상태에서는 자료 재수집을 시작할 수 없습니다."
+        else:
+            transient: dict[str, Any] | None = None
+            try:
+                transient = _unseal_claim_job_payload(sealed_payload)
+                context = transient.get("auth_context")
+                if (
+                    not isinstance(context, dict)
+                    or not isinstance(transient.get("hometax"), dict)
+                    or not isinstance(transient.get("comwel"), dict)
+                ):
+                    should_expire = True
+            except ClaimProviderError:
+                should_expire = True
+            finally:
+                if isinstance(transient, dict):
+                    transient.clear()
+            if not should_expire:
+                job["status"] = "queued"
+                job["safe_message"] = "인증 완료 자료의 재수집을 준비합니다."
+                job["updated_at"] = now
+
+    if should_expire:
+        _expire_claim_job(
+            normalized_case_id,
+            owner_ref,
+            owner_user_id,
+        )
+        return (
+            False,
+            "임시 인증정보가 만료되어 고객의 새 인증 요청이 필요합니다.",
+        )
+
+    try:
+        repository.update_case_status(
+            normalized_case_id,
+            overall_status="collecting",
+            last_safe_error_code=None,
+        )
+        repository.append_audit_event(
+            case_id=normalized_case_id,
+            action="collection_retry_requested",
+            source="provider",
+            outcome="requested",
+            metadata={
+                "previous_job_status": previous_status,
+                "reuses_authenticated_session": True,
+            },
+        )
+    except ClaimRepositoryError:
+        with _CLAIM_JOB_LOCK:
+            job = _CLAIM_JOBS.get(normalized_case_id)
+            if (
+                job
+                and job.get("owner_ref") == owner_ref
+                and str(job.get("status", "") or "") == "queued"
+            ):
+                job["status"] = previous_status
+                job["safe_message"] = "일부 자료를 다시 수집할 수 있습니다."
+                job["updated_at"] = time.time()
+        try:
+            repository.update_case_status(
+                normalized_case_id,
+                overall_status="auth_complete_collection_pending",
+                last_safe_error_code="COLLECTION_RETRY_STATE_SAVE_FAILED",
+            )
+        except ClaimRepositoryError:
+            pass
+        return False, "재수집 상태를 저장하지 못했습니다. 잠시 후 다시 시도해 주세요."
+
+    try:
+        activated = _activate_background_claim_job(
+            owner_user_id,
+            normalized_case_id,
+            initial_delay=0,
+        )
+    except Exception:
+        activated = False
+    if activated:
+        _update_claim_job(
+            normalized_case_id,
+            owner_ref,
+            safe_message="인증 완료 자료를 다시 수집하고 있습니다.",
+        )
+        return True, "인증 완료 상태를 유지한 채 자료 재수집을 시작했습니다."
+
+    with _CLAIM_JOB_LOCK:
+        job = _CLAIM_JOBS.get(normalized_case_id)
+        if (
+            job
+            and job.get("owner_ref") == owner_ref
+            and str(job.get("status", "") or "") in {"queued", "running"}
+        ):
+            job["status"] = previous_status
+            job["safe_message"] = "일부 자료를 다시 수집할 수 있습니다."
+            job["updated_at"] = time.time()
+    try:
+        repository.update_case_status(
+            normalized_case_id,
+            overall_status="auth_complete_collection_pending",
+            last_safe_error_code="COLLECTION_RETRY_START_FAILED",
+        )
+        repository.append_audit_event(
+            case_id=normalized_case_id,
+            action="collection_retry_requested",
+            source="provider",
+            outcome="failed",
+            metadata={"safe_error_code": "COLLECTION_RETRY_START_FAILED"},
+        )
+    except ClaimRepositoryError:
+        pass
+    return False, "재수집 작업을 시작하지 못했습니다. 잠시 후 다시 시도해 주세요."
+
+
+def _claim_collection_retry_state(
+    case: dict[str, Any],
+    job_snapshot: dict[str, Any] | None,
+    *,
+    provider_ready: bool,
+) -> str:
+    authentication_complete = (
+        str(case.get("hometax_status", "") or "") == "auth_complete"
+        and str(case.get("comwel_status", "") or "") == "auth_complete"
+    )
+    if not authentication_complete:
+        return "hidden"
+
+    overall_status = str(case.get("overall_status", "") or "")
+    if overall_status in {"collected", "ready"}:
+        return "complete"
+    if not job_snapshot:
+        return (
+            "reauth_required"
+            if overall_status
+            in {
+                "auth_complete_collection_pending",
+                "collection_queued",
+                "collecting",
+            }
+            else "hidden"
+        )
+
+    job_status = str(job_snapshot.get("status", "") or "")
+    if job_status in {"running", "queued"}:
+        return "running"
+    if job_status == "awaiting_management_selection":
+        return "selection_required"
+    if job_status == "complete":
+        return "complete"
+    if (
+        job_status == "expired"
+        or float(job_snapshot.get("expires_at", 0) or 0) <= time.time()
+    ):
+        return "reauth_required"
+    if job_status in {"paused", "collection_partial"}:
+        return "retryable" if provider_ready else "provider_unavailable"
+    return "hidden"
+
+
+def _render_claim_collection_retry_action(
+    user_id: str,
+    case: dict[str, Any],
+    job_snapshot: dict[str, Any] | None,
+    *,
+    provider_ready: bool,
+    key_prefix: str,
+) -> str:
+    state = _claim_collection_retry_state(
+        case,
+        job_snapshot,
+        provider_ready=provider_ready,
+    )
+    case_id = str(case.get("id", "") or "")
+    if state == "retryable":
+        st.warning(
+            "인증은 완료됐지만 일부 자료를 수집하지 못했습니다. "
+            "완료된 자료는 그대로 두고 실패한 자료만 다시 수집할 수 있습니다."
+        )
+        if st.button(
+            "실패 자료 재수집",
+            type="primary",
+            use_container_width=True,
+            key=f"{key_prefix}_{case_id}",
+        ):
+            retried, message = _retry_authenticated_claim_collection(
+                user_id,
+                case_id,
+            )
+            if retried:
+                st.session_state["_claim_active_case_v1"] = case_id
+                st.session_state.pop(
+                    f"_claim_collection_notified_{case_id}",
+                    None,
+                )
+                st.toast(message)
+                st.rerun(scope="app")
+            else:
+                st.error(message)
+    elif state == "running":
+        st.info(
+            "자료 수집 또는 재수집이 진행 중입니다. "
+            "완료된 자료는 다시 내려받지 않습니다."
+        )
+    elif state == "provider_unavailable":
+        st.error("자료수집 API 설정을 확인한 뒤 재수집할 수 있습니다.")
+    elif state == "reauth_required":
+        st.warning(
+            "재수집에 필요한 임시 인증정보가 만료됐거나 서버 재시작으로 "
+            "삭제되었습니다. 개인정보 보호를 위해 복구하지 않으므로 "
+            "고객에게 새 인증 요청을 보내 주세요."
+        )
+    return state
+
+
 def _select_claim_management_number(
     user_id: str,
     case_id: str,
@@ -2646,6 +2915,20 @@ def _render_auto_claim_monitor(
                 st.session_state.pop("_claim_active_case_v1", None)
             st.warning(str(job_snapshot.get("safe_message", "") or "인증정보가 만료되었습니다."))
             return
+        retry_state = _render_claim_collection_retry_action(
+            user_id,
+            current_case,
+            job_snapshot,
+            provider_ready=provider_ready,
+            key_prefix="claim_monitor_collection_retry",
+        )
+        if retry_state in {
+            "retryable",
+            "running",
+            "provider_unavailable",
+            "reauth_required",
+        }:
+            return
         manual_check = st.button(
             "지금 인증 상태 확인",
             use_container_width=True,
@@ -2749,7 +3032,11 @@ def _render_status_tab(
         )
 
 
-def _render_results_tab(repository: ClaimRepository | None) -> None:
+def _render_results_tab(
+    user_id: str,
+    repository: ClaimRepository | None,
+    provider_ready: bool,
+) -> None:
     if repository is None:
         st.info("전용 저장소 설치 후 수집결과가 표시됩니다.")
         return
@@ -2778,7 +3065,14 @@ def _render_results_tab(repository: ClaimRepository | None) -> None:
     with filter_cols[2]:
         status_filter = st.selectbox(
             "진행 상태",
-            ["전체", "인증 대기", "인증 완료", "수집 완료", "실패"],
+            [
+                "전체",
+                "인증 대기",
+                "인증 완료",
+                "일부 수집 실패",
+                "수집 완료",
+                "실패",
+            ],
             key="claim_result_status_filter_v1",
         )
 
@@ -2803,6 +3097,11 @@ def _render_results_tab(repository: ClaimRepository | None) -> None:
         status_group = (
             "수집 완료"
             if overall_status in {"collected", "ready"}
+            else "일부 수집 실패"
+            if (
+                overall_status == "auth_complete_collection_pending"
+                and bool(case.get("last_safe_error_code"))
+            )
             else "인증 완료"
             if overall_status
             in {
@@ -2847,8 +3146,18 @@ def _render_results_tab(repository: ClaimRepository | None) -> None:
     with metric_cols[2]:
         st.metric("전체 상태", _source_status(selected_case.get("overall_status")))
 
+    selected_case_id = str(selected_case.get("id", "") or "")
+    selected_job_snapshot = _claim_job_snapshot(user_id, selected_case_id)
+    _render_claim_collection_retry_action(
+        user_id,
+        selected_case,
+        selected_job_snapshot,
+        provider_ready=provider_ready,
+        key_prefix="claim_result_collection_retry",
+    )
+
     try:
-        documents = repository.list_documents(str(selected_case.get("id", "")))
+        documents = repository.list_documents(selected_case_id)
     except ClaimRepositoryError as exc:
         st.error(str(exc))
         return
@@ -3156,6 +3465,10 @@ def render_claim_correction_center(
             bool(readiness.get("simple_auth_ready")),
         )
     with result_tab:
-        _render_results_tab(repository)
+        _render_results_tab(
+            user_id,
+            repository,
+            bool(readiness.get("simple_auth_ready")),
+        )
     with catalog_tab:
         _render_catalog_tab()
