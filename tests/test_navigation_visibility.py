@@ -11,8 +11,10 @@ class NavigationVisibilityTests(unittest.TestCase):
     def test_sidebar_does_not_repeat_selected_group_badges(self):
         source = (ROOT / "app.py").read_text(encoding="utf-8")
 
-        self.assertIn('<span>업무 구분</span>', source)
-        self.assertIn('<span>세부 메뉴</span>', source)
+        self.assertIn('selected_group = st.pills(\n            "업무 구분"', source)
+        self.assertIn('selected_menu_label = st.radio(\n            "세부 메뉴"', source)
+        self.assertGreaterEqual(source.count('label_visibility="visible"'), 2)
+        self.assertNotIn("sidebar-nav-heading", source)
         self.assertNotIn("<small>1단계</small>", source)
         self.assertNotIn("<small>{html.escape(selected_group)}</small>", source)
 
