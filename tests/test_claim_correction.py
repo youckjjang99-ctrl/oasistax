@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -13,9 +15,20 @@ from cryptography.hazmat.primitives.serialization import (
 
 from claim_correction_catalog import DOCUMENT_SPECS, document_plan, seven_years
 from claim_correction_center import (
+    _CLAIM_JOBS,
+    _CLAIM_JOB_LOCK,
+    _advance_personal_case,
     _birth_date_from_identity,
+    _claim_job_owner_ref,
+    _claim_progress,
+    _collect_supported_hometax_documents,
+    _expire_claim_job,
     _is_valid_business_no,
+    _next_auth_action,
     _resolve_auth_progress,
+    _run_background_claim_job,
+    _seal_claim_job_payload,
+    _unseal_claim_job_payload,
 )
 from claim_correction_repository import (
     ClaimRepository,
@@ -86,6 +99,184 @@ class _DocumentResponse:
                 "CerCvaIsnNo": "provider-reference",
             },
         }
+
+
+class _CollectionRepository:
+    def __init__(self):
+        self.stored_codes = []
+        self.failed_codes = []
+
+    @staticmethod
+    def list_documents(_case_id):
+        return [
+            {
+                "source": "hometax",
+                "document_code": "hometax_business_registration_certificate",
+                "status": "auth_pending",
+            },
+            {
+                "source": "hometax",
+                "document_code": "hometax_tax_payment_certificate",
+                "status": "auth_pending",
+            },
+        ]
+
+    def store_collected_document(self, _case_id, *, document_code, document):
+        self.stored_codes.append(document_code)
+        return {"status": "ready", "size_bytes": len(document.content)}
+
+    def fail_document(self, _case_id, *, document_code, safe_error_code):
+        self.failed_codes.append((document_code, safe_error_code))
+
+
+class _CollectionClient:
+    def __init__(self):
+        self.business_calls = 0
+        self.tax_calls = 0
+
+    def collect_hometax_business_registration_certificate(self, **_kwargs):
+        self.business_calls += 1
+        return CollectedClaimDocument(
+            content=b"%PDF-business",
+            file_name="business.pdf",
+            content_type="application/pdf",
+            provider_reference="business",
+            facts={},
+        )
+
+    def collect_hometax_tax_payment_certificate(self, **_kwargs):
+        self.tax_calls += 1
+        return CollectedClaimDocument(
+            content=b"%PDF-tax",
+            file_name="tax.pdf",
+            content_type="application/pdf",
+            provider_reference="tax",
+            facts={},
+        )
+
+
+class _FlowRepository:
+    def __init__(self):
+        self.case = {
+            "id": "case-1",
+            "hometax_status": "auth_requested",
+            "comwel_status": "request_ready",
+            "overall_status": "auth_pending",
+        }
+        self.audit_events = []
+
+    def update_case_status(self, _case_id, **updates):
+        self.case.update(updates)
+        return dict(self.case)
+
+    def append_audit_event(self, **event):
+        self.audit_events.append(event)
+
+
+class _FlowClient:
+    def __init__(self, hometax_results):
+        self.hometax_results = list(hometax_results)
+        self.comwel_request_count = 0
+        self.comwel_check_count = 0
+
+    def check_hometax_kakao(self, **_kwargs):
+        return self.hometax_results.pop(0)
+
+    def request_comwel_kakao(self, **_kwargs):
+        self.comwel_request_count += 1
+        return {
+            "Token": "comwel-token",
+            "CxId": "comwel-cx",
+            "TxId": "comwel-tx",
+            "ReqTxId": "comwel-req",
+        }
+
+    def check_comwel_kakao(self, **_kwargs):
+        self.comwel_check_count += 1
+        return False
+
+
+class _BackgroundFlowRepository(_FlowRepository):
+    def __init__(self):
+        super().__init__()
+        self.documents = [
+            {
+                "source": "hometax",
+                "document_code": "hometax_business_registration_certificate",
+                "status": "auth_pending",
+            },
+            {
+                "source": "hometax",
+                "document_code": "hometax_tax_payment_certificate",
+                "status": "auth_pending",
+            },
+            {
+                "source": "comwel",
+                "document_code": "comwel_worker_status",
+                "status": "auth_pending",
+            },
+        ]
+
+    def get_case(self, _case_id):
+        return dict(self.case)
+
+    def list_documents(self, _case_id):
+        return [dict(document) for document in self.documents]
+
+    def update_document_status(self, _case_id, *, source, status):
+        for document in self.documents:
+            if document["source"] == source:
+                document["status"] = status
+
+    def store_collected_document(self, _case_id, *, document_code, document):
+        for row in self.documents:
+            if row["document_code"] == document_code:
+                row["status"] = "ready"
+        return {"status": "ready", "size_bytes": len(document.content)}
+
+    def fail_document(self, _case_id, *, document_code, safe_error_code):
+        for row in self.documents:
+            if row["document_code"] == document_code:
+                row["status"] = "failed"
+                row["last_safe_error_code"] = safe_error_code
+
+
+class _ComwelStatusFailureRepository(_FlowRepository):
+    def __init__(self):
+        super().__init__()
+        self.case.update(
+            {
+                "hometax_status": "auth_complete",
+                "comwel_status": "request_ready",
+            }
+        )
+
+    def get_case(self, _case_id):
+        return dict(self.case)
+
+    def update_case_status(self, _case_id, **updates):
+        if updates.get("comwel_status") == "auth_requested":
+            raise ClaimRepositoryError("temporary database failure")
+        return super().update_case_status(_case_id, **updates)
+
+
+class _BackgroundFlowClient(_CollectionClient):
+    @staticmethod
+    def check_hometax_kakao(**_kwargs):
+        return True
+
+    @staticmethod
+    def request_comwel_kakao(**_kwargs):
+        return {
+            "Token": "comwel-token",
+            "CxId": "comwel-cx",
+            "TxId": "comwel-tx",
+            "ReqTxId": "comwel-req",
+        }
+
+    @staticmethod
+    def check_comwel_kakao(**_kwargs):
+        return True
 
 
 class _FakeDatabase:
@@ -281,6 +472,383 @@ class ClaimCorrectionTests(unittest.TestCase):
         self.assertEqual(status, "auth_complete_collection_pending")
         self.assertTrue(all_completed)
         self.assertFalse(any_failed)
+
+    def test_claim_progress_uses_sequential_milestones(self):
+        self.assertEqual(
+            _claim_progress(
+                {
+                    "hometax_status": "auth_requested",
+                    "comwel_status": "request_ready",
+                    "overall_status": "auth_pending",
+                }
+            )[0],
+            25,
+        )
+        self.assertEqual(
+            _claim_progress(
+                {
+                    "hometax_status": "auth_complete",
+                    "comwel_status": "auth_requested",
+                    "overall_status": "auth_pending",
+                }
+            )[0],
+            50,
+        )
+        self.assertEqual(
+            _claim_progress(
+                {
+                    "hometax_status": "auth_complete",
+                    "comwel_status": "auth_complete",
+                    "overall_status": "collecting",
+                }
+            )[0],
+            75,
+        )
+        self.assertEqual(
+            _claim_progress({"overall_status": "ready"})[0],
+            100,
+        )
+
+    def test_next_auth_action_never_skips_hometax(self):
+        hometax_session = {
+            "Token": "token",
+            "CxId": "cx",
+            "TxId": "tx",
+            "ReqTxId": "req",
+        }
+        self.assertEqual(
+            _next_auth_action(
+                {
+                    "hometax_status": "auth_requested",
+                    "comwel_status": "request_ready",
+                },
+                {"hometax": hometax_session},
+            )[0],
+            "check_hometax",
+        )
+        self.assertEqual(
+            _next_auth_action(
+                {
+                    "hometax_status": "auth_complete",
+                    "comwel_status": "request_ready",
+                },
+                {"hometax": hometax_session},
+            )[0],
+            "request_comwel",
+        )
+        self.assertEqual(
+            _next_auth_action(
+                {
+                    "hometax_status": "auth_complete",
+                    "comwel_status": "auth_requested",
+                },
+                {
+                    "hometax": hometax_session,
+                    "comwel": hometax_session,
+                },
+            )[0],
+            "check_comwel",
+        )
+
+    def test_sequential_advance_requests_comwel_exactly_once(self):
+        repository = _FlowRepository()
+        client = _FlowClient([False, True])
+        transient = {
+            "expires_at": 9999999999,
+            "hometax": {
+                "Token": "token",
+                "CxId": "cx",
+                "TxId": "tx",
+                "ReqTxId": "req",
+            },
+        }
+        common = {
+            "representative": "홍길동",
+            "cellphone": "01012345678",
+            "birth_date": "19901019",
+            "identity_number": "9010191234567",
+        }
+
+        first = _advance_personal_case(
+            repository,
+            client,
+            case=dict(repository.case),
+            transient=transient,
+            **common,
+        )
+        self.assertEqual(first["event"], "hometax_pending")
+        self.assertEqual(client.comwel_request_count, 0)
+
+        second = _advance_personal_case(
+            repository,
+            client,
+            case=dict(repository.case),
+            transient=transient,
+            **common,
+        )
+        self.assertEqual(second["event"], "comwel_requested")
+        self.assertEqual(client.comwel_request_count, 1)
+        self.assertEqual(repository.case["hometax_status"], "auth_complete")
+        self.assertEqual(repository.case["comwel_status"], "auth_requested")
+
+        third = _advance_personal_case(
+            repository,
+            client,
+            case=dict(repository.case),
+            transient=transient,
+            **common,
+        )
+        self.assertEqual(third["event"], "comwel_pending")
+        self.assertEqual(client.comwel_request_count, 1)
+        self.assertEqual(client.comwel_check_count, 1)
+
+    def test_background_job_encrypts_identity_and_enforces_expiry(self):
+        case_id = "encrypted-case"
+        user_id = "owner-1"
+        owner_ref = _claim_job_owner_ref(user_id)
+        payload = {
+            "expires_at": time.time() + 60,
+            "auth_context": {
+                "identity_number": "9010191234567",
+                "representative": "홍길동",
+                "cellphone": "01012345678",
+                "birth_date": "19901019",
+            },
+            "hometax": {
+                "Token": "secret-token",
+                "CxId": "cx",
+                "TxId": "tx",
+                "ReqTxId": "req",
+            },
+        }
+        sealed = _seal_claim_job_payload(payload)
+        self.assertNotIn(b"9010191234567", sealed)
+        self.assertNotIn(b"secret-token", sealed)
+        self.assertEqual(
+            _unseal_claim_job_payload(sealed)["auth_context"][
+                "identity_number"
+            ],
+            "9010191234567",
+        )
+
+        with _CLAIM_JOB_LOCK:
+            _CLAIM_JOBS[case_id] = {
+                "owner_ref": owner_ref,
+                "sealed_payload": sealed,
+                "expires_at": time.time() - 1,
+                "status": "running",
+                "wake_event": threading.Event(),
+            }
+        try:
+            _expire_claim_job(case_id, owner_ref)
+            with _CLAIM_JOB_LOCK:
+                expired = dict(_CLAIM_JOBS[case_id])
+            self.assertEqual(expired["sealed_payload"], b"")
+            self.assertEqual(expired["status"], "expired")
+        finally:
+            with _CLAIM_JOB_LOCK:
+                _CLAIM_JOBS.pop(case_id, None)
+
+    def test_collection_partial_expiry_clears_encrypted_payload(self):
+        case_id = "partial-expiry-case"
+        user_id = "owner-partial"
+        owner_ref = _claim_job_owner_ref(user_id)
+        sealed = _seal_claim_job_payload(
+            {
+                "expires_at": time.time() - 1,
+                "auth_context": {
+                    "identity_number": "9010191234567",
+                },
+            }
+        )
+        with _CLAIM_JOB_LOCK:
+            _CLAIM_JOBS[case_id] = {
+                "owner_ref": owner_ref,
+                "sealed_payload": sealed,
+                "expires_at": time.time() - 1,
+                "status": "collection_partial",
+                "safe_message": "일부 서류 저장",
+                "wake_event": threading.Event(),
+            }
+        try:
+            _expire_claim_job(case_id, owner_ref)
+            with _CLAIM_JOB_LOCK:
+                expired = dict(_CLAIM_JOBS[case_id])
+            self.assertEqual(expired["sealed_payload"], b"")
+            self.assertEqual(expired["status"], "expired")
+            self.assertIn("일부 서류", expired["safe_message"])
+        finally:
+            with _CLAIM_JOB_LOCK:
+                _CLAIM_JOBS.pop(case_id, None)
+
+    def test_background_job_completes_sequential_auth_and_collection(self):
+        case_id = "case-1"
+        user_id = "owner-2"
+        owner_ref = _claim_job_owner_ref(user_id)
+        repository = _BackgroundFlowRepository()
+        client = _BackgroundFlowClient()
+        transient = {
+            "expires_at": time.time() + 60,
+            "business_number": "1208800767",
+            "auth_context": {
+                "representative": "홍길동",
+                "cellphone": "01012345678",
+                "birth_date": "19901019",
+                "identity_number": "9010191234567",
+            },
+            "hometax": {
+                "Token": "hometax-token",
+                "CxId": "hometax-cx",
+                "TxId": "hometax-tx",
+                "ReqTxId": "hometax-req",
+            },
+        }
+        with _CLAIM_JOB_LOCK:
+            _CLAIM_JOBS[case_id] = {
+                "owner_ref": owner_ref,
+                "sealed_payload": _seal_claim_job_payload(transient),
+                "expires_at": transient["expires_at"],
+                "status": "running",
+                "progress": 25,
+                "safe_message": "",
+                "summary": {},
+                "wake_event": threading.Event(),
+            }
+        try:
+            with (
+                patch(
+                    "claim_correction_center.ClaimRepository",
+                    return_value=repository,
+                ),
+                patch(
+                    "claim_correction_center.TilkoClaimClient",
+                    return_value=client,
+                ),
+                patch(
+                    "claim_correction_center.threading.Event.wait",
+                    return_value=False,
+                ),
+            ):
+                _run_background_claim_job(
+                    user_id,
+                    case_id,
+                    owner_ref,
+                )
+            with _CLAIM_JOB_LOCK:
+                completed = dict(_CLAIM_JOBS[case_id])
+            self.assertEqual(completed["status"], "complete")
+            self.assertEqual(completed["progress"], 100)
+            self.assertEqual(completed["sealed_payload"], b"")
+            self.assertEqual(repository.case["overall_status"], "ready")
+            self.assertEqual(
+                {
+                    row["document_code"]
+                    for row in repository.documents
+                    if row["status"] == "ready"
+                },
+                {
+                    "hometax_business_registration_certificate",
+                    "hometax_tax_payment_certificate",
+                },
+            )
+        finally:
+            with _CLAIM_JOB_LOCK:
+                _CLAIM_JOBS.pop(case_id, None)
+
+    def test_background_job_reseals_comwel_token_after_database_failure(self):
+        case_id = "case-1"
+        user_id = "owner-3"
+        owner_ref = _claim_job_owner_ref(user_id)
+        repository = _ComwelStatusFailureRepository()
+        client = _BackgroundFlowClient()
+        transient = {
+            "expires_at": time.time() + 60,
+            "business_number": "",
+            "auth_context": {
+                "representative": "홍길동",
+                "cellphone": "01012345678",
+                "birth_date": "19901019",
+                "identity_number": "9010191234567",
+            },
+            "hometax": {
+                "Token": "hometax-token",
+                "CxId": "hometax-cx",
+                "TxId": "hometax-tx",
+                "ReqTxId": "hometax-req",
+            },
+        }
+        with _CLAIM_JOB_LOCK:
+            _CLAIM_JOBS[case_id] = {
+                "owner_ref": owner_ref,
+                "sealed_payload": _seal_claim_job_payload(transient),
+                "expires_at": transient["expires_at"],
+                "status": "running",
+                "progress": 50,
+                "safe_message": "",
+                "summary": {},
+                "wake_event": threading.Event(),
+            }
+        original_expires_at = transient["expires_at"]
+        try:
+            with (
+                patch(
+                    "claim_correction_center.ClaimRepository",
+                    return_value=repository,
+                ),
+                patch(
+                    "claim_correction_center.TilkoClaimClient",
+                    return_value=client,
+                ),
+            ):
+                _run_background_claim_job(
+                    user_id,
+                    case_id,
+                    owner_ref,
+                )
+            with _CLAIM_JOB_LOCK:
+                paused = dict(_CLAIM_JOBS[case_id])
+            restored = _unseal_claim_job_payload(paused["sealed_payload"])
+            self.assertEqual(paused["status"], "paused")
+            self.assertEqual(restored["comwel"]["Token"], "comwel-token")
+            self.assertGreater(
+                paused["expires_at"],
+                original_expires_at + 500,
+            )
+        finally:
+            with _CLAIM_JOB_LOCK:
+                _CLAIM_JOBS.pop(case_id, None)
+
+    def test_missing_business_number_skips_only_business_certificate(self):
+        repository = _CollectionRepository()
+        client = _CollectionClient()
+        summary = _collect_supported_hometax_documents(
+            repository,
+            client,
+            case_id="case-1",
+            birth_date="19901019",
+            representative="홍길동",
+            cellphone="01012345678",
+            business_number="",
+            session={
+                "Token": "token",
+                "CxId": "cx",
+                "TxId": "tx",
+                "ReqTxId": "req",
+            },
+        )
+        self.assertEqual(summary["target"], 1)
+        self.assertEqual(summary["ready"], 1)
+        self.assertEqual(summary["failed"], 0)
+        self.assertIn(
+            "hometax_business_registration_certificate",
+            summary["skipped"],
+        )
+        self.assertEqual(client.business_calls, 0)
+        self.assertEqual(client.tax_calls, 1)
+        self.assertEqual(
+            repository.stored_codes,
+            ["hometax_tax_payment_certificate"],
+        )
 
     def test_sensitive_values_are_masked_before_storage(self):
         self.assertEqual(_masked_name("홍길동"), "홍*동")
@@ -552,12 +1120,24 @@ class ClaimCorrectionTests(unittest.TestCase):
         self.assertIn('elif active_tab == "경정청구":', source)
         self.assertIn("render_claim_correction_center(", source)
 
-    def test_personal_flow_always_requires_both_kakao_requests(self):
+    def test_personal_flow_sends_hometax_before_comwel(self):
         source = (ROOT / "claim_correction_center.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn('sources = ["hometax", "comwel"]', source)
-        self.assertIn('"카카오 인증 2건 발송"', source)
+        personal_flow = source[
+            source.index("def _render_personal_request"):
+            source.index("def _render_corporate_request")
+        ]
+        self.assertIn('"홈택스 카카오 인증 발송"', personal_flow)
+        self.assertIn('sources = ["hometax", "comwel"]', personal_flow)
+        self.assertNotIn("request_comwel_kakao(", personal_flow)
+        self.assertNotIn("상호명을 입력해주세요.", personal_flow)
+        self.assertIn(
+            "if business_digits and not _is_valid_business_no",
+            personal_flow,
+        )
+        self.assertIn('if action == "check_hometax":', source)
+        self.assertIn('transient["comwel"] = client.request_comwel_kakao(', source)
 
 
 if __name__ == "__main__":
