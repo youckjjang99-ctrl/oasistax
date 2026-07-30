@@ -1815,8 +1815,7 @@ with st.sidebar:
         st.markdown(
             """
             <div class="sidebar-nav-heading">
-                <span>업무 영역 전환</span>
-                <small>1단계</small>
+                <span>업무 구분</span>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1849,10 +1848,9 @@ with st.sidebar:
     }
     with st.container(key="sidebar_detail_navigation"):
         st.markdown(
-            f"""
+            """
             <div class="sidebar-nav-heading sidebar-nav-heading-detail">
                 <span>세부 메뉴</span>
-                <small>{html.escape(selected_group)}</small>
             </div>
             """,
             unsafe_allow_html=True,

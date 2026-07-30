@@ -664,21 +664,6 @@ button[data-baseweb="tab"][aria-selected="true"] {
     letter-spacing: -0.01em !important;
 }
 
-.sidebar-nav-heading small {
-    display: inline-flex !important;
-    align-items: center !important;
-    min-height: 21px !important;
-    padding: 0.14rem 0.45rem !important;
-    color: rgba(255, 255, 255, 0.82) !important;
-    border: 1px solid rgba(255, 255, 255, 0.2) !important;
-    border-radius: 999px !important;
-    background: rgba(255, 255, 255, 0.09) !important;
-    font-size: 0.66rem !important;
-    font-weight: 700 !important;
-    letter-spacing: 0 !important;
-    white-space: nowrap !important;
-}
-
 .sidebar-nav-heading-detail {
     padding-bottom: 0.1rem !important;
     border-bottom: 1px solid rgba(255, 255, 255, 0.14) !important;
@@ -1075,12 +1060,6 @@ button[data-baseweb="tab"][aria-selected="true"] {
 
     .sidebar-nav-heading {
         font-size: 0.75rem !important;
-    }
-
-    .sidebar-nav-heading small {
-        min-height: 19px !important;
-        padding: 0.1rem 0.38rem !important;
-        font-size: 0.62rem !important;
     }
 
     [data-testid="stSidebar"] [data-testid="stButtonGroup"] {
