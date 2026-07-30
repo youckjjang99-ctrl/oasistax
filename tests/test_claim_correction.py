@@ -29,7 +29,9 @@ from claim_correction_center import (
     _expire_claim_job,
     _is_valid_business_no,
     _next_auth_action,
+    _claim_collection_retry_state,
     _resolve_auth_progress,
+    _retry_authenticated_claim_collection,
     _run_background_claim_job,
     _seal_claim_job_payload,
     _select_claim_management_number,
@@ -1046,6 +1048,608 @@ class ClaimCorrectionTests(unittest.TestCase):
         finally:
             with _CLAIM_JOB_LOCK:
                 _CLAIM_JOBS.pop(case_id, None)
+
+    def test_authenticated_collection_retry_reuses_unexpired_encrypted_session(self):
+        case_id = "retry-collection-case"
+        user_id = "retry-owner"
+        owner_ref = _claim_job_owner_ref(user_id)
+        repository = _BackgroundFlowRepository()
+        repository.case.update(
+            {
+                "id": case_id,
+                "hometax_status": "auth_complete",
+                "comwel_status": "auth_complete",
+                "overall_status": "auth_complete_collection_pending",
+                "last_safe_error_code": "HOMETAX_DOCUMENT_COLLECTION_FAILED",
+            }
+        )
+        transient = {
+            "request_started_at": time.time() - 60,
+            "absolute_expires_at": time.time() + 900,
+            "expires_at": time.time() + 300,
+            "business_number": "1208800767",
+            "auth_context": {
+                "representative": "홍길동",
+                "cellphone": "01012345678",
+                "birth_date": "19901019",
+                "identity_number": "9010191234567",
+            },
+            "hometax": {"Token": "hometax-token"},
+            "comwel": {"Token": "comwel-token"},
+        }
+        with _CLAIM_JOB_LOCK:
+            _CLAIM_JOBS[case_id] = {
+                "owner_ref": owner_ref,
+                "owner_user_id": user_id,
+                "sealed_payload": _seal_claim_job_payload(transient),
+                "expires_at": transient["expires_at"],
+                "status": "collection_partial",
+                "progress": 84,
+                "safe_message": "일부 서류 저장",
+                "summary": {"ready": 1, "failed": 1},
+                "updated_at": time.time(),
+                "wake_event": threading.Event(),
+            }
+        try:
+            with (
+                patch(
+                    "claim_correction_center.ClaimRepository",
+                    return_value=repository,
+                ),
+                patch(
+                    "claim_correction_center.provider_readiness",
+                    return_value={"simple_auth_ready": True},
+                ),
+                patch(
+                    "claim_correction_center._CLAIM_JOB_EXECUTOR.submit",
+                ) as submit,
+            ):
+                retried, message = _retry_authenticated_claim_collection(
+                    user_id,
+                    case_id,
+                )
+            self.assertTrue(retried)
+            self.assertIn("재수집", message)
+            submit.assert_called_once()
+            self.assertEqual(repository.case["overall_status"], "collecting")
+            self.assertIsNone(repository.case["last_safe_error_code"])
+            self.assertEqual(
+                repository.audit_events[-1]["action"],
+                "collection_retry_requested",
+            )
+            self.assertEqual(
+                repository.audit_events[-1]["metadata"][
+                    "previous_job_status"
+                ],
+                "collection_partial",
+            )
+            with _CLAIM_JOB_LOCK:
+                retried_job = dict(_CLAIM_JOBS[case_id])
+            restored = _unseal_claim_job_payload(
+                retried_job["sealed_payload"]
+            )
+            self.assertEqual(retried_job["status"], "running")
+            self.assertEqual(retried_job["progress"], 84)
+            self.assertEqual(
+                restored["hometax"]["Token"],
+                "hometax-token",
+            )
+            self.assertEqual(
+                restored["comwel"]["Token"],
+                "comwel-token",
+            )
+        finally:
+            with _CLAIM_JOB_LOCK:
+                _CLAIM_JOBS.pop(case_id, None)
+
+    def test_authenticated_collection_retry_rejects_other_owner(self):
+        case_id = "retry-owner-scope-case"
+        repository = _BackgroundFlowRepository()
+        repository.case.update(
+            {
+                "id": case_id,
+                "hometax_status": "auth_complete",
+                "comwel_status": "auth_complete",
+            }
+        )
+        with _CLAIM_JOB_LOCK:
+            _CLAIM_JOBS[case_id] = {
+                "owner_ref": _claim_job_owner_ref("actual-owner"),
+                "owner_user_id": "actual-owner",
+                "sealed_payload": b"encrypted",
+                "expires_at": time.time() + 300,
+                "status": "collection_partial",
+                "wake_event": threading.Event(),
+            }
+        try:
+            with (
+                patch(
+                    "claim_correction_center.ClaimRepository",
+                    return_value=repository,
+                ),
+                patch(
+                    "claim_correction_center.provider_readiness",
+                    return_value={"simple_auth_ready": True},
+                ),
+                patch(
+                    "claim_correction_center._activate_background_claim_job",
+                ) as activate,
+            ):
+                retried, message = _retry_authenticated_claim_collection(
+                    "different-owner",
+                    case_id,
+                )
+            self.assertFalse(retried)
+            self.assertIn("임시 인증정보", message)
+            activate.assert_not_called()
+            self.assertEqual(repository.audit_events, [])
+        finally:
+            with _CLAIM_JOB_LOCK:
+                _CLAIM_JOBS.pop(case_id, None)
+
+    def test_authenticated_collection_retry_requires_both_completed_auths(self):
+        repository = _BackgroundFlowRepository()
+        repository.case.update(
+            {
+                "hometax_status": "auth_complete",
+                "comwel_status": "auth_pending",
+            }
+        )
+        with (
+            patch(
+                "claim_correction_center.ClaimRepository",
+                return_value=repository,
+            ),
+            patch(
+                "claim_correction_center.provider_readiness",
+                return_value={"simple_auth_ready": True},
+            ),
+        ):
+            retried, message = _retry_authenticated_claim_collection(
+                "owner",
+                "case-1",
+            )
+        self.assertFalse(retried)
+        self.assertIn("인증을 모두 완료", message)
+        self.assertEqual(repository.audit_events, [])
+
+    def test_collection_retry_does_not_change_state_without_provider_config(self):
+        with (
+            patch(
+                "claim_correction_center.provider_readiness",
+                return_value={"simple_auth_ready": False},
+            ),
+            patch(
+                "claim_correction_center.ClaimRepository",
+            ) as repository,
+        ):
+            retried, message = _retry_authenticated_claim_collection(
+                "owner",
+                "case-1",
+            )
+        self.assertFalse(retried)
+        self.assertIn("API 설정", message)
+        repository.assert_not_called()
+
+    def test_collection_retry_does_not_duplicate_running_or_queued_job(self):
+        user_id = "active-retry-owner"
+        owner_ref = _claim_job_owner_ref(user_id)
+        repository = _BackgroundFlowRepository()
+        repository.case.update(
+            {
+                "hometax_status": "auth_complete",
+                "comwel_status": "auth_complete",
+                "overall_status": "collecting",
+            }
+        )
+        for status in ("running", "queued"):
+            case_id = f"active-{status}"
+            with self.subTest(status=status):
+                with _CLAIM_JOB_LOCK:
+                    _CLAIM_JOBS[case_id] = {
+                        "owner_ref": owner_ref,
+                        "sealed_payload": b"encrypted-session",
+                        "expires_at": time.time() + 300,
+                        "status": status,
+                        "wake_event": threading.Event(),
+                    }
+                try:
+                    with (
+                        patch(
+                            "claim_correction_center.provider_readiness",
+                            return_value={"simple_auth_ready": True},
+                        ),
+                        patch(
+                            "claim_correction_center.ClaimRepository",
+                            return_value=repository,
+                        ),
+                        patch(
+                            "claim_correction_center._activate_background_claim_job",
+                        ) as activate,
+                    ):
+                        retried, message = (
+                            _retry_authenticated_claim_collection(
+                                user_id,
+                                case_id,
+                            )
+                        )
+                    self.assertTrue(retried)
+                    self.assertIn("이미 진행", message)
+                    activate.assert_not_called()
+                    self.assertEqual(repository.audit_events, [])
+                    with _CLAIM_JOB_LOCK:
+                        self.assertEqual(
+                            _CLAIM_JOBS[case_id]["status"],
+                            status,
+                        )
+                finally:
+                    with _CLAIM_JOB_LOCK:
+                        _CLAIM_JOBS.pop(case_id, None)
+
+    def test_collection_retry_rolls_case_back_when_worker_cannot_start(self):
+        case_id = "retry-start-failure"
+        user_id = "retry-start-owner"
+        owner_ref = _claim_job_owner_ref(user_id)
+        repository = _BackgroundFlowRepository()
+        repository.case.update(
+            {
+                "hometax_status": "auth_complete",
+                "comwel_status": "auth_complete",
+                "overall_status": "auth_complete_collection_pending",
+            }
+        )
+        transient = {
+            "expires_at": time.time() + 300,
+            "auth_context": {"identity_number": "9010191234567"},
+            "hometax": {"Token": "hometax-token"},
+            "comwel": {"Token": "comwel-token"},
+        }
+        with _CLAIM_JOB_LOCK:
+            _CLAIM_JOBS[case_id] = {
+                "owner_ref": owner_ref,
+                "sealed_payload": _seal_claim_job_payload(transient),
+                "expires_at": transient["expires_at"],
+                "status": "collection_partial",
+                "wake_event": threading.Event(),
+            }
+        try:
+            with (
+                patch(
+                    "claim_correction_center.provider_readiness",
+                    return_value={"simple_auth_ready": True},
+                ),
+                patch(
+                    "claim_correction_center.ClaimRepository",
+                    return_value=repository,
+                ),
+                patch(
+                    "claim_correction_center._activate_background_claim_job",
+                    return_value=False,
+                ),
+            ):
+                retried, _ = _retry_authenticated_claim_collection(
+                    user_id,
+                    case_id,
+                )
+            self.assertFalse(retried)
+            self.assertEqual(
+                repository.case["overall_status"],
+                "auth_complete_collection_pending",
+            )
+            self.assertEqual(
+                repository.case["last_safe_error_code"],
+                "COLLECTION_RETRY_START_FAILED",
+            )
+            with _CLAIM_JOB_LOCK:
+                self.assertEqual(
+                    _CLAIM_JOBS[case_id]["status"],
+                    "collection_partial",
+                )
+        finally:
+            with _CLAIM_JOB_LOCK:
+                _CLAIM_JOBS.pop(case_id, None)
+
+    def test_collection_retry_rolls_back_when_audit_save_fails(self):
+        case_id = "retry-audit-failure"
+        user_id = "retry-audit-owner"
+        owner_ref = _claim_job_owner_ref(user_id)
+        repository = _BackgroundFlowRepository()
+        repository.case.update(
+            {
+                "id": case_id,
+                "hometax_status": "auth_complete",
+                "comwel_status": "auth_complete",
+                "overall_status": "auth_complete_collection_pending",
+            }
+        )
+        repository.append_audit_event = MagicMock(
+            side_effect=ClaimRepositoryError("audit unavailable")
+        )
+        transient = {
+            "expires_at": time.time() + 300,
+            "auth_context": {"identity_number": "9010191234567"},
+            "hometax": {"Token": "hometax-token"},
+            "comwel": {"Token": "comwel-token"},
+        }
+        with _CLAIM_JOB_LOCK:
+            _CLAIM_JOBS[case_id] = {
+                "owner_ref": owner_ref,
+                "sealed_payload": _seal_claim_job_payload(transient),
+                "expires_at": transient["expires_at"],
+                "status": "collection_partial",
+                "wake_event": threading.Event(),
+            }
+        try:
+            with (
+                patch(
+                    "claim_correction_center.provider_readiness",
+                    return_value={"simple_auth_ready": True},
+                ),
+                patch(
+                    "claim_correction_center.ClaimRepository",
+                    return_value=repository,
+                ),
+                patch(
+                    "claim_correction_center._activate_background_claim_job",
+                ) as activate,
+            ):
+                retried, _ = _retry_authenticated_claim_collection(
+                    user_id,
+                    case_id,
+                )
+            self.assertFalse(retried)
+            activate.assert_not_called()
+            self.assertEqual(
+                repository.case["overall_status"],
+                "auth_complete_collection_pending",
+            )
+            self.assertEqual(
+                repository.case["last_safe_error_code"],
+                "COLLECTION_RETRY_STATE_SAVE_FAILED",
+            )
+            with _CLAIM_JOB_LOCK:
+                self.assertEqual(
+                    _CLAIM_JOBS[case_id]["status"],
+                    "collection_partial",
+                )
+        finally:
+            with _CLAIM_JOB_LOCK:
+                _CLAIM_JOBS.pop(case_id, None)
+
+    def test_collection_retry_rolls_back_when_executor_submit_fails(self):
+        case_id = "retry-executor-failure"
+        user_id = "retry-executor-owner"
+        owner_ref = _claim_job_owner_ref(user_id)
+        repository = _BackgroundFlowRepository()
+        repository.case.update(
+            {
+                "id": case_id,
+                "hometax_status": "auth_complete",
+                "comwel_status": "auth_complete",
+                "overall_status": "auth_complete_collection_pending",
+            }
+        )
+        transient = {
+            "expires_at": time.time() + 300,
+            "auth_context": {"identity_number": "9010191234567"},
+            "hometax": {"Token": "hometax-token"},
+            "comwel": {"Token": "comwel-token"},
+        }
+        with _CLAIM_JOB_LOCK:
+            _CLAIM_JOBS[case_id] = {
+                "owner_ref": owner_ref,
+                "sealed_payload": _seal_claim_job_payload(transient),
+                "expires_at": transient["expires_at"],
+                "status": "collection_partial",
+                "wake_event": threading.Event(),
+            }
+        try:
+            with (
+                patch(
+                    "claim_correction_center.provider_readiness",
+                    return_value={"simple_auth_ready": True},
+                ),
+                patch(
+                    "claim_correction_center.ClaimRepository",
+                    return_value=repository,
+                ),
+                patch(
+                    "claim_correction_center._CLAIM_JOB_EXECUTOR.submit",
+                    side_effect=RuntimeError("executor unavailable"),
+                ),
+            ):
+                retried, _ = _retry_authenticated_claim_collection(
+                    user_id,
+                    case_id,
+                )
+            self.assertFalse(retried)
+            self.assertEqual(
+                repository.case["overall_status"],
+                "auth_complete_collection_pending",
+            )
+            self.assertEqual(
+                repository.case["last_safe_error_code"],
+                "COLLECTION_RETRY_START_FAILED",
+            )
+            with _CLAIM_JOB_LOCK:
+                self.assertEqual(
+                    _CLAIM_JOBS[case_id]["status"],
+                    "collection_partial",
+                )
+        finally:
+            with _CLAIM_JOB_LOCK:
+                _CLAIM_JOBS.pop(case_id, None)
+
+    def test_authenticated_collection_retry_clears_expired_session(self):
+        case_id = "retry-expired-case"
+        user_id = "retry-expired-owner"
+        owner_ref = _claim_job_owner_ref(user_id)
+        repository = _BackgroundFlowRepository()
+        repository.case.update(
+            {
+                "id": case_id,
+                "hometax_status": "auth_complete",
+                "comwel_status": "auth_complete",
+                "overall_status": "auth_complete_collection_pending",
+            }
+        )
+        transient = {
+            "expires_at": time.time() - 1,
+            "auth_context": {
+                "identity_number": "9010191234567",
+            },
+            "hometax": {"Token": "hometax-token"},
+            "comwel": {"Token": "comwel-token"},
+        }
+        with _CLAIM_JOB_LOCK:
+            _CLAIM_JOBS[case_id] = {
+                "owner_ref": owner_ref,
+                "owner_user_id": user_id,
+                "sealed_payload": _seal_claim_job_payload(transient),
+                "expires_at": transient["expires_at"],
+                "status": "collection_partial",
+                "wake_event": threading.Event(),
+            }
+        try:
+            with (
+                patch(
+                    "claim_correction_center.ClaimRepository",
+                    return_value=repository,
+                ),
+                patch(
+                    "claim_correction_center.provider_readiness",
+                    return_value={"simple_auth_ready": True},
+                ),
+            ):
+                retried, message = _retry_authenticated_claim_collection(
+                    user_id,
+                    case_id,
+                )
+            self.assertFalse(retried)
+            self.assertIn("새 인증", message)
+            with _CLAIM_JOB_LOCK:
+                expired_job = dict(_CLAIM_JOBS[case_id])
+            self.assertEqual(expired_job["status"], "expired")
+            self.assertEqual(expired_job["sealed_payload"], b"")
+            self.assertEqual(
+                repository.case["overall_status"],
+                "auth_complete_collection_pending",
+            )
+            self.assertEqual(
+                repository.case["last_safe_error_code"],
+                "AUTH_SESSION_EXPIRED",
+            )
+        finally:
+            with _CLAIM_JOB_LOCK:
+                _CLAIM_JOBS.pop(case_id, None)
+
+    def test_collection_retry_ui_state_only_exposes_safe_retry_cases(self):
+        authenticated_case = {
+            "hometax_status": "auth_complete",
+            "comwel_status": "auth_complete",
+            "overall_status": "auth_complete_collection_pending",
+        }
+        future = time.time() + 300
+        scenarios = [
+            (
+                "partial",
+                authenticated_case,
+                {"status": "collection_partial", "expires_at": future},
+                True,
+                "retryable",
+            ),
+            (
+                "paused",
+                authenticated_case,
+                {"status": "paused", "expires_at": future},
+                True,
+                "retryable",
+            ),
+            (
+                "already-running",
+                authenticated_case,
+                {"status": "running", "expires_at": future},
+                True,
+                "running",
+            ),
+            (
+                "missing-memory-session",
+                authenticated_case,
+                None,
+                True,
+                "reauth_required",
+            ),
+            (
+                "missing-memory-session-while-collecting",
+                {
+                    **authenticated_case,
+                    "overall_status": "collecting",
+                },
+                None,
+                True,
+                "reauth_required",
+            ),
+            (
+                "missing-memory-session-while-queued",
+                {
+                    **authenticated_case,
+                    "overall_status": "collection_queued",
+                },
+                None,
+                True,
+                "reauth_required",
+            ),
+            (
+                "expired-session",
+                authenticated_case,
+                {"status": "expired", "expires_at": time.time() - 1},
+                True,
+                "reauth_required",
+            ),
+            (
+                "provider-unavailable",
+                authenticated_case,
+                {"status": "collection_partial", "expires_at": future},
+                False,
+                "provider_unavailable",
+            ),
+            (
+                "authentication-incomplete",
+                {
+                    **authenticated_case,
+                    "comwel_status": "auth_pending",
+                },
+                {"status": "paused", "expires_at": future},
+                True,
+                "hidden",
+            ),
+            (
+                "complete",
+                {
+                    **authenticated_case,
+                    "overall_status": "ready",
+                },
+                {"status": "complete", "expires_at": future},
+                True,
+                "complete",
+            ),
+        ]
+        for (
+            label,
+            case,
+            snapshot,
+            provider_ready,
+            expected,
+        ) in scenarios:
+            with self.subTest(label=label):
+                self.assertEqual(
+                    _claim_collection_retry_state(
+                        case,
+                        snapshot,
+                        provider_ready=provider_ready,
+                    ),
+                    expected,
+                )
 
     def test_background_job_completes_sequential_auth_and_collection(self):
         case_id = "case-1"
