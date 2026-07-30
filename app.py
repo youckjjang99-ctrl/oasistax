@@ -1812,19 +1812,11 @@ with st.sidebar:
         st.session_state["sidebar_menu_group_v1020"] = current_group
 
     with st.container(key="sidebar_group_switcher"):
-        st.markdown(
-            """
-            <div class="sidebar-nav-heading">
-                <span>업무 구분</span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
         selected_group = st.pills(
-            "업무 영역",
+            "업무 구분",
             list(menu_groups.keys()),
             key="sidebar_menu_group_v1020",
-            label_visibility="collapsed",
+            label_visibility="visible",
         )
     selected_group = selected_group or current_group
     if current_sidebar_value not in menu_groups[selected_group]:
@@ -1847,20 +1839,12 @@ with st.sidebar:
         "AI 사용량": "AI 사용량",
     }
     with st.container(key="sidebar_detail_navigation"):
-        st.markdown(
-            """
-            <div class="sidebar-nav-heading sidebar-nav-heading-detail">
-                <span>세부 메뉴</span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
         selected_menu_label = st.radio(
-            "메뉴",
+            "세부 메뉴",
             list(menu_groups[selected_group].keys()),
             key="active_main_menu_v1020",
             format_func=lambda value: menu_labels.get(value, value),
-            label_visibility="collapsed",
+            label_visibility="visible",
         )
     active_tab = menu_groups[selected_group][selected_menu_label]
 
