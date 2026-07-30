@@ -16,6 +16,9 @@ from cryptography.fernet import Fernet, InvalidToken
 
 from claim_correction_catalog import DOCUMENT_SPECS
 from claim_correction_repository import (
+    CLAIM_DOWNLOAD_EXTENSION_BY_CONTENT_TYPE,
+    CLAIM_DOWNLOAD_URL_TTL_SECONDS,
+    CLAIM_STORAGE_BUCKET,
     ClaimRepository,
     ClaimRepositoryError,
 )
@@ -89,6 +92,49 @@ def _clean(value: Any) -> str:
     if text.lower() in {"", "nan", "none", "nat"}:
         return ""
     return text
+
+
+def _claim_document_is_downloadable(
+    document: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> bool:
+    if (
+        str(document.get("status", "") or "").strip().lower() != "ready"
+        or not _clean(document.get("storage_path"))
+        or bool(document.get("deleted_at"))
+        or _clean(document.get("storage_bucket")) != CLAIM_STORAGE_BUCKET
+    ):
+        return False
+    content_type = _clean(document.get("content_type")).lower()
+    expected_extension = CLAIM_DOWNLOAD_EXTENSION_BY_CONTENT_TYPE.get(
+        content_type,
+        "",
+    )
+    if (
+        not expected_extension
+        or not _clean(document.get("storage_path"))
+        .lower()
+        .endswith(expected_extension)
+    ):
+        return False
+    retention_until = _clean(document.get("retention_until"))
+    if not retention_until:
+        return False
+    try:
+        retention_deadline = datetime.fromisoformat(
+            retention_until.replace("Z", "+00:00")
+        )
+        if retention_deadline.tzinfo is None:
+            retention_deadline = retention_deadline.replace(
+                tzinfo=timezone.utc
+            )
+    except ValueError:
+        return False
+    reference_now = now or datetime.now(timezone.utc)
+    if reference_now.tzinfo is None:
+        reference_now = reference_now.replace(tzinfo=timezone.utc)
+    return retention_deadline > reference_now
 
 
 def _digits(value: Any) -> str:
@@ -2879,7 +2925,9 @@ def _render_results_tab(repository: ClaimRepository | None) -> None:
                 "수집일": _clean(document.get("collected_at"))[:10] or "-",
                 "출력": (
                     "준비"
-                    if status in {"collected", "ready"}
+                    if _claim_document_is_downloadable(document)
+                    else "보관기간 만료"
+                    if status == "ready"
                     and document.get("storage_path")
                     else "-"
                 ),
@@ -2893,43 +2941,130 @@ def _render_results_tab(repository: ClaimRepository | None) -> None:
     ready_documents = [
         document
         for document in documents
-        if str(document.get("status", "")) == "ready"
-        and document.get("storage_path")
+        if _claim_document_is_downloadable(document)
+        and (
+            source_filter in {None, "전체"}
+            or (
+                source_filter == "홈택스"
+                and str(document.get("source", "")) in {"hometax", "홈택스"}
+            )
+            or (
+                source_filter == "근로복지공단"
+                and str(document.get("source", ""))
+                not in {"hometax", "홈택스"}
+            )
+        )
     ]
     if ready_documents:
-        st.markdown("#### 다운로드 가능한 서류")
+        st.markdown("#### 수집자료 다운로드")
+        st.caption(
+            f"현재 선택한 기관의 수집 완료 자료 {len(ready_documents):,}건입니다. "
+            "링크는 현재 로그인 계정에서 생성되며 1분간 유효합니다. "
+            "민감한 자료이므로 링크를 공유하지 마세요."
+        )
+        selected_case_id = str(selected_case.get("id", ""))
         for document in ready_documents:
-            try:
-                download_url = repository.document_download_url(
-                    str(selected_case.get("id", "")),
-                    str(document.get("id", "")),
-                )
-                content_type = str(
-                    document.get("content_type", "") or ""
-                ).lower()
-                file_label = (
-                    "PDF"
-                    if content_type == "application/pdf"
-                    else "엑셀"
-                    if "spreadsheet" in content_type
-                    or "excel" in content_type
-                    else "JSON"
-                    if content_type == "application/json"
-                    else "파일"
-                )
-                st.link_button(
-                    (
-                        f"{_clean(document.get('document_name'))} "
-                        f"{file_label} 다운로드"
-                    ),
-                    download_url,
-                    use_container_width=True,
-                )
-            except ClaimRepositoryError:
-                st.caption(
-                    f"{_clean(document.get('document_name'))}: "
-                    "다운로드 링크를 다시 생성해 주세요."
-                )
+            document_id = str(document.get("id", ""))
+            source = str(document.get("source", ""))
+            source_label = (
+                "홈택스"
+                if source in {"hometax", "홈택스"}
+                else "근로복지공단"
+            )
+            content_type = str(
+                document.get("content_type", "") or ""
+            ).lower()
+            file_label = (
+                "PDF"
+                if content_type == "application/pdf"
+                else "엑셀"
+                if "spreadsheet" in content_type or "excel" in content_type
+                else "JSON"
+                if content_type == "application/json"
+                else "파일"
+            )
+            size_bytes = int(document.get("size_bytes") or 0)
+            size_label = (
+                f"{size_bytes / (1024 * 1024):.1f}MB"
+                if size_bytes >= 1024 * 1024
+                else f"{max(1, round(size_bytes / 1024)):,}KB"
+                if size_bytes
+                else "크기 미확인"
+            )
+            document_name = (
+                _clean(document.get("document_name"))
+                or _clean(document.get("document_code"))
+                or "수집자료"
+            )
+            year_label = str(document.get("period_year") or "공통")
+            state_key = (
+                f"_claim_download_link_{selected_case_id}_{document_id}"
+            )
+            cached_link = st.session_state.get(state_key)
+            if not (
+                isinstance(cached_link, dict)
+                and _clean(cached_link.get("url"))
+                and float(cached_link.get("expires_at") or 0) > time.time()
+            ):
+                st.session_state.pop(state_key, None)
+                cached_link = None
+
+            with st.container(border=True):
+                info_col, action_col = st.columns([4.6, 1.4])
+                with info_col:
+                    st.markdown(f"**{html.escape(document_name)}**")
+                    st.caption(
+                        f"{source_label} · {year_label} · "
+                        f"{file_label} · {size_label} · "
+                        f"수집일 {_clean(document.get('collected_at'))[:10] or '-'}"
+                    )
+                with action_col:
+                    if cached_link:
+                        st.link_button(
+                            "파일 다운로드",
+                            str(cached_link["url"]),
+                            use_container_width=True,
+                        )
+                        if st.button(
+                            "링크 다시 생성",
+                            key=(
+                                "claim_download_refresh_"
+                                f"{selected_case_id}_{document_id}"
+                            ),
+                            use_container_width=True,
+                        ):
+                            st.session_state.pop(state_key, None)
+                            st.rerun()
+                    elif st.button(
+                        "다운로드 준비",
+                        key=(
+                            "claim_download_prepare_"
+                            f"{selected_case_id}_{document_id}"
+                        ),
+                        use_container_width=True,
+                        type="primary",
+                    ):
+                        try:
+                            download_url = repository.document_download_url(
+                                selected_case_id,
+                                document_id,
+                            )
+                            st.session_state[state_key] = {
+                                "url": download_url,
+                                "expires_at": (
+                                    time.time()
+                                    + CLAIM_DOWNLOAD_URL_TTL_SECONDS
+                                    - 5
+                                ),
+                            }
+                            st.rerun()
+                        except ClaimRepositoryError as exc:
+                            st.error(str(exc))
+    else:
+        st.info(
+            "현재 선택한 기관에는 다운로드 가능한 수집 완료 자료가 없습니다. "
+            "자료수집이 끝나면 이곳에 다운로드 버튼이 표시됩니다."
+        )
     st.caption(
         "홈택스 연결 서류와 근로복지공단 보수총액·사업장관리번호·사업장요율은 "
         "공식 문서 API로 수집합니다. 근로자고용정보현황은 공식 간편인증 API가 "

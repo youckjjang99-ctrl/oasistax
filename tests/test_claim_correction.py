@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import threading
 import time
 import unittest
@@ -19,6 +20,7 @@ from claim_correction_center import (
     _CLAIM_JOB_LOCK,
     _advance_personal_case,
     _birth_date_from_identity,
+    _claim_document_is_downloadable,
     _claim_job_owner_ref,
     _claim_job_can_continue,
     _claim_progress,
@@ -346,6 +348,7 @@ class _FakeDatabase:
         self.rpc_calls = []
         self.uploads = []
         self.deleted_objects = []
+        self.signed_url_calls = []
 
     def select(self, _table, filters=None, **_kwargs):
         result = self.rows
@@ -459,6 +462,14 @@ class _FakeDatabase:
         expires_in,
         download_name,
     ):
+        self.signed_url_calls.append(
+            {
+                "bucket": bucket,
+                "path": path,
+                "expires_in": expires_in,
+                "download_name": download_name,
+            }
+        )
         return (
             f"https://example.supabase.co/signed/{bucket}/{path}"
             f"?expires={expires_in}&download={download_name}"
@@ -505,6 +516,63 @@ class ClaimCorrectionTests(unittest.TestCase):
     def test_business_number_checksum(self):
         self.assertTrue(_is_valid_business_no("220-81-62517"))
         self.assertFalse(_is_valid_business_no("123-45-67890"))
+
+    def test_downloadable_document_requires_private_ready_file_metadata(self):
+        document = {
+            "status": "ready",
+            "storage_bucket": "oasis-claim-documents",
+            "storage_path": "owner/case/document.pdf",
+            "content_type": "application/pdf",
+            "retention_until": "2099-01-01T00:00:00+00:00",
+        }
+
+        self.assertTrue(_claim_document_is_downloadable(document))
+        self.assertFalse(
+            _claim_document_is_downloadable(
+                dict(document, storage_bucket="public-documents")
+            )
+        )
+        self.assertFalse(
+            _claim_document_is_downloadable(
+                dict(document, content_type="text/html")
+            )
+        )
+        self.assertFalse(
+            _claim_document_is_downloadable(
+                dict(document, storage_path="owner/case/document.xlsx")
+            )
+        )
+
+    def test_downloadable_document_rejects_missing_expired_or_deleted_file(self):
+        document = {
+            "status": "ready",
+            "storage_bucket": "oasis-claim-documents",
+            "storage_path": "owner/case/document.xlsx",
+            "content_type": (
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+            "retention_until": "2099-01-01T00:00:00+00:00",
+        }
+
+        self.assertFalse(
+            _claim_document_is_downloadable(
+                dict(document, retention_until=None)
+            )
+        )
+        self.assertFalse(
+            _claim_document_is_downloadable(
+                dict(document, retention_until="2020-01-01T00:00:00+00:00")
+            )
+        )
+        self.assertFalse(
+            _claim_document_is_downloadable(
+                dict(
+                    document,
+                    deleted_at="2026-07-30T00:00:00+00:00",
+                )
+            )
+        )
 
     def test_two_source_auth_never_completes_after_partial_failure(self):
         status, all_completed, any_failed = _resolve_auth_progress(
@@ -1865,6 +1933,175 @@ class ClaimCorrectionTests(unittest.TestCase):
             finalize["p_facts"]["download_file_name"],
             "management-numbers.json",
         )
+
+    def test_repository_creates_owner_scoped_short_lived_download_url(self):
+        owner_user_id = "owner-user"
+        case_id = "00000000-0000-0000-0000-000000000031"
+        document_id = "00000000-0000-0000-0000-000000000032"
+        owner_folder = hashlib.sha256(
+            owner_user_id.encode("utf-8")
+        ).hexdigest()[:24]
+        fake = _FakeDatabase(
+            rows=[
+                {
+                    "id": case_id,
+                    "owner_user_id": owner_user_id,
+                }
+            ],
+            documents=[
+                {
+                    "id": document_id,
+                    "case_id": case_id,
+                    "owner_user_id": owner_user_id,
+                    "document_code": "hometax_tax_payment_certificate",
+                    "status": "ready",
+                    "storage_bucket": "oasis-claim-documents",
+                    "storage_path": (
+                        f"{owner_folder}/{case_id}/{document_id}.pdf"
+                    ),
+                    "content_type": "application/pdf",
+                    "retention_until": "2099-01-01T00:00:00+00:00",
+                    "facts": {
+                        "download_file_name": "../납세증명서\r\n.pdf",
+                    },
+                }
+            ],
+        )
+        repository = ClaimRepository(owner_user_id, database=fake)
+
+        signed_url = repository.document_download_url(
+            case_id,
+            document_id,
+        )
+
+        self.assertIn("https://example.supabase.co/signed/", signed_url)
+        self.assertEqual(len(fake.signed_url_calls), 1)
+        call = fake.signed_url_calls[0]
+        self.assertEqual(call["bucket"], "oasis-claim-documents")
+        self.assertEqual(call["expires_in"], 60)
+        self.assertEqual(call["download_name"], "납세증명서.pdf")
+        self.assertNotIn(owner_user_id, call["path"])
+        audit_calls = [
+            parameters
+            for function_name, parameters in fake.rpc_calls
+            if function_name == "oasis_claim_append_audit"
+        ]
+        self.assertEqual(len(audit_calls), 1)
+        self.assertEqual(
+            audit_calls[0]["p_action"],
+            "download_link_issued",
+        )
+        self.assertEqual(
+            audit_calls[0]["p_metadata"]["document_id"],
+            document_id,
+        )
+
+    def test_repository_refuses_cross_owner_document_download(self):
+        owner_user_id = "owner-user"
+        case_id = "00000000-0000-0000-0000-000000000041"
+        document_id = "00000000-0000-0000-0000-000000000042"
+        another_owner_folder = hashlib.sha256(
+            b"another-owner"
+        ).hexdigest()[:24]
+        fake = _FakeDatabase(
+            documents=[
+                {
+                    "id": document_id,
+                    "case_id": case_id,
+                    "owner_user_id": owner_user_id,
+                    "document_code": "hometax_tax_payment_certificate",
+                    "status": "ready",
+                    "storage_bucket": "oasis-claim-documents",
+                    "storage_path": (
+                        f"{another_owner_folder}/{case_id}/"
+                        f"{document_id}.pdf"
+                    ),
+                    "content_type": "application/pdf",
+                    "retention_until": "2099-01-01T00:00:00+00:00",
+                }
+            ]
+        )
+        repository = ClaimRepository(owner_user_id, database=fake)
+
+        with self.assertRaises(ClaimRepositoryError):
+            repository.document_download_url(case_id, document_id)
+
+        self.assertEqual(fake.signed_url_calls, [])
+
+    def test_repository_refuses_expired_document_download(self):
+        owner_user_id = "owner-user"
+        case_id = "00000000-0000-0000-0000-000000000051"
+        document_id = "00000000-0000-0000-0000-000000000052"
+        owner_folder = hashlib.sha256(
+            owner_user_id.encode("utf-8")
+        ).hexdigest()[:24]
+        fake = _FakeDatabase(
+            documents=[
+                {
+                    "id": document_id,
+                    "case_id": case_id,
+                    "owner_user_id": owner_user_id,
+                    "document_code": "hometax_tax_payment_certificate",
+                    "status": "ready",
+                    "storage_bucket": "oasis-claim-documents",
+                    "storage_path": (
+                        f"{owner_folder}/{case_id}/{document_id}.pdf"
+                    ),
+                    "content_type": "application/pdf",
+                    "retention_until": "2020-01-01T00:00:00+00:00",
+                }
+            ]
+        )
+        repository = ClaimRepository(owner_user_id, database=fake)
+
+        with self.assertRaises(ClaimRepositoryError):
+            repository.document_download_url(case_id, document_id)
+
+        self.assertEqual(fake.signed_url_calls, [])
+
+    def test_repository_refuses_deleted_or_mismatched_document_download(self):
+        owner_user_id = "owner-user"
+        case_id = "00000000-0000-0000-0000-000000000061"
+        document_id = "00000000-0000-0000-0000-000000000062"
+        owner_folder = hashlib.sha256(
+            owner_user_id.encode("utf-8")
+        ).hexdigest()[:24]
+        base_document = {
+            "id": document_id,
+            "case_id": case_id,
+            "owner_user_id": owner_user_id,
+            "document_code": "hometax_tax_payment_certificate",
+            "status": "ready",
+            "storage_bucket": "oasis-claim-documents",
+            "storage_path": (
+                f"{owner_folder}/{case_id}/{document_id}.pdf"
+            ),
+            "content_type": "application/pdf",
+            "retention_until": "2099-01-01T00:00:00+00:00",
+        }
+        deleted = dict(
+            base_document,
+            deleted_at="2026-07-30T00:00:00+00:00",
+        )
+        fake = _FakeDatabase(documents=[deleted])
+        repository = ClaimRepository(owner_user_id, database=fake)
+
+        with self.assertRaises(ClaimRepositoryError):
+            repository.document_download_url(case_id, document_id)
+        self.assertEqual(fake.signed_url_calls, [])
+
+        mismatched = dict(
+            base_document,
+            storage_path=(
+                f"{owner_folder}/{case_id}/{document_id}.xlsx"
+            ),
+        )
+        fake = _FakeDatabase(documents=[mismatched])
+        repository = ClaimRepository(owner_user_id, database=fake)
+
+        with self.assertRaises(ClaimRepositoryError):
+            repository.document_download_url(case_id, document_id)
+        self.assertEqual(fake.signed_url_calls, [])
 
     def test_repository_rejects_mismatched_file_extension_and_content_type(self):
         case = {
