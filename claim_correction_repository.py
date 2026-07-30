@@ -5,7 +5,7 @@ import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from claim_correction_catalog import document_plan
@@ -14,13 +14,31 @@ from tilko_claim_client import CollectedClaimDocument
 
 
 CLAIM_STORAGE_BUCKET = "oasis-claim-documents"
-_CONTENT_TYPE_EXTENSIONS = {
+CLAIM_DOWNLOAD_URL_TTL_SECONDS = 60
+CLAIM_DOWNLOAD_EXTENSION_BY_CONTENT_TYPE = {
     "application/pdf": ".pdf",
     "application/json": ".json",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
     "application/vnd.ms-excel": ".xls",
     "text/csv": ".csv",
 }
+
+
+def _owner_storage_folder(owner_user_id: str) -> str:
+    return hashlib.sha256(owner_user_id.encode("utf-8")).hexdigest()[:24]
+
+
+def _safe_download_file_name(value: Any, fallback: str) -> str:
+    raw_name = str(value or "").replace("\\", "/").split("/")[-1].strip()
+    clean_name = "".join(
+        character
+        for character in raw_name
+        if ord(character) >= 32
+        and character not in {'"', "*", ":", "<", ">", "?", "|"}
+    ).strip(" .")
+    if not clean_name:
+        clean_name = str(fallback or "claim-document.bin").strip()
+    return clean_name[:180]
 
 
 class ClaimRepositoryError(RuntimeError):
@@ -413,13 +431,11 @@ class ClaimRepository:
         document_id = str(target.get("id", "")).strip()
         if not document_id:
             raise ClaimRepositoryError("서류 저장 식별값이 없습니다.")
-        owner_folder = hashlib.sha256(
-            self.owner_user_id.encode("utf-8")
-        ).hexdigest()[:24]
+        owner_folder = _owner_storage_folder(self.owner_user_id)
         requested_extension = Path(
             str(document.file_name or "")
         ).suffix.lower()
-        expected_extension = _CONTENT_TYPE_EXTENSIONS.get(
+        expected_extension = CLAIM_DOWNLOAD_EXTENSION_BY_CONTENT_TYPE.get(
             str(document.content_type or "").lower(),
             "",
         )
@@ -434,7 +450,7 @@ class ClaimRepository:
         extension = (
             requested_extension
             if requested_extension
-            in set(_CONTENT_TYPE_EXTENSIONS.values())
+            in set(CLAIM_DOWNLOAD_EXTENSION_BY_CONTENT_TYPE.values())
             else expected_extension
         )
         if not extension:
@@ -559,22 +575,70 @@ class ClaimRepository:
         case_id: str,
         document_id: str,
     ) -> str:
+        safe_case_id = str(case_id or "").strip()
+        safe_document_id = str(document_id or "").strip()
         target = next(
             (
                 document
-                for document in self.list_documents(case_id)
-                if str(document.get("id", "")) == str(document_id)
+                for document in self.list_documents(safe_case_id)
+                if str(document.get("id", "")) == safe_document_id
             ),
             None,
         )
         if (
             target is None
+            or str(target.get("owner_user_id", "")).strip().lower()
+            != self.owner_user_id
+            or str(target.get("case_id", "")).strip() != safe_case_id
             or str(target.get("status", "")) != "ready"
+            or target.get("deleted_at")
             or not target.get("storage_bucket")
             or not target.get("storage_path")
         ):
             raise ClaimRepositoryError(
                 "다운로드 가능한 서류를 찾지 못했습니다."
+            )
+        storage_bucket = str(target.get("storage_bucket", "")).strip()
+        storage_path = str(target.get("storage_path", "")).strip().lstrip("/")
+        storage_parts = PurePosixPath(storage_path).parts
+        expected_owner_folder = _owner_storage_folder(self.owner_user_id)
+        content_type = str(target.get("content_type", "") or "").strip().lower()
+        expected_extension = CLAIM_DOWNLOAD_EXTENSION_BY_CONTENT_TYPE.get(
+            content_type,
+            "",
+        )
+        if (
+            storage_bucket != CLAIM_STORAGE_BUCKET
+            or len(storage_parts) != 3
+            or storage_parts[0] != expected_owner_folder
+            or storage_parts[1] != safe_case_id
+            or PurePosixPath(storage_parts[2]).stem != safe_document_id
+            or PurePosixPath(storage_parts[2]).suffix.lower()
+            != expected_extension
+        ):
+            raise ClaimRepositoryError(
+                "다운로드 가능한 서류를 찾지 못했습니다."
+            )
+        retention_until = str(target.get("retention_until", "") or "").strip()
+        if not retention_until:
+            raise ClaimRepositoryError(
+                "서류 보관기한을 확인할 수 없습니다."
+            )
+        try:
+            retention_deadline = datetime.fromisoformat(
+                retention_until.replace("Z", "+00:00")
+            )
+            if retention_deadline.tzinfo is None:
+                retention_deadline = retention_deadline.replace(
+                    tzinfo=timezone.utc
+                )
+        except ValueError as exc:
+            raise ClaimRepositoryError(
+                "서류 보관기한을 확인할 수 없습니다."
+            ) from exc
+        if retention_deadline <= datetime.now(timezone.utc):
+            raise ClaimRepositoryError(
+                "서류 보관기한이 만료되었습니다."
             )
         try:
             facts = target.get("facts")
@@ -585,17 +649,44 @@ class ClaimRepository:
                 ).strip()
             if not download_name:
                 extension = Path(
-                    str(target.get("storage_path", "") or "")
+                    storage_path
                 ).suffix
                 download_name = (
                     f"{target.get('document_code') or 'claim-document'}"
                     f"{extension or '.bin'}"
                 )
-            return self.database.create_private_signed_url(
-                str(target["storage_bucket"]),
-                str(target["storage_path"]),
-                expires_in=60,
+            download_name = _safe_download_file_name(
+                download_name,
+                f"{target.get('document_code') or 'claim-document'}"
+                f"{expected_extension}",
+            )
+            if PurePosixPath(download_name).suffix.lower() != expected_extension:
+                download_name = _safe_download_file_name(
+                    (
+                        f"{target.get('document_code') or 'claim-document'}"
+                        f"{expected_extension}"
+                    ),
+                    f"claim-document{expected_extension}",
+                )
+            download_url = self.database.create_private_signed_url(
+                storage_bucket,
+                storage_path,
+                expires_in=CLAIM_DOWNLOAD_URL_TTL_SECONDS,
                 download_name=download_name,
             )
+            self.append_audit_event(
+                case_id=safe_case_id,
+                action="download_link_issued",
+                source=str(target.get("source", "") or "system"),
+                outcome="success",
+                metadata={
+                    "document_id": safe_document_id,
+                    "document_code": str(
+                        target.get("document_code", "") or ""
+                    ),
+                    "link_ttl_seconds": CLAIM_DOWNLOAD_URL_TTL_SECONDS,
+                },
+            )
+            return download_url
         except Exception as exc:
             raise _safe_storage_error(exc) from exc
