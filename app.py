@@ -1739,7 +1739,7 @@ if not st.session_state.get(crm_restore_session_key):
 # v3.0.0: 상단 탭/가로 메뉴 대신 사이드바 기반 메뉴로 전환
 with st.sidebar:
     st.markdown(
-        f'<div class="sidebar-logo">{logo_html(520)}</div>',
+        f'<div class="sidebar-logo">{logo_html(360)}</div>',
         unsafe_allow_html=True,
     )
 
@@ -1811,16 +1811,22 @@ with st.sidebar:
     if pending_menu in menu_label_map:
         st.session_state["sidebar_menu_group_v1020"] = current_group
 
-    st.markdown(
-        '<div class="sidebar-section-label">업무 영역</div>',
-        unsafe_allow_html=True,
-    )
-    selected_group = st.pills(
-        "업무 영역",
-        list(menu_groups.keys()),
-        key="sidebar_menu_group_v1020",
-        label_visibility="collapsed",
-    )
+    with st.container(key="sidebar_group_switcher"):
+        st.markdown(
+            """
+            <div class="sidebar-nav-heading">
+                <span>업무 영역 전환</span>
+                <small>1단계</small>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        selected_group = st.pills(
+            "업무 영역",
+            list(menu_groups.keys()),
+            key="sidebar_menu_group_v1020",
+            label_visibility="collapsed",
+        )
     selected_group = selected_group or current_group
     if current_sidebar_value not in menu_groups[selected_group]:
         current_sidebar_value = next(iter(menu_groups[selected_group]))
@@ -1841,13 +1847,23 @@ with st.sidebar:
         "클라우드 DB 관리": "클라우드 DB",
         "AI 사용량": "AI 사용량",
     }
-    selected_menu_label = st.radio(
-        "메뉴",
-        list(menu_groups[selected_group].keys()),
-        key="active_main_menu_v1020",
-        format_func=lambda value: menu_labels.get(value, value),
-        label_visibility="collapsed",
-    )
+    with st.container(key="sidebar_detail_navigation"):
+        st.markdown(
+            f"""
+            <div class="sidebar-nav-heading sidebar-nav-heading-detail">
+                <span>세부 메뉴</span>
+                <small>{html.escape(selected_group)}</small>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        selected_menu_label = st.radio(
+            "메뉴",
+            list(menu_groups[selected_group].keys()),
+            key="active_main_menu_v1020",
+            format_func=lambda value: menu_labels.get(value, value),
+            label_visibility="collapsed",
+        )
     active_tab = menu_groups[selected_group][selected_menu_label]
 
     # v5.0 호환 처리: 이전 세션의 고객관리 메뉴는 통합 화면으로 이동
