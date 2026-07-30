@@ -235,9 +235,9 @@ button[data-baseweb="tab"] {
         min-height: 0 !important;
     }
     [data-testid="stSidebar"] {
-        width: min(64vw, 240px) !important;
-        min-width: min(64vw, 240px) !important;
-        max-width: min(64vw, 240px) !important;
+        width: min(60vw, 220px) !important;
+        min-width: min(60vw, 220px) !important;
+        max-width: min(60vw, 220px) !important;
         box-sizing: border-box !important;
     }
     [data-testid="stSidebar"] > div:first-child {
@@ -323,22 +323,32 @@ button[data-baseweb="tab"] {
         color: #ffffff !important;
         fill: #ffffff !important;
     }
+    [data-testid="stSidebar"]
+    [data-testid="stMarkdownContainer"]:has(> .sidebar-logo) {
+        margin-bottom: 0 !important;
+    }
     .sidebar-logo {
-        height: 70px !important;
-        margin: -0.1rem 0 0.15rem 0 !important;
+        position: relative !important;
+        z-index: 1 !important;
+        height: 58px !important;
+        margin: 0 !important;
+        overflow: hidden !important;
     }
     [data-testid="stSidebar"] .sidebar-logo img {
-        width: 300px !important;
+        width: 250px !important;
         max-width: none !important;
         left: 50% !important;
         top: 50% !important;
         transform: translate(-50%, -50%) !important;
         margin: 0 !important;
+        filter: brightness(0) invert(1) !important;
     }
     .sidebar-user-card {
+        position: relative !important;
+        clear: both !important;
         border-radius: 10px !important;
         padding: 7px 9px !important;
-        margin: 0 0 0.2rem 0 !important;
+        margin: 0 0 0.45rem 0 !important;
     }
     .sidebar-user-card .name {
         font-size: 14px !important;
@@ -347,8 +357,11 @@ button[data-baseweb="tab"] {
         font-size: 10px !important;
     }
     .sidebar-section-label {
+        position: relative !important;
+        clear: both !important;
         font-size: 10px !important;
-        margin: 4px 0 4px 2px !important;
+        line-height: 1.2 !important;
+        margin: 0.3rem 0 0.25rem 2px !important;
         letter-spacing: 0.8px !important;
     }
     [data-testid="stSidebar"] [data-testid="stButtonGroup"] {
@@ -390,11 +403,29 @@ button[data-baseweb="tab"] {
         color: var(--oasis-blue-text) !important;
         box-shadow: 0 7px 18px rgba(0,0,0,0.15) !important;
     }
-    [data-testid="stSidebar"] div[role="radiogroup"] label {
+    [data-testid="stSidebar"] [data-testid="stRadio"]
+    div[role="radiogroup"] {
+        display: flex !important;
+        flex-direction: column !important;
+        align-items: flex-start !important;
+        gap: 3px !important;
         width: 100% !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stRadio"]
+    [data-testid="stRadioOption"] {
+        width: fit-content !important;
+        min-width: 0 !important;
+        max-width: 100% !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stRadio"]
+    div[role="radiogroup"] label {
+        display: inline-flex !important;
+        width: fit-content !important;
+        min-width: 0 !important;
+        max-width: 100% !important;
         min-height: 34px !important;
-        margin-bottom: 3px !important;
-        padding: 6px 9px !important;
+        margin: 0 !important;
+        padding: 6px 7px !important;
         border-radius: 9px !important;
         box-sizing: border-box !important;
     }
@@ -406,8 +437,12 @@ button[data-baseweb="tab"] {
     > div > div:first-child > div:first-child {
         display: none !important;
     }
-    [data-testid="stSidebar"] div[role="radiogroup"] label p {
-        width: 100% !important;
+    [data-testid="stSidebar"] [data-testid="stRadio"]
+    div[role="radiogroup"] label [data-testid="stMarkdownContainer"],
+    [data-testid="stSidebar"] [data-testid="stRadio"]
+    div[role="radiogroup"] label p {
+        width: auto !important;
+        min-width: 0 !important;
         font-size: 13px !important;
         font-weight: 650 !important;
         letter-spacing: -0.15px !important;
