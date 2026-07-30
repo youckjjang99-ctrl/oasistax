@@ -5,7 +5,8 @@
     "aptPackages": [
       "ffmpeg",
       "tesseract-ocr",
-      "tesseract-ocr-kor"
+      "tesseract-ocr-kor",
+      "fonts-nanum"
     ]
   }
 }

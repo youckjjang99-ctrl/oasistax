@@ -5,6 +5,7 @@ from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from xml.sax.saxutils import escape
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
@@ -30,15 +31,15 @@ from temporary_advance_calculator import (
     representative_burden_text,
 )
 
-NAVY = colors.HexColor("#0B2B5B")
-BLUE = colors.HexColor("#1E5BD7")
-GREEN = colors.HexColor("#16835F")
-LIGHT = colors.HexColor("#F3F7FC")
-MID = colors.HexColor("#D7E2F0")
-TEXT = colors.HexColor("#172033")
-MUTED = colors.HexColor("#667085")
-FONT_NORMAL = "Helvetica"
-FONT_BOLD = "Helvetica-Bold"
+NAVY = colors.HexColor("#12345B")
+BLUE = colors.HexColor("#2563EB")
+GREEN = colors.HexColor("#128263")
+LIGHT = colors.HexColor("#F4F7FB")
+MID = colors.HexColor("#D5DFEB")
+TEXT = colors.HexColor("#1F2937")
+MUTED = colors.HexColor("#526175")
+FONT_NORMAL = "OasisKR"
+FONT_BOLD = "OasisKR-Bold"
 
 
 RED = colors.HexColor("#C43D3D")
@@ -54,8 +55,14 @@ def _font_paths() -> tuple[str, str] | None:
     project_dir = Path(__file__).resolve().parent
     candidates = [
         (project_dir / "assets" / "NanumGothic.ttf", project_dir / "assets" / "NanumGothicBold.ttf"),
+        (project_dir / "assets" / "NanumGothic-Regular.ttf", project_dir / "assets" / "NanumGothic-Bold.ttf"),
+        (Path(r"C:\Windows\Fonts\NanumBarunGothic.ttf"), Path(r"C:\Windows\Fonts\NanumBarunGothicBold.ttf")),
+        (Path(r"C:\Windows\Fonts\NanumGothic-Regular.ttf"), Path(r"C:\Windows\Fonts\NanumGothic-Bold.ttf")),
+        (Path(r"C:\Windows\Fonts\malgun.ttf"), Path(r"C:\Windows\Fonts\malgunbd.ttf")),
+        (Path(r"C:\Windows\Fonts\NotoSansKR-VF.ttf"), Path(r"C:\Windows\Fonts\NotoSansKR-VF.ttf")),
         (Path("/usr/share/fonts/truetype/nanum/NanumGothic.ttf"), Path("/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf")),
         (Path("/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf"), Path("/usr/share/fonts/truetype/nanum/NanumBarunGothicBold.ttf")),
+        (Path("/usr/share/fonts/truetype/nanum/NanumGothic-Regular.ttf"), Path("/usr/share/fonts/truetype/nanum/NanumGothic-Bold.ttf")),
         (Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"), Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc")),
         (Path("/usr/share/fonts/truetype/unfonts-core/UnDotum.ttf"), Path("/usr/share/fonts/truetype/unfonts-core/UnDotumBold.ttf")),
     ]
@@ -67,8 +74,8 @@ def _font_paths() -> tuple[str, str] | None:
 
 def _register_fonts() -> tuple[str, str]:
     registered = set(pdfmetrics.getRegisteredFontNames())
-    if {FONT_NORMAL, "OasisKR-Bold"}.issubset(registered):
-        return FONT_NORMAL, "OasisKR-Bold"
+    if {FONT_NORMAL, FONT_BOLD}.issubset(registered):
+        return FONT_NORMAL, FONT_BOLD
 
     paths = _font_paths()
     if paths:
@@ -83,7 +90,7 @@ def _register_fonts() -> tuple[str, str]:
                 italic=FONT_NORMAL,
                 boldItalic=FONT_BOLD,
             )
-            return FONT_NORMAL, "OasisKR-Bold"
+            return FONT_NORMAL, FONT_BOLD
         except Exception:
             pass
 
@@ -108,6 +115,19 @@ def _money(value: Any) -> str:
     return f"{int(round(number)):,}원"
 
 
+def _compact_money(value: Any) -> str:
+    try:
+        number = float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return "-"
+    absolute = abs(number)
+    if absolute >= 100_000_000:
+        return f"{number / 100_000_000:,.1f}억원"
+    if absolute >= 10_000:
+        return f"{number / 10_000:,.0f}만원"
+    return f"{number:,.0f}원"
+
+
 def _pct(value: Any) -> str:
     if value is None:
         return "-"
@@ -118,19 +138,60 @@ def _pct(value: Any) -> str:
 
 
 def _safe_list(values: Any, fallback: str) -> list[str]:
-    items = [str(x).strip() for x in (values or []) if str(x).strip()]
+    source = [values] if isinstance(values, str) else (values or [])
+    items = [str(x).strip() for x in source if str(x).strip()]
     return items or [fallback]
 
 
-def _header_footer(canvas, doc) -> None:
+def _paragraph_text(value: Any) -> str:
+    return escape(_clean(value)).replace("\n", "<br/>")
+
+
+def _paragraph(value: Any, style: ParagraphStyle) -> Paragraph:
+    return Paragraph(_paragraph_text(value), style)
+
+
+def _header_footer(
+    canvas,
+    doc,
+    company_name: str = "",
+    report_date: str = "",
+) -> None:
     canvas.saveState()
     width, height = A4
+    canvas.setFont(FONT_BOLD, 8)
+    canvas.setFillColor(NAVY)
+    canvas.drawString(18 * mm, height - 11 * mm, "OASIS 기업 컨설팅 보고서")
+    if company_name:
+        canvas.setFont(FONT_NORMAL, 8)
+        canvas.setFillColor(MUTED)
+        canvas.drawRightString(
+            width - 18 * mm,
+            height - 11 * mm,
+            _clean(company_name)[:34],
+        )
+    canvas.setStrokeColor(MID)
+    canvas.line(
+        18 * mm,
+        height - 14 * mm,
+        width - 18 * mm,
+        height - 14 * mm,
+    )
     canvas.setStrokeColor(MID)
     canvas.line(18 * mm, 14 * mm, width - 18 * mm, 14 * mm)
-    canvas.setFont(FONT_NORMAL, 7.5)
+    canvas.setFont(FONT_NORMAL, 8)
     canvas.setFillColor(MUTED)
-    canvas.drawString(18 * mm, 9 * mm, "OASIS AI CONSULTING REPORT")
-    canvas.drawRightString(width - 18 * mm, 9 * mm, f"{doc.page}")
+    canvas.drawString(18 * mm, 9 * mm, "OASIS TAX & ACCOUNTING")
+    footer_right = " · ".join(
+        value
+        for value in (
+            report_date,
+            "대외비",
+            f"{max(doc.page - 1, 1):02d}",
+        )
+        if value
+    )
+    canvas.drawRightString(width - 18 * mm, 9 * mm, footer_right)
     canvas.restoreState()
 
 
@@ -170,7 +231,7 @@ def _cover(canvas, doc, analysis: dict[str, Any], logo_path: str | None, consult
     canvas.restoreState()
 
 
-def build_representative_pdf(
+def _build_representative_pdf_legacy(
     analysis: dict[str, Any],
     consultant_name: str = "",
     logo_path: str | None = None,
@@ -370,11 +431,11 @@ def build_representative_pdf(
     return output.getvalue()
 
 
-# v8.6.1 representative PDF redesign.
-# This later definition intentionally replaces the legacy builder above.
+# Representative PDF design helpers.
 def _pdf_number(value: Any) -> float:
     try:
-        return float(str(value or 0).replace(",", ""))
+        cleaned = re.sub(r"[^0-9.+-]", "", str(value or 0))
+        return float(cleaned or 0)
     except (TypeError, ValueError):
         return 0.0
 
@@ -384,23 +445,24 @@ def _pdf_section_title(text: str, styles: dict[str, Any]) -> Table:
         f"section_{abs(hash(text))}",
         parent=styles["BodyText"],
         fontName=FONT_BOLD,
-        fontSize=14,
+        fontSize=13.5,
         leading=19,
         textColor=NAVY,
+        keepWithNext=True,
     )
     table = Table(
-        [[Paragraph(text, title_style)]],
-        colWidths=[174 * mm],
+        [[_paragraph(text, title_style)]],
+        colWidths=[178 * mm],
     )
     table.setStyle(
         TableStyle(
             [
                 ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F3F7FC")),
-                ("LINEBEFORE", (0, 0), (0, 0), 4, BLUE),
-                ("LEFTPADDING", (0, 0), (-1, -1), 10),
+                ("LINEBEFORE", (0, 0), (0, 0), 3, BLUE),
+                ("LEFTPADDING", (0, 0), (-1, -1), 9),
                 ("RIGHTPADDING", (0, 0), (-1, -1), 10),
-                ("TOPPADDING", (0, 0), (-1, -1), 8),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 7),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
             ]
         )
     )
@@ -418,44 +480,43 @@ def _pdf_kpi_card(
         f"kpi_label_{abs(hash(label))}",
         parent=styles["BodyText"],
         fontName=FONT_BOLD,
-        fontSize=8,
-        leading=11,
+        fontSize=8.7,
+        leading=12,
         textColor=MUTED,
     )
     value_style = ParagraphStyle(
         f"kpi_value_{abs(hash(label))}",
         parent=styles["BodyText"],
         fontName=FONT_BOLD,
-        fontSize=15,
-        leading=19,
+        fontSize=15.5,
+        leading=20,
         textColor=NAVY,
     )
     note_style = ParagraphStyle(
         f"kpi_note_{abs(hash(label))}",
         parent=styles["BodyText"],
         fontName=FONT_NORMAL,
-        fontSize=7,
-        leading=10,
+        fontSize=8.2,
+        leading=11.5,
         textColor=BLUE,
     )
     card = Table(
         [
-            [Paragraph(label, label_style)],
-            [Paragraph(value, value_style)],
-            [Paragraph(note, note_style)],
+            [_paragraph(label, label_style)],
+            [_paragraph(value, value_style)],
+            [_paragraph(note, note_style)],
         ],
-        colWidths=[40 * mm],
-        rowHeights=[8 * mm, 13 * mm, 8 * mm],
+        colWidths=[83 * mm],
     )
     card.setStyle(
         TableStyle(
             [
                 ("BACKGROUND", (0, 0), (-1, -1), background),
                 ("BOX", (0, 0), (-1, -1), 0.7, MID),
-                ("LEFTPADDING", (0, 0), (-1, -1), 9),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 9),
-                ("TOPPADDING", (0, 0), (-1, -1), 3),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ("LEFTPADDING", (0, 0), (-1, -1), 11),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 11),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ]
         )
@@ -478,8 +539,8 @@ def _pdf_bar_row(
         f"bar_label_{abs(hash(label + display))}",
         parent=styles["BodyText"],
         fontName=FONT_BOLD,
-        fontSize=8,
-        leading=10,
+        fontSize=8.8,
+        leading=11.5,
         textColor=TEXT,
     )
     row = [Paragraph(label, label_style), *cells, display]
@@ -488,7 +549,7 @@ def _pdf_bar_row(
         ("BACKGROUND", (1, 0), (12, 0), colors.HexColor("#F4F6F9")),
         ("ALIGN", (13, 0), (13, 0), "RIGHT"),
         ("FONTNAME", (13, 0), (13, 0), FONT_BOLD),
-        ("FONTSIZE", (13, 0), (13, 0), 8),
+        ("FONTSIZE", (13, 0), (13, 0), 8.5),
         ("TEXTCOLOR", (13, 0), (13, 0), NAVY),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
     ]
@@ -511,10 +572,10 @@ def build_representative_pdf(
     doc = SimpleDocTemplate(
         output,
         pagesize=A4,
-        rightMargin=18 * mm,
-        leftMargin=18 * mm,
-        topMargin=17 * mm,
-        bottomMargin=19 * mm,
+        rightMargin=16 * mm,
+        leftMargin=16 * mm,
+        topMargin=20 * mm,
+        bottomMargin=18 * mm,
         title=f"{_clean(analysis.get('company_name'))} AI 기업컨설팅 보고서",
         author="OASIS TAX & ACCOUNTING",
     )
@@ -524,32 +585,57 @@ def build_representative_pdf(
         "v861_cover_title",
         parent=styles["Heading1"],
         fontName=FONT_BOLD,
-        fontSize=25,
-        leading=32,
+        fontSize=27,
+        leading=35,
         textColor=colors.white,
-        spaceAfter=8,
+        spaceAfter=10,
     )
     cover_sub = ParagraphStyle(
         "v861_cover_sub",
         parent=styles["BodyText"],
         fontName=FONT_NORMAL,
-        fontSize=10,
-        leading=16,
+        fontSize=10.5,
+        leading=17,
         textColor=colors.HexColor("#DCE8FA"),
+    )
+    cover_brand = ParagraphStyle(
+        "v861_cover_brand",
+        parent=cover_sub,
+        fontName=FONT_BOLD,
+        fontSize=11,
+        leading=15,
+        textColor=colors.white,
+        tracking=0.6,
+    )
+    cover_meta_label = ParagraphStyle(
+        "v861_cover_meta_label",
+        parent=cover_sub,
+        fontName=FONT_BOLD,
+        fontSize=9,
+        leading=13,
+        textColor=colors.HexColor("#BFD2EC"),
+    )
+    cover_meta_value = ParagraphStyle(
+        "v861_cover_meta_value",
+        parent=cover_sub,
+        fontSize=9.5,
+        leading=14,
+        textColor=colors.white,
     )
     body = ParagraphStyle(
         "v861_body",
         parent=styles["BodyText"],
         fontName=FONT_NORMAL,
-        fontSize=9,
-        leading=15,
+        fontSize=9.7,
+        leading=15.8,
         textColor=TEXT,
+        wordWrap="CJK",
     )
     body_small = ParagraphStyle(
         "v861_body_small",
         parent=body,
-        fontSize=7.8,
-        leading=12,
+        fontSize=8.5,
+        leading=13,
         textColor=MUTED,
     )
     body_bold = ParagraphStyle(
@@ -566,34 +652,44 @@ def build_representative_pdf(
     story = []
 
     cover_content = [
-        [Paragraph("OASIS AI CORPORATE CONSULTING", cover_sub)],
-        [Spacer(1, 9 * mm)],
-        [Paragraph(company, cover_title)],
-        [Paragraph("기업 현황 진단 및 실행전략 보고서", cover_sub)],
-        [Spacer(1, 20 * mm)],
+        [Paragraph("OASIS TAX & ACCOUNTING", cover_brand)],
+        [Paragraph("기업 컨설팅 리포트", cover_sub)],
+        [Spacer(1, 18 * mm)],
+        [_paragraph(company, cover_title)],
+        [Paragraph("기업 현황 진단과 실행 우선순위", cover_sub)],
+        [Spacer(1, 18 * mm)],
         [
             Table(
                 [
-                    ["사업자등록번호", business_no],
-                    ["업종", industry],
-                    ["담당 컨설턴트", consultant_name or "-"],
-                    ["작성일", report_date],
+                    [
+                        Paragraph("사업자등록번호", cover_meta_label),
+                        _paragraph(business_no, cover_meta_value),
+                    ],
+                    [
+                        Paragraph("업종", cover_meta_label),
+                        _paragraph(industry, cover_meta_value),
+                    ],
+                    [
+                        Paragraph("담당 컨설턴트", cover_meta_label),
+                        _paragraph(consultant_name or "-", cover_meta_value),
+                    ],
+                    [
+                        Paragraph("작성일", cover_meta_label),
+                        _paragraph(report_date, cover_meta_value),
+                    ],
                 ],
-                colWidths=[42 * mm, 108 * mm],
+                colWidths=[40 * mm, 112 * mm],
                 style=TableStyle(
                     [
-                        ("FONTNAME", (0, 0), (0, -1), FONT_BOLD),
-                        ("FONTNAME", (1, 0), (1, -1), FONT_NORMAL),
-                        ("FONTSIZE", (0, 0), (-1, -1), 9),
-                        ("TEXTCOLOR", (0, 0), (-1, -1), colors.white),
                         ("LINEBELOW", (0, 0), (-1, -1), 0.4, colors.HexColor("#6487B8")),
-                        ("TOPPADDING", (0, 0), (-1, -1), 8),
-                        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                        ("TOPPADDING", (0, 0), (-1, -1), 7),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
                     ]
                 ),
             )
         ],
-        [Spacer(1, 33 * mm)],
+        [Spacer(1, 27 * mm)],
         [
             Paragraph(
                 "본 보고서는 현재 확보된 기업자료를 기반으로 상담 방향과 "
@@ -604,7 +700,7 @@ def build_representative_pdf(
     ]
     cover = Table(
         cover_content,
-        colWidths=[174 * mm],
+        colWidths=[178 * mm],
         rowHeights=None,
     )
     cover.setStyle(
@@ -612,18 +708,22 @@ def build_representative_pdf(
             [
                 ("BACKGROUND", (0, 0), (-1, -1), NAVY),
                 ("BOX", (0, 0), (-1, -1), 0, NAVY),
-                ("LEFTPADDING", (0, 0), (-1, -1), 18),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 18),
-                ("TOPPADDING", (0, 0), (-1, -1), 18),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 18),
+                ("LEFTPADDING", (0, 0), (-1, -1), 20),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 20),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, 0), 20),
+                ("BOTTOMPADDING", (0, -1), (-1, -1), 20),
             ]
         )
     )
     story += [cover, PageBreak()]
 
-    story += [_pdf_section_title("01. Executive Summary", styles), Spacer(1, 5 * mm)]
+    story += [_pdf_section_title("01. 핵심 요약", styles), Spacer(1, 5 * mm)]
 
-    completeness = int(analysis.get("completeness", 0) or 0)
+    completeness = int(
+        max(0, min(_pdf_number(analysis.get("completeness")), 100))
+    )
     kpis = [
         _pdf_kpi_card(
             "자료 충족도",
@@ -634,35 +734,37 @@ def build_representative_pdf(
         ),
         _pdf_kpi_card(
             "매출액",
-            _money(analysis.get("sales")),
-            "최근 결산 기준",
+            _compact_money(analysis.get("sales")),
+            f"정확한 금액 {_money(analysis.get('sales'))}",
             colors.HexColor("#EAF8F2"),
             styles,
         ),
         _pdf_kpi_card(
             "영업이익",
-            _money(analysis.get("operating_profit")),
-            "본업 수익성",
+            _compact_money(analysis.get("operating_profit")),
+            f"영업이익률 {_pct(analysis.get('operating_margin'))}",
             colors.HexColor("#F3EDFF"),
             styles,
         ),
         _pdf_kpi_card(
             "당기순이익",
-            _money(analysis.get("net_income")),
-            "세후 최종손익",
+            _compact_money(analysis.get("net_income")),
+            f"순이익률 {_pct(analysis.get('net_margin'))}",
             colors.HexColor("#FFF4E7"),
             styles,
         ),
     ]
     story += [
         Table(
-            [kpis],
-            colWidths=[43.5 * mm] * 4,
+            [kpis[:2], kpis[2:]],
+            colWidths=[89 * mm] * 2,
             style=TableStyle(
                 [
                     ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 1.5),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 1.5),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 2),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+                    ("TOPPADDING", (0, 0), (-1, -1), 2),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
                 ]
             ),
         ),
@@ -674,27 +776,33 @@ def build_representative_pdf(
             [
                 Paragraph("기업 개요", body_bold),
                 Paragraph(
-                    f"{company}은(는) {industry or '업종 미확인'} 기업으로, "
-                    f"현재 자료 충족도는 {completeness}%입니다.",
+                    _paragraph_text(
+                        f"{company}은(는) {industry or '업종 미확인'} 기업으로, "
+                        f"현재 자료 충족도는 {completeness}%입니다."
+                    ),
                     body,
                 ),
             ],
             [
                 Paragraph("핵심 진단", body_bold),
                 Paragraph(
-                    (analysis.get("strengths") or ["추가 자료 확인 필요"])[0],
+                    _paragraph_text(
+                        (analysis.get("strengths") or ["추가 자료 확인 필요"])[0]
+                    ),
                     body,
                 ),
             ],
             [
                 Paragraph("우선 과제", body_bold),
                 Paragraph(
-                    (analysis.get("cautions") or ["중대한 경고사항 없음"])[0],
+                    _paragraph_text(
+                        (analysis.get("cautions") or ["중대한 경고사항 없음"])[0]
+                    ),
                     body,
                 ),
             ],
         ],
-        colWidths=[30 * mm, 144 * mm],
+        colWidths=[31 * mm, 147 * mm],
     )
     summary_table.setStyle(
         TableStyle(
@@ -711,42 +819,87 @@ def build_representative_pdf(
     )
     story += [summary_table, Spacer(1, 8 * mm)]
 
-    story += [_pdf_section_title("02. 재무 현황과 가독성 그래프", styles), Spacer(1, 5 * mm)]
+    story += [_pdf_section_title("02. 재무 현황", styles), Spacer(1, 5 * mm)]
 
-    financial_items = [
-        ("매출액", _pdf_number(analysis.get("sales")), _money(analysis.get("sales")), BLUE),
-        ("영업이익", _pdf_number(analysis.get("operating_profit")), _money(analysis.get("operating_profit")), GREEN),
-        ("당기순이익", _pdf_number(analysis.get("net_income")), _money(analysis.get("net_income")), colors.HexColor("#7048C8")),
-        ("자산총계", _pdf_number(analysis.get("assets")), _money(analysis.get("assets")), colors.HexColor("#2B78C5")),
-        ("부채총계", _pdf_number(analysis.get("liabilities")), _money(analysis.get("liabilities")), colors.HexColor("#D98B32")),
-        ("자본총계", _pdf_number(analysis.get("equity")), _money(analysis.get("equity")), colors.HexColor("#16835F")),
-    ]
-    maximum = max([abs(item[1]) for item in financial_items] + [1])
-    bar_rows = []
-    bar_styles = []
-    for row_index, item in enumerate(financial_items):
-        row, commands = _pdf_bar_row(
-            item[0],
-            abs(item[1]),
-            maximum,
-            item[2],
-            item[3],
-            styles,
+    def make_financial_chart(items: list[tuple[str, float, str, Any]]) -> Table:
+        maximum = max([abs(item[1]) for item in items] + [1])
+        bar_rows = []
+        bar_styles = []
+        for row_index, item in enumerate(items):
+            item_color = RED if item[1] < 0 else item[3]
+            row, commands = _pdf_bar_row(
+                item[0],
+                abs(item[1]),
+                maximum,
+                item[2],
+                item_color,
+                styles,
+            )
+            bar_rows.append(row)
+            for command in commands:
+                cmd = list(command)
+                for pos in (1, 2):
+                    if isinstance(cmd[pos], tuple):
+                        cmd[pos] = (cmd[pos][0], row_index)
+                bar_styles.append(tuple(cmd))
+        result = Table(
+            bar_rows,
+            colWidths=[29 * mm] + [7.5 * mm] * 12 + [49 * mm],
+            rowHeights=[8.5 * mm] * len(bar_rows),
         )
-        bar_rows.append(row)
-        for command in commands:
-            cmd = list(command)
-            for pos in (1, 2):
-                if isinstance(cmd[pos], tuple):
-                    cmd[pos] = (cmd[pos][0], row_index)
-            bar_styles.append(tuple(cmd))
-    chart = Table(
-        bar_rows,
-        colWidths=[27 * mm] + [7 * mm] * 12 + [42 * mm],
-        rowHeights=[8 * mm] * len(bar_rows),
-    )
-    chart.setStyle(TableStyle(bar_styles))
-    story += [chart, Spacer(1, 6 * mm)]
+        result.setStyle(TableStyle(bar_styles))
+        return result
+
+    profit_items = [
+        (
+            "매출액",
+            _pdf_number(analysis.get("sales")),
+            _compact_money(analysis.get("sales")),
+            BLUE,
+        ),
+        (
+            "영업이익",
+            _pdf_number(analysis.get("operating_profit")),
+            _compact_money(analysis.get("operating_profit")),
+            GREEN,
+        ),
+        (
+            "당기순이익",
+            _pdf_number(analysis.get("net_income")),
+            _compact_money(analysis.get("net_income")),
+            colors.HexColor("#7048C8"),
+        ),
+    ]
+    balance_items = [
+        (
+            "자산총계",
+            _pdf_number(analysis.get("assets")),
+            _compact_money(analysis.get("assets")),
+            colors.HexColor("#2B78C5"),
+        ),
+        (
+            "부채총계",
+            _pdf_number(analysis.get("liabilities")),
+            _compact_money(analysis.get("liabilities")),
+            colors.HexColor("#D98B32"),
+        ),
+        (
+            "자본총계",
+            _pdf_number(analysis.get("equity")),
+            _compact_money(analysis.get("equity")),
+            colors.HexColor("#16835F"),
+        ),
+    ]
+    story += [
+        Paragraph("손익 현황", body_bold),
+        Spacer(1, 2 * mm),
+        make_financial_chart(profit_items),
+        Spacer(1, 4 * mm),
+        Paragraph("재무상태", body_bold),
+        Spacer(1, 2 * mm),
+        make_financial_chart(balance_items),
+        Spacer(1, 6 * mm),
+    ]
 
     ratio_data = [
         ["지표", "현재값", "판단 관점"],
@@ -768,7 +921,7 @@ def build_representative_pdf(
     ]
     ratio_table = Table(
         ratio_data,
-        colWidths=[42 * mm, 38 * mm, 94 * mm],
+        colWidths=[42 * mm, 38 * mm, 98 * mm],
         repeatRows=1,
     )
     ratio_table.setStyle(
@@ -779,14 +932,14 @@ def build_representative_pdf(
                 ("BACKGROUND", (0, 0), (-1, 0), NAVY),
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
                 ("GRID", (0, 0), (-1, -1), 0.4, MID),
-                ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+                ("FONTSIZE", (0, 0), (-1, -1), 9),
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                 ("TOPPADDING", (0, 0), (-1, -1), 7),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
             ]
         )
     )
-    story += [ratio_table, PageBreak()]
+    story += [KeepTogether([ratio_table]), Spacer(1, 8 * mm)]
 
     story += [_pdf_section_title("03. 강점 · 확인 필요 · 실행전략", styles), Spacer(1, 5 * mm)]
 
@@ -795,15 +948,17 @@ def build_representative_pdf(
             f"box_title_{abs(hash(title_text))}",
             parent=body,
             fontName=FONT_BOLD,
-            fontSize=11,
-            leading=15,
+            fontSize=11.5,
+            leading=16,
             textColor=title_color,
         )
         content = [Paragraph(title_text, title_style)]
-        for value in (values or ["추가 확인이 필요합니다."])[:7]:
-            content.append(Paragraph(f"• {value}", body))
-            content.append(Spacer(1, 1.5 * mm))
-        box = Table([[content]], colWidths=[82 * mm])
+        for value in _safe_list(values, "추가 확인이 필요합니다.")[:5]:
+            content.append(
+                Paragraph(f"- {_paragraph_text(value)}", body)
+            )
+            content.append(Spacer(1, 1.3 * mm))
+        box = Table([[content]], colWidths=[178 * mm])
         box.setStyle(
             TableStyle(
                 [
@@ -834,29 +989,26 @@ def build_representative_pdf(
         RED,
     )
     story += [
-        Table(
-            [[strengths_box, cautions_box]],
-            colWidths=[87 * mm, 87 * mm],
-            style=TableStyle(
-                [
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 2),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 2),
-                ]
-            ),
-        ),
-        Spacer(1, 7 * mm),
+        strengths_box,
+        Spacer(1, 4 * mm),
+        cautions_box,
+        Spacer(1, 6 * mm),
     ]
 
     strategy_rows = [["우선순위", "실행전략"]]
     for index, value in enumerate(
-        (analysis.get("strategy") or [])[:10],
+        _safe_list(
+            analysis.get("strategy"),
+            "추가 자료 확인 후 실행전략을 확정합니다.",
+        )[:10],
         start=1,
     ):
-        strategy_rows.append([f"{index:02d}", Paragraph(value, body)])
+        strategy_rows.append(
+            [f"{index:02d}", Paragraph(_paragraph_text(value), body)]
+        )
     strategy_table = Table(
         strategy_rows,
-        colWidths=[22 * mm, 152 * mm],
+        colWidths=[22 * mm, 156 * mm],
         repeatRows=1,
     )
     strategy_table.setStyle(
@@ -880,6 +1032,8 @@ def build_representative_pdf(
     )
     story += [strategy_table, Spacer(1, 8 * mm)]
 
+    section_number = 4
+    detail_page_started = False
     saved_policies = [
         item
         for item in (
@@ -888,19 +1042,26 @@ def build_representative_pdf(
         if isinstance(item, dict)
     ]
     if saved_policies:
+        if not detail_page_started:
+            story += [PageBreak()]
+            detail_page_started = True
         story += [
-            _pdf_section_title("04. 저장된 정책자금 추천", styles),
+            _pdf_section_title(
+                f"{section_number:02d}. 저장된 정책자금 추천",
+                styles,
+            ),
             Spacer(1, 5 * mm),
         ]
+        section_number += 1
         policy_rows = [["점수", "분류", "공고명", "기관", "신청종료"]]
         for item in saved_policies[:12]:
             policy_rows.append(
                 [
-                    str(item.get("score", "")),
-                    _clean(item.get("category", "")),
-                    Paragraph(_clean(item.get("title", "")), body_small),
-                    Paragraph(_clean(item.get("agency", "")), body_small),
-                    _clean(item.get("end_date", "")),
+                    _paragraph(item.get("score", ""), body_small),
+                    _paragraph(item.get("category", ""), body_small),
+                    _paragraph(item.get("title", ""), body_small),
+                    _paragraph(item.get("agency", ""), body_small),
+                    _paragraph(item.get("end_date", ""), body_small),
                 ]
             )
         policy_table = Table(
@@ -916,7 +1077,7 @@ def build_representative_pdf(
                     ("BACKGROUND", (0, 0), (-1, 0), NAVY),
                     ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
                     ("GRID", (0, 0), (-1, -1), 0.35, MID),
-                    ("FONTSIZE", (0, 0), (-1, -1), 7.4),
+                    ("FONTSIZE", (0, 0), (-1, -1), 8.2),
                     ("ALIGN", (0, 1), (0, -1), "CENTER"),
                     ("VALIGN", (0, 0), (-1, -1), "TOP"),
                     ("TOPPADDING", (0, 0), (-1, -1), 6),
@@ -931,18 +1092,28 @@ def build_representative_pdf(
     tax_result = analysis.get("tax_diagnosis") or {}
     tax_items = tax_result.get("items") or []
     if tax_items:
+        if not detail_page_started:
+            story += [PageBreak()]
+            detail_page_started = True
         story += [
-            _pdf_section_title("05. AI 절세기회 사전검토", styles),
+            _pdf_section_title(
+                f"{section_number:02d}. AI 절세기회 사전검토",
+                styles,
+            ),
             Spacer(1, 5 * mm),
         ]
+        section_number += 1
         tax_rows = [["검토 항목", "상태", "예상 범위", "신뢰도"]]
         for item in tax_items[:8]:
             tax_rows.append(
                 [
-                    Paragraph(_clean(item.get("name")), body_small),
-                    _clean(item.get("status")),
-                    _clean(item.get("rate_range")),
-                    f"{item.get('confidence', 0)}%",
+                    _paragraph(item.get("name"), body_small),
+                    _paragraph(item.get("status"), body_small),
+                    _paragraph(item.get("rate_range"), body_small),
+                    _paragraph(
+                        f"{item.get('confidence', 0)}%",
+                        body_small,
+                    ),
                 ]
             )
         tax_table = Table(
@@ -958,7 +1129,7 @@ def build_representative_pdf(
                     ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#16835F")),
                     ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
                     ("GRID", (0, 0), (-1, -1), 0.35, MID),
-                    ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+                    ("FONTSIZE", (0, 0), (-1, -1), 8.2),
                     ("VALIGN", (0, 0), (-1, -1), "TOP"),
                     ("TOPPADDING", (0, 0), (-1, -1), 6),
                     ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
@@ -969,6 +1140,9 @@ def build_representative_pdf(
 
     temporary_advance = analysis.get("temporary_advance") or {}
     if temporary_advance:
+        if not detail_page_started:
+            story += [PageBreak()]
+            detail_page_started = True
         advance_inputs = temporary_advance.get("inputs", {}) or {}
         advance_representative = (
             temporary_advance.get("representative", {}) or {}
@@ -976,9 +1150,13 @@ def build_representative_pdf(
         advance_company = temporary_advance.get("company", {}) or {}
         advance_estimation = temporary_advance.get("estimation", {}) or {}
         story += [
-            _pdf_section_title("06. 가지급금 세무/4대보험 사전진단", styles),
+            _pdf_section_title(
+                f"{section_number:02d}. 가지급금 세무/4대보험 사전진단",
+                styles,
+            ),
             Spacer(1, 5 * mm),
         ]
+        section_number += 1
         if not advance_estimation.get("balance_confirmed", False):
             advance_rows = [
                 ["관점", "항목", "추정금액", "판단 기준"],
@@ -1049,8 +1227,8 @@ def build_representative_pdf(
         )
         advance_rendered = [
             [
-                Paragraph(
-                    _clean(value),
+                _paragraph(
+                    value,
                     advance_header if row_index == 0 else body_small,
                 )
                 for value in row
@@ -1092,6 +1270,56 @@ def build_representative_pdf(
             Spacer(1, 7 * mm),
         ]
 
+    if detail_page_started:
+        preparation_rows = [["구분", "다음 상담 준비사항"]]
+        for value in _safe_list(
+            analysis.get("cautions"),
+            "추가 확인사항을 정리합니다.",
+        )[:2]:
+            preparation_rows.append(
+                ["확인", _paragraph(value, body_small)]
+            )
+        for value in _safe_list(
+            analysis.get("strategy"),
+            "확인된 자료를 바탕으로 실행계획을 확정합니다.",
+        )[:2]:
+            preparation_rows.append(
+                ["실행", _paragraph(value, body_small)]
+            )
+        preparation_table = Table(
+            preparation_rows,
+            colWidths=[24 * mm, 154 * mm],
+            repeatRows=1,
+        )
+        preparation_table.setStyle(
+            TableStyle(
+                [
+                    ("FONTNAME", (0, 0), (-1, 0), FONT_BOLD),
+                    ("FONTNAME", (0, 1), (0, -1), FONT_BOLD),
+                    ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("BACKGROUND", (0, 1), (0, -1), LIGHT),
+                    ("TEXTCOLOR", (0, 1), (0, -1), BLUE),
+                    ("GRID", (0, 0), (-1, -1), 0.35, MID),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("ALIGN", (0, 1), (0, -1), "CENTER"),
+                    ("TOPPADDING", (0, 0), (-1, -1), 6),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 7),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+                ]
+            )
+        )
+        story += [
+            _pdf_section_title(
+                f"{section_number:02d}. 다음 상담 준비",
+                styles,
+            ),
+            Spacer(1, 5 * mm),
+            preparation_table,
+            Spacer(1, 7 * mm),
+        ]
+
     story += [
         Spacer(1, 4 * mm),
         Paragraph(
@@ -1109,7 +1337,12 @@ def build_representative_pdf(
         canvas.restoreState()
 
     def later_pages(canvas, doc_obj):
-        _header_footer(canvas, doc_obj)
+        _header_footer(
+            canvas,
+            doc_obj,
+            company_name=company,
+            report_date=report_date,
+        )
 
     doc.build(
         story,

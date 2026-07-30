@@ -72,21 +72,46 @@ def _inject_report_css() -> None:
     st.markdown(
         """
         <style>
+        .oasis-report-hero {
+          padding:22px 24px; border-radius:18px;
+          background:linear-gradient(135deg,#12345b,#2563eb);
+          color:#fff; margin:8px 0 18px;
+          box-shadow:0 10px 24px rgba(37,99,235,.16);
+        }
+        .oasis-report-eyebrow {
+          color:#dbeafe; font-size:.78rem; font-weight:700;
+          letter-spacing:.04em; margin-bottom:7px;
+        }
+        .oasis-report-title {
+          color:#fff; font-size:clamp(1.35rem,2.2vw,1.75rem);
+          line-height:1.25; font-weight:800; letter-spacing:-.025em;
+          word-break:keep-all; overflow-wrap:break-word;
+        }
+        .oasis-report-meta {
+          color:#e8f1ff; margin-top:8px; font-size:.88rem;
+          line-height:1.55; word-break:keep-all;
+        }
         .oasis-kpi-card {
-          min-height:132px; padding:18px 18px 15px; border-radius:16px;
+          min-height:120px; padding:16px 17px 14px; border-radius:14px;
           border:1px solid color-mix(in srgb, var(--card-accent) 24%, white);
           background:linear-gradient(145deg,#fff,var(--card-bg));
-          box-shadow:0 7px 20px rgba(15,42,80,.08); margin-bottom:8px;
+          box-shadow:0 5px 16px rgba(15,42,80,.07); margin-bottom:8px;
           position:relative; overflow:hidden;
         }
         .oasis-kpi-card:before {content:"";position:absolute;left:0;top:0;bottom:0;width:5px;background:var(--card-accent);}
-        .oasis-kpi-label {font-size:.87rem;font-weight:750;color:#475467;margin-bottom:13px;}
-        .oasis-kpi-value {font-size:1.78rem;line-height:1.1;font-weight:850;color:#172033;letter-spacing:-.04em;word-break:keep-all;}
-        .oasis-kpi-note {font-size:.76rem;color:var(--card-accent);font-weight:700;margin-top:12px;}
+        .oasis-kpi-label {font-size:.86rem;font-weight:700;color:#475467;margin-bottom:11px;}
+        .oasis-kpi-value {font-size:1.55rem;line-height:1.15;font-weight:800;color:#172033;letter-spacing:-.035em;word-break:keep-all;}
+        .oasis-kpi-note {font-size:.78rem;line-height:1.45;color:var(--card-accent);font-weight:700;margin-top:10px;}
         .oasis-section-card {border:1px solid #dbe4ef;border-radius:16px;background:#fff;padding:18px 20px;box-shadow:0 5px 16px rgba(15,42,80,.055);height:100%;}
         .oasis-section-card h4 {margin:0 0 12px;color:#0b2b5b;}
         .oasis-section-card ul {padding-left:20px;margin:0;}
         .oasis-section-card li {margin-bottom:7px;color:#344054;}
+        @media (max-width:768px) {
+          .oasis-report-hero {padding:18px 17px;border-radius:15px;margin-top:4px;}
+          .oasis-report-meta {font-size:.8rem;}
+          .oasis-kpi-card {min-height:108px;padding:14px 15px 13px;}
+          .oasis-kpi-value {font-size:1.35rem;}
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -1268,37 +1293,34 @@ def render_ai_consulting_report_page(
         employee_context=employee_context,
     )
 
+    _inject_report_css()
+    safe_company_name = html.escape(
+        str(analysis.get("company_name") or "기업명 미확인")
+    )
+    safe_business_no = html.escape(
+        str(analysis.get("business_no") or "-")
+    )
+    safe_user_name = html.escape(str(user_name or "-"))
     st.markdown(
         f"""
-        <div style="
-            padding:22px 24px;
-            border-radius:20px;
-            background:linear-gradient(135deg,#123d7a,#2563eb);
-            color:white;
-            margin:8px 0 18px 0;
-            box-shadow:0 12px 28px rgba(37,99,235,.18);
-        ">
-            <div style="font-size:1.45rem;font-weight:800;">
-                {analysis['company_name']} 컨설팅 리포트
-            </div>
-            <div style="margin-top:7px;opacity:.9;">
-                사업자번호 {analysis['business_no']} ·
-                작성자 {user_name or '-'} ·
-                {datetime.now().strftime('%Y-%m-%d')}
-            </div>
+        <div class="oasis-report-hero">
+          <div class="oasis-report-eyebrow">OASIS CONSULTING BRIEF</div>
+          <div class="oasis-report-title">{safe_company_name} 컨설팅 리포트</div>
+          <div class="oasis-report-meta">
+            사업자번호 {safe_business_no} · 작성자 {safe_user_name} ·
+            {datetime.now().strftime('%Y-%m-%d')}
+          </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    _inject_report_css()
     health = analysis.get("company_health", {}) or {}
-    kpi_columns = st.columns(5, gap="medium")
+    kpi_columns = st.columns(4, gap="medium")
     kpi_items = [
         ("자료 충족도", f"{analysis['completeness']}%", analysis.get("completeness_status", "자료 부족"), "blue"),
-        ("AI 신뢰도", f"{analysis.get('ai_confidence', 0)}%", analysis.get("ai_confidence_status", "낮음"), "purple"),
+        ("분석 근거 신뢰도", f"{analysis.get('ai_confidence', 0)}%", analysis.get("ai_confidence_status", "낮음"), "purple"),
         ("기업 건강점수", f"{health.get('health_score', 0)}점", health.get("stage", "판단보류"), "green"),
-        ("절세 가능성", f"{health.get('tax_opportunity_score', 0)}점", health.get("tax_opportunity_level", "자료 부족"), "orange"),
         ("세무 리스크", f"{health.get('tax_risk_score', 0)}점", "높을수록 추가 확인 필요", "red"),
     ]
     for column, (label, value, note, tone) in zip(kpi_columns, kpi_items):
@@ -1423,33 +1445,10 @@ def render_ai_consulting_report_page(
             st.caption(enterprise_health.get("stage_reason", ""))
         st.caption(enterprise_health.get("disclaimer", ""))
 
-    source_columns = st.columns(5, gap="medium")
-    source_columns[0].metric(
-        "등록 등기정보",
-        "1건" if registry else "0건",
-    )
-    source_columns[1].metric(
-        "저장 주가평가",
-        "1건" if stock_record else "0건",
-    )
-    source_columns[2].metric(
-        "직원현황",
-        (
-            f"{analysis.get('employee_summary', {}).get('active_count', 0)}명"
-            if analysis.get("data_sources", {}).get("employee_status")
-            else "0명"
-        ),
-    )
-    source_columns[3].metric(
-        "상담일지",
-        f"{consultation_context.get('count', 0)}건",
-    )
-    source_columns[4].metric(
-        "녹취 반영",
-        f"{consultation_context.get('transcript_count', 0)}건",
-    )
-
-    with st.expander("자료 연결 진단", expanded=False):
+    with st.expander("분석에 반영된 자료 확인", expanded=False):
+        st.caption(
+            "등기·주가평가·고용·상담일지·녹취의 연결 상태를 확인합니다."
+        )
         st.write(f"조회 회사명: {company_name or '-'}")
         st.write(f"조회 사업자등록번호: {business_no or '-'}")
         st.write(
