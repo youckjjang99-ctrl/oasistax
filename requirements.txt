@@ -4,6 +4,7 @@ numpy==1.26.4
 pyarrow==18.1.0
 openpyxl==3.1.5
 requests==2.32.3
+cryptography==49.0.0
 pillow==11.1.0
 python-dateutil==2.9.0.post0
 pypdf==5.9.0

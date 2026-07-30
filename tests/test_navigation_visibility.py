@@ -17,6 +17,7 @@ class NavigationVisibilityTests(unittest.TestCase):
         self.assertNotIn("sidebar-nav-heading", source)
         self.assertNotIn("<small>1단계</small>", source)
         self.assertNotIn("<small>{html.escape(selected_group)}</small>", source)
+        self.assertIn('"경정청구": "경정청구"', source)
 
     def test_enterprise_tools_are_visible_in_one_tab_row(self):
         source = (ROOT / "enterprise_center.py").read_text(encoding="utf-8")

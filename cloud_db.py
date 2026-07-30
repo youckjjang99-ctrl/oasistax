@@ -139,6 +139,27 @@ class CloudDatabase:
             )
         return response.json() if response.text else []
 
+    def rpc(
+        self,
+        function_name: str,
+        parameters: dict[str, Any],
+    ) -> Any:
+        safe_name = re.sub(r"[^a-zA-Z0-9_]", "", str(function_name or ""))
+        if not safe_name or safe_name != function_name:
+            raise ValueError("올바르지 않은 RPC 함수명입니다.")
+        response = requests.post(
+            f"{self.config.url}/rest/v1/rpc/{safe_name}",
+            headers=self.headers,
+            data=json.dumps(parameters, ensure_ascii=False, default=str),
+            timeout=self.config.timeout,
+        )
+        if not response.ok:
+            raise RuntimeError(
+                f"{safe_name} 실행 실패 HTTP {response.status_code}: "
+                f"{response.text[:800]}"
+            )
+        return response.json() if response.text else None
+
     def select(
         self,
         table: str,

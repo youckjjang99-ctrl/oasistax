@@ -511,6 +511,7 @@ def reject_user(user_id, approved_by=""):
             "회원 거절정보를 Supabase에 저장하지 못했습니다. "
             f"({type(exc).__name__})"
         )
+    _register_login_session(user_id)
     return True, f"{user_id} 회원을 거절 처리했습니다."
 
 
@@ -554,6 +555,9 @@ def _session_is_current(user_id: str, token: str) -> bool:
 
 
 def _clear_local_login_state() -> None:
+    for key in list(st.session_state.keys()):
+        if str(key).startswith(("claim_", "_claim_")):
+            st.session_state.pop(key, None)
     st.session_state.logged_in = False
     st.session_state.current_user_id = ""
     st.session_state.current_user_name = ""
@@ -651,6 +655,18 @@ def render_password_change(user_id: str) -> None:
             st.rerun()
 
 def check_login():
+    claim_bucket = st.session_state.get("_claim_auth_sessions_v1")
+    if isinstance(claim_bucket, dict):
+        now = time.time()
+        for case_id, value in list(claim_bucket.items()):
+            expires_at = (
+                float(value.get("expires_at", 0) or 0)
+                if isinstance(value, dict)
+                else 0
+            )
+            if expires_at <= now:
+                claim_bucket.pop(case_id, None)
+
     if "logged_in" not in st.session_state:
         st.session_state.logged_in = False
 
@@ -683,6 +699,14 @@ def check_login():
             st.warning(
                 "동일 계정으로 새 로그인이 확인되어 현재 기기에서 자동 로그아웃되었습니다."
             )
+            return False
+        current_user = load_users().get(
+            _safe_user_id(st.session_state.current_user_id),
+            {},
+        )
+        if str(current_user.get("status", "")).strip() != "approved":
+            _clear_local_login_state()
+            st.warning("승인된 계정만 이용할 수 있습니다.")
             return False
 
     return st.session_state.logged_in

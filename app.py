@@ -18,6 +18,7 @@ from cloud_admin import render_cloud_database_page
 from ai_usage import render_ai_usage_page
 from cloud_restore import restore_customer_db_if_needed
 from cloud_crm_restore import restore_crm_from_cloud
+from claim_correction_center import render_claim_correction_center
 from enterprise_center import render_enterprise_management_center
 from enterprise_customer_management import render_customer_trash_page
 from prospect_db_center import (
@@ -1758,6 +1759,7 @@ with st.sidebar:
             "DB발굴": "DB발굴",
             "기업등록": "기업등록",
             "기업 컨설팅": "기업관리센터",
+            "경정청구": "경정청구",
             "AI 코파일럿": "AI 코파일럿",
         },
         "고객관리": {
@@ -1828,6 +1830,7 @@ with st.sidebar:
         "DB발굴": "DB발굴",
         "기업등록": "기업등록",
         "기업 컨설팅": "기업 컨설팅",
+        "경정청구": "경정청구",
         "AI 코파일럿": "AI 코파일럿",
         "내 누적 고객DB": "내 고객DB",
         "실행이력": "실행이력",
@@ -1890,6 +1893,12 @@ if active_tab == "홈":
 
 elif active_tab == "기업관리센터":
     render_enterprise_management_center(
+        CURRENT_USER_ID,
+        CURRENT_USER_NAME,
+    )
+
+elif active_tab == "경정청구":
+    render_claim_correction_center(
         CURRENT_USER_ID,
         CURRENT_USER_NAME,
     )
