@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import os
 from dataclasses import dataclass
 from typing import Any, Iterable
@@ -22,6 +23,12 @@ HOMETAX_SIMPLE_AUTH_REQUEST = (
     "/api/v2.0/HometaxSimpleAuth/SimpleAuthRequest"
 )
 HOMETAX_SIMPLE_AUTH_CHECK = "/api/v2.0/HometaxSimpleAuth/LoginCheck"
+HOMETAX_TAX_PAYMENT_CERTIFICATE = (
+    "/api/v2.0/HometaxSimpleAuth/UTERDAAA04"
+)
+HOMETAX_BUSINESS_REGISTRATION_CERTIFICATE = (
+    "/api/v2.0/HometaxSimpleAuth/UTEABGAA21"
+)
 COMWEL_SIMPLE_AUTH_REQUEST = (
     "/api/v2.0/KcomwelSimpleAuth/SimpleAuthRequest"
 )
@@ -31,6 +38,15 @@ SESSION_FIELDS = ("Token", "CxId", "TxId", "ReqTxId")
 
 class ClaimProviderError(RuntimeError):
     """A provider error whose text is safe to show in the app."""
+
+
+@dataclass(frozen=True)
+class CollectedClaimDocument:
+    content: bytes
+    file_name: str
+    content_type: str
+    provider_reference: str
+    facts: dict[str, Any]
 
 
 def _read_secret(name: str, default: str = "") -> str:
@@ -210,6 +226,85 @@ def _boolean_result(response_data: dict[str, Any]) -> bool:
     if result is False:
         return False
     raise ClaimProviderError("인증 완료 응답 형식을 확인해주세요.")
+
+
+def _collected_pdf(
+    response_data: dict[str, Any],
+    *,
+    fallback_name: str,
+) -> CollectedClaimDocument:
+    raw_result = response_data.get("Result")
+    candidates = (
+        raw_result
+        if isinstance(raw_result, list)
+        else [raw_result]
+        if isinstance(raw_result, dict)
+        else []
+    )
+    selected = next(
+        (
+            row
+            for row in candidates
+            if isinstance(row, dict)
+            and str(row.get("PdfData", "") or "").strip()
+        ),
+        None,
+    )
+    if selected is None:
+        issued = next(
+            (
+                str(row.get("Issued", "") or "").strip()
+                for row in candidates
+                if isinstance(row, dict)
+                and str(row.get("Issued", "") or "").strip()
+            ),
+            "",
+        )
+        suffix = f" ({issued})" if issued else ""
+        raise ClaimProviderError(
+            f"홈택스에서 발급된 PDF를 받지 못했습니다{suffix}."
+        )
+
+    try:
+        content = base64.b64decode(
+            str(selected.get("PdfData", "")).strip(),
+            validate=True,
+        )
+    except (ValueError, binascii.Error) as exc:
+        raise ClaimProviderError(
+            "홈택스 PDF 응답을 확인하지 못했습니다."
+        ) from exc
+    if not content.startswith(b"%PDF-"):
+        raise ClaimProviderError("홈택스 응답이 PDF 형식이 아닙니다.")
+    if len(content) > 20 * 1024 * 1024:
+        raise ClaimProviderError("홈택스 PDF가 허용 크기를 초과했습니다.")
+
+    raw_name = str(selected.get("FileName", "") or "").strip()
+    safe_name = "".join(
+        character
+        for character in (raw_name or fallback_name)
+        if character.isalnum() or character in "._-() "
+    ).strip()
+    if not safe_name.lower().endswith(".pdf"):
+        safe_name = f"{safe_name or fallback_name}.pdf"
+    provider_reference = str(
+        selected.get("CerCvaIsnNo")
+        or selected.get("CvaId")
+        or response_data.get("ApiTxKey")
+        or ""
+    ).strip()
+    return CollectedClaimDocument(
+        content=content,
+        file_name=safe_name,
+        content_type="application/pdf",
+        provider_reference=provider_reference,
+        facts={
+            "issued": str(selected.get("Issued", "") or "").strip(),
+            "provider_status": str(
+                selected.get("CvaDcumIsnStatCdNm", "") or ""
+            ).strip(),
+        },
+    )
 
 
 class TilkoClaimClient:
@@ -397,3 +492,91 @@ class TilkoClaimClient:
             ),
         )
         return _boolean_result(response)
+
+    def _hometax_auth(
+        self,
+        *,
+        birth_date: str,
+        user_name: str,
+        cellphone: str,
+        session: dict[str, str],
+    ) -> dict[str, str]:
+        return {
+            "BirthDate": birth_date,
+            "PrivateAuthType": "0",
+            "UserName": user_name,
+            "UserCellphoneNumber": cellphone,
+            **{key: session.get(key, "") for key in SESSION_FIELDS},
+        }
+
+    def collect_hometax_business_registration_certificate(
+        self,
+        *,
+        birth_date: str,
+        user_name: str,
+        cellphone: str,
+        business_number: str,
+        session: dict[str, str],
+    ) -> CollectedClaimDocument:
+        payload = {
+            "Auth": self._hometax_auth(
+                birth_date=birth_date,
+                user_name=user_name,
+                cellphone=cellphone,
+                session=session,
+            ),
+            "BusinessNumber": business_number,
+            "EnglCvaAplnYn": "N",
+            "ResnoOpYn": "N",
+            "IssueType": "99",
+            "Organization": "99",
+        }
+        response = self._post(
+            self.config.hometax_host,
+            HOMETAX_BUSINESS_REGISTRATION_CERTIFICATE,
+            payload,
+            (
+                "Auth.BirthDate",
+                "Auth.UserName",
+                "Auth.UserCellphoneNumber",
+                "BusinessNumber",
+            ),
+        )
+        return _collected_pdf(
+            response,
+            fallback_name="business-registration-certificate",
+        )
+
+    def collect_hometax_tax_payment_certificate(
+        self,
+        *,
+        birth_date: str,
+        user_name: str,
+        cellphone: str,
+        session: dict[str, str],
+    ) -> CollectedClaimDocument:
+        payload = {
+            "Auth": self._hometax_auth(
+                birth_date=birth_date,
+                user_name=user_name,
+                cellphone=cellphone,
+                session=session,
+            ),
+            "IssueType": "B0007",
+            "Organization": "99",
+            "ResnoOpYn": "N",
+        }
+        response = self._post(
+            self.config.hometax_host,
+            HOMETAX_TAX_PAYMENT_CERTIFICATE,
+            payload,
+            (
+                "Auth.BirthDate",
+                "Auth.UserName",
+                "Auth.UserCellphoneNumber",
+            ),
+        )
+        return _collected_pdf(
+            response,
+            fallback_name="tax-payment-certificate",
+        )

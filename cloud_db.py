@@ -5,6 +5,7 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
 import requests
 
@@ -159,6 +160,102 @@ class CloudDatabase:
                 f"{response.text[:800]}"
             )
         return response.json() if response.text else None
+
+    def upload_private_object(
+        self,
+        bucket: str,
+        path: str,
+        content: bytes,
+        content_type: str,
+    ) -> None:
+        safe_bucket = re.sub(r"[^a-zA-Z0-9_-]", "", str(bucket or ""))
+        clean_path = str(path or "").strip().lstrip("/")
+        if (
+            not safe_bucket
+            or safe_bucket != bucket
+            or not clean_path
+            or ".." in clean_path.split("/")
+        ):
+            raise ValueError("올바르지 않은 Storage 경로입니다.")
+        headers = {
+            "apikey": self.config.secret_key,
+            "Authorization": f"Bearer {self.config.secret_key}",
+            "Content-Type": str(content_type or "application/octet-stream"),
+            "x-upsert": "false",
+        }
+        encoded_path = quote(clean_path, safe="/")
+        response = requests.post(
+            (
+                f"{self.config.url}/storage/v1/object/"
+                f"{safe_bucket}/{encoded_path}"
+            ),
+            headers=headers,
+            data=content,
+            timeout=max(self.config.timeout, 60),
+        )
+        if not response.ok:
+            raise RuntimeError(
+                f"Storage 업로드 실패 HTTP {response.status_code}"
+            )
+
+    def delete_private_object(self, bucket: str, path: str) -> None:
+        safe_bucket = re.sub(r"[^a-zA-Z0-9_-]", "", str(bucket or ""))
+        clean_path = str(path or "").strip().lstrip("/")
+        if not safe_bucket or not clean_path:
+            return
+        requests.delete(
+            f"{self.config.url}/storage/v1/object/{safe_bucket}",
+            headers=self.headers,
+            data=json.dumps({"prefixes": [clean_path]}),
+            timeout=self.config.timeout,
+        )
+
+    def create_private_signed_url(
+        self,
+        bucket: str,
+        path: str,
+        *,
+        expires_in: int = 60,
+        download_name: str = "",
+    ) -> str:
+        safe_bucket = re.sub(r"[^a-zA-Z0-9_-]", "", str(bucket or ""))
+        clean_path = str(path or "").strip().lstrip("/")
+        if not safe_bucket or not clean_path:
+            raise ValueError("올바르지 않은 Storage 경로입니다.")
+        encoded_path = quote(clean_path, safe="/")
+        payload: dict[str, Any] = {
+            "expiresIn": max(10, min(int(expires_in), 300)),
+        }
+        if download_name:
+            payload["download"] = str(download_name)
+        response = requests.post(
+            (
+                f"{self.config.url}/storage/v1/object/sign/"
+                f"{safe_bucket}/{encoded_path}"
+            ),
+            headers=self.headers,
+            data=json.dumps(payload, ensure_ascii=False),
+            timeout=self.config.timeout,
+        )
+        if not response.ok:
+            raise RuntimeError(
+                f"Storage 다운로드 링크 생성 실패 HTTP "
+                f"{response.status_code}"
+            )
+        data = response.json() if response.text else {}
+        signed_url = str(
+            data.get("signedURL") or data.get("signedUrl") or ""
+        ).strip()
+        if not signed_url:
+            raise RuntimeError("Storage 다운로드 링크를 받지 못했습니다.")
+        if signed_url.startswith("http"):
+            return signed_url
+        if signed_url.startswith("/storage/v1/"):
+            return f"{self.config.url}{signed_url}"
+        return (
+            f"{self.config.url}/storage/v1/"
+            f"{signed_url.lstrip('/')}"
+        )
 
     def select(
         self,

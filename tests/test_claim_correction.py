@@ -26,6 +26,7 @@ from claim_correction_repository import (
 )
 from tilko_claim_client import (
     ClaimProviderError,
+    CollectedClaimDocument,
     TilkoClaimClient,
     TilkoClaimConfig,
     provider_readiness,
@@ -69,13 +70,34 @@ class _CheckResponse:
         }
 
 
+class _DocumentResponse:
+    ok = True
+    status_code = 200
+
+    @staticmethod
+    def json():
+        return {
+            "ErrorCode": 0,
+            "Result": {
+                "FileName": "certificate.pdf",
+                "PdfData": base64.b64encode(
+                    b"%PDF-1.7\nclaim-document"
+                ).decode("ascii"),
+                "CerCvaIsnNo": "provider-reference",
+            },
+        }
+
+
 class _FakeDatabase:
-    def __init__(self, rows=None):
+    def __init__(self, rows=None, documents=None):
         self.rows = list(rows or [])
+        self.documents = list(documents or [])
         self.inserted = []
         self.upserted = []
         self.updated = []
         self.rpc_calls = []
+        self.uploads = []
+        self.deleted_objects = []
 
     def select(self, _table, filters=None, **_kwargs):
         result = self.rows
@@ -115,7 +137,14 @@ class _FakeDatabase:
                 and str(row.get("id")) == str(parameters["p_case_id"])
             ][:1]
         if function_name == "oasis_claim_list_documents":
-            return []
+            return [
+                row
+                for row in self.documents
+                if str(row.get("owner_user_id"))
+                == str(parameters["p_owner_user_id"])
+                and str(row.get("case_id"))
+                == str(parameters["p_case_id"])
+            ]
         if function_name == "oasis_claim_update_case_status":
             matches = [
                 row
@@ -131,9 +160,61 @@ class _FakeDatabase:
             return [updated]
         if function_name == "oasis_claim_update_document_status":
             return 0
+        if function_name == "oasis_claim_finalize_document":
+            matches = [
+                row
+                for row in self.documents
+                if str(row.get("owner_user_id"))
+                == str(parameters["p_owner_user_id"])
+                and str(row.get("case_id"))
+                == str(parameters["p_case_id"])
+                and str(row.get("id"))
+                == str(parameters["p_document_id"])
+            ]
+            if not matches:
+                return []
+            updated = dict(matches[0])
+            updated.update(
+                {
+                    "status": parameters["p_status"],
+                    "storage_bucket": parameters["p_storage_bucket"],
+                    "storage_path": parameters["p_storage_path"],
+                    "content_sha256": parameters["p_content_sha256"],
+                    "content_type": parameters["p_content_type"],
+                    "size_bytes": parameters["p_size_bytes"],
+                    "retention_until": parameters["p_retention_until"],
+                    "facts": parameters["p_facts"],
+                }
+            )
+            return [updated]
         if function_name == "oasis_claim_append_audit":
             return 1
         raise AssertionError(function_name)
+
+    def upload_private_object(
+        self,
+        bucket,
+        path,
+        content,
+        content_type,
+    ):
+        self.uploads.append((bucket, path, content, content_type))
+
+    def delete_private_object(self, bucket, path):
+        self.deleted_objects.append((bucket, path))
+
+    def create_private_signed_url(
+        self,
+        bucket,
+        path,
+        *,
+        expires_in,
+        download_name,
+    ):
+        return (
+            f"https://example.supabase.co/signed/{bucket}/{path}"
+            f"?expires={expires_in}&download={download_name}"
+        )
 
 
 def _public_key_b64() -> str:
@@ -316,6 +397,112 @@ class ClaimCorrectionTests(unittest.TestCase):
         self.assertEqual(payload["IndividualFlag"], "1")
         self.assertEqual(payload["Auth"]["PrivateAuthType"], "0")
         self.assertEqual(payload["Auth"]["Token"], "token")
+
+    @patch(
+        "tilko_claim_client.requests.post",
+        return_value=_DocumentResponse(),
+    )
+    def test_hometax_business_certificate_encrypts_business_number(
+        self,
+        post,
+    ):
+        config = TilkoClaimConfig(
+            api_key="api-key",
+            rsa_public_key=_public_key_b64(),
+            collection_enabled=True,
+        )
+        document = TilkoClaimClient(
+            config
+        ).collect_hometax_business_registration_certificate(
+            birth_date="19901019",
+            user_name="대표자",
+            cellphone="01012345678",
+            business_number="2208162517",
+            session={
+                "Token": "token",
+                "CxId": "cx",
+                "TxId": "tx",
+                "ReqTxId": "req",
+            },
+        )
+        payload = post.call_args.kwargs["json"]
+        self.assertNotEqual(payload["BusinessNumber"], "2208162517")
+        self.assertEqual(payload["EnglCvaAplnYn"], "N")
+        self.assertEqual(payload["ResnoOpYn"], "N")
+        self.assertEqual(payload["IssueType"], "99")
+        self.assertEqual(payload["Organization"], "99")
+        self.assertTrue(document.content.startswith(b"%PDF-"))
+        self.assertEqual(document.content_type, "application/pdf")
+
+    @patch(
+        "tilko_claim_client.requests.post",
+        return_value=_DocumentResponse(),
+    )
+    def test_hometax_tax_certificate_uses_non_disclosing_defaults(
+        self,
+        post,
+    ):
+        config = TilkoClaimConfig(
+            api_key="api-key",
+            rsa_public_key=_public_key_b64(),
+            collection_enabled=True,
+        )
+        TilkoClaimClient(config).collect_hometax_tax_payment_certificate(
+            birth_date="19901019",
+            user_name="대표자",
+            cellphone="01012345678",
+            session={
+                "Token": "token",
+                "CxId": "cx",
+                "TxId": "tx",
+                "ReqTxId": "req",
+            },
+        )
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["IssueType"], "B0007")
+        self.assertEqual(payload["Organization"], "99")
+        self.assertEqual(payload["ResnoOpYn"], "N")
+
+    def test_repository_uploads_ready_document_to_private_storage(self):
+        case = {
+            "id": "00000000-0000-0000-0000-000000000001",
+            "owner_user_id": "owner-user",
+        }
+        stored_document = {
+            "id": "00000000-0000-0000-0000-000000000002",
+            "case_id": case["id"],
+            "owner_user_id": "owner-user",
+            "source": "hometax",
+            "document_code": "hometax_business_registration_certificate",
+            "status": "integration_required",
+        }
+        fake = _FakeDatabase([case], [stored_document])
+        repository = ClaimRepository("owner-user", database=fake)
+        ready = repository.store_collected_document(
+            case["id"],
+            document_code="hometax_business_registration_certificate",
+            document=CollectedClaimDocument(
+                content=b"%PDF-1.7\nclaim-document",
+                file_name="certificate.pdf",
+                content_type="application/pdf",
+                provider_reference="provider-reference",
+                facts={"issued": "Y"},
+            ),
+        )
+        self.assertEqual(ready["status"], "ready")
+        self.assertEqual(len(fake.uploads), 1)
+        self.assertEqual(fake.uploads[0][0], "oasis-claim-documents")
+        self.assertNotIn("owner-user", fake.uploads[0][1])
+        finalize_calls = [
+            call
+            for call in fake.rpc_calls
+            if call[0] == "oasis_claim_finalize_document"
+        ]
+        self.assertEqual(len(finalize_calls), 1)
+        self.assertEqual(
+            len(finalize_calls[0][1]["p_content_sha256"]),
+            64,
+        )
 
     def test_case_and_document_plan_use_one_transaction_rpc(self):
         fake = _FakeDatabase()
