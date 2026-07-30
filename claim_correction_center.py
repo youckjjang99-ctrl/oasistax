@@ -31,11 +31,13 @@ from tilko_claim_client import (
 from utils import get_user_cumulative_db_path
 
 
-CONSENT_VERSION = "claim-collection-v1-2026-07"
+CONSENT_VERSION = "claim-collection-v2-2026-07"
 RETENTION_POLICY_VERSION = "claim-document-retention-v1-2026-07"
 CONSENT_NOTICE_TEXT = (
     "고객에게 수집 항목·이용 목적·보유기간·제3자 제공 내용을 안내했고 "
-    "유효한 동의를 확인했습니다."
+    "유효한 동의를 확인했습니다. 주민등록번호는 DB·로그에 저장하지 않고 "
+    "인증 및 자료수집 중 암호화된 서버 메모리에 최대 45분 보관한 뒤 "
+    "즉시 삭제합니다."
 )
 COLLECTION_AUTHORITY_TEXT = (
     "민감정보 처리가 필요한 경우 적용되는 법적 근거와 위임 범위를 "
@@ -45,6 +47,14 @@ CONSENT_TEXT_SHA256 = hashlib.sha256(
     f"{CONSENT_NOTICE_TEXT}|{COLLECTION_AUTHORITY_TEXT}".encode("utf-8")
 ).hexdigest()
 AUTH_TTL_SECONDS = 10 * 60
+COLLECTION_TTL_SECONDS = 45 * 60
+AUTH_POLL_SECONDS = 1.0
+AUTH_MEDIUM_POLL_SECONDS = 3.0
+AUTH_SLOW_POLL_SECONDS = 10.0
+AUTH_FAST_POLL_WINDOW_SECONDS = 30.0
+AUTH_MEDIUM_POLL_WINDOW_SECONDS = 90.0
+TRANSIENT_AUTH_RETRY_SECONDS = 3.0
+COMWEL_DISPATCH_DELAY_SECONDS = 1.0
 _CLAIM_JOB_CIPHER = Fernet(Fernet.generate_key())
 _CLAIM_JOB_LOCK = threading.RLock()
 _CLAIM_JOBS: dict[str, dict[str, Any]] = {}
@@ -62,8 +72,8 @@ STATUS_LABELS = {
     "auth_partial": "일부 인증 완료 · 재요청 필요",
     "certificate_required": "공동인증서 대기",
     "collection_queued": "자료수집 대기",
-    "auth_complete_collection_pending": "인증 완료 · 자료수집 연동 대기",
-    "integration_required": "문서 API 연결 대기",
+    "auth_complete_collection_pending": "인증 완료 · 일부 자료 재수집 필요",
+    "integration_required": "현재 자동수집 미지원",
     "collecting": "자료수집 중",
     "collected": "수집 완료",
     "ready": "결과 확인 가능",
@@ -222,15 +232,94 @@ def _next_auth_action(
     return "", ""
 
 
-def _safe_provider_error_code(exc: Exception) -> str:
+def _safe_provider_error_code(
+    exc: Exception,
+    source: str = "HOMETAX",
+) -> str:
+    prefix = re.sub(r"[^A-Z0-9_]", "", str(source or "").upper())
+    if not prefix:
+        prefix = "DOCUMENT"
     match = re.search(
         r"(?:오류코드|TargetCode|ErrorCode)\s*[:：]\s*([A-Za-z0-9_-]+)",
         str(exc),
         flags=re.IGNORECASE,
     )
     if match:
-        return f"HOMETAX_{match.group(1).upper()}"[:80]
-    return "HOMETAX_DOCUMENT_COLLECTION_FAILED"
+        return f"{prefix}_{match.group(1).upper()}"[:80]
+    return f"{prefix}_DOCUMENT_COLLECTION_FAILED"[:80]
+
+
+def _provider_error_code(exc: Exception) -> str:
+    explicit = str(getattr(exc, "error_code", "") or "").strip().upper()
+    if explicit:
+        return explicit
+    match = re.search(
+        r"(?:오류코드|TargetCode|ErrorCode)\s*[:：]\s*([A-Za-z0-9_-]+)",
+        str(exc),
+        flags=re.IGNORECASE,
+    )
+    return match.group(1).upper() if match else ""
+
+
+def _is_transient_auth_error(exc: Exception) -> bool:
+    return _provider_error_code(exc) in {"OACX_NO_USER"}
+
+
+def _document_label(document_code: str) -> str:
+    code = str(document_code or "").strip()
+    for spec in DOCUMENT_SPECS:
+        if spec.code == code:
+            return spec.name
+    return code or "서류"
+
+
+def _auth_poll_delay(transient: dict[str, Any]) -> float:
+    stage_started_at = float(
+        transient.get("stage_started_at", time.time()) or time.time()
+    )
+    elapsed = time.time() - stage_started_at
+    if elapsed <= AUTH_FAST_POLL_WINDOW_SECONDS:
+        return AUTH_POLL_SECONDS
+    if elapsed <= AUTH_MEDIUM_POLL_WINDOW_SECONDS:
+        return AUTH_MEDIUM_POLL_SECONDS
+    return AUTH_SLOW_POLL_SECONDS
+
+
+def _claim_absolute_expiry(transient: dict[str, Any]) -> float:
+    absolute_expires_at = float(
+        transient.get("absolute_expires_at", 0) or 0
+    )
+    if absolute_expires_at > 0:
+        return absolute_expires_at
+    request_started_at = float(
+        transient.get("request_started_at", time.time()) or time.time()
+    )
+    absolute_expires_at = request_started_at + COLLECTION_TTL_SECONDS
+    transient["request_started_at"] = request_started_at
+    transient["absolute_expires_at"] = absolute_expires_at
+    return absolute_expires_at
+
+
+def _set_claim_expiry(
+    transient: dict[str, Any],
+    ttl_seconds: float,
+) -> float:
+    expires_at = min(
+        time.time() + max(float(ttl_seconds), 0.0),
+        _claim_absolute_expiry(transient),
+    )
+    transient["expires_at"] = expires_at
+    return expires_at
+
+
+def _ensure_claim_operation_active(
+    should_continue: Any | None,
+) -> None:
+    if callable(should_continue) and not bool(should_continue()):
+        raise ClaimProviderError(
+            "인증 유효시간이 지나 임시 인증정보를 삭제했습니다.",
+            error_code="AUTH_SESSION_EXPIRED",
+        )
 
 
 def _collect_supported_hometax_documents(
@@ -244,16 +333,34 @@ def _collect_supported_hometax_documents(
     business_number: str,
     session: dict[str, str],
     on_progress: Any | None = None,
+    should_continue: Any | None = None,
 ) -> dict[str, Any]:
+    _ensure_claim_operation_active(should_continue)
+    hometax_documents = [
+        document
+        for document in repository.list_documents(case_id)
+        if str(document.get("source", "")) == "hometax"
+    ]
     existing = {
         str(document.get("document_code", "")): str(
             document.get("status", "")
         )
-        for document in repository.list_documents(case_id)
-        if str(document.get("source", "")) == "hometax"
+        for document in hometax_documents
     }
     jobs: list[tuple[str, Any]] = []
-    skipped_codes: list[str] = []
+    supported_codes = {
+        "hometax_business_registration_certificate",
+        "hometax_tax_payment_certificate",
+    }
+    skipped_codes: list[str] = [
+        (
+            f"{document.get('document_code')}:{document.get('period_year')}"
+            if document.get("period_year")
+            else str(document.get("document_code", ""))
+        )
+        for document in hometax_documents
+        if str(document.get("document_code", "")) not in supported_codes
+    ]
     if _is_valid_business_no(business_number):
         jobs.append(
             (
@@ -290,8 +397,16 @@ def _collect_supported_hometax_documents(
             if on_progress:
                 on_progress(completed_count, target_count, document_code)
             continue
+        if on_progress:
+            on_progress(
+                completed_count + failed_count,
+                target_count,
+                document_code,
+            )
         try:
+            _ensure_claim_operation_active(should_continue)
             collected = collector()
+            _ensure_claim_operation_active(should_continue)
             repository.store_collected_document(
                 case_id,
                 document_code=document_code,
@@ -299,6 +414,12 @@ def _collect_supported_hometax_documents(
             )
             completed_count += 1
         except (ClaimProviderError, ClaimRepositoryError) as exc:
+            if isinstance(exc, ClaimProviderError):
+                if (
+                    _is_transient_auth_error(exc)
+                    or _provider_error_code(exc) == "AUTH_SESSION_EXPIRED"
+                ):
+                    raise
             failed_count += 1
             safe_error_code = _safe_provider_error_code(exc)
             errors.append(
@@ -327,21 +448,306 @@ def _collect_supported_hometax_documents(
     }
 
 
+def _collect_supported_comwel_documents(
+    repository: ClaimRepository,
+    client: TilkoClaimClient,
+    *,
+    case_id: str,
+    identity_number: str,
+    representative: str,
+    cellphone: str,
+    business_number: str,
+    session: dict[str, str],
+    selected_management_number: str = "",
+    on_progress: Any | None = None,
+    should_continue: Any | None = None,
+) -> dict[str, Any]:
+    _ensure_claim_operation_active(should_continue)
+    documents = [
+        document
+        for document in repository.list_documents(case_id)
+        if str(document.get("source", "")) == "comwel"
+    ]
+    existing = {
+        (
+            str(document.get("document_code", "")),
+            int(document.get("period_year") or 0),
+        ): document
+        for document in documents
+    }
+    remuneration_years = sorted(
+        {
+            int(document.get("period_year") or 0)
+            for document in documents
+            if str(document.get("document_code", ""))
+            == "comwel_total_remuneration"
+            and int(document.get("period_year") or 0) > 0
+        },
+        reverse=True,
+    )
+    rate_years = sorted(
+        {
+            int(document.get("period_year") or 0)
+            for document in documents
+            if str(document.get("document_code", ""))
+            == "comwel_workplace_rate"
+            and int(document.get("period_year") or 0) > 0
+        },
+        reverse=True,
+    )
+    business_valid = _is_valid_business_no(business_number)
+    has_management_document = (
+        "comwel_management_number_list",
+        0,
+    ) in existing
+    management_numbers: list[str] = []
+    completed_count = 0
+    failed_count = 0
+    errors: list[dict[str, str]] = []
+    skipped_codes: list[str] = []
+    target_count = len(remuneration_years)
+    if business_valid and has_management_document:
+        target_count += 1 + len(rate_years)
+    else:
+        skipped_codes.extend(
+            (
+                ["comwel_management_number_list"]
+                if has_management_document
+                else []
+            )
+            + [
+                f"comwel_workplace_rate:{year}"
+                for year in rate_years
+            ]
+        )
+
+    def report(document_code: str) -> None:
+        if on_progress:
+            on_progress(
+                completed_count + failed_count,
+                max(target_count, 1),
+                document_code,
+            )
+
+    def store_one(
+        document_code: str,
+        collector: Any,
+        *,
+        period_year: int | None = None,
+    ) -> Any | None:
+        nonlocal completed_count, failed_count
+        key = (document_code, int(period_year or 0))
+        current = existing.get(key)
+        if current and str(current.get("status", "")) == "ready":
+            completed_count += 1
+            report(document_code)
+            return current
+        report(document_code)
+        try:
+            _ensure_claim_operation_active(should_continue)
+            collected = collector()
+            _ensure_claim_operation_active(should_continue)
+            stored = repository.store_collected_document(
+                case_id,
+                document_code=document_code,
+                document=collected,
+                period_year=period_year,
+            )
+            completed_count += 1
+            report(document_code)
+            return {
+                **dict(stored or {}),
+                "facts": dict(collected.facts or {}),
+            }
+        except (ClaimProviderError, ClaimRepositoryError) as exc:
+            if isinstance(exc, ClaimProviderError):
+                if (
+                    _is_transient_auth_error(exc)
+                    or _provider_error_code(exc) == "AUTH_SESSION_EXPIRED"
+                ):
+                    raise
+            failed_count += 1
+            safe_error_code = _safe_provider_error_code(exc, "COMWEL")
+            errors.append(
+                {
+                    "document_code": document_code,
+                    "period_year": str(period_year or ""),
+                    "safe_error_code": safe_error_code,
+                    "message": str(exc)[:240],
+                }
+            )
+            try:
+                repository.fail_document(
+                    case_id,
+                    document_code=document_code,
+                    period_year=period_year,
+                    safe_error_code=safe_error_code,
+                )
+            except ClaimRepositoryError:
+                pass
+            report(document_code)
+            return None
+
+    if business_valid and has_management_document:
+        management_document = store_one(
+            "comwel_management_number_list",
+            lambda: client.collect_comwel_management_numbers(
+                identity_number=identity_number,
+                user_name=representative,
+                cellphone=cellphone,
+                business_number=business_number,
+                session=session,
+            ),
+        )
+        management_facts = (
+            management_document.get("facts")
+            if isinstance(management_document, dict)
+            else {}
+        )
+        if isinstance(management_facts, dict):
+            numbers = management_facts.get("management_numbers")
+            if isinstance(numbers, list):
+                management_numbers = [
+                    _digits(number)
+                    for number in numbers
+                    if _digits(number)
+                ]
+    requested_management_number = _digits(selected_management_number)
+    management_number = (
+        requested_management_number
+        if requested_management_number in {
+            _digits(number) for number in management_numbers
+        }
+        else management_numbers[0]
+        if len(management_numbers) == 1
+        else ""
+    )
+    selection_required = bool(
+        business_valid
+        and has_management_document
+        and len(management_numbers) > 1
+        and not management_number
+        and rate_years
+    )
+
+    for year in remuneration_years:
+        store_one(
+            "comwel_total_remuneration",
+            lambda year=year: client.collect_comwel_total_remuneration(
+                year=year,
+                identity_number=identity_number,
+                user_name=representative,
+                cellphone=cellphone,
+                business_number="",
+                management_number=management_number,
+                session=session,
+            ),
+            period_year=year,
+        )
+
+    if business_valid and has_management_document and management_number:
+        for year in rate_years:
+            store_one(
+                "comwel_workplace_rate",
+                lambda year=year: client.collect_comwel_workplace_rate(
+                    year=year,
+                    identity_number=identity_number,
+                    user_name=representative,
+                    cellphone=cellphone,
+                    management_number=management_number,
+                    session=session,
+                ),
+                period_year=year,
+            )
+    elif business_valid and has_management_document:
+        skipped_codes.extend(
+            [
+                (
+                    f"comwel_workplace_rate:{year}:"
+                    "management_number_selection_required"
+                    if selection_required
+                    else f"comwel_workplace_rate:{year}:"
+                    "management_number_missing"
+                )
+                for year in rate_years
+            ]
+        )
+        target_count -= len(rate_years)
+
+    skipped_codes.append("comwel_worker_status:certificate_required")
+    return {
+        "target": max(0, target_count),
+        "ready": completed_count,
+        "failed": failed_count,
+        "skipped": skipped_codes,
+        "errors": errors,
+        "management_numbers": management_numbers,
+        "selection_required": selection_required,
+    }
+
+
 def _collect_case_documents(
     repository: ClaimRepository,
     client: TilkoClaimClient,
     *,
     case_id: str,
     birth_date: str,
+    identity_number: str,
     representative: str,
     cellphone: str,
     transient: dict[str, Any],
     on_progress: Any | None = None,
+    should_continue: Any | None = None,
 ) -> dict[str, Any]:
+    _ensure_claim_operation_active(should_continue)
+    planned_documents = repository.list_documents(case_id)
+    business_number = str(transient.get("business_number", ""))
+    hometax_target = 1 + int(_is_valid_business_no(business_number))
+    comwel_target = sum(
+        1
+        for document in planned_documents
+        if str(document.get("document_code", ""))
+        == "comwel_total_remuneration"
+    )
+    has_management_plan = any(
+        str(document.get("document_code", ""))
+        == "comwel_management_number_list"
+        for document in planned_documents
+    )
+    if _is_valid_business_no(business_number) and has_management_plan:
+        comwel_target += 1 + sum(
+            1
+            for document in planned_documents
+            if str(document.get("document_code", ""))
+            == "comwel_workplace_rate"
+        )
+    planned_target = max(1, hometax_target + comwel_target)
+
+    def hometax_progress(
+        processed: int,
+        _total: int,
+        document_code: str,
+    ) -> None:
+        if on_progress:
+            on_progress(processed, planned_target, document_code)
+
+    def comwel_progress(
+        processed: int,
+        _total: int,
+        document_code: str,
+    ) -> None:
+        if on_progress:
+            on_progress(
+                hometax_target + processed,
+                planned_target,
+                document_code,
+            )
+
     for source in ("hometax", "comwel"):
+        _ensure_claim_operation_active(should_continue)
         source_documents = [
             document
-            for document in repository.list_documents(case_id)
+            for document in planned_documents
             if str(document.get("source", "")) == source
         ]
         if not any(
@@ -354,23 +760,84 @@ def _collect_case_documents(
                 status="integration_required",
             )
 
-    summary = _collect_supported_hometax_documents(
+    hometax_summary = _collect_supported_hometax_documents(
         repository,
         client,
         case_id=case_id,
         birth_date=birth_date,
         representative=representative,
         cellphone=cellphone,
-        business_number=str(transient.get("business_number", "")),
+        business_number=business_number,
         session=transient["hometax"],
-        on_progress=on_progress,
+        on_progress=hometax_progress,
+        should_continue=should_continue,
     )
+    _ensure_claim_operation_active(should_continue)
+    comwel_summary = _collect_supported_comwel_documents(
+        repository,
+        client,
+        case_id=case_id,
+        identity_number=identity_number,
+        representative=representative,
+        cellphone=cellphone,
+        business_number=business_number,
+        session=transient["comwel"],
+        selected_management_number=str(
+            transient.get("selected_management_number", "")
+        ),
+        on_progress=comwel_progress,
+        should_continue=should_continue,
+    )
+    _ensure_claim_operation_active(should_continue)
+    summary = {
+        "target": int(hometax_summary["target"])
+        + int(comwel_summary["target"]),
+        "ready": int(hometax_summary["ready"])
+        + int(comwel_summary["ready"]),
+        "failed": int(hometax_summary["failed"])
+        + int(comwel_summary["failed"]),
+        "skipped": list(hometax_summary["skipped"])
+        + list(comwel_summary["skipped"]),
+        "errors": list(hometax_summary["errors"])
+        + list(comwel_summary["errors"]),
+        "sources": {
+            "hometax": hometax_summary,
+            "comwel": comwel_summary,
+        },
+        "management_numbers": list(
+            comwel_summary.get("management_numbers", [])
+        ),
+        "selection_required": bool(
+            comwel_summary.get("selection_required")
+        ),
+    }
     collection_complete = bool(
         summary["target"] > 0
         and summary["ready"] == summary["target"]
         and summary["failed"] == 0
+        and not summary["selection_required"]
     )
     summary["complete"] = collection_complete
+    _ensure_claim_operation_active(should_continue)
+    if summary["selection_required"]:
+        repository.update_case_status(
+            case_id,
+            overall_status="auth_complete_collection_pending",
+            last_safe_error_code=None,
+        )
+        repository.append_audit_event(
+            case_id=case_id,
+            action="management_number_selection_required",
+            source="comwel",
+            outcome="pending",
+            metadata={
+                "management_number_count": len(
+                    summary["management_numbers"]
+                ),
+                "ready_document_count": summary["ready"],
+            },
+        )
+        return summary
     if collection_complete:
         repository.update_case_status(
             case_id,
@@ -380,13 +847,13 @@ def _collect_case_documents(
         repository.append_audit_event(
             case_id=case_id,
             action="collection_complete",
-            source="hometax",
+            source="provider",
             outcome="success",
             metadata={
                 "supported_document_count": summary["target"],
                 "ready_document_count": summary["ready"],
                 "skipped_document_codes": summary["skipped"],
-                "scope": "currently_connected_hometax_documents",
+                "scope": "currently_connected_documents",
             },
         )
         return summary
@@ -394,7 +861,7 @@ def _collect_case_documents(
     first_error = (
         summary["errors"][0]["safe_error_code"]
         if summary["errors"]
-        else "HOMETAX_DOCUMENT_COLLECTION_FAILED"
+        else "DOCUMENT_COLLECTION_FAILED"
     )
     repository.update_case_status(
         case_id,
@@ -404,7 +871,7 @@ def _collect_case_documents(
     repository.append_audit_event(
         case_id=case_id,
         action="collection_partial",
-        source="hometax",
+        source="provider",
         outcome="failed",
         metadata={
             "supported_document_count": summary["target"],
@@ -429,7 +896,9 @@ def _advance_personal_case(
     birth_date: str,
     identity_number: str,
     on_progress: Any | None = None,
+    should_continue: Any | None = None,
 ) -> dict[str, Any]:
+    _ensure_claim_operation_active(should_continue)
     case_id = str(case.get("id", ""))
     action, _ = _next_auth_action(case, transient)
     if not action:
@@ -442,6 +911,7 @@ def _advance_personal_case(
             cellphone=cellphone,
             session=transient["hometax"],
         )
+        _ensure_claim_operation_active(should_continue)
         if not hometax_complete:
             repository.update_case_status(
                 case_id,
@@ -465,12 +935,23 @@ def _advance_personal_case(
         )
         try:
             if not transient.get("comwel"):
-                transient["comwel"] = client.request_comwel_kakao(
+                _ensure_claim_operation_active(should_continue)
+                if COMWEL_DISPATCH_DELAY_SECONDS > 0:
+                    time.sleep(COMWEL_DISPATCH_DELAY_SECONDS)
+                _ensure_claim_operation_active(should_continue)
+                comwel_session = client.request_comwel_kakao(
                     identity_number=identity_number,
                     user_name=representative,
                     cellphone=cellphone,
                 )
-        except ClaimProviderError:
+                _ensure_claim_operation_active(should_continue)
+                transient["comwel"] = comwel_session
+        except ClaimProviderError as exc:
+            if (
+                _is_transient_auth_error(exc)
+                or _provider_error_code(exc) == "AUTH_SESSION_EXPIRED"
+            ):
+                raise
             repository.update_case_status(
                 case_id,
                 hometax_status="auth_complete",
@@ -486,7 +967,8 @@ def _advance_personal_case(
                 metadata={"safe_error_code": "COMWEL_AUTH_REQUEST_FAILED"},
             )
             raise
-        transient["expires_at"] = time.time() + AUTH_TTL_SECONDS
+        _set_claim_expiry(transient, AUTH_TTL_SECONDS)
+        transient["stage_started_at"] = time.time()
         repository.update_case_status(
             case_id,
             hometax_status="auth_complete",
@@ -505,12 +987,16 @@ def _advance_personal_case(
         return {"event": "comwel_requested", "action": action}
 
     if action == "request_comwel":
-        transient["comwel"] = client.request_comwel_kakao(
+        _ensure_claim_operation_active(should_continue)
+        comwel_session = client.request_comwel_kakao(
             identity_number=identity_number,
             user_name=representative,
             cellphone=cellphone,
         )
-        transient["expires_at"] = time.time() + AUTH_TTL_SECONDS
+        _ensure_claim_operation_active(should_continue)
+        transient["comwel"] = comwel_session
+        _set_claim_expiry(transient, AUTH_TTL_SECONDS)
+        transient["stage_started_at"] = time.time()
         repository.update_case_status(
             case_id,
             comwel_status="auth_requested",
@@ -534,6 +1020,7 @@ def _advance_personal_case(
             cellphone=cellphone,
             session=transient["comwel"],
         )
+        _ensure_claim_operation_active(should_continue)
         if not comwel_complete:
             repository.update_case_status(
                 case_id,
@@ -564,25 +1051,40 @@ def _advance_personal_case(
             outcome="success",
             metadata={"collection_started": True},
         )
+        _set_claim_expiry(transient, COLLECTION_TTL_SECONDS)
     elif action == "collect":
+        _ensure_claim_operation_active(should_continue)
         repository.update_case_status(
             case_id,
             overall_status="collecting",
             last_safe_error_code=None,
         )
+        _set_claim_expiry(transient, COLLECTION_TTL_SECONDS)
 
+    if on_progress:
+        on_progress(0, 1, "collection_preparing")
+    _ensure_claim_operation_active(should_continue)
     summary = _collect_case_documents(
         repository,
         client,
         case_id=case_id,
         birth_date=birth_date,
+        identity_number=identity_number,
         representative=representative,
         cellphone=cellphone,
         transient=transient,
         on_progress=on_progress,
+        should_continue=should_continue,
+    )
+    event = (
+        "management_selection_required"
+        if summary.get("selection_required")
+        else "collection_complete"
+        if summary["complete"]
+        else "collection_partial"
     )
     return {
-        "event": "collection_complete" if summary["complete"] else "collection_partial",
+        "event": event,
         "action": action,
         "summary": summary,
     }
@@ -618,12 +1120,89 @@ def _unseal_claim_job_payload(value: bytes) -> dict[str, Any]:
     return payload
 
 
-def _expire_claim_job(case_id: str, owner_ref: str) -> None:
+def _sync_interrupted_claim_case(
+    user_id: str,
+    case_id: str,
+    *,
+    active_action: str,
+    safe_error_code: str,
+    outcome: str,
+) -> None:
+    owner_user_id = str(user_id or "").strip().lower()
+    if not owner_user_id:
+        return
+    try:
+        repository = ClaimRepository(owner_user_id)
+        case = repository.get_case(case_id)
+        if not case:
+            return
+        hometax_status = str(case.get("hometax_status", "") or "")
+        comwel_status = str(case.get("comwel_status", "") or "")
+        updates: dict[str, Any] = {
+            "last_safe_error_code": safe_error_code,
+        }
+        if safe_error_code == "AUTH_SESSION_EXPIRED":
+            if hometax_status != "auth_complete":
+                updates["hometax_status"] = "failed"
+            elif comwel_status != "auth_complete":
+                updates["comwel_status"] = "failed"
+        elif (
+            active_action == "check_hometax"
+            and hometax_status != "auth_complete"
+        ):
+            updates["hometax_status"] = "failed"
+        elif (
+            active_action in {"request_comwel", "check_comwel"}
+            and comwel_status != "auth_complete"
+        ):
+            updates["comwel_status"] = "failed"
+
+        authentication_complete = (
+            hometax_status == "auth_complete"
+            and comwel_status == "auth_complete"
+        )
+        collection_started = (
+            active_action == "collect"
+            or str(case.get("overall_status", "") or "")
+            in {
+                "collecting",
+                "collection_queued",
+                "auth_complete_collection_pending",
+            }
+        )
+        updates["overall_status"] = (
+            "auth_complete_collection_pending"
+            if authentication_complete or collection_started
+            else "auth_partial"
+        )
+        repository.update_case_status(case_id, **updates)
+        repository.append_audit_event(
+            case_id=case_id,
+            action="background_auth_or_collection",
+            source="provider",
+            outcome=outcome,
+            metadata={"safe_error_code": safe_error_code},
+        )
+    except ClaimRepositoryError:
+        return
+
+
+def _expire_claim_job(
+    case_id: str,
+    owner_ref: str,
+    user_id: str = "",
+) -> None:
+    owner_user_id = str(user_id or "").strip().lower()
+    previous_status = ""
     with _CLAIM_JOB_LOCK:
         job = _CLAIM_JOBS.get(case_id)
         if not job or job.get("owner_ref") != owner_ref:
             return
         previous_status = str(job.get("status", "") or "")
+        owner_user_id = (
+            owner_user_id
+            or str(job.get("owner_user_id", "") or "").strip().lower()
+        )
         job["sealed_payload"] = b""
         if previous_status != "complete":
             job["status"] = "expired"
@@ -641,19 +1220,80 @@ def _expire_claim_job(case_id: str, owner_ref: str) -> None:
         wake_event = job.get("wake_event")
         if isinstance(wake_event, threading.Event):
             wake_event.set()
+    if previous_status != "complete":
+        _sync_interrupted_claim_case(
+            owner_user_id,
+            case_id,
+            active_action=(
+                "collect"
+                if previous_status
+                in {
+                    "collection_partial",
+                    "awaiting_management_selection",
+                }
+                else ""
+            ),
+            safe_error_code="AUTH_SESSION_EXPIRED",
+            outcome="expired",
+        )
 
 
 def _update_claim_job(
     case_id: str,
     owner_ref: str,
     **updates: Any,
-) -> None:
+) -> bool:
+    expired_owner_user_id = ""
     with _CLAIM_JOB_LOCK:
         job = _CLAIM_JOBS.get(case_id)
         if not job or job.get("owner_ref") != owner_ref:
-            return
-        job.update(updates)
-        job["updated_at"] = time.time()
+            return False
+        current_status = str(job.get("status", "") or "")
+        current_expires_at = float(job.get("expires_at", 0) or 0)
+        if current_status in {"complete", "expired"}:
+            return False
+        if (
+            current_expires_at <= time.time()
+            or not job.get("sealed_payload")
+        ):
+            job["sealed_payload"] = b""
+            job["status"] = "expired"
+            job["safe_message"] = (
+                "인증 유효시간이 지나 임시 인증정보를 삭제했습니다. "
+                "새 인증 요청을 시작해 주세요."
+            )
+            job["updated_at"] = time.time()
+            expired_owner_user_id = str(
+                job.get("owner_user_id", "") or ""
+            ).strip().lower()
+            wake_event = job.get("wake_event")
+            if isinstance(wake_event, threading.Event):
+                wake_event.set()
+        else:
+            job.update(updates)
+            job["updated_at"] = time.time()
+            return True
+    _sync_interrupted_claim_case(
+        expired_owner_user_id,
+        case_id,
+        active_action="",
+        safe_error_code="AUTH_SESSION_EXPIRED",
+        outcome="expired",
+    )
+    return False
+
+
+def _claim_job_can_continue(case_id: str, owner_ref: str) -> bool:
+    with _CLAIM_JOB_LOCK:
+        job = _CLAIM_JOBS.get(case_id)
+        return bool(
+            job
+            and job.get("owner_ref") == owner_ref
+            and str(job.get("status", "") or "")
+            not in {"complete", "expired"}
+            and float(job.get("expires_at", 0) or 0) > time.time()
+            and job.get("sealed_payload")
+        )
 
 
 def _run_background_claim_job(
@@ -672,6 +1312,8 @@ def _run_background_claim_job(
         wake_event.clear()
 
     transient: dict[str, Any] | None = None
+    context: dict[str, Any] | None = None
+    active_action = ""
     try:
         repository = ClaimRepository(user_id)
         client = TilkoClaimClient()
@@ -686,7 +1328,7 @@ def _run_background_claim_job(
                 sealed_payload,
                 bytes,
             ) or not sealed_payload:
-                _expire_claim_job(case_id, owner_ref)
+                _expire_claim_job(case_id, owner_ref, user_id)
                 return
 
             transient = _unseal_claim_job_payload(sealed_payload)
@@ -704,38 +1346,161 @@ def _run_background_claim_job(
             def update_collection_progress(
                 processed: int,
                 total: int,
-                _document_code: str,
+                document_code: str,
             ) -> None:
                 ratio = processed / max(total, 1)
-                percentage = min(99, 75 + round(ratio * 25))
-                _update_claim_job(
+                percentage = min(99, 75 + round(ratio * 24))
+                _set_claim_expiry(
+                    transient,
+                    COLLECTION_TTL_SECONDS,
+                )
+                if transient["expires_at"] <= time.time():
+                    raise ClaimProviderError(
+                        "인증 유효시간이 지나 임시 인증정보를 삭제했습니다.",
+                        error_code="AUTH_SESSION_EXPIRED",
+                    )
+                updated = _update_claim_job(
                     case_id,
                     owner_ref,
+                    sealed_payload=_seal_claim_job_payload(transient),
+                    expires_at=transient["expires_at"],
                     progress=percentage,
                     status="running",
                     safe_message=(
-                        "현재 연결된 홈택스 서류 수집 중 "
+                        f"{_document_label(document_code)} 수집 중 "
                         f"({processed}/{total}건)"
                     ),
                 )
+                if not updated:
+                    transient.clear()
+                    context.clear()
+                    raise ClaimProviderError(
+                        "인증 유효시간이 지나 임시 인증정보를 삭제했습니다.",
+                        error_code="AUTH_SESSION_EXPIRED",
+                    )
 
-            result = _advance_personal_case(
-                repository,
-                client,
-                case=case,
-                transient=transient,
-                representative=str(
-                    context.get("representative", "")
-                ).strip(),
-                cellphone=_digits(context.get("cellphone")),
-                birth_date=_digits(context.get("birth_date")),
-                identity_number=_digits(context.get("identity_number")),
-                on_progress=update_collection_progress,
-            )
+            try:
+                active_action = _next_auth_action(
+                    case,
+                    transient,
+                )[0]
+                result = _advance_personal_case(
+                    repository,
+                    client,
+                    case=case,
+                    transient=transient,
+                    representative=str(
+                        context.get("representative", "")
+                    ).strip(),
+                    cellphone=_digits(context.get("cellphone")),
+                    birth_date=_digits(context.get("birth_date")),
+                    identity_number=_digits(context.get("identity_number")),
+                    on_progress=update_collection_progress,
+                    should_continue=lambda: _claim_job_can_continue(
+                        case_id,
+                        owner_ref,
+                    ),
+                )
+            except ClaimProviderError as exc:
+                if not _is_transient_auth_error(exc):
+                    raise
+                if not _claim_job_can_continue(case_id, owner_ref):
+                    _sync_interrupted_claim_case(
+                        user_id,
+                        case_id,
+                        active_action=active_action,
+                        safe_error_code="AUTH_SESSION_EXPIRED",
+                        outcome="expired",
+                    )
+                    transient.clear()
+                    context.clear()
+                    return
+                retry_count = int(
+                    transient.get("provider_session_retry_count", 0) or 0
+                ) + 1
+                transient["provider_session_retry_count"] = retry_count
+                updated = _update_claim_job(
+                    case_id,
+                    owner_ref,
+                    sealed_payload=_seal_claim_job_payload(transient),
+                    expires_at=float(
+                        transient.get("expires_at", time.time()) or time.time()
+                    ),
+                    status="running",
+                    progress=max(25, int(job.get("progress", 25) or 25)),
+                    safe_message=(
+                        "인증정보가 중계 서버에 반영되는 중입니다. "
+                        "자동으로 다시 확인합니다."
+                    ),
+                )
+                if not updated:
+                    transient.clear()
+                    context.clear()
+                    return
+                if retry_count == 1:
+                    repository.append_audit_event(
+                        case_id=case_id,
+                        action="auth_check",
+                        source="provider",
+                        outcome="pending",
+                        metadata={
+                            "safe_error_code": _provider_error_code(exc),
+                            "automatic_retry": True,
+                        },
+                    )
+                wake_event.wait(
+                    max(
+                        TRANSIENT_AUTH_RETRY_SECONDS,
+                        _auth_poll_delay(transient),
+                    )
+                )
+                wake_event.clear()
+                continue
+            if not _claim_job_can_continue(case_id, owner_ref):
+                _sync_interrupted_claim_case(
+                    user_id,
+                    case_id,
+                    active_action=active_action,
+                    safe_error_code="AUTH_SESSION_EXPIRED",
+                    outcome="expired",
+                )
+                transient.clear()
+                context.clear()
+                return
             event = str(result.get("event", "") or "")
             updated_case = repository.get_case(case_id) or case
             percentage, progress_text = _claim_progress(updated_case)
 
+            if event == "management_selection_required":
+                summary = dict(result.get("summary") or {})
+                management_numbers = [
+                    str(number)
+                    for number in summary.get("management_numbers", [])
+                    if str(number).strip()
+                ]
+                updated = _update_claim_job(
+                    case_id,
+                    owner_ref,
+                    sealed_payload=_seal_claim_job_payload(transient),
+                    expires_at=float(
+                        transient.get("expires_at", time.time()) or time.time()
+                    ),
+                    status="awaiting_management_selection",
+                    progress=max(85, percentage),
+                    safe_message=(
+                        "사업장관리번호를 선택하면 사업장요율 수집을 "
+                        "계속합니다."
+                    ),
+                    summary={
+                        "ready": int(summary.get("ready", 0) or 0),
+                        "failed": int(summary.get("failed", 0) or 0),
+                        "management_numbers": management_numbers,
+                    },
+                )
+                if not updated:
+                    transient.clear()
+                    context.clear()
+                return
             if event == "collection_complete":
                 summary = dict(result.get("summary") or {})
                 _update_claim_job(
@@ -745,8 +1510,14 @@ def _run_background_claim_job(
                     status="complete",
                     progress=100,
                     safe_message=(
-                        f"현재 연결된 홈택스 서류 "
+                        f"현재 연결된 서류 "
                         f"{int(summary.get('ready', 0) or 0)}건 수집 완료"
+                        + (
+                            f", 추가 정보·미지원 "
+                            f"{len(summary.get('skipped', []))}건"
+                            if summary.get("skipped")
+                            else ""
+                        )
                     ),
                     summary={
                         "ready": int(summary.get("ready", 0) or 0),
@@ -754,10 +1525,12 @@ def _run_background_claim_job(
                         "skipped_count": len(summary.get("skipped", [])),
                     },
                 )
+                transient.clear()
+                context.clear()
                 return
             if event == "collection_partial":
                 summary = dict(result.get("summary") or {})
-                _update_claim_job(
+                updated = _update_claim_job(
                     case_id,
                     owner_ref,
                     sealed_payload=_seal_claim_job_payload(transient),
@@ -767,7 +1540,7 @@ def _run_background_claim_job(
                     status="collection_partial",
                     progress=percentage,
                     safe_message=(
-                        f"홈택스 서류 {int(summary.get('ready', 0) or 0)}건 저장, "
+                        f"서류 {int(summary.get('ready', 0) or 0)}건 저장, "
                         f"{int(summary.get('failed', 0) or 0)}건 실패"
                     ),
                     summary={
@@ -776,9 +1549,12 @@ def _run_background_claim_job(
                         "skipped_count": len(summary.get("skipped", [])),
                     },
                 )
+                if not updated:
+                    transient.clear()
+                    context.clear()
                 return
 
-            _update_claim_job(
+            updated = _update_claim_job(
                 case_id,
                 owner_ref,
                 sealed_payload=_seal_claim_job_payload(transient),
@@ -787,11 +1563,39 @@ def _run_background_claim_job(
                 ),
                 status="running",
                 progress=percentage,
-                safe_message=progress_text,
+                safe_message=(
+                    progress_text.split("·", 1)[-1].strip()
+                    if "·" in progress_text
+                    else progress_text
+                ),
             )
-            wake_event.wait(15)
+            if not updated:
+                transient.clear()
+                context.clear()
+                return
+            wake_event.wait(_auth_poll_delay(transient))
             wake_event.clear()
     except (ClaimProviderError, ClaimRepositoryError) as exc:
+        if isinstance(transient, dict) and not _claim_job_can_continue(
+            case_id,
+            owner_ref,
+        ):
+            _sync_interrupted_claim_case(
+                user_id,
+                case_id,
+                active_action=active_action,
+                safe_error_code="AUTH_SESSION_EXPIRED",
+                outcome="expired",
+            )
+            transient.clear()
+            if isinstance(context, dict):
+                context.clear()
+            return
+        safe_error_code = (
+            _safe_provider_error_code(exc, "BACKGROUND")
+            if isinstance(exc, ClaimProviderError)
+            else "BACKGROUND_REPOSITORY_FAILED"
+        )
         resealed = (
             _seal_claim_job_payload(transient)
             if isinstance(transient, dict)
@@ -811,22 +1615,34 @@ def _run_background_claim_job(
                 else {}
             ),
             status="paused",
-            safe_message=str(exc)[:240],
+            safe_message=(
+                "인증 또는 자료수집 연결이 중단되었습니다. "
+                "잠시 후 다시 시도해 주세요."
+            ),
         )
-        try:
-            ClaimRepository(user_id).append_audit_event(
-                case_id=case_id,
-                action="background_auth_or_collection",
-                source="provider",
-                outcome="failed",
-                metadata={
-                    "safe_error_code": "BACKGROUND_AUTH_OR_COLLECTION_FAILED",
-                    "safe_message": str(exc)[:240],
-                },
-            )
-        except ClaimRepositoryError:
-            pass
+        _sync_interrupted_claim_case(
+            user_id,
+            case_id,
+            active_action=active_action,
+            safe_error_code=safe_error_code,
+            outcome="failed",
+        )
     except Exception:
+        if isinstance(transient, dict) and not _claim_job_can_continue(
+            case_id,
+            owner_ref,
+        ):
+            _sync_interrupted_claim_case(
+                user_id,
+                case_id,
+                active_action=active_action,
+                safe_error_code="AUTH_SESSION_EXPIRED",
+                outcome="expired",
+            )
+            transient.clear()
+            if isinstance(context, dict):
+                context.clear()
+            return
         resealed = (
             _seal_claim_job_payload(transient)
             if isinstance(transient, dict)
@@ -851,6 +1667,13 @@ def _run_background_claim_job(
                 "잠시 후 다시 시도해 주세요."
             ),
         )
+        _sync_interrupted_claim_case(
+            user_id,
+            case_id,
+            active_action=active_action,
+            safe_error_code="BACKGROUND_UNEXPECTED_ERROR",
+            outcome="failed",
+        )
 
 
 def _claim_job_sweeper() -> None:
@@ -862,15 +1685,27 @@ def _claim_job_sweeper() -> None:
                 (
                     case_id,
                     str(job.get("owner_ref", "")),
+                    str(job.get("owner_user_id", "") or ""),
                     float(job.get("expires_at", 0) or 0),
                     str(job.get("status", "") or ""),
                     float(job.get("updated_at", 0) or 0),
                 )
                 for case_id, job in _CLAIM_JOBS.items()
             ]
-        for case_id, owner_ref, expires_at, status, updated_at in jobs:
+        for (
+            case_id,
+            owner_ref,
+            owner_user_id,
+            expires_at,
+            status,
+            updated_at,
+        ) in jobs:
             if status != "complete" and expires_at <= now:
-                _expire_claim_job(case_id, owner_ref)
+                _expire_claim_job(
+                    case_id,
+                    owner_ref,
+                    owner_user_id,
+                )
             if status in {"complete", "collection_partial", "expired"}:
                 if updated_at and now - updated_at > 30 * 60:
                     with _CLAIM_JOB_LOCK:
@@ -904,10 +1739,13 @@ def _register_background_claim_job(
 ) -> None:
     _ensure_claim_job_sweeper()
     owner_ref = _claim_job_owner_ref(user_id)
+    absolute_expires_at = _claim_absolute_expiry(transient)
     expires_at = min(
         float(transient.get("expires_at", 0) or 0),
         time.time() + AUTH_TTL_SECONDS,
+        absolute_expires_at,
     )
+    transient["expires_at"] = expires_at
     wake_event = threading.Event()
     with _CLAIM_JOB_LOCK:
         existing = _CLAIM_JOBS.get(case_id)
@@ -915,6 +1753,7 @@ def _register_background_claim_job(
             return
         _CLAIM_JOBS[case_id] = {
             "owner_ref": owner_ref,
+            "owner_user_id": str(user_id or "").strip().lower(),
             "sealed_payload": _seal_claim_job_payload(transient),
             "expires_at": expires_at,
             "status": "queued",
@@ -930,7 +1769,7 @@ def _activate_background_claim_job(
     user_id: str,
     case_id: str,
     *,
-    initial_delay: float = 15.0,
+    initial_delay: float = AUTH_POLL_SECONDS,
 ) -> bool:
     owner_ref = _claim_job_owner_ref(user_id)
     with _CLAIM_JOB_LOCK:
@@ -995,6 +1834,69 @@ def _retry_or_wake_claim_job(user_id: str, case_id: str) -> bool:
         if job.get("status") == "running":
             wake_event.set()
             return True
+    return _activate_background_claim_job(
+        user_id,
+        case_id,
+        initial_delay=0,
+    )
+
+
+def _select_claim_management_number(
+    user_id: str,
+    case_id: str,
+    management_number: str,
+) -> bool:
+    owner_ref = _claim_job_owner_ref(user_id)
+    selected_digits = _digits(management_number)
+    expired_after_unseal = False
+    with _CLAIM_JOB_LOCK:
+        job = _CLAIM_JOBS.get(case_id)
+        if (
+            not job
+            or job.get("owner_ref") != owner_ref
+            or job.get("status") != "awaiting_management_selection"
+            or float(job.get("expires_at", 0) or 0) <= time.time()
+            or not job.get("sealed_payload")
+        ):
+            return False
+        summary = dict(job.get("summary") or {})
+        allowed_numbers = {
+            _digits(number)
+            for number in summary.get("management_numbers", [])
+            if _digits(number)
+        }
+        if selected_digits not in allowed_numbers:
+            return False
+        transient = _unseal_claim_job_payload(job["sealed_payload"])
+        transient["selected_management_number"] = selected_digits
+        _set_claim_expiry(transient, COLLECTION_TTL_SECONDS)
+        if transient["expires_at"] <= time.time():
+            job["sealed_payload"] = b""
+            job["status"] = "expired"
+            job["safe_message"] = (
+                "인증 유효시간이 지나 임시 인증정보를 삭제했습니다. "
+                "새 인증 요청을 시작해 주세요."
+            )
+            job["updated_at"] = time.time()
+            transient.clear()
+            expired_after_unseal = True
+        else:
+            job["sealed_payload"] = _seal_claim_job_payload(transient)
+            job["expires_at"] = transient["expires_at"]
+            job["status"] = "queued"
+            job["progress"] = max(85, int(job.get("progress", 0) or 0))
+            job["safe_message"] = "선택한 사업장의 요율 수집을 준비합니다."
+            job["summary"] = {}
+            job["updated_at"] = time.time()
+    if expired_after_unseal:
+        _sync_interrupted_claim_case(
+            user_id,
+            case_id,
+            active_action="collect",
+            safe_error_code="AUTH_SESSION_EXPIRED",
+            outcome="expired",
+        )
+        return False
     return _activate_background_claim_job(
         user_id,
         case_id,
@@ -1128,65 +2030,84 @@ def _render_personal_request(
         horizontal=True,
         key="claim_personal_input_mode_v2",
         help=(
-            "카카오톡 발송은 등록 고객을 불러와 인증을 요청하고, "
-            "직접입력은 신규 고객 정보를 담당자가 입력합니다."
+            "카카오톡 발송은 담당자가 고객 이름·주민등록번호·휴대전화를 "
+            "입력해 바로 인증을 보내는 방식입니다. 고객은 카카오톡에서 "
+            "기관 인증만 승인합니다."
         ),
     )
-    row, suffix = _selected_customer(user_id, input_mode)
-    company_default = _clean(row.get("업체명"))
-    business_default = _format_business_no(row.get("사업자등록번호"))
-    representative_default = _clean(row.get("대표자명"))
-    phone_default = _format_phone(
-        row.get("휴대전화")
-        or row.get("휴대폰번호")
-        or row.get("전화번호")
-    )
+    remote_input = input_mode == "카카오톡 발송"
+    suffix = "kakao" if remote_input else "manual"
+    company_name = ""
+    business_no = ""
+    identity_front = ""
+    identity_rear = ""
 
     form_key = f"claim_personal_request_{suffix}"
     with st.form(form_key, clear_on_submit=True):
-        st.markdown("#### 개인사업자 카카오 인증 요청")
-        st.caption(
-            "홈택스 인증을 먼저 발송합니다. 고객이 홈택스 인증을 마치면 "
-            "Railway 자동 작업이 확인한 뒤 근로복지공단 인증을 이어서 "
-            "발송합니다."
+        st.markdown(
+            "#### 개인사업자 카카오 인증 직접발송"
+            if remote_input
+            else "#### 개인사업자 카카오 인증 요청"
         )
-        company_col, business_col = st.columns(2)
-        with company_col:
-            company_name = st.text_input(
-                "상호명 (선택)",
-                value=company_default,
-                key=f"claim_company_{suffix}",
+        if remote_input:
+            st.caption(
+                "담당자가 고객정보를 입력해 홈택스 인증을 먼저 발송합니다. "
+                "고객은 카카오톡에서 인증만 승인하면 됩니다."
             )
-        with business_col:
-            business_no = st.text_input(
-                "사업자등록번호 (선택)",
-                value=business_default,
-                placeholder="000-00-00000",
-                key=f"claim_business_no_{suffix}",
+            with st.expander(
+                "사업장관리번호·사업장요율까지 수집하려면 (선택)"
+            ):
+                business_no = st.text_input(
+                    "사업자등록번호 (선택)",
+                    placeholder="000-00-00000",
+                    key=f"claim_business_no_{suffix}",
+                    help=(
+                        "인증 발송에는 필요하지 않습니다. 입력하지 않아도 "
+                        "보수총액신고내역은 수집되지만, 사업장관리번호와 "
+                        "사업장요율은 수집할 수 없습니다."
+                    ),
+                )
+        else:
+            st.caption(
+                "홈택스 인증을 먼저 발송합니다. 고객이 홈택스 인증을 마치면 "
+                "약 1초 후 근로복지공단 인증 발송을 시작합니다."
             )
+            company_col, business_col = st.columns(2)
+            with company_col:
+                company_name = st.text_input(
+                    "상호명 (선택)",
+                    key=f"claim_company_{suffix}",
+                )
+            with business_col:
+                business_no = st.text_input(
+                    "사업자등록번호 (선택)",
+                    placeholder="000-00-00000",
+                    key=f"claim_business_no_{suffix}",
+                    help=(
+                        "인증 자체에는 선택값이지만, 사업장관리번호와 "
+                        "사업장요율 수집에는 필요합니다."
+                    ),
+                )
 
         name_col, phone_col = st.columns(2)
         with name_col:
             representative = st.text_input(
                 "대표자 이름",
-                value=representative_default,
                 key=f"claim_representative_{suffix}",
             )
         with phone_col:
             cellphone = st.text_input(
                 "대표자 휴대전화",
-                value=phone_default,
                 placeholder="010-0000-0000",
                 key=f"claim_cellphone_{suffix}",
             )
 
         st.markdown("**인증·수집 기관**")
         st.info(
-            "① 홈택스 인증 발송 → ② 홈택스 승인 확인 → "
-            "③ 근로복지공단 인증 발송 → ④ 두 기관 인증 완료 후 자료수집"
+            "① 홈택스 인증 발송 → ② 홈택스 승인 자동 확인 → "
+            "③ 약 1초 후 근로복지공단 인증 발송 → "
+            "④ 두 기관 인증 완료 후 자료수집"
         )
-        needs_comwel_identity = True
-
         id_front_col, id_rear_col = st.columns(2)
         with id_front_col:
             identity_front = st.text_input(
@@ -1202,24 +2123,17 @@ def _render_personal_request(
             )
         with id_rear_col:
             identity_rear = st.text_input(
-                (
-                    "주민등록번호 뒤 7자리"
-                    if needs_comwel_identity
-                    else "주민등록번호 구분값 1자리"
-                ),
-                max_chars=7 if needs_comwel_identity else 1,
-                placeholder=(
-                    "근로복지공단 인증에만 사용"
-                    if needs_comwel_identity
-                    else "생년대 구분값"
-                ),
+                "주민등록번호 뒤 7자리",
+                max_chars=7,
+                placeholder="근로복지공단 인증에만 사용",
                 type="password",
                 key=f"claim_identity_rear_{suffix}",
-                help=(
-                    "순차 인증 자동 확인을 위해 같은 브라우저의 서버 메모리에 "
-                    "최대 10분만 보관하며 DB·로그에는 저장하지 않습니다."
-                ),
-            )
+                    help=(
+                        "순차 인증 자동 확인을 위해 Railway 서버 메모리에 "
+                        "인증 및 자료수집 중 최대 45분만 암호화해 보관하며 "
+                        "DB·로그에는 저장하지 않습니다."
+                    ),
+                )
 
         consent_confirmed = st.checkbox(
             CONSENT_NOTICE_TEXT,
@@ -1230,7 +2144,11 @@ def _render_personal_request(
             key=f"claim_legal_basis_{suffix}",
         )
         submitted = st.form_submit_button(
-            "홈택스 카카오 인증 발송",
+            (
+                "홈택스 카카오 인증 직접발송"
+                if remote_input
+                else "홈택스 카카오 인증 발송"
+            ),
             use_container_width=True,
             type="primary",
             disabled=not (repository and provider_ready),
@@ -1272,8 +2190,17 @@ def _render_personal_request(
     source_results: dict[str, str] = {
         "comwel_status": "request_ready",
     }
+    request_started_at = time.time()
     transient: dict[str, Any] = {
-        "expires_at": time.time() + AUTH_TTL_SECONDS,
+        "request_started_at": request_started_at,
+        "absolute_expires_at": (
+            request_started_at + COLLECTION_TTL_SECONDS
+        ),
+        "expires_at": min(
+            request_started_at + AUTH_TTL_SECONDS,
+            request_started_at + COLLECTION_TTL_SECONDS,
+        ),
+        "stage_started_at": request_started_at,
         "expected_sources": list(sources),
         "business_number": business_digits,
         "auth_context": {
@@ -1566,7 +2493,7 @@ def _cases_dataframe(cases: list[dict[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-@st.fragment(run_every="15s")
+@st.fragment(run_every="2s")
 def _render_auto_claim_monitor(
     user_id: str,
     case_id: str,
@@ -1601,14 +2528,55 @@ def _render_auto_claim_monitor(
     if job_snapshot:
         job_status = str(job_snapshot.get("status", "") or "")
         summary = dict(job_snapshot.get("summary") or {})
+        if job_status == "awaiting_management_selection":
+            management_numbers = [
+                str(number)
+                for number in summary.get("management_numbers", [])
+                if str(number).strip()
+            ]
+            st.info(
+                "여러 사업장이 확인됐습니다. 사업장요율을 수집할 "
+                "사업장관리번호를 선택해 주세요."
+            )
+            if not management_numbers:
+                st.warning(
+                    "선택 가능한 사업장관리번호를 확인하지 못했습니다. "
+                    "새 인증 요청을 시작해 주세요."
+                )
+                return
+            selected_management_number = st.selectbox(
+                "사업장관리번호",
+                management_numbers,
+                key=f"claim_management_number_{case_id}",
+            )
+            if st.button(
+                "선택 사업장 요율 수집 계속",
+                type="primary",
+                use_container_width=True,
+                key=f"claim_management_number_continue_{case_id}",
+            ):
+                if _select_claim_management_number(
+                    user_id,
+                    case_id,
+                    selected_management_number,
+                ):
+                    st.toast("선택한 사업장의 요율 수집을 시작합니다.")
+                    st.rerun(scope="app")
+                else:
+                    st.warning(
+                        "임시 인증정보가 만료됐습니다. "
+                        "새 인증 요청을 시작해 주세요."
+                    )
+            return
         if job_status == "complete" or progress_percent == 100:
             skipped_count = int(summary.get("skipped_count", 0) or 0)
             ready_count = int(summary.get("ready", 0) or 0)
             completion_message = (
-                f"현재 연결된 홈택스 서류 {ready_count}건 수집이 "
+                f"현재 연결된 서류 {ready_count}건 수집이 "
                 "완료되었습니다."
                 + (
-                    f" 사업자등록번호 미입력으로 {skipped_count}건은 제외했습니다."
+                    f" 현재 인증방식 또는 필수 식별정보 제한으로 "
+                    f"{skipped_count}건은 제외했습니다."
                     if skipped_count
                     else ""
                 )
@@ -1653,7 +2621,8 @@ def _render_auto_claim_monitor(
                 int(float(job_snapshot.get("expires_at", 0) or 0) - time.time()),
             )
             st.caption(
-                "화면을 이동하거나 닫아도 Railway 서버가 15초마다 자동으로 "
+                "화면을 이동하거나 닫아도 Railway 서버가 처음 30초는 약 1초마다, "
+                "다음 60초는 약 3초마다, 이후에는 약 10초마다 자동으로 "
                 f"확인합니다. 임시 인증정보는 {remaining // 60}분 "
                 f"{remaining % 60}초 뒤 자동 삭제됩니다."
             )
@@ -1663,7 +2632,7 @@ def _render_auto_claim_monitor(
         if st.session_state.get("_claim_active_case_v1") == case_id:
             st.session_state.pop("_claim_active_case_v1", None)
         st.success(
-            "현재 연결된 홈택스 서류 수집이 완료되었습니다. "
+            "현재 연결된 서류 수집이 완료되었습니다. "
             "‘수집결과’에서 확인해 주세요."
         )
         return
@@ -1722,7 +2691,7 @@ def _render_status_tab(
     st.progress(progress_percent, text=progress_text)
     if progress_percent == 100:
         st.success(
-            "현재 연결된 홈택스 서류 수집이 완료되었습니다. "
+            "현재 연결된 서류 수집이 완료되었습니다. "
             "‘수집결과’에서 확인해 주세요."
         )
     elif selected_case.get("business_type") == "corporation":
@@ -1840,6 +2809,30 @@ def _render_results_tab(repository: ClaimRepository | None) -> None:
     if not documents:
         st.info("이 요청에 등록된 수집 항목이 없습니다.")
         return
+    management_document = next(
+        (
+            document
+            for document in documents
+            if str(document.get("document_code", ""))
+            == "comwel_management_number_list"
+            and str(document.get("status", "")) == "ready"
+        ),
+        {},
+    )
+    management_facts = (
+        management_document.get("facts")
+        if isinstance(management_document, dict)
+        else {}
+    )
+    management_numbers = (
+        management_facts.get("management_numbers")
+        if isinstance(management_facts, dict)
+        else []
+    )
+    multiple_management_numbers = (
+        isinstance(management_numbers, list)
+        and len(management_numbers) > 1
+    )
     source_filter = st.segmented_control(
         "기관",
         ["전체", "홈택스", "근로복지공단"],
@@ -1849,6 +2842,8 @@ def _render_results_tab(repository: ClaimRepository | None) -> None:
     rows = []
     for document in documents:
         source = str(document.get("source", ""))
+        document_code = str(document.get("document_code", ""))
+        status = str(document.get("status", ""))
         source_label = (
             "홈택스"
             if source in {"hometax", "홈택스"}
@@ -1861,11 +2856,30 @@ def _render_results_tab(repository: ClaimRepository | None) -> None:
                 "자료명": _clean(document.get("document_name")),
                 "기관": source_label,
                 "연도": document.get("period_year") or "-",
-                "상태": _source_status(document.get("status")),
+                "상태": (
+                    "공동인증서 필요"
+                    if document_code == "comwel_worker_status"
+                    and status == "integration_required"
+                    else "사업장 선택 필요"
+                    if document_code == "comwel_workplace_rate"
+                    and status == "integration_required"
+                    and multiple_management_numbers
+                    else "사업자번호 필요"
+                    if document_code
+                    in {
+                        "comwel_management_number_list",
+                        "comwel_workplace_rate",
+                    }
+                    and status == "integration_required"
+                    and not _clean(
+                        selected_case.get("business_no_masked")
+                    )
+                    else _source_status(status)
+                ),
                 "수집일": _clean(document.get("collected_at"))[:10] or "-",
                 "출력": (
                     "준비"
-                    if document.get("status") in {"collected", "ready"}
+                    if status in {"collected", "ready"}
                     and document.get("storage_path")
                     else "-"
                 ),
@@ -1890,10 +2904,23 @@ def _render_results_tab(repository: ClaimRepository | None) -> None:
                     str(selected_case.get("id", "")),
                     str(document.get("id", "")),
                 )
+                content_type = str(
+                    document.get("content_type", "") or ""
+                ).lower()
+                file_label = (
+                    "PDF"
+                    if content_type == "application/pdf"
+                    else "엑셀"
+                    if "spreadsheet" in content_type
+                    or "excel" in content_type
+                    else "JSON"
+                    if content_type == "application/json"
+                    else "파일"
+                )
                 st.link_button(
                     (
                         f"{_clean(document.get('document_name'))} "
-                        "PDF 다운로드"
+                        f"{file_label} 다운로드"
                     ),
                     download_url,
                     use_container_width=True,
@@ -1904,8 +2931,9 @@ def _render_results_tab(repository: ClaimRepository | None) -> None:
                     "다운로드 링크를 다시 생성해 주세요."
                 )
     st.caption(
-        "공개 명세가 확인된 홈택스 서류부터 원문 수집과 다운로드를 제공합니다. "
-        "나머지 항목은 승인된 문서별 API 명세를 받은 뒤 순차 활성화됩니다."
+        "홈택스 연결 서류와 근로복지공단 보수총액·사업장관리번호·사업장요율은 "
+        "공식 문서 API로 수집합니다. 근로자고용정보현황은 공식 간편인증 API가 "
+        "없어 공동인증서 수집 기능을 연결한 뒤 활성화됩니다."
     )
 
 
