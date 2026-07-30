@@ -182,6 +182,72 @@ def _resolve_auth_progress(
     return overall_status, all_completed, any_failed
 
 
+def _collect_supported_hometax_documents(
+    repository: ClaimRepository,
+    client: TilkoClaimClient,
+    *,
+    case_id: str,
+    birth_date: str,
+    representative: str,
+    cellphone: str,
+    business_number: str,
+    session: dict[str, str],
+) -> tuple[int, int]:
+    existing = {
+        str(document.get("document_code", "")): str(
+            document.get("status", "")
+        )
+        for document in repository.list_documents(case_id)
+        if str(document.get("source", "")) == "hometax"
+    }
+    jobs = (
+        (
+            "hometax_business_registration_certificate",
+            lambda: client.collect_hometax_business_registration_certificate(
+                birth_date=birth_date,
+                user_name=representative,
+                cellphone=cellphone,
+                business_number=business_number,
+                session=session,
+            ),
+        ),
+        (
+            "hometax_tax_payment_certificate",
+            lambda: client.collect_hometax_tax_payment_certificate(
+                birth_date=birth_date,
+                user_name=representative,
+                cellphone=cellphone,
+                session=session,
+            ),
+        ),
+    )
+    completed_count = 0
+    failed_count = 0
+    for document_code, collector in jobs:
+        if existing.get(document_code) == "ready":
+            completed_count += 1
+            continue
+        try:
+            collected = collector()
+            repository.store_collected_document(
+                case_id,
+                document_code=document_code,
+                document=collected,
+            )
+            completed_count += 1
+        except (ClaimProviderError, ClaimRepositoryError):
+            failed_count += 1
+            try:
+                repository.fail_document(
+                    case_id,
+                    document_code=document_code,
+                    safe_error_code="HOMETAX_DOCUMENT_COLLECTION_FAILED",
+                )
+            except ClaimRepositoryError:
+                pass
+    return completed_count, failed_count
+
+
 def _case_label(row: dict[str, Any]) -> str:
     company = _clean(row.get("company_name")) or "업체명 없음"
     requested = _clean(row.get("requested_at"))
@@ -449,6 +515,7 @@ def _render_personal_request(
     transient: dict[str, Any] = {
         "expires_at": time.time() + AUTH_TTL_SECONDS,
         "expected_sources": list(sources),
+        "business_number": business_digits,
     }
     provider_failures: list[tuple[str, str]] = []
     try:
@@ -895,24 +962,56 @@ def _render_status_tab(
             ("comwel_status", "comwel"),
         ):
             if updates.get(status_key) == "auth_complete":
-                repository.update_document_status(
-                    case_id,
-                    source=source,
-                    status="integration_required",
-                )
+                source_documents = [
+                    document
+                    for document in repository.list_documents(case_id)
+                    if str(document.get("source", "")) == source
+                ]
+                if not any(
+                    str(document.get("status", "")) == "ready"
+                    for document in source_documents
+                ):
+                    repository.update_document_status(
+                        case_id,
+                        source=source,
+                        status="integration_required",
+                    )
+        hometax_collection = (0, 0)
+        if updates.get("hometax_status") == "auth_complete":
+            hometax_collection = _collect_supported_hometax_documents(
+                repository,
+                client,
+                case_id=case_id,
+                birth_date=_birth_date_from_identity(
+                    front_digits,
+                    rear_digits,
+                ),
+                representative=representative.strip(),
+                cellphone=phone_digits,
+                business_number=str(
+                    transient.get("business_number", "")
+                ),
+                session=transient["hometax"],
+            )
         repository.append_audit_event(
             case_id=case_id,
             action="auth_check",
             source="provider",
             outcome="success" if all_completed else "pending",
-            metadata={"all_sources_complete": all_completed},
+            metadata={
+                "all_sources_complete": all_completed,
+                "hometax_documents_ready": hometax_collection[0],
+                "hometax_documents_failed": hometax_collection[1],
+            },
         )
         if all_completed:
             _session_bucket(user_id).pop(case_id, None)
             transient.clear()
             st.session_state["_claim_flash_v1"] = (
-                "고객 인증을 확인했습니다. 외부 자료수집 API 계약과 "
-                "문서별 연동이 완료되면 수집을 실행할 수 있습니다."
+                f"고객 인증을 확인했습니다. 홈택스 서류 "
+                f"{hometax_collection[0]}건을 수집했고 "
+                f"{hometax_collection[1]}건은 재확인이 필요합니다. "
+                "근로복지공단 서류는 공식 명세 확인 후 순차 연결합니다."
             )
             st.rerun()
         if any_failed:
@@ -1072,7 +1171,7 @@ def _render_results_tab(repository: ClaimRepository | None) -> None:
                 "수집일": _clean(document.get("collected_at"))[:10] or "-",
                 "출력": (
                     "준비"
-                    if document.get("status") == "collected"
+                    if document.get("status") in {"collected", "ready"}
                     and document.get("storage_path")
                     else "-"
                 ),
@@ -1083,9 +1182,36 @@ def _render_results_tab(repository: ClaimRepository | None) -> None:
         use_container_width=True,
         hide_index=True,
     )
+    ready_documents = [
+        document
+        for document in documents
+        if str(document.get("status", "")) == "ready"
+        and document.get("storage_path")
+    ]
+    if ready_documents:
+        st.markdown("#### 다운로드 가능한 서류")
+        for document in ready_documents:
+            try:
+                download_url = repository.document_download_url(
+                    str(selected_case.get("id", "")),
+                    str(document.get("id", "")),
+                )
+                st.link_button(
+                    (
+                        f"{_clean(document.get('document_name'))} "
+                        "PDF 다운로드"
+                    ),
+                    download_url,
+                    use_container_width=True,
+                )
+            except ClaimRepositoryError:
+                st.caption(
+                    f"{_clean(document.get('document_name'))}: "
+                    "다운로드 링크를 다시 생성해 주세요."
+                )
     st.caption(
-        "현재는 인증 요청과 결과 목록 저장소까지 준비된 상태입니다. "
-        "원문 수집·다운로드는 승인된 문서별 API 계약을 연결한 뒤 활성화됩니다."
+        "공개 명세가 확인된 홈택스 서류부터 원문 수집과 다운로드를 제공합니다. "
+        "나머지 항목은 승인된 문서별 API 명세를 받은 뒤 순차 활성화됩니다."
     )
 
 

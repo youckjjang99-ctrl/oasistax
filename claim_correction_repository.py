@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from claim_correction_catalog import document_plan
 from cloud_db import CloudDatabase, cloud_is_configured
+from tilko_claim_client import CollectedClaimDocument
+
+
+CLAIM_STORAGE_BUCKET = "oasis-claim-documents"
 
 
 class ClaimRepositoryError(RuntimeError):
@@ -353,5 +358,191 @@ class ClaimRepository:
                 return rows[0]
             current.update(clean_updates)
             return current
+        except Exception as exc:
+            raise _safe_storage_error(exc) from exc
+
+    def _document_by_code(
+        self,
+        case_id: str,
+        document_code: str,
+        period_year: int | None = None,
+    ) -> dict[str, Any]:
+        documents = self.list_documents(case_id)
+        matches = [
+            document
+            for document in documents
+            if str(document.get("document_code", "")) == document_code
+            and (
+                period_year is None
+                or int(document.get("period_year") or 0) == int(period_year)
+            )
+        ]
+        if len(matches) != 1:
+            raise ClaimRepositoryError(
+                "수집할 경정청구 서류 항목을 확인하지 못했습니다."
+            )
+        return matches[0]
+
+    def store_collected_document(
+        self,
+        case_id: str,
+        *,
+        document_code: str,
+        document: CollectedClaimDocument,
+        period_year: int | None = None,
+    ) -> dict[str, Any]:
+        target = self._document_by_code(
+            case_id,
+            document_code,
+            period_year,
+        )
+        document_id = str(target.get("id", "")).strip()
+        if not document_id:
+            raise ClaimRepositoryError("서류 저장 식별값이 없습니다.")
+        owner_folder = hashlib.sha256(
+            self.owner_user_id.encode("utf-8")
+        ).hexdigest()[:24]
+        storage_path = (
+            f"{owner_folder}/{case_id}/{document_id}.pdf"
+        )
+        content_sha256 = hashlib.sha256(document.content).hexdigest()
+        retention_days = max(
+            1,
+            min(
+                int(os.environ.get("CLAIM_DOCUMENT_RETENTION_DAYS", "90")),
+                365,
+            ),
+        )
+        retention_until = (
+            datetime.now(timezone.utc) + timedelta(days=retention_days)
+        ).isoformat()
+        provider_reference_hash = (
+            hashlib.sha256(
+                document.provider_reference.encode("utf-8")
+            ).hexdigest()
+            if document.provider_reference
+            else ""
+        )
+        facts = {
+            key: value
+            for key, value in dict(document.facts or {}).items()
+            if key not in {"identity_number", "birth_date", "cellphone"}
+        }
+        if provider_reference_hash:
+            facts["provider_reference_sha256"] = provider_reference_hash
+
+        try:
+            self.database.upload_private_object(
+                CLAIM_STORAGE_BUCKET,
+                storage_path,
+                document.content,
+                document.content_type,
+            )
+            rows = self.database.rpc(
+                "oasis_claim_finalize_document",
+                {
+                    "p_owner_user_id": self.owner_user_id,
+                    "p_case_id": str(case_id),
+                    "p_document_id": document_id,
+                    "p_status": "ready",
+                    "p_storage_bucket": CLAIM_STORAGE_BUCKET,
+                    "p_storage_path": storage_path,
+                    "p_content_sha256": content_sha256,
+                    "p_content_type": document.content_type,
+                    "p_size_bytes": len(document.content),
+                    "p_retention_until": retention_until,
+                    "p_facts": facts,
+                    "p_safe_error_code": None,
+                },
+            )
+        except Exception as exc:
+            try:
+                self.database.delete_private_object(
+                    CLAIM_STORAGE_BUCKET,
+                    storage_path,
+                )
+            except Exception:
+                pass
+            raise _safe_storage_error(exc) from exc
+        if isinstance(rows, list) and rows:
+            return rows[0]
+        target.update(
+            {
+                "status": "ready",
+                "storage_bucket": CLAIM_STORAGE_BUCKET,
+                "storage_path": storage_path,
+                "content_sha256": content_sha256,
+                "content_type": document.content_type,
+                "size_bytes": len(document.content),
+                "retention_until": retention_until,
+            }
+        )
+        return target
+
+    def fail_document(
+        self,
+        case_id: str,
+        *,
+        document_code: str,
+        safe_error_code: str,
+        period_year: int | None = None,
+    ) -> None:
+        target = self._document_by_code(
+            case_id,
+            document_code,
+            period_year,
+        )
+        try:
+            self.database.rpc(
+                "oasis_claim_finalize_document",
+                {
+                    "p_owner_user_id": self.owner_user_id,
+                    "p_case_id": str(case_id),
+                    "p_document_id": str(target.get("id", "")),
+                    "p_status": "failed",
+                    "p_storage_bucket": None,
+                    "p_storage_path": None,
+                    "p_content_sha256": None,
+                    "p_content_type": None,
+                    "p_size_bytes": None,
+                    "p_retention_until": None,
+                    "p_facts": {},
+                    "p_safe_error_code": str(safe_error_code or "")[:80],
+                },
+            )
+        except Exception as exc:
+            raise _safe_storage_error(exc) from exc
+
+    def document_download_url(
+        self,
+        case_id: str,
+        document_id: str,
+    ) -> str:
+        target = next(
+            (
+                document
+                for document in self.list_documents(case_id)
+                if str(document.get("id", "")) == str(document_id)
+            ),
+            None,
+        )
+        if (
+            target is None
+            or str(target.get("status", "")) != "ready"
+            or not target.get("storage_bucket")
+            or not target.get("storage_path")
+        ):
+            raise ClaimRepositoryError(
+                "다운로드 가능한 서류를 찾지 못했습니다."
+            )
+        try:
+            return self.database.create_private_signed_url(
+                str(target["storage_bucket"]),
+                str(target["storage_path"]),
+                expires_in=60,
+                download_name=(
+                    f"{target.get('document_code') or 'claim-document'}.pdf"
+                ),
+            )
         except Exception as exc:
             raise _safe_storage_error(exc) from exc

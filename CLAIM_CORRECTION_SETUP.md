@@ -14,6 +14,7 @@ TILKO_API_KEY=<발급받은 API KEY>
 TILKO_RSA_PUBLIC_KEY=<API KEY에 대응하는 RSA 공개키>
 TILKO_HOMETAX_HOST=https://api.tilko.net
 TILKO_COMWEL_HOST=https://api24.tilko.net
+CLAIM_DOCUMENT_RETENTION_DAYS=90
 ```
 
 법인 공동인증서는 단순 공용 링크만 설정하지 않습니다. 공급사 계약 후
@@ -24,10 +25,14 @@ TILKO_COMWEL_HOST=https://api24.tilko.net
 임의 호스트는 고객 인증정보 유출을 막기 위해 차단합니다.
 
 현재 구현 범위는 개인사업자 인증 요청·완료 확인, 요청별 문서계획,
-진행상황과 수집결과 화면, 전용 비공개 저장소까지입니다. 법인
-공동인증서와 실제 11종 원문 수집은
-계약 계정에서 문서별 API 사용 승인을 받은 뒤 각 응답 스키마와 보유기간을
-확정해 별도 수집 워커를 연결해야 활성화됩니다.
+진행상황과 수집결과 화면, 전용 비공개 저장소, 홈택스 사업자등록증명원과
+국세 납세증명서 원문 PDF 수집·다운로드입니다. 저장 파일은 기본 90일
+보관하며 사용자가 다운로드할 때마다 짧은 만료시간의 서명 URL을
+발급합니다.
+
+나머지 홈택스·근로복지공단 서류와 법인 공동인증서는 계약 계정에서
+문서별 API 사용 승인을 받고 공식 요청·응답 스키마를 확인한 뒤
+순차적으로 활성화합니다.
 
 ## Supabase
 
@@ -35,6 +40,7 @@ TILKO_COMWEL_HOST=https://api24.tilko.net
 
 ```text
 supabase_v1022_claim_correction.sql
+supabase_v1023_claim_document_delivery.sql
 ```
 
 이 스크립트는 다음 항목을 만듭니다.
@@ -43,6 +49,7 @@ supabase_v1022_claim_correction.sql
 - `oasis_claim_documents`
 - `oasis_claim_audit_events`
 - 비공개 Storage 버킷 `oasis-claim-documents`
+- 서버 전용 문서 완료 처리 함수 `oasis_claim_finalize_document`
 
 익명 사용자와 일반 인증 사용자의 직접 DB·Storage 접근은 허용하지
 않습니다. 현재 앱에서는 Railway 서버의 경정청구 전용 저장 계층만 이
