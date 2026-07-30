@@ -64,12 +64,16 @@ def _customer_reference(
     owner_user_id: str,
     business_no: str,
     company_name: str,
+    representative_name: str = "",
+    cellphone: str = "",
 ) -> str:
     source = "|".join(
         (
             owner_user_id.strip().lower(),
             "".join(character for character in business_no if character.isdigit()),
             company_name.strip().lower(),
+            representative_name.strip().lower(),
+            "".join(character for character in cellphone if character.isdigit()),
         )
     )
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
@@ -144,6 +148,8 @@ class ClaimRepository:
                 self.owner_user_id,
                 business_no,
                 company_name,
+                representative_name,
+                cellphone,
             ),
             "company_name": str(company_name or "").strip(),
             "business_no_masked": _masked_business_no(business_no),
