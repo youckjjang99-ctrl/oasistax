@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import json
 import math
 import re
@@ -700,6 +701,9 @@ def render_copilot_page(
         current_text,
     )
 
+    safe_company_name = html.escape(company_name or "기업명 미확인")
+    safe_business_no = html.escape(business_no or "-")
+    safe_user_name = html.escape(user_name or "-")
     st.markdown(
         f"""
         <div style="
@@ -710,10 +714,10 @@ def render_copilot_page(
             margin:8px 0 16px 0;
         ">
             <div style="font-size:1.45rem;font-weight:800;">
-                {company_name or '기업명 미확인'}
+                {safe_company_name}
             </div>
             <div style="margin-top:6px;opacity:.9;">
-                사업자번호 {business_no or '-'} · 담당 {user_name or '-'}
+                사업자번호 {safe_business_no} · 담당 {safe_user_name}
             </div>
         </div>
         """,
@@ -806,8 +810,8 @@ def render_copilot_page(
             use_container_width=True,
         )
 
-    top = recommendations[:5]
-    st.markdown("### 이번 상담 우선순위")
+    top = recommendations[:3]
+    st.markdown("### 이번 상담 핵심 우선순위")
     stage_columns = st.columns([1, 1, 2], gap="medium")
     stage_columns[0].metric(
         "기업 성장단계",
@@ -826,11 +830,11 @@ def render_copilot_page(
     st.markdown(
         """
         <style>
-        .copilot-priority-card {min-height:150px;padding:17px;border:1px solid #d9e3f0;border-radius:16px;background:linear-gradient(145deg,#ffffff,#f6f9fd);box-shadow:0 7px 20px rgba(15,42,80,.07);position:relative;overflow:hidden;margin-bottom:7px;}
+        .copilot-priority-card {min-height:140px;padding:18px;border:1px solid #d9e3f0;border-radius:15px;background:linear-gradient(145deg,#ffffff,#f6f9fd);box-shadow:0 5px 16px rgba(15,42,80,.07);position:relative;overflow:hidden;margin-bottom:7px;}
         .copilot-priority-card:before {content:"";position:absolute;left:0;top:0;right:0;height:4px;background:#1e5bd7;}
-        .copilot-priority-topic {font-weight:800;color:#344054;font-size:.88rem;margin-top:4px;min-height:42px;}
-        .copilot-priority-score {font-size:2rem;font-weight:900;color:#0b2b5b;letter-spacing:-.04em;margin:5px 0;}
-        .copilot-priority-note {font-size:.74rem;color:#667085;line-height:1.35;}
+        .copilot-priority-topic {font-weight:800;color:#344054;font-size:.92rem;margin-top:4px;min-height:34px;}
+        .copilot-priority-score {font-size:1.75rem;font-weight:800;color:#0b2b5b;letter-spacing:-.04em;margin:5px 0;}
+        .copilot-priority-note {font-size:.78rem;color:#5b687b;line-height:1.45;}
         </style>
         """,
         unsafe_allow_html=True,
@@ -849,13 +853,21 @@ def render_copilot_page(
             if penalty_items
             else ""
         )
+        safe_topic = html.escape(str(item.get("topic", "")))
+        safe_score = html.escape(str(item.get("score", 0)))
+        safe_status = html.escape(str(item.get("status", "")))
+        safe_confidence = html.escape(
+            str(item.get("confidence", 0))
+        )
+        safe_evidence = html.escape(evidence)
+        safe_penalty = html.escape(penalty)
         card_html = (
             '<div class="copilot-priority-card">'
-            f'<div class="copilot-priority-topic">{item["topic"]}</div>'
-            f'<div class="copilot-priority-score">{item["score"]}점</div>'
+            f'<div class="copilot-priority-topic">{safe_topic}</div>'
+            f'<div class="copilot-priority-score">{safe_score}점</div>'
             '<div class="copilot-priority-note">'
-            f'{item.get("status", "")} · 확신도 {item.get("confidence", 0)}점<br>'
-            f'{evidence}<br>{penalty}'
+            f'{safe_status} · 확신도 {safe_confidence}점<br>'
+            f'{safe_evidence}<br>{safe_penalty}'
             '</div></div>'
         )
         with columns[index]:
