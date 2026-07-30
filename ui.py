@@ -37,6 +37,7 @@ def apply_oasis_ui():
  */
 .sidebar-logo {
     position: relative !important;
+    box-sizing: border-box !important;
     width: 100% !important;
     height: 118px !important;
     margin: 0 0 0.35rem 0 !important;
@@ -57,27 +58,6 @@ def apply_oasis_ui():
 }
 [data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
     gap: 0.65rem !important;
-}
-
-.sidebar-brand {
-    text-align: center !important;
-    color: #fff !important;
-    margin: 0 0 0.9rem 0 !important;
-}
-.sidebar-brand-title {
-    font-size: 25px !important;
-    font-weight: 950 !important;
-    color: #fff !important;
-    letter-spacing: -0.7px !important;
-    line-height: 1.18 !important;
-    text-shadow: 0 10px 22px rgba(0,0,0,0.16) !important;
-}
-.sidebar-brand-sub {
-    font-size: 13px !important;
-    color: rgba(255,255,255,0.92) !important;
-    margin-top: 7px !important;
-    letter-spacing: 0.8px !important;
-    font-weight: 800 !important;
 }
 
 .sidebar-user-card {
@@ -103,7 +83,7 @@ def apply_oasis_ui():
     letter-spacing: 1.1px !important;
 }
 
-/* Streamlit 기본 radio 아이콘 숨기고, 흰색 채워진 원을 직접 표시 */
+/* 사이드 메뉴는 장식 아이콘 없이 단일 텍스트만 표시한다. */
 [data-testid="stSidebar"] div[role="radiogroup"] label {
     position: relative !important;
     display: flex !important;
@@ -142,15 +122,26 @@ def apply_oasis_ui():
 
 [data-testid="stSidebar"] div[role="radiogroup"] label p {
     font-size: 15px !important;
-    font-weight: 880 !important;
-    letter-spacing: -0.35px !important;
+    font-weight: 650 !important;
+    letter-spacing: -0.2px !important;
     color: var(--oasis-menu-text) !important;
     line-height: 1.2 !important;
+    margin: 0 !important;
+    text-shadow: none !important;
+    -webkit-text-stroke: 0 transparent !important;
+    font-synthesis: none !important;
+}
+[data-testid="stSidebar"] div[role="radiogroup"] label p::before,
+[data-testid="stSidebar"] div[role="radiogroup"] label p::after,
+[data-testid="stSidebar"] div[role="radiogroup"] label
+[data-testid="stMarkdownContainer"] > p ~ p {
+    content: none !important;
+    display: none !important;
 }
 
 [data-testid="stSidebar"] div[role="radiogroup"] label:has(input:checked) p {
     color: var(--oasis-blue-text) !important;
-    font-weight: 950 !important;
+    font-weight: 750 !important;
 }
 
 [data-testid="stSidebar"] .stButton > button {
@@ -244,13 +235,14 @@ button[data-baseweb="tab"] {
         min-height: 0 !important;
     }
     [data-testid="stSidebar"] {
-        width: min(82vw, 300px) !important;
-        min-width: min(82vw, 300px) !important;
-        max-width: min(82vw, 300px) !important;
+        width: min(64vw, 240px) !important;
+        min-width: min(64vw, 240px) !important;
+        max-width: min(64vw, 240px) !important;
+        box-sizing: border-box !important;
     }
     [data-testid="stSidebar"] > div:first-child {
         width: 100% !important;
-        padding: 0.35rem 0.7rem 0.7rem 0.7rem !important;
+        padding: 0.25rem 0.5rem 0.6rem 0.5rem !important;
         overflow-x: hidden !important;
     }
     [data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
@@ -260,8 +252,8 @@ button[data-baseweb="tab"] {
         position: sticky !important;
         top: 0 !important;
         z-index: 1002 !important;
-        height: 42px !important;
-        min-height: 42px !important;
+        height: 36px !important;
+        min-height: 36px !important;
         margin: 0 0 -0.1rem 0 !important;
         justify-content: flex-end !important;
         pointer-events: none !important;
@@ -279,9 +271,9 @@ button[data-baseweb="tab"] {
         justify-content: center !important;
         gap: 3px !important;
         width: auto !important;
-        min-width: 66px !important;
-        height: 36px !important;
-        padding: 0 9px !important;
+        min-width: 58px !important;
+        height: 32px !important;
+        padding: 0 8px !important;
         border: 1px solid rgba(255,255,255,0.72) !important;
         border-radius: 12px !important;
         background: rgba(255,255,255,0.96) !important;
@@ -291,8 +283,8 @@ button[data-baseweb="tab"] {
     [data-testid="stSidebarCollapseButton"] button::after {
         content: "닫기" !important;
         color: var(--oasis-blue-text) !important;
-        font-size: 12px !important;
-        font-weight: 850 !important;
+        font-size: 11px !important;
+        font-weight: 700 !important;
         line-height: 1 !important;
     }
     [data-testid="stSidebarCollapseButton"] svg {
@@ -332,43 +324,31 @@ button[data-baseweb="tab"] {
         fill: #ffffff !important;
     }
     .sidebar-logo {
-        height: 110px !important;
-        margin: -0.15rem 0 0.25rem 0 !important;
+        height: 70px !important;
+        margin: -0.1rem 0 0.15rem 0 !important;
     }
     [data-testid="stSidebar"] .sidebar-logo img {
-        width: 480px !important;
+        width: 300px !important;
         max-width: none !important;
         left: 50% !important;
         top: 50% !important;
         transform: translate(-50%, -50%) !important;
         margin: 0 !important;
     }
-    .sidebar-brand {
-        margin-bottom: 0.65rem !important;
-    }
-    .sidebar-brand-title {
-        font-size: 21px !important;
-        letter-spacing: -0.4px !important;
-    }
-    .sidebar-brand-sub {
-        font-size: 10px !important;
-        margin-top: 4px !important;
-        letter-spacing: 0.55px !important;
-    }
     .sidebar-user-card {
-        border-radius: 12px !important;
-        padding: 8px 11px !important;
-        margin: 0 0 0.35rem 0 !important;
+        border-radius: 10px !important;
+        padding: 7px 9px !important;
+        margin: 0 0 0.2rem 0 !important;
     }
     .sidebar-user-card .name {
-        font-size: 16px !important;
+        font-size: 14px !important;
     }
     .sidebar-user-card .role {
-        font-size: 12px !important;
+        font-size: 10px !important;
     }
     .sidebar-section-label {
         font-size: 10px !important;
-        margin: 7px 0 5px 3px !important;
+        margin: 4px 0 4px 2px !important;
         letter-spacing: 0.8px !important;
     }
     [data-testid="stSidebar"] [data-testid="stButtonGroup"] {
@@ -380,21 +360,21 @@ button[data-baseweb="tab"] {
         display: grid !important;
         grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
         width: 100% !important;
-        gap: 5px !important;
+        gap: 3px !important;
     }
     [data-testid="stSidebar"] [data-testid="stButtonGroup"]
     [data-variant="pills"] {
         width: 100% !important;
         min-width: 0 !important;
-        min-height: 34px !important;
-        padding: 5px 3px !important;
+        min-height: 30px !important;
+        padding: 4px 2px !important;
         justify-content: center !important;
         border: 1px solid rgba(255,255,255,0.24) !important;
         border-radius: 10px !important;
         background: rgba(255,255,255,0.08) !important;
         color: rgba(255,255,255,0.88) !important;
-        font-size: 11px !important;
-        font-weight: 800 !important;
+        font-size: 10px !important;
+        font-weight: 650 !important;
         white-space: nowrap !important;
     }
     [data-testid="stSidebar"] [data-testid="stButtonGroup"]
@@ -412,10 +392,10 @@ button[data-baseweb="tab"] {
     }
     [data-testid="stSidebar"] div[role="radiogroup"] label {
         width: 100% !important;
-        min-height: 38px !important;
-        margin-bottom: 4px !important;
-        padding: 7px 10px !important;
-        border-radius: 10px !important;
+        min-height: 34px !important;
+        margin-bottom: 3px !important;
+        padding: 6px 9px !important;
+        border-radius: 9px !important;
         box-sizing: border-box !important;
     }
     [data-testid="stSidebar"] [data-testid="stRadio"],
@@ -428,8 +408,9 @@ button[data-baseweb="tab"] {
     }
     [data-testid="stSidebar"] div[role="radiogroup"] label p {
         width: 100% !important;
-        font-size: 14px !important;
-        letter-spacing: -0.25px !important;
+        font-size: 13px !important;
+        font-weight: 650 !important;
+        letter-spacing: -0.15px !important;
         white-space: nowrap !important;
     }
     [data-testid="stSidebar"] div[role="radiogroup"] label:hover {
