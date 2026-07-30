@@ -324,7 +324,11 @@ button[data-baseweb="tab"] {
         fill: #ffffff !important;
     }
     [data-testid="stSidebar"]
-    [data-testid="stMarkdownContainer"]:has(> .sidebar-logo) {
+    [data-testid="stMarkdownContainer"]:has(> .sidebar-logo),
+    [data-testid="stSidebar"]
+    [data-testid="stMarkdownContainer"]:has(> .sidebar-user-card),
+    [data-testid="stSidebar"]
+    [data-testid="stMarkdownContainer"]:has(> .sidebar-section-label) {
         margin-bottom: 0 !important;
     }
     .sidebar-logo {
@@ -348,7 +352,7 @@ button[data-baseweb="tab"] {
         clear: both !important;
         border-radius: 10px !important;
         padding: 7px 9px !important;
-        margin: 0 0 0.45rem 0 !important;
+        margin: 0 !important;
     }
     .sidebar-user-card .name {
         font-size: 14px !important;
@@ -361,7 +365,7 @@ button[data-baseweb="tab"] {
         clear: both !important;
         font-size: 10px !important;
         line-height: 1.2 !important;
-        margin: 0.3rem 0 0.25rem 2px !important;
+        margin: 0 0 0 2px !important;
         letter-spacing: 0.8px !important;
     }
     [data-testid="stSidebar"] [data-testid="stButtonGroup"] {
