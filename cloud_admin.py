@@ -25,7 +25,6 @@ def render_cloud_database_page(
     if not is_admin(current_user_id):
         st.error("관리자 권한이 필요합니다.")
         return
-    st.markdown("## 클라우드 DB 관리")
     st.caption(
         "기존 고객DB와 JSON 파일을 삭제하거나 수정하지 않고 "
         "Supabase에 복사하는 v4.0 1단계 화면입니다."

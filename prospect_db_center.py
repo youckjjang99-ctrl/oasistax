@@ -1881,7 +1881,6 @@ def render_prospect_db_center(
     can_view_mobile: bool = False,
     is_admin_user: bool = False,
 ) -> None:
-    st.markdown("## DB발굴")
     st.caption(
         "행안부 자료는 사용하지 않습니다. 국민연금 월별 자료와 "
         "근로복지공단 연간 자료에서 고용증가기업 또는 신규개업 "
@@ -2622,7 +2621,7 @@ def render_prospect_admin_settings(current_user_id: str = "") -> None:
     if not is_admin(current_user_id):
         st.error("관리자 권한이 필요합니다.")
         return
-    st.markdown("## 영업후보 데이터 연결 관리")
+    st.markdown("## 데이터 연결 관리")
     st.caption(
         "국민연금·카카오·네이버·인허가 API와 Supabase 테이블을 "
         "관리자가 점검하는 화면입니다."

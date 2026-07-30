@@ -274,14 +274,13 @@ def _render_enterprise_dashboard_styles() -> None:
     st.markdown(
         """
         <style>
-        .block-container {padding-top: 1.4rem; max-width: 1320px;}
         .oasis-hero {
             padding: 24px 28px; border: 1px solid #e7edf7; border-radius: 22px;
             background: radial-gradient(circle at 88% 14%, rgba(99,102,241,.13), transparent 34%),
                         linear-gradient(135deg, #ffffff 0%, #f6f9ff 100%);
             box-shadow: 0 12px 34px rgba(31,64,124,.08); margin: 8px 0 18px;
         }
-        .oasis-title {color:#172033; font-size:1.72rem; font-weight:850; letter-spacing:-.03em;}
+        .oasis-title {color:#172033; font-size:1.72rem; font-weight:800; letter-spacing:-.03em;}
         .oasis-meta {color:#6b768c; font-size:.93rem; margin-top:8px;}
         .oasis-metric-grid {
             display:grid; grid-template-columns:repeat(4,minmax(0,1fr));
@@ -297,10 +296,10 @@ def _render_enterprise_dashboard_styles() -> None:
         .oasis-metric-card.sales {background:linear-gradient(145deg,#f4fff9,#edf9f3); border-color:#ceeadd;}
         .oasis-metric-card.profit {background:linear-gradient(145deg,#fff9f2,#fff4e8); border-color:#f3ddc1;}
         .oasis-metric-label {color:#69758c; font-size:.86rem; font-weight:700; margin-bottom:15px;}
-        .oasis-metric-value {color:#182338; font-size:1.56rem; font-weight:850; line-height:1.15;}
+        .oasis-metric-value {color:#182338; font-size:1.56rem; font-weight:800; line-height:1.15;}
         .oasis-badge {
             display:inline-block; margin-top:11px; padding:5px 10px; border-radius:999px;
-            color:#3568c8; background:rgba(76,132,237,.11); font-size:.78rem; font-weight:750;
+            color:#3568c8; background:rgba(76,132,237,.11); font-size:.78rem; font-weight:700;
         }
         .oasis-section-card {
             height:100%; min-height:245px; padding:20px 22px; border:1px solid #e4eaf3;
@@ -309,7 +308,7 @@ def _render_enterprise_dashboard_styles() -> None:
         .oasis-section-card.blue {background:linear-gradient(145deg,#fff,#f5f9ff); border-color:#d7e4fb;}
         .oasis-section-card.amber {background:linear-gradient(145deg,#fffefa,#fff9ef); border-color:#f0dfbf;}
         .oasis-section-card.violet {background:linear-gradient(145deg,#fff,#f9f7ff); border-color:#e2dcfb;}
-        .oasis-section-title {color:#1f2c43; font-size:1.13rem; font-weight:850; margin-bottom:14px;}
+        .oasis-section-title {color:#1f2c43; font-size:1.13rem; font-weight:800; margin-bottom:14px;}
         .oasis-item {position:relative; padding:8px 0 8px 22px; color:#344158; line-height:1.5;}
         .oasis-item:before {content:"✓"; position:absolute; left:0; top:8px; color:#3478e5; font-weight:900;}
         .oasis-question-card {
@@ -321,11 +320,20 @@ def _render_enterprise_dashboard_styles() -> None:
         .oasis-question-number {
             min-width:25px; height:25px; border-radius:8px; display:inline-flex;
             align-items:center; justify-content:center; background:#eaf2ff;
-            color:#2867cf; font-size:.82rem; font-weight:850;
+            color:#2867cf; font-size:.82rem; font-weight:800;
         }
-        div[data-baseweb="tab-list"] {gap:10px; border-bottom:1px solid #e6ebf3;}
-        button[data-baseweb="tab"] {padding:10px 12px 12px; font-weight:750;}
         @media (max-width:900px) {.oasis-metric-grid {grid-template-columns:repeat(2,minmax(0,1fr));}}
+        @media (max-width:520px) {
+            .oasis-hero {padding:18px; border-radius:16px; margin-top:0;}
+            .oasis-title {font-size:1.42rem;}
+            .oasis-meta {font-size:.84rem; line-height:1.65;}
+            .oasis-metric-grid {gap:9px;}
+            .oasis-metric-card {min-height:112px; padding:14px;}
+            .oasis-metric-label {margin-bottom:9px;}
+            .oasis-metric-value {font-size:1.2rem;}
+            .oasis-section-card,
+            .oasis-question-card {min-height:0; padding:16px;}
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -386,7 +394,6 @@ def render_enterprise_management_center(
     user_id: str,
     user_name: str = "",
 ) -> None:
-    st.markdown("## 기업 컨설팅")
     st.caption(
         "고객 한 곳을 선택해 기업정보·CRM·정책자금 설정·주가평가·"
         "기업 히스토리를 한 화면에서 관리합니다."
@@ -407,12 +414,9 @@ def render_enterprise_management_center(
         <style>
         .enterprise-selector-title {
             font-size: 1.28rem;
-            font-weight: 850;
+            font-weight: 800;
             color: #182235;
             margin: 0.2rem 0 0.25rem 0;
-        }
-        div[data-testid="stButton"] button[kind="secondary"] {
-            min-height: 40px;
         }
         </style>
         """,
@@ -457,17 +461,18 @@ def render_enterprise_management_center(
         )
     selected_row = customers.loc[row_map[selected_label]]
     with delete_col:
-        if st.button(
-            "기업 삭제",
-            help="선택한 기업을 휴지통으로 이동합니다.",
-            key=f"enterprise_delete_x_v720_{selected_label}",
-            use_container_width=True,
-        ):
-            confirm_delete_dialog(
-                user_id=user_id,
-                user_name=user_name,
-                selected_row=selected_row,
-            )
+        with st.container(key="enterprise_delete_action"):
+            if st.button(
+                "기업 삭제",
+                help="선택한 기업을 휴지통으로 이동합니다.",
+                key=f"enterprise_delete_x_v720_{selected_label}",
+                use_container_width=True,
+            ):
+                confirm_delete_dialog(
+                    user_id=user_id,
+                    user_name=user_name,
+                    selected_row=selected_row,
+                )
 
     company_name = _clean(selected_row.get("업체명", ""))
     business_no = _normalize_business_no(
@@ -482,6 +487,7 @@ def render_enterprise_management_center(
     st.session_state["_oasis_active_company_name"] = company_name
 
     customer_key = make_customer_key(company_name, business_no)
+    crm_widget_suffix = f"{user_id}:{customer_key}"
 
     integration = reconcile_enterprise_consulting_context(
         user_id=user_id,
@@ -782,7 +788,7 @@ def render_enterprise_management_center(
                     "고객 상태",
                     STATUS_OPTIONS,
                     index=status_index,
-                    key="enterprise_status",
+                    key=f"enterprise_status:{crm_widget_suffix}",
                 )
             with c2:
                 current_stage = crm_profile.get(
@@ -798,7 +804,7 @@ def render_enterprise_management_center(
                     "상담 진행단계",
                     PIPELINE_OPTIONS,
                     index=stage_index,
-                    key="enterprise_pipeline",
+                    key=f"enterprise_pipeline:{crm_widget_suffix}",
                 )
             with c3:
                 current_priority = str(
@@ -814,7 +820,7 @@ def render_enterprise_management_center(
                     PRIORITY_OPTIONS,
                     index=priority_index,
                     format_func=lambda value: "★" * int(value),
-                    key="enterprise_priority",
+                    key=f"enterprise_priority:{crm_widget_suffix}",
                 )
 
             d1, d2, d3 = st.columns(3)
@@ -832,7 +838,7 @@ def render_enterprise_management_center(
                     "다음 액션",
                     ACTION_OPTIONS,
                     index=action_index,
-                    key="enterprise_action",
+                    key=f"enterprise_action:{crm_widget_suffix}",
                 )
             with d2:
                 current_date = _clean(
@@ -851,7 +857,7 @@ def render_enterprise_management_center(
                 next_date_value = st.date_input(
                     "다음 예정일",
                     value=default_date,
-                    key="enterprise_next_date",
+                    key=f"enterprise_next_date:{crm_widget_suffix}",
                 )
             with d3:
                 assigned_manager = st.text_input(
@@ -861,21 +867,21 @@ def render_enterprise_management_center(
                         or user_name
                         or ""
                     ),
-                    key="enterprise_manager",
+                    key=f"enterprise_manager:{crm_widget_suffix}",
                 )
 
             memo = st.text_area(
                 "상담 메모",
                 value=_clean(crm_record.get("memo", "")),
                 height=150,
-                key="enterprise_memo",
+                key=f"enterprise_memo:{crm_widget_suffix}",
             )
 
             if st.button(
                 "CRM 저장",
                 type="primary",
                 use_container_width=True,
-                key="enterprise_save_crm",
+                key=f"enterprise_save_crm:{crm_widget_suffix}",
             ):
                 profile = save_crm_profile(
                     user_id,
