@@ -288,7 +288,13 @@ class ClaimBusinessAutofillFlowTests(unittest.TestCase):
                 VALID_BUSINESS_NUMBER,
             )
             self.assertEqual(job["status"], "queued")
-            self.assertEqual(job["summary"], {})
+            self.assertEqual(
+                job["summary"],
+                {
+                    "ready": 0,
+                    "target": 0,
+                },
+            )
 
             safe_job_view = {
                 key: value
@@ -303,7 +309,7 @@ class ClaimBusinessAutofillFlowTests(unittest.TestCase):
             with _CLAIM_JOB_LOCK:
                 _CLAIM_JOBS.pop(case_id, None)
 
-    def test_missing_or_invalid_hometax_business_skips_comwel_with_safe_error(
+    def test_missing_business_collects_remuneration_and_blocks_dependent_docs(
         self,
     ):
         repository = _repository()
@@ -330,7 +336,7 @@ class ClaimBusinessAutofillFlowTests(unittest.TestCase):
 
         self.assertTrue(summary["business_number_missing"])
         self.assertFalse(summary["business_selection_required"])
-        self.assertEqual(summary["business_blocked_count"], 2)
+        self.assertEqual(summary["business_blocked_count"], 1)
         self.assertTrue(
             any(
                 error.get("safe_error_code")
@@ -339,7 +345,7 @@ class ClaimBusinessAutofillFlowTests(unittest.TestCase):
             )
         )
         client.collect_comwel_management_numbers.assert_not_called()
-        client.collect_comwel_total_remuneration.assert_not_called()
+        client.collect_comwel_total_remuneration.assert_called_once()
         client.collect_comwel_workplace_rate.assert_not_called()
 
     def test_business_choice_mask_distinguishes_same_prefix_numbers(self):

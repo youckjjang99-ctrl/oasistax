@@ -4,6 +4,22 @@ from dataclasses import dataclass
 from datetime import date
 
 
+AUTOMATIC_COLLECTION_CODES = frozenset(
+    {
+        "hometax_business_registration_list",
+        "hometax_business_registration_certificate",
+        "hometax_tax_payment_certificate",
+        "comwel_total_remuneration",
+        "comwel_management_number_list",
+        "comwel_workplace_rate",
+    }
+)
+
+
+def automatic_collection_supported(document_code: str) -> bool:
+    return str(document_code or "").strip() in AUTOMATIC_COLLECTION_CODES
+
+
 @dataclass(frozen=True)
 class ClaimDocumentSpec:
     code: str
@@ -33,11 +49,11 @@ DOCUMENT_SPECS: tuple[ClaimDocumentSpec, ...] = (
     ),
     ClaimDocumentSpec(
         code="hometax_business_registration_list",
-        name="사업장등록번호명세서",
+        name="홈택스 사업자정보 조회",
         source="홈택스",
         period="현재",
         endpoint_hint="MyBizInfo",
-        description="홈택스에 연결된 사업장 등록번호 목록",
+        description="홈택스 응답에서 확인한 사업자정보의 마스킹 조회본",
     ),
     ClaimDocumentSpec(
         code="comwel_management_number_list",
@@ -123,7 +139,14 @@ def document_plan(reference_year: int | None = None) -> list[dict[str, object]]:
                         "document_name": spec.name,
                         "source": spec.source,
                         "period_year": year,
-                        "status": "인증 대기",
+                        "status": (
+                            "인증 대기"
+                            if automatic_collection_supported(spec.code)
+                            else "연동 예정"
+                        ),
+                        "automatic_collection": automatic_collection_supported(
+                            spec.code
+                        ),
                     }
                 )
         else:
@@ -133,7 +156,14 @@ def document_plan(reference_year: int | None = None) -> list[dict[str, object]]:
                     "document_name": spec.name,
                     "source": spec.source,
                     "period_year": None,
-                    "status": "인증 대기",
+                    "status": (
+                        "인증 대기"
+                        if automatic_collection_supported(spec.code)
+                        else "연동 예정"
+                    ),
+                    "automatic_collection": automatic_collection_supported(
+                        spec.code
+                    ),
                 }
             )
     return rows

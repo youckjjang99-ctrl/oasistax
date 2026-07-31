@@ -15,7 +15,11 @@ import pandas as pd
 import streamlit as st
 from cryptography.fernet import Fernet, InvalidToken
 
-from claim_correction_catalog import DOCUMENT_SPECS
+from claim_correction_catalog import (
+    AUTOMATIC_COLLECTION_CODES,
+    DOCUMENT_SPECS,
+    automatic_collection_supported,
+)
 from claim_correction_repository import (
     CLAIM_DOWNLOAD_EXTENSION_BY_CONTENT_TYPE,
     CLAIM_DOWNLOAD_URL_TTL_SECONDS,
@@ -78,7 +82,7 @@ STATUS_LABELS = {
     "certificate_required": "공동인증서 대기",
     "collection_queued": "자료수집 대기",
     "auth_complete_collection_pending": "인증 완료 · 일부 자료 재수집 필요",
-    "integration_required": "현재 자동수집 미지원",
+    "integration_required": "자동수집 연동 예정",
     "collecting": "자료수집 중",
     "collected": "수집 완료",
     "ready": "결과 확인 가능",
@@ -101,6 +105,9 @@ def _claim_document_is_downloadable(
     *,
     now: datetime | None = None,
 ) -> bool:
+    facts = document.get("facts")
+    if isinstance(facts, dict) and facts.get("no_data") is True:
+        return False
     if (
         str(document.get("status", "") or "").strip().lower() != "ready"
         or not _clean(document.get("storage_path"))
@@ -209,6 +216,84 @@ def _source_status(value: Any) -> str:
     return STATUS_LABELS.get(key, key or "-")
 
 
+def _claim_result_document_status(
+    document: dict[str, Any],
+    selected_case: dict[str, Any],
+    *,
+    multiple_management_numbers: bool = False,
+    no_management_workplaces: bool = False,
+) -> str:
+    document_code = str(document.get("document_code", ""))
+    status = str(document.get("status", ""))
+    facts = document.get("facts")
+    document_safe_error_code = (
+        str(facts.get("safe_error_code", ""))
+        if isinstance(facts, dict)
+        else ""
+    )
+    case_safe_error_code = str(
+        selected_case.get("last_safe_error_code", "")
+    )
+    business_dependent_codes = {
+        "hometax_business_registration_certificate",
+        "comwel_management_number_list",
+        "comwel_workplace_rate",
+    }
+
+    if isinstance(facts, dict) and facts.get("no_data") is True:
+        return "조회된 신고내역 없음"
+    if (
+        document_code == "comwel_workplace_rate"
+        and no_management_workplaces
+    ):
+        return "조회된 가입 사업장 없음"
+    if (
+        document_code == "comwel_worker_status"
+        and status == "integration_required"
+    ):
+        return "공동인증서 필요"
+    if (
+        document_code == "comwel_workplace_rate"
+        and status == "integration_required"
+        and multiple_management_numbers
+    ):
+        return "사업장 선택 필요"
+    if (
+        document_code in business_dependent_codes
+        and (
+            document_safe_error_code == "BUSINESS_NUMBER_NOT_FOUND"
+            or (
+                status in {"auth_pending", "integration_required"}
+                and case_safe_error_code == "BUSINESS_NUMBER_NOT_FOUND"
+            )
+        )
+    ):
+        return "홈택스 사업자번호 확인 필요"
+    if (
+        document_code == "hometax_business_registration_list"
+        and status == "ready"
+        and str(
+            (facts or {}).get("record_count", "")
+            if isinstance(facts, dict)
+            else ""
+        )
+        == "0"
+        and case_safe_error_code == "BUSINESS_NUMBER_NOT_FOUND"
+    ):
+        return "사업자번호 미확인"
+    if (
+        status == "integration_required"
+        and automatic_collection_supported(document_code)
+    ):
+        return "재수집 필요"
+    if (
+        status == "auth_pending"
+        and not automatic_collection_supported(document_code)
+    ):
+        return _source_status("integration_required")
+    return _source_status(status)
+
+
 def _resolve_auth_progress(
     expected_sources: list[str],
     source_statuses: dict[str, Any],
@@ -232,22 +317,216 @@ def _resolve_auth_progress(
     return overall_status, all_completed, any_failed
 
 
-def _claim_progress(case: dict[str, Any]) -> tuple[int, str]:
+CLAIM_AUTH_STAGE_MESSAGES = (
+    "국세청 홈택스 인증요청을 보냈습니다.",
+    "홈택스 인증이 완료되어 근로복지공단 인증을 발송했습니다.",
+    "최종 인증이 모두 완료되었습니다.",
+    "자료를 수집하겠습니다.",
+)
+
+
+def _claim_auth_stage(case: dict[str, Any]) -> tuple[int, str]:
     overall_status = str(case.get("overall_status", "") or "").strip()
     hometax_status = str(case.get("hometax_status", "") or "").strip()
     comwel_status = str(case.get("comwel_status", "") or "").strip()
 
-    if overall_status in {"ready", "collected"}:
-        return 100, "100% · 현재 연결된 서류 수집 완료"
-    if overall_status == "collecting":
-        return 75, "75% · 두 기관 인증 완료 · 자료를 수집하고 있습니다."
-    if hometax_status == "auth_complete" and comwel_status == "auth_complete":
-        return 75, "75% · 두 기관 인증 완료 · 자료수집을 시작할 수 있습니다."
-    if hometax_status == "auth_complete":
-        return 50, "50% · 홈택스 완료 · 근로복지공단 인증 대기"
-    if hometax_status in {"auth_requested", "auth_pending"}:
-        return 25, "25% · 홈택스 인증 요청 발송 · 고객 승인 대기"
-    return 0, "0% · 고객정보 확인 및 홈택스 인증 요청 준비"
+    both_complete = (
+        hometax_status == "auth_complete"
+        and comwel_status == "auth_complete"
+    )
+    if hometax_status == "failed":
+        return 1, "국세청 홈택스 인증을 완료하지 못했습니다."
+    if hometax_status == "auth_complete" and comwel_status == "failed":
+        return 2, "근로복지공단 인증을 완료하지 못했습니다."
+    if both_complete and overall_status in {
+        "auth_complete_collection_pending",
+        "collecting",
+        "collected",
+        "ready",
+    }:
+        return 4, CLAIM_AUTH_STAGE_MESSAGES[3]
+    if both_complete:
+        return 3, CLAIM_AUTH_STAGE_MESSAGES[2]
+    if (
+        hometax_status == "auth_complete"
+        and comwel_status in {
+            "request_ready",
+            "auth_requested",
+            "auth_pending",
+            "auth_complete",
+        }
+    ):
+        return 2, CLAIM_AUTH_STAGE_MESSAGES[1]
+    if hometax_status in {
+        "auth_requested",
+        "auth_pending",
+        "auth_complete",
+        "failed",
+    }:
+        return 1, CLAIM_AUTH_STAGE_MESSAGES[0]
+    return 0, "국세청 홈택스 인증요청을 준비하고 있습니다."
+
+
+def _claim_collection_progress(
+    documents: list[dict[str, Any]],
+) -> tuple[int, str, int, int]:
+    management_document = next(
+        (
+            document
+            for document in documents
+            if str(document.get("document_code", "")).strip()
+            == "comwel_management_number_list"
+            and str(document.get("status", "")).strip().lower() == "ready"
+        ),
+        {},
+    )
+    management_facts = (
+        management_document.get("facts")
+        if isinstance(management_document, dict)
+        else {}
+    )
+    no_management_workplaces = bool(
+        isinstance(management_facts, dict)
+        and (
+            str(management_facts.get("record_count", "")) == "0"
+            or management_facts.get("management_numbers") == []
+        )
+    )
+    targets = [
+        document
+        for document in documents
+        if automatic_collection_supported(
+            str(document.get("document_code", "")).strip()
+        )
+        and not (
+            no_management_workplaces
+            and str(document.get("document_code", "")).strip()
+            == "comwel_workplace_rate"
+        )
+    ]
+    target_count = len(targets)
+    ready_count = sum(
+        1
+        for document in targets
+        if str(document.get("status", "")).strip().lower() == "ready"
+    )
+    if target_count:
+        calculated = round((ready_count / target_count) * 100)
+        percentage = (
+            100
+            if ready_count >= target_count
+            else min(99, calculated)
+        )
+    else:
+        percentage = 0
+    return (
+        percentage,
+        (
+            f"{percentage}% · 자동수집 대상 {target_count}건 중 "
+            f"{ready_count}건 수집 완료"
+            if target_count
+            else "0% · 수집할 자동연동 자료를 확인하고 있습니다."
+        ),
+        ready_count,
+        target_count,
+    )
+
+
+def _claim_collection_progress_from_repository(
+    repository: Any,
+    case_id: str,
+) -> tuple[int, str, int, int, bool]:
+    try:
+        documents = repository.list_documents(case_id)
+        if isinstance(documents, list):
+            percentage, text, ready_count, target_count = (
+                _claim_collection_progress(documents)
+            )
+            return (
+                percentage,
+                text,
+                ready_count,
+                target_count,
+                True,
+            )
+    except Exception:
+        # 진행률 조회 실패가 실제 서류 수집을 중단시키면 안 된다.
+        pass
+    return (
+        0,
+        "0% · Supabase의 실제 수집 자료를 확인하고 있습니다.",
+        0,
+        0,
+        False,
+    )
+
+
+def _claim_progress(
+    case: dict[str, Any],
+    documents: list[dict[str, Any]] | None = None,
+) -> tuple[int, str]:
+    if documents is not None:
+        percentage, text, _, _ = _claim_collection_progress(documents)
+        return percentage, text
+    return 0, "0% · 실제 수집 자료를 확인한 뒤 진행률을 표시합니다."
+
+
+def _render_claim_auth_stage(case: dict[str, Any]) -> None:
+    stage, _ = _claim_auth_stage(case)
+    overall_status = str(case.get("overall_status", "") or "").strip()
+    hometax_status = str(case.get("hometax_status", "") or "").strip()
+    comwel_status = str(case.get("comwel_status", "") or "").strip()
+    failed_stage = (
+        1
+        if hometax_status == "failed"
+        else 2
+        if hometax_status == "auth_complete" and comwel_status == "failed"
+        else 0
+    )
+    collection_finished = overall_status in {"ready", "collected"}
+    rows: list[str] = []
+    for index, message in enumerate(CLAIM_AUTH_STAGE_MESSAGES, start=1):
+        if index == failed_stage:
+            state = "실패"
+            background = "#fff1f1"
+            border = "#f2b8b8"
+            color = "#b42318"
+        elif index < stage or (
+            index == 4 and stage == 4 and collection_finished
+        ):
+            state = "완료"
+            background = "#eef8f2"
+            border = "#b9e2c8"
+            color = "#18733d"
+        elif index == stage:
+            state = "진행"
+            background = "#eef5ff"
+            border = "#b9d3ff"
+            color = "#155dcc"
+        else:
+            state = "대기"
+            background = "#f7f8fa"
+            border = "#e1e5eb"
+            color = "#758096"
+        rows.append(
+            (
+                f'<div style="display:flex;align-items:center;gap:.7rem;'
+                f'padding:.62rem .75rem;border:1px solid {border};'
+                f'border-radius:10px;background:{background};">'
+                f'<span style="font-weight:800;color:{color};'
+                f'min-width:1.8rem;">{index:02d}</span>'
+                f'<span style="flex:1;color:#17335f;">'
+                f'{html.escape(message)}</span>'
+                f'<span style="font-size:.78rem;font-weight:700;'
+                f'color:{color};">{state}</span></div>'
+            )
+        )
+    st.markdown(
+        '<div style="display:grid;gap:.45rem;margin:.2rem 0 1rem;">'
+        + "".join(rows)
+        + "</div>",
+        unsafe_allow_html=True,
+    )
 
 
 def _next_auth_action(
@@ -438,8 +717,11 @@ def _discover_hometax_business_number(
     errors: list[dict[str, str]] = []
     ready_count = 1 if existing_ready else 0
     failed_count = 0
+    discovery_already_attempted = bool(
+        transient.get("hometax_business_discovery_attempted")
+    )
 
-    if not candidates:
+    if not candidates and not discovery_already_attempted:
         if on_progress:
             on_progress(0, 1, "hometax_business_registration_list")
         try:
@@ -468,6 +750,10 @@ def _discover_hometax_business_number(
                     document=discovery.document,
                 )
                 ready_count = 1
+            # An empty successful response is also cached for the lifetime of
+            # this authenticated job. Otherwise every retry would purchase the
+            # same MyBizInfo lookup again.
+            transient["hometax_business_discovery_attempted"] = True
         except (ClaimProviderError, ClaimRepositoryError) as exc:
             if isinstance(exc, ClaimProviderError) and (
                 _is_transient_auth_error(exc)
@@ -548,6 +834,8 @@ def _collect_supported_hometax_documents(
     cellphone: str,
     business_number: str,
     session: dict[str, str],
+    force_tax_number_discovery: bool = False,
+    known_ready_codes: set[str] | None = None,
     on_progress: Any | None = None,
     should_continue: Any | None = None,
 ) -> dict[str, Any]:
@@ -607,10 +895,22 @@ def _collect_supported_hometax_documents(
     completed_count = 0
     failed_count = 0
     errors: list[dict[str, str]] = []
+    transient_business_numbers: list[str] = []
+    ready_codes = set(known_ready_codes or set())
+    tax_number_discovery_attempted = False
     target_count = len(jobs)
     for document_code, collector in jobs:
-        if existing.get(document_code) == "ready":
+        preexisting_ready = bool(
+            document_code in ready_codes
+            or existing.get(document_code) == "ready"
+        )
+        force_refresh = bool(
+            force_tax_number_discovery
+            and document_code == "hometax_tax_payment_certificate"
+        )
+        if preexisting_ready and not force_refresh:
             completed_count += 1
+            ready_codes.add(document_code)
             if on_progress:
                 on_progress(completed_count, target_count, document_code)
             continue
@@ -624,11 +924,28 @@ def _collect_supported_hometax_documents(
             _ensure_claim_operation_active(should_continue)
             collected = collector()
             _ensure_claim_operation_active(should_continue)
-            repository.store_collected_document(
-                case_id,
-                document_code=document_code,
-                document=collected,
-            )
+            if document_code == "hometax_tax_payment_certificate":
+                business_numbers = collected.transient_facts.get(
+                    "business_numbers"
+                )
+                if isinstance(business_numbers, list):
+                    for candidate in business_numbers:
+                        digits = _digits(candidate)
+                        if (
+                            _is_valid_business_no(digits)
+                            and digits not in transient_business_numbers
+                        ):
+                            transient_business_numbers.append(digits)
+                tax_number_discovery_attempted = True
+            # A forced number-only refresh must never overwrite a previously
+            # downloadable certificate. It is used only for transient facts.
+            if not (force_refresh and preexisting_ready):
+                repository.store_collected_document(
+                    case_id,
+                    document_code=document_code,
+                    document=collected,
+                )
+            ready_codes.add(document_code)
             completed_count += 1
         except (ClaimProviderError, ClaimRepositoryError) as exc:
             if isinstance(exc, ClaimProviderError):
@@ -637,7 +954,6 @@ def _collect_supported_hometax_documents(
                     or _provider_error_code(exc) == "AUTH_SESSION_EXPIRED"
                 ):
                     raise
-            failed_count += 1
             safe_error_code = _safe_provider_error_code(exc)
             errors.append(
                 {
@@ -646,14 +962,21 @@ def _collect_supported_hometax_documents(
                     "message": str(exc)[:240],
                 }
             )
-            try:
-                repository.fail_document(
-                    case_id,
-                    document_code=document_code,
-                    safe_error_code=safe_error_code,
-                )
-            except ClaimRepositoryError:
-                pass
+            if force_refresh and preexisting_ready:
+                # The refresh failed, but the previously stored document is
+                # still valid and must remain downloadable.
+                completed_count += 1
+                ready_codes.add(document_code)
+            else:
+                failed_count += 1
+                try:
+                    repository.fail_document(
+                        case_id,
+                        document_code=document_code,
+                        safe_error_code=safe_error_code,
+                    )
+                except ClaimRepositoryError:
+                    pass
         if on_progress:
             on_progress(completed_count + failed_count, target_count, document_code)
     return {
@@ -662,6 +985,9 @@ def _collect_supported_hometax_documents(
         "failed": failed_count,
         "skipped": skipped_codes,
         "errors": errors,
+        "business_numbers": transient_business_numbers,
+        "ready_codes": sorted(ready_codes),
+        "tax_number_discovery_attempted": tax_number_discovery_attempted,
     }
 
 
@@ -959,32 +1285,8 @@ def _collect_case_documents(
     if business_number:
         transient["business_number"] = business_number
     discovery_target = int(business_discovery.get("target", 0) or 0)
-    hometax_target = 1 + int(_is_valid_business_no(business_number))
-    comwel_target = sum(
-        1
-        for document in planned_documents
-        if str(document.get("document_code", ""))
-        == "comwel_total_remuneration"
-    )
-    has_management_plan = any(
-        str(document.get("document_code", ""))
-        == "comwel_management_number_list"
-        for document in planned_documents
-    )
     business_valid = _is_valid_business_no(business_number)
-    if business_valid and has_management_plan:
-        comwel_target += 1 + sum(
-            1
-            for document in planned_documents
-            if str(document.get("document_code", ""))
-            == "comwel_workplace_rate"
-        )
-    elif not business_valid:
-        comwel_target = 0
-    planned_target = max(
-        1,
-        discovery_target + hometax_target + comwel_target,
-    )
+    planned_target = estimated_target
 
     def hometax_progress(
         processed: int,
@@ -998,6 +1300,179 @@ def _collect_case_documents(
                 document_code,
             )
 
+    hometax_summary = _collect_supported_hometax_documents(
+        repository,
+        client,
+        case_id=case_id,
+        birth_date=birth_date,
+        representative=representative,
+        cellphone=cellphone,
+        business_number=business_number,
+        session=transient["hometax"],
+        force_tax_number_discovery=bool(
+            not business_valid
+            and not business_discovery.get("candidates")
+            and not transient.get(
+                "hometax_tax_number_discovery_attempted"
+            )
+        ),
+        on_progress=hometax_progress,
+        should_continue=should_continue,
+    )
+    _ensure_claim_operation_active(should_continue)
+    if hometax_summary.get("tax_number_discovery_attempted"):
+        transient["hometax_tax_number_discovery_attempted"] = True
+        transient["hometax_tax_business_numbers"] = list(
+            hometax_summary.get("business_numbers", [])
+        )
+
+    # MyBizInfo가 개인 납세자 정보만 돌려주는 경우에도, 이미 수집하는
+    # 국세납세증명서의 공식 JsonData에서 사업자번호를 메모리 내에서만
+    # 보조 확인합니다. 원문 번호는 문서 facts·감사로그에 저장하지 않습니다.
+    if (
+        not business_valid
+        and not business_discovery.get("candidates")
+    ):
+        fallback_numbers = [
+            _digits(candidate)
+            for candidate in (
+                list(
+                    transient.get("hometax_tax_business_numbers", [])
+                )
+                + list(hometax_summary.get("business_numbers", []))
+            )
+            if _is_valid_business_no(candidate)
+        ]
+        fallback_numbers = list(dict.fromkeys(fallback_numbers))
+        fallback_candidates = [
+            {
+                "business_number": candidate,
+                "business_name": "",
+                "business_status": "",
+            }
+            for candidate in fallback_numbers
+        ]
+        if fallback_candidates:
+            business_discovery["candidates"] = fallback_candidates
+            transient["business_candidates"] = fallback_candidates
+            requested_number = _digits(
+                transient.get("selected_business_number")
+                or transient.get("business_number")
+            )
+            if (
+                _is_valid_business_no(requested_number)
+                and requested_number in fallback_numbers
+            ):
+                business_number = requested_number
+            elif len(fallback_numbers) == 1:
+                business_number = fallback_numbers[0]
+            business_discovery["business_number"] = business_number
+            business_discovery["selection_required"] = bool(
+                len(fallback_numbers) > 1 and not business_number
+            )
+            business_valid = _is_valid_business_no(business_number)
+            if business_valid:
+                transient["business_number"] = business_number
+                # 첫 호출에서 저장한 국세납세증명서는 재사용하고,
+                # 사업자번호가 필요한 사업자등록증명원만 이어서 수집합니다.
+                hometax_summary = _collect_supported_hometax_documents(
+                    repository,
+                    client,
+                    case_id=case_id,
+                    birth_date=birth_date,
+                    representative=representative,
+                    cellphone=cellphone,
+                    business_number=business_number,
+                    session=transient["hometax"],
+                    known_ready_codes=set(
+                        hometax_summary.get("ready_codes", [])
+                    ),
+                    on_progress=hometax_progress,
+                    should_continue=should_continue,
+                )
+                _ensure_claim_operation_active(should_continue)
+
+    business_selection_required = bool(
+        business_discovery.get("selection_required")
+    )
+    business_dependent_documents = [
+        document
+        for document in planned_documents
+        if str(document.get("document_code", ""))
+        in {
+            "hometax_business_registration_certificate",
+            "comwel_management_number_list",
+            "comwel_workplace_rate",
+        }
+        and str(document.get("status", "")) != "ready"
+    ]
+    comwel_business_dependent_documents = [
+        document
+        for document in business_dependent_documents
+        if str(document.get("source", "")) == "comwel"
+    ]
+    business_number_missing = bool(
+        not business_valid
+        and business_dependent_documents
+        and not business_selection_required
+    )
+    business_blocked_count = (
+        len(comwel_business_dependent_documents)
+        if business_number_missing
+        else 0
+    )
+    blocked_status_errors: list[dict[str, str]] = []
+    if business_number_missing:
+        for document in business_dependent_documents:
+            status = str(document.get("status", ""))
+            facts = document.get("facts")
+            safe_error_code = (
+                str(facts.get("safe_error_code", ""))
+                if isinstance(facts, dict)
+                else ""
+            )
+            if (
+                status == "failed"
+                and safe_error_code == "BUSINESS_NUMBER_NOT_FOUND"
+            ):
+                continue
+            # Preserve an earlier provider failure rather than rewriting its
+            # diagnostic. Only pending/planned rows are converted to an
+            # explicit compatible failed status.
+            if status not in {"auth_pending", "integration_required"}:
+                continue
+            try:
+                failure_kwargs: dict[str, Any] = {
+                    "document_code": str(
+                        document.get("document_code", "")
+                    ),
+                    "safe_error_code": "BUSINESS_NUMBER_NOT_FOUND",
+                }
+                if document.get("period_year"):
+                    failure_kwargs["period_year"] = int(
+                        document.get("period_year")
+                    )
+                repository.fail_document(
+                    case_id,
+                    **failure_kwargs,
+                )
+            except ClaimRepositoryError:
+                blocked_status_errors.append(
+                    {
+                        "document_code": str(
+                            document.get("document_code", "")
+                        ),
+                        "safe_error_code": (
+                            "BUSINESS_BLOCK_STATUS_SAVE_FAILED"
+                        ),
+                        "message": (
+                            "사업자번호 필요 상태를 저장하지 못했습니다."
+                        ),
+                    }
+                )
+
+    hometax_target = int(hometax_summary.get("target", 0) or 0)
+
     def comwel_progress(
         processed: int,
         _total: int,
@@ -1010,69 +1485,7 @@ def _collect_case_documents(
                 document_code,
             )
 
-    for source in ("hometax", "comwel"):
-        _ensure_claim_operation_active(should_continue)
-        source_documents = [
-            document
-            for document in planned_documents
-            if str(document.get("source", "")) == source
-        ]
-        if not any(
-            str(document.get("status", "")) == "ready"
-            for document in source_documents
-        ):
-            repository.update_document_status(
-                case_id,
-                source=source,
-                status="integration_required",
-            )
-
-    hometax_summary = _collect_supported_hometax_documents(
-        repository,
-        client,
-        case_id=case_id,
-        birth_date=birth_date,
-        representative=representative,
-        cellphone=cellphone,
-        business_number=business_number,
-        session=transient["hometax"],
-        on_progress=hometax_progress,
-        should_continue=should_continue,
-    )
-    _ensure_claim_operation_active(should_continue)
-    business_selection_required = bool(
-        business_discovery.get("selection_required")
-    )
-    business_number_missing = bool(
-        not business_valid
-        and any(
-            str(document.get("source", "")) == "comwel"
-            and str(document.get("document_code", ""))
-            in {
-                "comwel_total_remuneration",
-                "comwel_management_number_list",
-                "comwel_workplace_rate",
-            }
-            for document in planned_documents
-        )
-        and not business_selection_required
-    )
-    business_blocked_count = (
-        sum(
-            1
-            for document in planned_documents
-            if str(document.get("source", "")) == "comwel"
-            and str(document.get("document_code", ""))
-            in {
-                "comwel_total_remuneration",
-                "comwel_management_number_list",
-                "comwel_workplace_rate",
-            }
-        )
-        if business_number_missing
-        else 0
-    )
-    if business_valid:
+    if not business_selection_required:
         comwel_summary = _collect_supported_comwel_documents(
             repository,
             client,
@@ -1094,7 +1507,7 @@ def _collect_case_documents(
             "ready": 0,
             "failed": 0,
             "skipped": [
-                "comwel_documents:business_number_discovery_required"
+                "comwel_documents:business_number_selection_required"
             ],
             "errors": [],
             "management_numbers": [],
@@ -1115,7 +1528,8 @@ def _collect_case_documents(
         + list(comwel_summary["skipped"]),
         "errors": list(business_discovery.get("errors", []))
         + list(hometax_summary["errors"])
-        + list(comwel_summary["errors"]),
+        + list(comwel_summary["errors"])
+        + blocked_status_errors,
         "sources": {
             "hometax_business_discovery": business_discovery,
             "hometax": hometax_summary,
@@ -1699,12 +2113,34 @@ def _run_background_claim_job(
                 )
 
             def update_collection_progress(
-                processed: int,
-                total: int,
+                _processed: int,
+                _total: int,
                 document_code: str,
             ) -> None:
-                ratio = processed / max(total, 1)
-                percentage = min(99, 75 + round(ratio * 24))
+                with _CLAIM_JOB_LOCK:
+                    current_job = dict(_CLAIM_JOBS.get(case_id) or {})
+                current_summary = dict(current_job.get("summary") or {})
+                (
+                    percentage,
+                    _progress_text,
+                    ready_count,
+                    target_count,
+                    progress_verified,
+                ) = _claim_collection_progress_from_repository(
+                    repository,
+                    case_id,
+                )
+                if (
+                    not progress_verified
+                    and current_summary.get("progress_verified") is True
+                ):
+                    percentage = int(current_job.get("progress", 0) or 0)
+                    ready_count = int(
+                        current_summary.get("ready", 0) or 0
+                    )
+                    target_count = int(
+                        current_summary.get("target", 0) or 0
+                    )
                 _set_claim_expiry(
                     transient,
                     COLLECTION_TTL_SECONDS,
@@ -1722,9 +2158,16 @@ def _run_background_claim_job(
                     progress=percentage,
                     status="running",
                     safe_message=(
-                        f"{_document_label(document_code)} 수집 중 "
-                        f"({processed}/{total}건)"
+                        f"{_document_label(document_code)} 수집 중 · "
+                        f"{ready_count}/{target_count}건 수집 완료"
+                        if target_count
+                        else f"{_document_label(document_code)} 수집 중"
                     ),
+                    summary={
+                        "ready": ready_count,
+                        "target": target_count,
+                        "progress_verified": progress_verified,
+                    },
                 )
                 if not updated:
                     transient.clear()
@@ -1782,7 +2225,7 @@ def _run_background_claim_job(
                         transient.get("expires_at", time.time()) or time.time()
                     ),
                     status="running",
-                    progress=max(25, int(job.get("progress", 25) or 25)),
+                    progress=int(job.get("progress", 0) or 0),
                     safe_message=(
                         "인증정보가 중계 서버에 반영되는 중입니다. "
                         "자동으로 다시 확인합니다."
@@ -1824,7 +2267,17 @@ def _run_background_claim_job(
                 return
             event = str(result.get("event", "") or "")
             updated_case = repository.get_case(case_id) or case
-            percentage, progress_text = _claim_progress(updated_case)
+            (
+                percentage,
+                _progress_text,
+                ready_count,
+                target_count,
+                progress_verified,
+            ) = _claim_collection_progress_from_repository(
+                repository,
+                case_id,
+            )
+            _, auth_stage_message = _claim_auth_stage(updated_case)
 
             if event == "business_selection_required":
                 summary = dict(result.get("summary") or {})
@@ -1870,13 +2323,15 @@ def _run_background_claim_job(
                         or time.time()
                     ),
                     status="awaiting_business_selection",
-                    progress=max(80, percentage),
+                    progress=percentage,
                     safe_message=(
                         "홈택스에서 여러 사업자가 확인됐습니다. "
                         "자료를 수집할 사업자를 선택해 주세요."
                     ),
                     summary={
-                        "ready": int(summary.get("ready", 0) or 0),
+                        "ready": ready_count,
+                        "target": target_count,
+                        "progress_verified": progress_verified,
                         "failed": int(summary.get("failed", 0) or 0),
                         "business_choices": business_choices,
                     },
@@ -1900,13 +2355,15 @@ def _run_background_claim_job(
                         transient.get("expires_at", time.time()) or time.time()
                     ),
                     status="awaiting_management_selection",
-                    progress=max(85, percentage),
+                    progress=percentage,
                     safe_message=(
                         "사업장관리번호를 선택하면 사업장요율 수집을 "
                         "계속합니다."
                     ),
                     summary={
-                        "ready": int(summary.get("ready", 0) or 0),
+                        "ready": ready_count,
+                        "target": target_count,
+                        "progress_verified": progress_verified,
                         "failed": int(summary.get("failed", 0) or 0),
                         "management_numbers": management_numbers,
                     },
@@ -1917,15 +2374,89 @@ def _run_background_claim_job(
                 return
             if event == "collection_complete":
                 summary = dict(result.get("summary") or {})
+                (
+                    percentage,
+                    _progress_text,
+                    ready_count,
+                    target_count,
+                    progress_verified,
+                ) = _claim_collection_progress_from_repository(
+                    repository,
+                    case_id,
+                )
+                if (
+                    not progress_verified
+                    or target_count <= 0
+                    or ready_count != target_count
+                ):
+                    verification_error_code = (
+                        "COLLECTION_PROGRESS_UNVERIFIED"
+                        if not progress_verified
+                        else "COLLECTION_PROGRESS_INCOMPLETE"
+                    )
+                    try:
+                        repository.update_case_status(
+                            case_id,
+                            overall_status=(
+                                "auth_complete_collection_pending"
+                            ),
+                            last_safe_error_code=verification_error_code,
+                        )
+                        repository.append_audit_event(
+                            case_id=case_id,
+                            action="collection_progress_verification",
+                            source="supabase",
+                            outcome="pending",
+                            metadata={
+                                "safe_error_code": (
+                                    verification_error_code
+                                ),
+                                "ready_document_count": ready_count,
+                                "target_document_count": target_count,
+                            },
+                        )
+                    except ClaimRepositoryError:
+                        pass
+                    safe_message = (
+                        "Supabase의 실제 수집 상태를 확인하지 못했습니다. "
+                        "완료로 처리하지 않고 다시 확인합니다."
+                        if not progress_verified
+                        else (
+                            f"자동수집 대상 {target_count}건 중 "
+                            f"{ready_count}건만 확인되어 완료로 처리하지 "
+                            "않았습니다."
+                        )
+                    )
+                    _update_claim_job(
+                        case_id,
+                        owner_ref,
+                        sealed_payload=_seal_claim_job_payload(transient),
+                        expires_at=float(
+                            transient.get("expires_at", time.time())
+                            or time.time()
+                        ),
+                        status="paused",
+                        progress=min(99, percentage),
+                        safe_message=safe_message,
+                        summary={
+                            "ready": ready_count,
+                            "target": target_count,
+                            "progress_verified": progress_verified,
+                            "failed": int(
+                                summary.get("failed", 0) or 0
+                            ),
+                        },
+                    )
+                    return
                 _update_claim_job(
                     case_id,
                     owner_ref,
                     sealed_payload=b"",
                     status="complete",
-                    progress=100,
+                    progress=percentage,
                     safe_message=(
                         f"현재 연결된 서류 "
-                        f"{int(summary.get('ready', 0) or 0)}건 수집 완료"
+                        f"{ready_count}건 수집 완료"
                         + (
                             f", 추가 정보·미지원 "
                             f"{len(summary.get('skipped', []))}건"
@@ -1934,7 +2465,9 @@ def _run_background_claim_job(
                         )
                     ),
                     summary={
-                        "ready": int(summary.get("ready", 0) or 0),
+                        "ready": ready_count,
+                        "target": target_count,
+                        "progress_verified": True,
                         "failed": int(summary.get("failed", 0) or 0),
                         "skipped_count": len(summary.get("skipped", [])),
                     },
@@ -1950,10 +2483,22 @@ def _run_background_claim_job(
                 blocked_count = int(
                     summary.get("business_blocked_count", 0) or 0
                 )
+                (
+                    percentage,
+                    _progress_text,
+                    ready_count,
+                    target_count,
+                    progress_verified,
+                ) = _claim_collection_progress_from_repository(
+                    repository,
+                    case_id,
+                )
+                percentage = min(99, percentage)
                 safe_message = (
-                    "홈택스에서 사업자등록번호를 확인하지 못해 "
-                    f"근로복지공단 서류 {blocked_count}건 수집을 "
-                    "시작하지 못했습니다. 새 인증 요청이 필요합니다."
+                    "홈택스에서 사업자등록번호를 자동 확인하지 못했습니다. "
+                    "사업자번호 없이 조회 가능한 보수총액은 수집을 시도했고, "
+                    f"사업자번호가 필요한 관리번호·요율 {blocked_count}건은 "
+                    "보류했습니다."
                     if business_number_missing
                     else (
                         f"서류 {int(summary.get('ready', 0) or 0)}건 저장, "
@@ -1971,7 +2516,9 @@ def _run_background_claim_job(
                     progress=percentage,
                     safe_message=safe_message,
                     summary={
-                        "ready": int(summary.get("ready", 0) or 0),
+                        "ready": ready_count,
+                        "target": target_count,
+                        "progress_verified": progress_verified,
                         "failed": int(summary.get("failed", 0) or 0),
                         "skipped_count": len(summary.get("skipped", [])),
                         "blocked_count": blocked_count,
@@ -1992,11 +2539,12 @@ def _run_background_claim_job(
                 ),
                 status="running",
                 progress=percentage,
-                safe_message=(
-                    progress_text.split("·", 1)[-1].strip()
-                    if "·" in progress_text
-                    else progress_text
-                ),
+                safe_message=auth_stage_message,
+                summary={
+                    "ready": ready_count,
+                    "target": target_count,
+                    "progress_verified": progress_verified,
+                },
             )
             if not updated:
                 transient.clear()
@@ -2186,9 +2734,12 @@ def _register_background_claim_job(
             "sealed_payload": _seal_claim_job_payload(transient),
             "expires_at": expires_at,
             "status": "queued",
-            "progress": 25,
-            "safe_message": "홈택스 인증 요청 상태를 저장했습니다.",
-            "summary": {},
+            "progress": 0,
+            "safe_message": CLAIM_AUTH_STAGE_MESSAGES[0],
+            "summary": {
+                "ready": 0,
+                "target": 0,
+            },
             "updated_at": time.time(),
             "wake_event": wake_event,
         }
@@ -2216,7 +2767,7 @@ def _activate_background_claim_job(
                 wake_event.set()
             return True
         job["status"] = "running"
-        job["safe_message"] = "홈택스 인증 완료 여부를 자동 확인합니다."
+        job["safe_message"] = CLAIM_AUTH_STAGE_MESSAGES[0]
         job["updated_at"] = time.time()
     _CLAIM_JOB_EXECUTOR.submit(
         _run_background_claim_job,
@@ -2458,10 +3009,10 @@ def _claim_collection_retry_state(
     if not authentication_complete:
         return "hidden"
 
-    overall_status = str(case.get("overall_status", "") or "")
-    if overall_status in {"collected", "ready"}:
-        return "complete"
     if not job_snapshot:
+        overall_status = str(case.get("overall_status", "") or "")
+        if overall_status in {"collected", "ready"}:
+            return "complete"
         return (
             "reauth_required"
             if overall_status
@@ -2474,6 +3025,8 @@ def _claim_collection_retry_state(
         )
 
     job_status = str(job_snapshot.get("status", "") or "")
+    if job_status in {"paused", "collection_partial"}:
+        return "retryable" if provider_ready else "provider_unavailable"
     if job_status in {"running", "queued"}:
         return "running"
     if job_status in {
@@ -2488,8 +3041,6 @@ def _claim_collection_retry_state(
         or float(job_snapshot.get("expires_at", 0) or 0) <= time.time()
     ):
         return "reauth_required"
-    if job_status in {"paused", "collection_partial"}:
-        return "retryable" if provider_ready else "provider_unavailable"
     return "hidden"
 
 
@@ -2604,14 +3155,18 @@ def _select_claim_business_number(
             transient.clear()
             expired_after_unseal = True
         else:
+            previous_summary = dict(job.get("summary") or {})
             job["sealed_payload"] = _seal_claim_job_payload(transient)
             job["expires_at"] = transient["expires_at"]
             job["status"] = "queued"
-            job["progress"] = max(80, int(job.get("progress", 0) or 0))
+            job["progress"] = int(job.get("progress", 0) or 0)
             job["safe_message"] = (
                 "선택한 사업자번호로 근로복지공단 자료수집을 준비합니다."
             )
-            job["summary"] = {}
+            job["summary"] = {
+                "ready": int(previous_summary.get("ready", 0) or 0),
+                "target": int(previous_summary.get("target", 0) or 0),
+            }
             job["updated_at"] = time.time()
     if expired_after_unseal:
         _sync_interrupted_claim_case(
@@ -2669,12 +3224,16 @@ def _select_claim_management_number(
             transient.clear()
             expired_after_unseal = True
         else:
+            previous_summary = dict(job.get("summary") or {})
             job["sealed_payload"] = _seal_claim_job_payload(transient)
             job["expires_at"] = transient["expires_at"]
             job["status"] = "queued"
-            job["progress"] = max(85, int(job.get("progress", 0) or 0))
+            job["progress"] = int(job.get("progress", 0) or 0)
             job["safe_message"] = "선택한 사업장의 요율 수집을 준비합니다."
-            job["summary"] = {}
+            job["summary"] = {
+                "ready": int(previous_summary.get("ready", 0) or 0),
+                "target": int(previous_summary.get("target", 0) or 0),
+            }
             job["updated_at"] = time.time()
     if expired_after_unseal:
         _sync_interrupted_claim_case(
@@ -3300,18 +3859,24 @@ def _render_auto_claim_monitor(
         st.caption("경정청구 요청 건을 찾지 못했습니다.")
         return
 
-    progress_percent, progress_text = _claim_progress(current_case)
-    if job_snapshot:
-        progress_percent = max(
-            progress_percent,
-            int(job_snapshot.get("progress", 0) or 0),
+    st.markdown("#### 인증 진행")
+    _render_claim_auth_stage(current_case)
+    st.markdown("#### 자료수집 진행률")
+    (
+        progress_percent,
+        progress_text,
+        ready_count,
+        target_count,
+        progress_verified,
+    ) = _claim_collection_progress_from_repository(
+        repository,
+        case_id,
+    )
+    st.progress(progress_percent, text=progress_text)
+    if not progress_verified:
+        st.caption(
+            "Supabase의 실제 수집 상태가 확인되면 진행률을 표시합니다."
         )
-        if job_snapshot.get("safe_message"):
-            progress_text = (
-                f"{progress_percent}% · "
-                f"{job_snapshot['safe_message']}"
-            )
-    progress_bar = st.progress(progress_percent, text=progress_text)
 
     if job_snapshot:
         job_status = str(job_snapshot.get("status", "") or "")
@@ -3405,9 +3970,13 @@ def _render_auto_claim_monitor(
                         "새 인증 요청을 시작해 주세요."
                     )
             return
-        if job_status == "complete" or progress_percent == 100:
+        verified_complete = bool(
+            progress_verified
+            and target_count > 0
+            and ready_count == target_count
+        )
+        if job_status == "complete" and verified_complete:
             skipped_count = int(summary.get("skipped_count", 0) or 0)
-            ready_count = int(summary.get("ready", 0) or 0)
             completion_message = (
                 f"현재 연결된 서류 {ready_count}건 수집이 "
                 "완료되었습니다."
@@ -3430,6 +3999,12 @@ def _render_auto_claim_monitor(
                 st.rerun(scope="app")
             st.success(
                 f"{completion_message} ‘수집결과’에서 확인해 주세요."
+            )
+            return
+        if job_status == "complete" and not verified_complete:
+            st.warning(
+                "작업 종료 신호는 받았지만 Supabase의 실제 수집 자료가 "
+                "모두 확인되지 않아 완료로 표시하지 않았습니다."
             )
             return
         if job_status == "expired":
@@ -3479,7 +4054,13 @@ def _render_auto_claim_monitor(
             )
         return
 
-    if progress_percent == 100:
+    if (
+        progress_verified
+        and target_count > 0
+        and ready_count == target_count
+        and str(current_case.get("overall_status", "") or "")
+        in {"ready", "collected"}
+    ):
         if st.session_state.get("_claim_active_case_v1") == case_id:
             st.session_state.pop("_claim_active_case_v1", None)
         st.success(
@@ -3538,9 +4119,31 @@ def _render_status_tab(
             )
         return
 
-    progress_percent, progress_text = _claim_progress(selected_case)
+    st.markdown("#### 인증 진행")
+    _render_claim_auth_stage(selected_case)
+    st.markdown("#### 자료수집 진행률")
+    (
+        progress_percent,
+        progress_text,
+        ready_count,
+        target_count,
+        progress_verified,
+    ) = _claim_collection_progress_from_repository(
+        repository,
+        case_id,
+    )
     st.progress(progress_percent, text=progress_text)
-    if progress_percent == 100:
+    if not progress_verified:
+        st.caption(
+            "Supabase의 실제 수집 상태가 확인되면 진행률을 표시합니다."
+        )
+    if (
+        progress_verified
+        and target_count > 0
+        and ready_count == target_count
+        and str(selected_case.get("overall_status", "") or "")
+        in {"ready", "collected"}
+    ):
         st.success(
             "현재 연결된 서류 수집이 완료되었습니다. "
             "‘수집결과’에서 확인해 주세요."
@@ -3710,6 +4313,15 @@ def _render_results_tab(
         isinstance(management_numbers, list)
         and len(management_numbers) > 1
     )
+    no_management_workplaces = bool(
+        isinstance(management_document, dict)
+        and str(management_document.get("status", "")) == "ready"
+        and isinstance(management_facts, dict)
+        and (
+            str(management_facts.get("record_count", "")) == "0"
+            or management_facts.get("management_numbers") == []
+        )
+    )
     source_filter = st.segmented_control(
         "기관",
         ["전체", "홈택스", "근로복지공단"],
@@ -3733,25 +4345,13 @@ def _render_results_tab(
                 "자료명": _clean(document.get("document_name")),
                 "기관": source_label,
                 "연도": document.get("period_year") or "-",
-                "상태": (
-                    "공동인증서 필요"
-                    if document_code == "comwel_worker_status"
-                    and status == "integration_required"
-                    else "사업장 선택 필요"
-                    if document_code == "comwel_workplace_rate"
-                    and status == "integration_required"
-                    and multiple_management_numbers
-                    else "홈택스 사업자번호 확인 필요"
-                    if document_code
-                    in {
-                        "comwel_management_number_list",
-                        "comwel_workplace_rate",
-                    }
-                    and status == "integration_required"
-                    and not _clean(
-                        selected_case.get("business_no_masked")
-                    )
-                    else _source_status(status)
+                "상태": _claim_result_document_status(
+                    document,
+                    selected_case,
+                    multiple_management_numbers=(
+                        multiple_management_numbers
+                    ),
+                    no_management_workplaces=no_management_workplaces,
                 ),
                 "수집일": _clean(document.get("collected_at"))[:10] or "-",
                 "출력": (
@@ -3897,9 +4497,9 @@ def _render_results_tab(
             "자료수집이 끝나면 이곳에 다운로드 버튼이 표시됩니다."
         )
     st.caption(
-        "홈택스 연결 서류와 근로복지공단 보수총액·사업장관리번호·사업장요율은 "
-        "공식 문서 API로 수집합니다. 근로자고용정보현황은 공식 간편인증 API가 "
-        "없어 공동인증서 수집 기능을 연결한 뒤 활성화됩니다."
+        "현재 자동수집 지원: 홈택스 사업자정보 조회·사업자등록증명원·"
+        "국세납세증명서, 근로복지공단 보수총액·사업장관리번호·사업장요율. "
+        "그 밖의 항목은 결과 오류가 아니라 공급사 API 연동 예정 항목입니다."
     )
 
 
@@ -3909,6 +4509,11 @@ def _render_catalog_tab() -> None:
             "자료명": spec.name,
             "기관": spec.source,
             "기간": spec.period,
+            "자동수집": (
+                "지원"
+                if spec.code in AUTOMATIC_COLLECTION_CODES
+                else "연동 예정"
+            ),
             "설명": spec.description,
         }
         for spec in DOCUMENT_SPECS

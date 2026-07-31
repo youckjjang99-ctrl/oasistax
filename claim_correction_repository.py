@@ -8,7 +8,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from claim_correction_catalog import document_plan
+from claim_correction_catalog import (
+    automatic_collection_supported,
+    document_plan,
+)
 from cloud_db import CloudDatabase, cloud_is_configured
 from tilko_claim_client import CollectedClaimDocument
 
@@ -219,7 +222,13 @@ class ClaimRepository:
                         "document_code": row["document_code"],
                         "document_name": row["document_name"],
                         "period_year": row["period_year"],
-                        "status": "auth_pending",
+                        "status": (
+                            "auth_pending"
+                            if automatic_collection_supported(
+                                str(row["document_code"])
+                            )
+                            else "integration_required"
+                        ),
                         "facts": {},
                         "created_at": now,
                         "updated_at": now,
