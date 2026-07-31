@@ -16,10 +16,14 @@ from cryptography.hazmat.primitives.serialization import (
 
 from claim_correction_catalog import DOCUMENT_SPECS, document_plan, seven_years
 from claim_correction_center import (
+    CLAIM_AUTH_STAGE_MESSAGES,
     _CLAIM_JOBS,
     _CLAIM_JOB_LOCK,
     _advance_personal_case,
     _birth_date_from_identity,
+    _claim_auth_stage,
+    _claim_collection_progress,
+    _claim_collection_progress_from_repository,
     _claim_document_is_downloadable,
     _claim_job_owner_ref,
     _claim_job_can_continue,
@@ -600,41 +604,189 @@ class ClaimCorrectionTests(unittest.TestCase):
         self.assertTrue(all_completed)
         self.assertFalse(any_failed)
 
-    def test_claim_progress_uses_sequential_milestones(self):
-        self.assertEqual(
-            _claim_progress(
+    def test_auth_stages_do_not_increase_collection_progress(self):
+        cases = [
+            (
                 {
                     "hometax_status": "auth_requested",
                     "comwel_status": "request_ready",
                     "overall_status": "auth_pending",
-                }
-            )[0],
-            25,
-        )
-        self.assertEqual(
-            _claim_progress(
+                },
+                1,
+                CLAIM_AUTH_STAGE_MESSAGES[0],
+            ),
+            (
                 {
                     "hometax_status": "auth_complete",
                     "comwel_status": "auth_requested",
                     "overall_status": "auth_pending",
-                }
-            )[0],
-            50,
-        )
-        self.assertEqual(
-            _claim_progress(
+                },
+                2,
+                CLAIM_AUTH_STAGE_MESSAGES[1],
+            ),
+            (
+                {
+                    "hometax_status": "auth_complete",
+                    "comwel_status": "auth_complete",
+                    "overall_status": "auth_pending",
+                },
+                3,
+                CLAIM_AUTH_STAGE_MESSAGES[2],
+            ),
+            (
                 {
                     "hometax_status": "auth_complete",
                     "comwel_status": "auth_complete",
                     "overall_status": "collecting",
-                }
-            )[0],
-            75,
-        )
+                },
+                4,
+                CLAIM_AUTH_STAGE_MESSAGES[3],
+            ),
+            (
+                {
+                    "hometax_status": "failed",
+                    "comwel_status": "request_ready",
+                    "overall_status": "auth_partial",
+                },
+                1,
+                "국세청 홈택스 인증을 완료하지 못했습니다.",
+            ),
+            (
+                {
+                    "hometax_status": "auth_complete",
+                    "comwel_status": "failed",
+                    "overall_status": "auth_partial",
+                },
+                2,
+                "근로복지공단 인증을 완료하지 못했습니다.",
+            ),
+        ]
+        for case, expected_stage, expected_message in cases:
+            with self.subTest(stage=expected_stage):
+                self.assertEqual(
+                    _claim_auth_stage(case),
+                    (expected_stage, expected_message),
+                )
+                self.assertEqual(_claim_progress(case)[0], 0)
+
         self.assertEqual(
             _claim_progress({"overall_status": "ready"})[0],
-            100,
+            0,
         )
+
+    def test_collection_progress_counts_only_ready_supported_documents(self):
+        documents = [
+            {
+                "document_code": "hometax_business_registration_list",
+                "status": "ready",
+                "facts": {"no_data": True, "record_count": 0},
+            },
+            {
+                "document_code": "hometax_tax_payment_certificate",
+                "status": "ready",
+                "facts": {},
+            },
+            {
+                "document_code": "hometax_business_registration_certificate",
+                "status": "failed",
+                "facts": {"safe_error_code": "PROVIDER_ERROR"},
+            },
+            {
+                "document_code": "comwel_total_remuneration",
+                "period_year": 2025,
+                "status": "auth_pending",
+                "facts": {},
+            },
+            {
+                "document_code": "hometax_income_tax_return",
+                "period_year": 2025,
+                "status": "ready",
+                "facts": {},
+            },
+        ]
+
+        percentage, text, ready_count, target_count = (
+            _claim_collection_progress(documents)
+        )
+
+        self.assertEqual(target_count, 4)
+        self.assertEqual(ready_count, 2)
+        self.assertEqual(percentage, 50)
+        self.assertIn("4건 중 2건", text)
+
+    def test_collection_progress_excludes_rates_when_no_workplace_exists(self):
+        documents = [
+            {
+                "document_code": "comwel_management_number_list",
+                "status": "ready",
+                "facts": {
+                    "record_count": 0,
+                    "management_numbers": [],
+                    "no_data": True,
+                },
+            },
+            {
+                "document_code": "comwel_total_remuneration",
+                "period_year": 2025,
+                "status": "ready",
+                "facts": {"no_data": True},
+            },
+            {
+                "document_code": "comwel_workplace_rate",
+                "period_year": 2025,
+                "status": "auth_pending",
+                "facts": {},
+            },
+            {
+                "document_code": "comwel_workplace_rate",
+                "period_year": 2024,
+                "status": "failed",
+                "facts": {"safe_error_code": "NO_WORKPLACE"},
+            },
+        ]
+
+        percentage, _, ready_count, target_count = (
+            _claim_collection_progress(documents)
+        )
+
+        self.assertEqual(target_count, 2)
+        self.assertEqual(ready_count, 2)
+        self.assertEqual(percentage, 100)
+
+    def test_collection_progress_caps_incomplete_ratio_at_ninety_nine(self):
+        documents = [
+            {
+                "document_code": "comwel_total_remuneration",
+                "period_year": 1800 + index,
+                "status": "ready" if index < 199 else "failed",
+                "facts": {},
+            }
+            for index in range(200)
+        ]
+
+        percentage, _, ready_count, target_count = (
+            _claim_collection_progress(documents)
+        )
+
+        self.assertEqual(target_count, 200)
+        self.assertEqual(ready_count, 199)
+        self.assertEqual(percentage, 99)
+
+    def test_repository_progress_failure_is_unverified_and_zero(self):
+        repository = MagicMock()
+        repository.list_documents.side_effect = RuntimeError(
+            "temporary Supabase failure"
+        )
+
+        result = _claim_collection_progress_from_repository(
+            repository,
+            "progress-case",
+        )
+
+        self.assertEqual(result[0], 0)
+        self.assertIn("Supabase", result[1])
+        self.assertEqual(result[2:4], (0, 0))
+        self.assertFalse(result[4])
 
     def test_next_auth_action_never_skips_hometax(self):
         hometax_session = {
@@ -1720,6 +1872,129 @@ class ClaimCorrectionTests(unittest.TestCase):
                     "hometax_business_registration_certificate",
                     "hometax_tax_payment_certificate",
                 },
+            )
+        finally:
+            with _CLAIM_JOB_LOCK:
+                _CLAIM_JOBS.pop(case_id, None)
+
+    def test_collection_complete_event_pauses_when_documents_are_incomplete(
+        self,
+    ):
+        case_id = "strict-completion-case"
+        user_id = "strict-completion-owner"
+        owner_ref = _claim_job_owner_ref(user_id)
+        repository = _BackgroundFlowRepository()
+        repository.case.update(
+            {
+                "id": case_id,
+                "hometax_status": "auth_complete",
+                "comwel_status": "auth_complete",
+                "overall_status": "collecting",
+            }
+        )
+        repository.documents = [
+            {
+                "source": "hometax",
+                "document_code": "hometax_tax_payment_certificate",
+                "status": "ready",
+            },
+            {
+                "source": "hometax",
+                "document_code": "hometax_business_registration_certificate",
+                "status": "failed",
+            },
+            {
+                "source": "comwel",
+                "document_code": "comwel_total_remuneration",
+                "period_year": 2025,
+                "status": "auth_pending",
+            },
+        ]
+        transient = {
+            "expires_at": time.time() + 300,
+            "auth_context": {
+                "representative": "홍길동",
+                "cellphone": "01012345678",
+                "birth_date": "19901019",
+                "identity_number": "9010191234567",
+            },
+            "hometax": {"Token": "hometax-token"},
+            "comwel": {"Token": "comwel-token"},
+        }
+        with _CLAIM_JOB_LOCK:
+            _CLAIM_JOBS[case_id] = {
+                "owner_ref": owner_ref,
+                "owner_user_id": user_id,
+                "sealed_payload": _seal_claim_job_payload(transient),
+                "expires_at": transient["expires_at"],
+                "status": "running",
+                "progress": 0,
+                "safe_message": "",
+                "summary": {},
+                "wake_event": threading.Event(),
+            }
+        try:
+            with (
+                patch(
+                    "claim_correction_center.ClaimRepository",
+                    return_value=repository,
+                ),
+                patch("claim_correction_center.TilkoClaimClient"),
+                patch(
+                    "claim_correction_center._advance_personal_case",
+                    return_value={
+                        "event": "collection_complete",
+                        "summary": {
+                            "ready": 3,
+                            "failed": 0,
+                            "skipped": [],
+                        },
+                    },
+                ),
+            ):
+                _run_background_claim_job(
+                    user_id,
+                    case_id,
+                    owner_ref,
+                )
+
+            with _CLAIM_JOB_LOCK:
+                paused = dict(_CLAIM_JOBS[case_id])
+            restored = _unseal_claim_job_payload(
+                paused["sealed_payload"]
+            )
+
+            self.assertEqual(paused["status"], "paused")
+            self.assertEqual(paused["progress"], 33)
+            self.assertNotEqual(paused["sealed_payload"], b"")
+            self.assertEqual(
+                paused["summary"],
+                {
+                    "ready": 1,
+                    "target": 3,
+                    "progress_verified": True,
+                    "failed": 0,
+                },
+            )
+            self.assertEqual(
+                restored["hometax"]["Token"],
+                "hometax-token",
+            )
+            self.assertEqual(
+                restored["comwel"]["Token"],
+                "comwel-token",
+            )
+            self.assertEqual(
+                repository.case["overall_status"],
+                "auth_complete_collection_pending",
+            )
+            self.assertEqual(
+                repository.case["last_safe_error_code"],
+                "COLLECTION_PROGRESS_INCOMPLETE",
+            )
+            self.assertEqual(
+                repository.audit_events[-1]["action"],
+                "collection_progress_verification",
             )
         finally:
             with _CLAIM_JOB_LOCK:

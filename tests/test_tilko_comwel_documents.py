@@ -121,6 +121,81 @@ class TilkoComwelDocumentTests(unittest.TestCase):
         self.assertNotIn("01012345678", facts)
 
     @patch("tilko_claim_client.requests.post")
+    def test_total_remuneration_empty_result_returns_no_data_json(self, post):
+        post.return_value = _JsonResponse(
+            {
+                "ErrorCode": 0,
+                "ApiTxKey": "empty-remuneration-reference",
+                "Result": [],
+            }
+        )
+
+        document = _client().collect_comwel_total_remuneration(
+            year=2025,
+            identity_number="9010191234567",
+            user_name="홍길동",
+            cellphone="01012345678",
+            session=_session(),
+            business_number="2208162517",
+        )
+
+        self.assertEqual(document.content_type, "application/json")
+        self.assertEqual(
+            document.file_name,
+            "comwel-total-remuneration-2025-no-data.json",
+        )
+        self.assertEqual(
+            document.facts,
+            {
+                "no_data": True,
+                "record_count": 0,
+                "year": "2025",
+            },
+        )
+        self.assertEqual(
+            json.loads(document.content.decode("utf-8")),
+            document.facts,
+        )
+        stored = document.content.decode("utf-8")
+        self.assertNotIn("9010191234567", stored)
+        self.assertNotIn("01012345678", stored)
+        self.assertNotIn("홍길동", stored)
+
+    @patch("tilko_claim_client.requests.post")
+    def test_total_remuneration_nonempty_result_without_file_still_fails(
+        self,
+        post,
+    ):
+        post.return_value = _JsonResponse(
+            {
+                "ErrorCode": 0,
+                "Result": {"Data": []},
+            }
+        )
+
+        with self.assertRaises(ClaimProviderError):
+            _client().collect_comwel_total_remuneration(
+                year=2025,
+                identity_number="9010191234567",
+                user_name="홍길동",
+                cellphone="01012345678",
+                session=_session(),
+            )
+
+    @patch("tilko_claim_client.requests.post")
+    def test_empty_result_without_success_code_still_fails(self, post):
+        post.return_value = _JsonResponse({"Result": []})
+
+        with self.assertRaises(ClaimProviderError):
+            _client().collect_comwel_total_remuneration(
+                year=2025,
+                identity_number="9010191234567",
+                user_name="홍길동",
+                cellphone="01012345678",
+                session=_session(),
+            )
+
+    @patch("tilko_claim_client.requests.post")
     def test_management_numbers_returns_redacted_private_json(self, post):
         post.return_value = _JsonResponse(
             {
@@ -224,6 +299,88 @@ class TilkoComwelDocumentTests(unittest.TestCase):
         facts = json.dumps(document.facts, ensure_ascii=False)
         self.assertNotIn("9010191234567", facts)
         self.assertNotIn("01012345678", facts)
+
+    @patch("tilko_claim_client.requests.post")
+    def test_workplace_rate_empty_result_returns_no_data_json(self, post):
+        post.return_value = _JsonResponse(
+            {
+                "ErrorCode": 0,
+                "ApiTxKey": "empty-rate-reference",
+                "ResultData": {},
+            }
+        )
+
+        document = _client().collect_comwel_workplace_rate(
+            year=2024,
+            identity_number="9010191234567",
+            user_name="홍길동",
+            cellphone="01012345678",
+            session=_session(),
+            management_number="123-45-67890",
+        )
+
+        self.assertEqual(document.content_type, "application/json")
+        self.assertEqual(
+            document.file_name,
+            "comwel-workplace-rate-2024-no-data.json",
+        )
+        self.assertEqual(
+            document.facts,
+            {
+                "no_data": True,
+                "record_count": 0,
+                "year": "2024",
+            },
+        )
+        self.assertEqual(
+            json.loads(document.content.decode("utf-8")),
+            document.facts,
+        )
+        stored = document.content.decode("utf-8")
+        self.assertNotIn("9010191234567", stored)
+        self.assertNotIn("01012345678", stored)
+        self.assertNotIn("123-45-67890", stored)
+
+    @patch("tilko_claim_client.requests.post")
+    def test_workplace_rate_nonempty_result_without_file_still_fails(
+        self,
+        post,
+    ):
+        post.return_value = _JsonResponse(
+            {
+                "ErrorCode": 0,
+                "Result": {"Issued": "N"},
+            }
+        )
+
+        with self.assertRaises(ClaimProviderError):
+            _client().collect_comwel_workplace_rate(
+                year=2024,
+                identity_number="9010191234567",
+                user_name="홍길동",
+                cellphone="01012345678",
+                session=_session(),
+                management_number="123-45-67890",
+            )
+
+    @patch("tilko_claim_client.requests.post")
+    def test_empty_result_with_provider_error_still_fails(self, post):
+        post.return_value = _JsonResponse(
+            {
+                "ErrorCode": 1,
+                "TargetCode": "COMWEL_FAILURE",
+                "Result": [],
+            }
+        )
+
+        with self.assertRaises(ClaimProviderError):
+            _client().collect_comwel_total_remuneration(
+                year=2025,
+                identity_number="9010191234567",
+                user_name="홍길동",
+                cellphone="01012345678",
+                session=_session(),
+            )
 
     def test_management_number_collection_requires_business_number(self):
         with self.assertRaises(ClaimProviderError):

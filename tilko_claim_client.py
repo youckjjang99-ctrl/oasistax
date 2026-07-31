@@ -4,7 +4,7 @@ import base64
 import binascii
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 import requests
@@ -97,6 +97,9 @@ class CollectedClaimDocument:
     content_type: str
     provider_reference: str
     facts: dict[str, Any]
+    # 인증 세션 안에서 다음 기관 요청에만 사용하는 값입니다.
+    # Repository는 facts만 저장하므로 이 값은 DB·파일·감사로그에 남지 않습니다.
+    transient_facts: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -143,6 +146,73 @@ def _hometax_business_number(value: Any) -> str:
     if len(compact) != 10 or not compact.isascii() or not compact.isdigit():
         return ""
     return compact
+
+
+def _valid_hometax_business_number(value: Any) -> str:
+    digits = _hometax_business_number(value)
+    if not digits:
+        return ""
+    weights = (1, 3, 7, 1, 3, 7, 1, 3, 5)
+    checksum = sum(
+        int(digit) * weight
+        for digit, weight in zip(digits[:9], weights)
+    )
+    checksum += (int(digits[8]) * 5) // 10
+    expected = (10 - (checksum % 10)) % 10
+    return digits if expected == int(digits[-1]) else ""
+
+
+def _hometax_tax_payment_business_numbers(
+    response_data: dict[str, Any],
+) -> tuple[str, ...]:
+    """Extract exact allowlisted business numbers without retaining JsonData.
+
+    Tilko's UTERDAAA04 response can also contain a resident number and other
+    numeric identifiers. Only documented business-number paths are inspected,
+    and only valid 10-digit Korean business numbers are returned.
+    """
+
+    raw_result = response_data.get("Result")
+    result_rows = (
+        raw_result
+        if isinstance(raw_result, list)
+        else [raw_result]
+        if isinstance(raw_result, dict)
+        else []
+    )
+    raw_candidates: list[Any] = []
+    for result in result_rows:
+        if not isinstance(result, dict):
+            continue
+        json_data = result.get("JsonData")
+        if not isinstance(json_data, dict):
+            continue
+        raw_candidates.append(json_data.get("txprDscmNo"))
+
+        linked_rows = json_data.get("cvaTrtRsltLnkDVOList")
+        if isinstance(linked_rows, list):
+            for row in linked_rows:
+                if not isinstance(row, dict):
+                    continue
+                raw_candidates.extend(
+                    (
+                        row.get("txprDscmNo"),
+                        row.get("aplcTxprDscmNo"),
+                    )
+                )
+
+        result_message = json_data.get("resultMsg")
+        if isinstance(result_message, dict):
+            session_map = result_message.get("sessionMap")
+            if isinstance(session_map, dict):
+                raw_candidates.append(session_map.get("txprDscmNo"))
+
+    business_numbers: list[str] = []
+    for raw_candidate in raw_candidates:
+        business_number = _valid_hometax_business_number(raw_candidate)
+        if business_number and business_number not in business_numbers:
+            business_numbers.append(business_number)
+    return tuple(business_numbers)
 
 
 def _safe_hometax_business_metadata(value: Any) -> str:
@@ -296,6 +366,68 @@ def _response_result(response_data: dict[str, Any]) -> Any:
             return response_data[key]
     raise ClaimProviderError(
         "근로복지공단 문서 응답에 결과 데이터가 없습니다."
+    )
+
+
+def _empty_result_without_file(
+    response_data: dict[str, Any],
+    *,
+    file_field: str,
+) -> bool:
+    if str(response_data.get("ErrorCode", "")).strip() != "0":
+        return False
+    result_values = [
+        response_data[key]
+        for key in ("Result", "ResultData")
+        if key in response_data
+    ]
+    if not result_values:
+        return False
+
+    def is_empty(value: Any) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return not value.strip()
+        if isinstance(value, (dict, list, tuple)):
+            return not value
+        return False
+
+    return (
+        all(is_empty(value) for value in result_values)
+        and not _first_response_value(response_data, file_field)
+    )
+
+
+def _collected_no_data_json(
+    response_data: dict[str, Any],
+    *,
+    fallback_name: str,
+    year: str,
+) -> CollectedClaimDocument:
+    facts = {
+        "no_data": True,
+        "record_count": 0,
+        "year": year,
+    }
+    content = json.dumps(
+        facts,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return CollectedClaimDocument(
+        content=content,
+        file_name=_safe_document_name(
+            "",
+            fallback_stem=fallback_name,
+            extension="json",
+        ),
+        content_type="application/json",
+        provider_reference=str(
+            response_data.get("ApiTxKey", "") or ""
+        ).strip(),
+        facts=facts,
     )
 
 
@@ -640,6 +772,7 @@ def _collected_pdf(
     response_data: dict[str, Any],
     *,
     fallback_name: str,
+    transient_facts: dict[str, Any] | None = None,
 ) -> CollectedClaimDocument:
     raw_result = response_data.get("Result")
     candidates = (
@@ -715,6 +848,7 @@ def _collected_pdf(
                 "CvaDcumIsnStatCdNm",
             ),
         },
+        transient_facts=dict(transient_facts or {}),
     )
 
 
@@ -1053,6 +1187,17 @@ class TilkoClaimClient:
             payload,
             tuple(encrypted_paths),
         )
+        if _empty_result_without_file(
+            response,
+            file_field="ExcelData",
+        ):
+            return _collected_no_data_json(
+                response,
+                fallback_name=(
+                    f"comwel-total-remuneration-{selected_year}-no-data"
+                ),
+                year=selected_year,
+            )
         facts: dict[str, Any] = {"year": selected_year}
         if selected_management_number:
             facts["management_numbers"] = [selected_management_number]
@@ -1143,6 +1288,17 @@ class TilkoClaimClient:
                 "Auth.UserCellphoneNumber",
             ),
         )
+        if _empty_result_without_file(
+            response,
+            file_field="PdfData",
+        ):
+            return _collected_no_data_json(
+                response,
+                fallback_name=(
+                    f"comwel-workplace-rate-{selected_year}-no-data"
+                ),
+                year=selected_year,
+            )
         document = _collected_pdf(
             response,
             fallback_name=f"comwel-workplace-rate-{selected_year}",
@@ -1281,7 +1437,11 @@ class TilkoClaimClient:
                 "Auth.UserCellphoneNumber",
             ),
         )
+        business_numbers = _hometax_tax_payment_business_numbers(response)
         return _collected_pdf(
             response,
             fallback_name="tax-payment-certificate",
+            transient_facts={
+                "business_numbers": list(business_numbers),
+            },
         )
