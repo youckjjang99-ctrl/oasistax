@@ -133,6 +133,170 @@ def _transient() -> dict:
     {"CLAIM_DOCUMENT_VARIANT_KEY": TEST_VARIANT_SECRET},
 )
 class ClaimBusinessAutofillFlowTests(unittest.TestCase):
+    def test_refund_is_collected_once_per_taxpayer_across_businesses(self):
+        repository = MagicMock()
+        repository.list_documents.return_value = [
+            {
+                "source": "hometax",
+                "document_code": "hometax_refund",
+                "period_year": None,
+                "collection_key": "default",
+                "status": "auth_pending",
+            }
+        ]
+        repository.store_collected_document.return_value = {
+            "status": "ready"
+        }
+        client = MagicMock()
+        client.hometax_refund_ready = True
+        client.collect_hometax_refund.return_value = _document(
+            "hometax-refund.json",
+            facts={"record_count": 2},
+        )
+
+        summary = _collect_supported_hometax_documents(
+            repository,
+            client,
+            case_id="refund-taxpayer-case",
+            birth_date="19901019",
+            representative="홍길동",
+            cellphone="01012345678",
+            identity_number="9010191234567",
+            business_number=VALID_BUSINESS_NUMBER,
+            businesses=[
+                {
+                    "business_number": VALID_BUSINESS_NUMBER,
+                    "business_name": "오아시스 본점",
+                },
+                {
+                    "business_number": SECOND_VALID_BUSINESS_NUMBER,
+                    "business_name": "오아시스 지점",
+                },
+            ],
+            session=_transient()["hometax"],
+        )
+
+        self.assertEqual(summary["target"], 1)
+        self.assertEqual(summary["ready"], 1)
+        client.collect_hometax_refund.assert_called_once_with(
+            taxpayer_number="9010191234567"
+        )
+        refund_calls = [
+            call
+            for call in repository.store_collected_document.call_args_list
+            if call.kwargs["document_code"] == "hometax_refund"
+        ]
+        self.assertEqual(len(refund_calls), 1)
+
+    def test_unconfigured_refund_is_skipped_without_inflating_progress(self):
+        repository = MagicMock()
+        repository.list_documents.return_value = [
+            {
+                "source": "hometax",
+                "document_code": "hometax_refund",
+                "period_year": None,
+                "collection_key": "default",
+                "status": "integration_required",
+            }
+        ]
+        client = MagicMock()
+        client.hometax_refund_ready = False
+
+        summary = _collect_supported_hometax_documents(
+            repository,
+            client,
+            case_id="refund-unconfigured-case",
+            birth_date="19901019",
+            representative="홍길동",
+            cellphone="01012345678",
+            identity_number="9010191234567",
+            business_number=VALID_BUSINESS_NUMBER,
+            session=_transient()["hometax"],
+        )
+
+        self.assertEqual(summary["target"], 0)
+        self.assertEqual(summary["ready"], 0)
+        self.assertIn(
+            "hometax_refund:agent_credentials_required",
+            summary["skipped"],
+        )
+        client.collect_hometax_refund.assert_not_called()
+
+    def test_worker_status_is_collected_for_each_management_scope(self):
+        repository = MagicMock()
+        repository.list_documents.return_value = [
+            {
+                "source": "comwel",
+                "document_code": "comwel_management_number_list",
+                "period_year": None,
+                "collection_key": "default",
+                "status": "auth_pending",
+            },
+            {
+                "source": "comwel",
+                "document_code": "comwel_worker_status",
+                "period_year": None,
+                "collection_key": "default",
+                "status": "auth_pending",
+            },
+        ]
+        repository.store_collected_document.return_value = {
+            "status": "ready"
+        }
+        client = MagicMock()
+        client.comwel_worker_status_ready = True
+        client.collect_comwel_management_numbers.return_value = _document(
+            "management-numbers.json",
+            facts={
+                "management_numbers": [
+                    "1112233333",
+                    "2223344444",
+                ]
+            },
+        )
+        client.collect_comwel_worker_status.return_value = _document(
+            "comwel-worker-status.json",
+            facts={"record_count": 3, "active_count": 1},
+        )
+
+        summary = _collect_supported_comwel_documents(
+            repository,
+            client,
+            case_id="worker-status-case",
+            identity_number="9010191234567",
+            representative="홍길동",
+            cellphone="01012345678",
+            business_number=VALID_BUSINESS_NUMBER,
+            businesses=[
+                {
+                    "business_number": VALID_BUSINESS_NUMBER,
+                    "business_name": "오아시스",
+                }
+            ],
+            session=_transient()["comwel"],
+        )
+
+        self.assertEqual(summary["target"], 3)
+        self.assertEqual(summary["ready"], 3)
+        self.assertEqual(
+            client.collect_comwel_worker_status.call_count,
+            2,
+        )
+        called_management_numbers = {
+            call.kwargs["management_number"]
+            for call in client.collect_comwel_worker_status.call_args_list
+        }
+        self.assertEqual(
+            called_management_numbers,
+            {"1112233333", "2223344444"},
+        )
+        worker_store_calls = [
+            call
+            for call in repository.store_collected_document.call_args_list
+            if call.kwargs["document_code"] == "comwel_worker_status"
+        ]
+        self.assertEqual(len(worker_store_calls), 2)
+
     def test_single_hometax_business_is_forwarded_to_comwel_collectors(self):
         repository = _repository()
         client = _client_with_discovery(

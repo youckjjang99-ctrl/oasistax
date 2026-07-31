@@ -12,9 +12,11 @@ AUTOMATIC_COLLECTION_CODES = frozenset(
         "hometax_income_tax_help",
         "hometax_income_tax_return",
         "hometax_closure_certificate",
+        "hometax_refund",
         "comwel_total_remuneration",
         "comwel_management_number_list",
         "comwel_workplace_rate",
+        "comwel_worker_status",
     }
 )
 
@@ -110,16 +112,16 @@ DOCUMENT_SPECS: tuple[ClaimDocumentSpec, ...] = (
         code="hometax_refund",
         name="환급금",
         source="홈택스",
-        period="조회 가능 기간",
-        endpoint_hint="계약 API 확정 필요",
-        description="환급 가능액과 처리 상태",
+        period="최근 5년",
+        endpoint_hint="HometaxAgent/UTERDAAA01/HwanGeubGeum",
+        description="세무대리인 수임 고객의 환급금과 처리 상태",
     ),
     ClaimDocumentSpec(
         code="comwel_worker_status",
         name="근로자고용정보현황",
         source="근로복지공단",
         period="현재",
-        endpoint_hint="SelectGeunRoJaGyIryeok 계열",
+        endpoint_hint="Tilko 계약형 KcomwelSimpleAuth 경로",
         description="사업장별 근로자 고용정보 현황",
     ),
 )

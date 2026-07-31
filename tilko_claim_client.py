@@ -6,7 +6,7 @@ import io
 import json
 import os
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Iterable
 
 import requests
@@ -47,6 +47,9 @@ HOMETAX_INCOME_TAX_RETURN = (
     "/api/v1.0/hometaxsimpleauth/uternaaz110/"
     "jonghabsodeugse/singo"
 )
+HOMETAX_AGENT_REFUND = (
+    "/api/v1.0/HometaxAgent/UTERDAAA01/HwanGeubGeum"
+)
 COMWEL_SIMPLE_AUTH_REQUEST = (
     "/api/v2.0/KcomwelSimpleAuth/SimpleAuthRequest"
 )
@@ -65,6 +68,7 @@ COMWEL_REMUNERATION_NO_DATA_ERROR_CODES = frozenset(
     {"7701001", "COMWEL_7701001"}
 )
 MAX_COLLECTED_DOCUMENT_BYTES = 20 * 1024 * 1024
+MAX_AGENT_CREDENTIAL_BYTES = 2 * 1024 * 1024
 
 
 def _safe_provider_code(value: Any) -> str | None:
@@ -554,38 +558,95 @@ def _management_numbers(value: Any) -> list[str]:
 
 _PRIVATE_JSON_REDACTED_KEYS = frozenset(
     {
+        "accountnumber",
+        "acntno",
+        "accno",
+        "address",
+        "apitxkey",
         "birthdate",
+        "businessnumber",
         "cellphone",
+        "certfile",
+        "cookie",
+        "credential",
+        "cxid",
+        "email",
+        "geunrojanm",
+        "geunrojargno",
+        "geunrojawonbuno",
+        "gwanrino",
         "identitynumber",
+        "keyfile",
         "mobileno",
+        "password",
         "phone",
+        "reqtxid",
         "residentregistrationnumber",
+        "rprstxprnm",
         "resno",
+        "rgno",
+        "session",
         "ssn",
         "telno",
+        "tel1",
+        "tel2",
+        "token",
+        "txprdscmno",
+        "txid",
+        "txprnm",
         "usercellphonenumber",
         "username",
     }
 )
 _PRIVATE_JSON_REDACTED_KEY_FRAGMENTS = (
+    "account",
+    "acnt",
+    "accno",
+    "addr",
+    "apitxkey",
     "birth",
+    "businessnumber",
     "cellphone",
     "ceoname",
+    "certfile",
+    "cookie",
+    "credential",
+    "cxid",
     "daepyoname",
+    "daepyoja",
+    "email",
+    "fax",
+    "geunroja",
+    "gwanrino",
     "handphone",
     "hpno",
     "identityno",
     "identitynumber",
     "jumin",
+    "keyfile",
     "mobileno",
     "mobilephone",
+    "password",
     "phoneno",
     "representativename",
+    "reqtxid",
     "residentregistration",
+    "rgno",
+    "rprstxprnm",
+    "saeopjanggwanri",
+    "saeopjanghp",
+    "saeopjangtel",
+    "saeopjadrno",
     "saupjuname",
     "socialsecurity",
+    "secret",
     "telno",
+    "token",
+    "txprdscmno",
+    "txprnm",
+    "txid",
     "username",
+    "wonbuno",
 )
 
 
@@ -652,6 +713,70 @@ def _enabled(value: str) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _validated_worker_status_endpoint(value: Any) -> str:
+    """Return a contract endpoint only when it is a safe Tilko API path.
+
+    Tilko does not publish a general simple-auth worker-history endpoint.  The
+    path must therefore be supplied for this account and is deliberately not
+    guessed from another vendor's private proxy route.
+    """
+
+    endpoint = str(value or "").strip()
+    normalized = endpoint.casefold()
+    if not endpoint or not normalized.startswith(
+        "/api/v2.0/kcomwelsimpleauth/"
+    ):
+        return ""
+    if endpoint.endswith("/") or any(
+        marker in endpoint for marker in ("?", "#", "\\", "%", "..", "//")
+    ):
+        return ""
+    if not all(
+        character.isascii()
+        and (character.isalnum() or character in "/._-")
+        for character in endpoint
+    ):
+        return ""
+    suffix = endpoint[len("/api/v2.0/KcomwelSimpleAuth/") :]
+    return endpoint if suffix else ""
+
+
+def _decode_agent_credential(value: str, *, label: str) -> bytes:
+    encoded = str(value or "").strip()
+    if not encoded:
+        raise ClaimProviderError(f"{label}이 설정되지 않았습니다.")
+    try:
+        content = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ClaimProviderError(
+            f"{label}의 Base64 형식을 확인해주세요."
+        ) from exc
+    if not content:
+        raise ClaimProviderError(f"{label}이 비어 있습니다.")
+    if len(content) > MAX_AGENT_CREDENTIAL_BYTES:
+        raise ClaimProviderError(f"{label}이 허용 크기를 초과했습니다.")
+    return content
+
+
+def _query_date(value: Any, *, label: str) -> str:
+    raw = str(value or "").strip().replace("-", "")
+    if len(raw) != 8 or not raw.isascii() or not raw.isdigit():
+        raise ClaimProviderError(f"{label}는 YYYYMMDD 형식이어야 합니다.")
+    try:
+        datetime.strptime(raw, "%Y%m%d")
+    except ValueError as exc:
+        raise ClaimProviderError(f"{label}가 올바른 날짜가 아닙니다.") from exc
+    return raw
+
+
+def _five_years_before(selected: date) -> date:
+    try:
+        return selected.replace(year=selected.year - 5)
+    except ValueError:
+        # 2월 29일은 5년 전 같은 달의 마지막 유효일로 맞춥니다.
+        return selected.replace(year=selected.year - 5, day=28)
+
+
 @dataclass(frozen=True)
 class TilkoClaimConfig:
     api_key: str
@@ -660,6 +785,16 @@ class TilkoClaimConfig:
     hometax_host: str = HOMETAX_HOST
     comwel_host: str = COMWEL_HOST
     timeout_seconds: int = 60
+    hometax_refund_enabled: bool = False
+    hometax_agent_cert_file_b64: str = ""
+    hometax_agent_key_file_b64: str = ""
+    hometax_agent_cert_password: str = ""
+    hometax_agent_id: str = ""
+    hometax_agent_password: str = ""
+    hometax_agent_dept_user_id: str = ""
+    hometax_agent_dept_user_password: str = ""
+    comwel_worker_status_enabled: bool = False
+    comwel_worker_status_endpoint: str = ""
 
     @property
     def simple_auth_ready(self) -> bool:
@@ -677,6 +812,37 @@ class TilkoClaimConfig:
         # 구현되기 전에는 활성화하지 않는다.
         return False
 
+    @property
+    def hometax_refund_ready(self) -> bool:
+        return bool(
+            self.collection_enabled
+            and self.hometax_refund_enabled
+            and self.api_key
+            and self.rsa_public_key
+            and self.hometax_host.rstrip("/") == HOMETAX_HOST
+            and self.hometax_agent_cert_file_b64
+            and self.hometax_agent_key_file_b64
+            and self.hometax_agent_cert_password
+            and (
+                bool(self.hometax_agent_id)
+                == bool(self.hometax_agent_password)
+            )
+            and (
+                bool(self.hometax_agent_dept_user_id)
+                == bool(self.hometax_agent_dept_user_password)
+            )
+        )
+
+    @property
+    def comwel_worker_status_ready(self) -> bool:
+        return bool(
+            self.simple_auth_ready
+            and self.comwel_worker_status_enabled
+            and _validated_worker_status_endpoint(
+                self.comwel_worker_status_endpoint
+            )
+        )
+
 
 def get_tilko_claim_config() -> TilkoClaimConfig:
     return TilkoClaimConfig(
@@ -693,6 +859,37 @@ def get_tilko_claim_config() -> TilkoClaimConfig:
             "TILKO_COMWEL_HOST",
             COMWEL_HOST,
         ).rstrip("/"),
+        hometax_refund_enabled=_enabled(
+            _read_secret("CLAIM_HOMETAX_REFUND_ENABLED", "false")
+        ),
+        hometax_agent_cert_file_b64=_read_secret(
+            "TILKO_HOMETAX_AGENT_CERT_FILE_B64"
+        ),
+        hometax_agent_key_file_b64=_read_secret(
+            "TILKO_HOMETAX_AGENT_KEY_FILE_B64"
+        ),
+        hometax_agent_cert_password=_read_secret(
+            "TILKO_HOMETAX_AGENT_CERT_PASSWORD"
+        ),
+        hometax_agent_id=_read_secret("TILKO_HOMETAX_AGENT_ID"),
+        hometax_agent_password=_read_secret(
+            "TILKO_HOMETAX_AGENT_PASSWORD"
+        ),
+        hometax_agent_dept_user_id=_read_secret(
+            "TILKO_HOMETAX_AGENT_DEPT_USER_ID"
+        ),
+        hometax_agent_dept_user_password=_read_secret(
+            "TILKO_HOMETAX_AGENT_DEPT_USER_PASSWORD"
+        ),
+        comwel_worker_status_enabled=_enabled(
+            _read_secret(
+                "CLAIM_COMWEL_WORKER_STATUS_ENABLED",
+                "false",
+            )
+        ),
+        comwel_worker_status_endpoint=_read_secret(
+            "TILKO_COMWEL_WORKER_STATUS_ENDPOINT"
+        ),
     )
 
 
@@ -711,10 +908,47 @@ def provider_readiness(
         missing.append("TILKO_HOMETAX_HOST")
     if selected.comwel_host.rstrip("/") != COMWEL_HOST:
         missing.append("TILKO_COMWEL_HOST")
+    refund_missing: list[str] = []
+    if not selected.hometax_refund_enabled:
+        refund_missing.append("CLAIM_HOMETAX_REFUND_ENABLED")
+    if not selected.hometax_agent_cert_file_b64:
+        refund_missing.append("TILKO_HOMETAX_AGENT_CERT_FILE_B64")
+    if not selected.hometax_agent_key_file_b64:
+        refund_missing.append("TILKO_HOMETAX_AGENT_KEY_FILE_B64")
+    if not selected.hometax_agent_cert_password:
+        refund_missing.append("TILKO_HOMETAX_AGENT_CERT_PASSWORD")
+    if bool(selected.hometax_agent_id) != bool(
+        selected.hometax_agent_password
+    ):
+        refund_missing.extend(
+            ("TILKO_HOMETAX_AGENT_ID", "TILKO_HOMETAX_AGENT_PASSWORD")
+        )
+    if bool(selected.hometax_agent_dept_user_id) != bool(
+        selected.hometax_agent_dept_user_password
+    ):
+        refund_missing.extend(
+            (
+                "TILKO_HOMETAX_AGENT_DEPT_USER_ID",
+                "TILKO_HOMETAX_AGENT_DEPT_USER_PASSWORD",
+            )
+        )
+    worker_missing: list[str] = []
+    if not selected.comwel_worker_status_enabled:
+        worker_missing.append("CLAIM_COMWEL_WORKER_STATUS_ENABLED")
+    if not _validated_worker_status_endpoint(
+        selected.comwel_worker_status_endpoint
+    ):
+        worker_missing.append("TILKO_COMWEL_WORKER_STATUS_ENDPOINT")
     return {
         "simple_auth_ready": selected.simple_auth_ready,
         "corporate_auth_ready": selected.corporate_auth_ready,
+        "hometax_refund_ready": selected.hometax_refund_ready,
+        "comwel_worker_status_ready": (
+            selected.comwel_worker_status_ready
+        ),
         "missing": missing,
+        "hometax_refund_missing": refund_missing,
+        "comwel_worker_status_missing": worker_missing,
     }
 
 
@@ -737,8 +971,12 @@ def _load_public_key(value: str):
 
 
 def _aes_encrypt(aes_key: bytes, plain_text: Any) -> str:
+    if isinstance(plain_text, (bytes, bytearray, memoryview)):
+        plain_bytes = bytes(plain_text)
+    else:
+        plain_bytes = str(plain_text or "").encode("utf-8")
     padder = padding.PKCS7(128).padder()
-    padded = padder.update(str(plain_text or "").encode("utf-8"))
+    padded = padder.update(plain_bytes)
     padded += padder.finalize()
     encryptor = Cipher(
         algorithms.AES(aes_key),
@@ -993,6 +1231,383 @@ def _collected_private_json(
     )
 
 
+def _first_named_list(value: Any, field_names: Iterable[str]) -> list[Any]:
+    expected = {
+        "".join(
+            character
+            for character in str(field_name).casefold()
+            if character.isascii() and character.isalnum()
+        )
+        for field_name in field_names
+    }
+    for mapping in _iter_response_mappings(value):
+        for key, candidate in mapping.items():
+            normalized = "".join(
+                character
+                for character in str(key).casefold()
+                if character.isascii() and character.isalnum()
+            )
+            if normalized in expected and isinstance(candidate, list):
+                return candidate
+    return []
+
+
+def _worker_status_rows(response_data: dict[str, Any]) -> list[Any] | None:
+    expected = {"dsoutlist", "workerlist", "employeelist"}
+    for mapping in _iter_response_mappings(response_data):
+        for key, candidate in mapping.items():
+            normalized = "".join(
+                character
+                for character in str(key).casefold()
+                if character.isascii() and character.isalnum()
+            )
+            if normalized in expected:
+                return candidate if isinstance(candidate, list) else None
+    result = response_data.get("Result")
+    return result if isinstance(result, list) else None
+
+
+def _worker_status_counts(rows: Iterable[Any]) -> tuple[int, int]:
+    active = 0
+    ended = 0
+    ended_labels = {
+        "고용종료",
+        "상실",
+        "자격상실",
+        "종료",
+        "퇴사",
+    }
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        statuses = {
+            str(row.get(field_name, "") or "").strip()
+            for field_name in (
+                "GY_STATUS_NM",
+                "SJ_STATUS_NM",
+                "EmploymentStatus",
+                "StatusName",
+                "employment_insurance_status",
+                "industrial_insurance_status",
+            )
+            if str(row.get(field_name, "") or "").strip()
+        }
+        if statuses and all(
+            any(label in status for label in ended_labels)
+            for status in statuses
+        ):
+            ended += 1
+        else:
+            active += 1
+    return active, ended
+
+
+_WORKER_STATUS_SAFE_FIELD_ALIASES: tuple[
+    tuple[str, tuple[str, ...]], ...
+] = (
+    ("worker_type", ("GEUNROJA_FG", "WorkerType")),
+    (
+        "industrial_insurance_acquired_date",
+        ("SJB_JAGYEOK_CHWIDEUK_DT", "IndustrialAcquiredDate"),
+    ),
+    (
+        "employment_insurance_acquired_date",
+        ("GYB_JAGYEOK_CHWIDEUK_DT", "EmploymentAcquiredDate"),
+    ),
+    (
+        "industrial_insurance_lost_date",
+        ("SJB_JAGYEOK_SANGSIL_DT", "IndustrialLostDate"),
+    ),
+    (
+        "employment_insurance_lost_date",
+        ("GYB_JAGYEOK_SANGSIL_DT", "EmploymentLostDate"),
+    ),
+    (
+        "industrial_insurance_status",
+        ("SJ_STATUS_NM", "IndustrialStatus"),
+    ),
+    (
+        "employment_insurance_status",
+        ("GY_STATUS_NM", "EmploymentStatus", "StatusName"),
+    ),
+    (
+        "industrial_monthly_average_wage",
+        ("SJ_MM_AVG_BOSU_PRC", "IndustrialMonthlyAverageWage"),
+    ),
+    (
+        "employment_monthly_average_wage",
+        ("GY_MM_AVG_BOSU_PRC", "EmploymentMonthlyAverageWage"),
+    ),
+    (
+        "industrial_loss_reason_code",
+        ("SJ_SANGSIL_SAYU_CD", "IndustrialLossReasonCode"),
+    ),
+    (
+        "industrial_loss_reason",
+        ("SJ_SANGSIL_SAYU_NM", "IndustrialLossReason"),
+    ),
+    (
+        "employment_loss_reason_code",
+        ("GY_SANGSIL_SAYU_CD", "EmploymentLossReasonCode"),
+    ),
+    (
+        "employment_loss_reason",
+        ("GY_SANGSIL_SAYU_NM", "EmploymentLossReason"),
+    ),
+    (
+        "employment_occupation",
+        ("GY_JIKJONG_NM", "EmploymentOccupation"),
+    ),
+)
+
+
+def _safe_worker_status_rows(rows: Iterable[Any]) -> list[dict[str, Any]]:
+    """Return only the reviewed, non-identifying worker status fields.
+
+    Provider responses can add fields without notice.  An allowlist prevents a
+    newly added name, resident number, ledger number, cookie, or credential
+    field from being persisted merely because the redaction denylist did not
+    know its name yet.
+    """
+
+    safe_rows: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        safe_row: dict[str, Any] = {}
+        for safe_name, aliases in _WORKER_STATUS_SAFE_FIELD_ALIASES:
+            selected: Any = None
+            for alias in aliases:
+                if alias in row and row[alias] not in (None, ""):
+                    selected = row[alias]
+                    break
+            if isinstance(selected, bool):
+                safe_row[safe_name] = selected
+            elif isinstance(selected, (int, float)):
+                safe_row[safe_name] = selected
+            elif isinstance(selected, str):
+                text = selected.strip()
+                if text and not _looks_like_private_identifier(text):
+                    safe_row[safe_name] = text[:240]
+        if safe_row:
+            safe_rows.append(safe_row)
+    return safe_rows
+
+
+def _collected_worker_status_json(
+    response_data: dict[str, Any],
+) -> CollectedClaimDocument:
+    result = _response_result(response_data)
+    if not isinstance(result, (dict, list)):
+        raise ClaimProviderError(
+            "근로자 고용정보 현황 응답 형식을 확인해주세요."
+        )
+    rows = _worker_status_rows(response_data)
+    if rows is None:
+        raise ClaimProviderError(
+            "근로자 고용정보 현황 응답 형식을 확인해주세요."
+        )
+    safe_rows = _safe_worker_status_rows(rows)
+    if rows and not safe_rows:
+        raise ClaimProviderError(
+            "근로자 고용정보 현황 응답 필드가 변경되었습니다."
+        )
+    active_count, ended_count = _worker_status_counts(safe_rows)
+    facts = {
+        "record_count": len(safe_rows),
+        "active_count": active_count,
+        "ended_count": ended_count,
+        "no_data": not bool(safe_rows),
+    }
+    content = json.dumps(
+        {
+            "schema_version": 1,
+            "record_count": len(safe_rows),
+            "active_count": active_count,
+            "ended_count": ended_count,
+            "workers": safe_rows,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(content) > MAX_COLLECTED_DOCUMENT_BYTES:
+        raise ClaimProviderError(
+            "근로자 고용정보 현황 응답이 허용 크기를 초과했습니다."
+        )
+    return CollectedClaimDocument(
+        content=content,
+        file_name="comwel-worker-status.json",
+        content_type="application/json",
+        provider_reference=str(
+            response_data.get("ApiTxKey", "") or ""
+        ).strip(),
+        facts=facts,
+    )
+
+
+def _refund_rows(response_data: dict[str, Any]) -> list[Any] | None:
+    outer_result = response_data.get("Result")
+    if isinstance(outer_result, list):
+        return outer_result
+    if isinstance(outer_result, dict):
+        nested = outer_result.get("Result")
+        if isinstance(nested, list):
+            return nested
+        expected = {"refundlist", "hwangeubgeumlist"}
+        for mapping in _iter_response_mappings(outer_result):
+            for key, candidate in mapping.items():
+                normalized = "".join(
+                    character
+                    for character in str(key).casefold()
+                    if character.isascii() and character.isalnum()
+                )
+                if normalized in expected:
+                    return candidate if isinstance(candidate, list) else None
+    return None
+
+
+_REFUND_SAFE_FIELD_ALIASES: tuple[
+    tuple[str, tuple[str, ...]], ...
+] = (
+    ("start_date", ("strtDt", "startDate")),
+    ("end_date", ("endDt", "endDate")),
+    ("inquiry_class_code", ("inqrClCd", "inquiryClassCode")),
+    (
+        "treatment_status",
+        ("trtStatCd", "treatmentStatus", "treatmentStatusCode"),
+    ),
+    (
+        "unpaid_refund_amount",
+        (
+            "unpdRfndScnt",
+            "refundAmount",
+            "refundAmt",
+            "hwanGeubGeum",
+        ),
+    ),
+    ("tax_agent_yn", ("txaaYn", "taxAgentYn")),
+    ("tax_office_name", ("txhfOgzNm", "taxOfficeName")),
+)
+_REFUND_SAFE_NESTED_KEYS = frozenset(
+    {
+        "amount",
+        "amt",
+        "code",
+        "label",
+        "name",
+        "scnt",
+        "text",
+        "value",
+    }
+)
+
+
+def _safe_refund_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or _looks_like_private_identifier(text):
+            return None
+        return text[:240]
+    if isinstance(value, dict):
+        safe: dict[str, Any] = {}
+        for key, candidate in value.items():
+            normalized = "".join(
+                character
+                for character in str(key).casefold()
+                if character.isascii() and character.isalnum()
+            )
+            if normalized not in _REFUND_SAFE_NESTED_KEYS:
+                continue
+            safe_candidate = _safe_refund_value(candidate)
+            if safe_candidate not in (None, "", [], {}):
+                safe[str(key)[:80]] = safe_candidate
+        return safe or None
+    if isinstance(value, list):
+        safe_items = [
+            safe_candidate
+            for candidate in value[:100]
+            if (
+                safe_candidate := _safe_refund_value(candidate)
+            ) not in (None, "", [], {})
+        ]
+        return safe_items or None
+    return None
+
+
+def _safe_refund_rows(rows: Iterable[Any]) -> list[dict[str, Any]]:
+    """Persist only reviewed refund fields, never provider/session metadata."""
+
+    safe_rows: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        safe_row: dict[str, Any] = {}
+        for safe_name, aliases in _REFUND_SAFE_FIELD_ALIASES:
+            selected: Any = None
+            for alias in aliases:
+                if alias in row and row[alias] not in (None, ""):
+                    selected = row[alias]
+                    break
+            safe_value = _safe_refund_value(selected)
+            if safe_value not in (None, "", [], {}):
+                safe_row[safe_name] = safe_value
+        if safe_row:
+            safe_rows.append(safe_row)
+    return safe_rows
+
+
+def _collected_refund_json(
+    response_data: dict[str, Any],
+    *,
+    start_date: str,
+    end_date: str,
+) -> CollectedClaimDocument:
+    result = response_data.get("Result")
+    if not isinstance(result, (dict, list)):
+        raise ClaimProviderError("환급금 조회 응답 형식을 확인해주세요.")
+    rows = _refund_rows(response_data)
+    if rows is None:
+        raise ClaimProviderError("환급금 조회 응답 형식을 확인해주세요.")
+    safe_rows = _safe_refund_rows(rows)
+    if rows and not safe_rows:
+        raise ClaimProviderError("환급금 조회 응답 필드가 변경되었습니다.")
+    facts = {
+        "record_count": len(safe_rows),
+        "no_data": not bool(safe_rows),
+        "query_start_date": start_date,
+        "query_end_date": end_date,
+    }
+    content = json.dumps(
+        {
+            "schema_version": 1,
+            "query_start_date": start_date,
+            "query_end_date": end_date,
+            "refunds": safe_rows,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(content) > MAX_COLLECTED_DOCUMENT_BYTES:
+        raise ClaimProviderError("환급금 응답이 허용 크기를 초과했습니다.")
+    return CollectedClaimDocument(
+        content=content,
+        file_name="hometax-refund.json",
+        content_type="application/json",
+        provider_reference=str(
+            response_data.get("ApiTxKey", "") or ""
+        ).strip(),
+        facts=facts,
+    )
+
+
 def _collected_hometax_income_tax_return(
     response_data: dict[str, Any],
     *,
@@ -1190,6 +1805,14 @@ class TilkoClaimClient:
                 "경정청구 인증 연동이 아직 활성화되지 않았습니다."
             )
 
+    @property
+    def hometax_refund_ready(self) -> bool:
+        return self.config.hometax_refund_ready
+
+    @property
+    def comwel_worker_status_ready(self) -> bool:
+        return self.config.comwel_worker_status_ready
+
     def _post(
         self,
         host: str,
@@ -1197,15 +1820,44 @@ class TilkoClaimClient:
         payload: dict[str, Any],
         encrypted_paths: Iterable[str],
     ) -> dict[str, Any]:
-        normalized_endpoint = str(endpoint or "").strip().casefold()
+        endpoint = str(endpoint or "").strip()
+        normalized_endpoint = endpoint.casefold()
+        hometax_simple_endpoints = {
+            candidate.casefold()
+            for candidate in (
+                HOMETAX_SIMPLE_AUTH_REQUEST,
+                HOMETAX_SIMPLE_AUTH_CHECK,
+                HOMETAX_BUSINESS_INFO,
+                HOMETAX_BUSINESS_REGISTRATIONS,
+                HOMETAX_TAX_PAYMENT_CERTIFICATE,
+                HOMETAX_BUSINESS_REGISTRATION_CERTIFICATE,
+                HOMETAX_CLOSURE_CERTIFICATE,
+                HOMETAX_INCOME_TAX_HELP,
+                HOMETAX_INCOME_TAX_RETURN,
+            )
+        }
+        worker_endpoint = _validated_worker_status_endpoint(
+            self.config.comwel_worker_status_endpoint
+        )
+        comwel_simple_endpoints = {
+            candidate.casefold()
+            for candidate in (
+                COMWEL_SIMPLE_AUTH_REQUEST,
+                COMWEL_SIMPLE_AUTH_CHECK,
+                COMWEL_TOTAL_REMUNERATION,
+                COMWEL_MANAGEMENT_NUMBERS,
+                COMWEL_WORKPLACE_RATE,
+            )
+        }
+        if worker_endpoint:
+            comwel_simple_endpoints.add(worker_endpoint.casefold())
+
         if (
-            normalized_endpoint.startswith("/api/v1.0/hometaxsimpleauth/")
-            or normalized_endpoint.startswith("/api/v2.0/hometaxsimpleauth/")
+            normalized_endpoint in hometax_simple_endpoints
+            or normalized_endpoint == HOMETAX_AGENT_REFUND.casefold()
         ):
             expected_host = HOMETAX_HOST
-        elif normalized_endpoint.startswith(
-            "/api/v2.0/kcomwelsimpleauth/"
-        ):
+        elif normalized_endpoint in comwel_simple_endpoints:
             expected_host = COMWEL_HOST
         else:
             raise ClaimProviderError("허용되지 않은 Tilko API 경로입니다.")
@@ -1265,6 +1917,158 @@ class TilkoClaimClient:
                 error_code=_response_error_code(data),
             )
         return data
+
+    def collect_hometax_refund(
+        self,
+        *,
+        taxpayer_number: str,
+        start_date: Any = "",
+        end_date: Any = "",
+    ) -> CollectedClaimDocument:
+        if not self.hometax_refund_ready:
+            raise ClaimProviderError(
+                "환급금 조회용 세무대리인 인증서 연동이 설정되지 않았습니다.",
+                error_code="HOMETAX_REFUND_API_NOT_CONFIGURED",
+            )
+        selected_taxpayer_number = _valid_hometax_taxpayer_number(
+            taxpayer_number
+        )
+        if not selected_taxpayer_number:
+            raise ClaimProviderError(
+                "환급금 조회에는 유효한 납세자 식별번호가 필요합니다."
+            )
+
+        selected_end_date = (
+            _query_date(end_date, label="환급금 조회 종료일")
+            if str(end_date or "").strip()
+            else date.today().strftime("%Y%m%d")
+        )
+        end_day = datetime.strptime(selected_end_date, "%Y%m%d").date()
+        selected_start_date = (
+            _query_date(start_date, label="환급금 조회 시작일")
+            if str(start_date or "").strip()
+            else _five_years_before(end_day).strftime("%Y%m%d")
+        )
+        if selected_start_date > selected_end_date:
+            raise ClaimProviderError(
+                "환급금 조회 시작일은 종료일보다 늦을 수 없습니다."
+            )
+
+        agent_id = self.config.hometax_agent_id
+        agent_password = self.config.hometax_agent_password
+        department_id = self.config.hometax_agent_dept_user_id
+        department_password = (
+            self.config.hometax_agent_dept_user_password
+        )
+        if bool(agent_id) != bool(agent_password):
+            raise ClaimProviderError(
+                "세무대리인 아이디와 비밀번호 설정을 함께 확인해주세요."
+            )
+        if bool(department_id) != bool(department_password):
+            raise ClaimProviderError(
+                "세무대리 부서 아이디와 비밀번호 설정을 함께 확인해주세요."
+            )
+
+        payload: dict[str, Any] = {
+            "CertFile": _decode_agent_credential(
+                self.config.hometax_agent_cert_file_b64,
+                label="세무대리인 인증서 파일",
+            ),
+            "KeyFile": _decode_agent_credential(
+                self.config.hometax_agent_key_file_b64,
+                label="세무대리인 개인키 파일",
+            ),
+            "CertPassword": self.config.hometax_agent_cert_password,
+            "BusinessNumber": selected_taxpayer_number,
+            "StartDate": selected_start_date,
+            "EndDate": selected_end_date,
+        }
+        encrypted_paths = [
+            "CertFile",
+            "KeyFile",
+            "CertPassword",
+            "BusinessNumber",
+            "StartDate",
+            "EndDate",
+        ]
+        for field_name, value in (
+            ("AgentId", agent_id),
+            ("AgentPassword", agent_password),
+            ("DeptUserId", department_id),
+            ("DeptUserPassword", department_password),
+        ):
+            if value:
+                payload[field_name] = value
+                encrypted_paths.append(field_name)
+
+        response = self._post(
+            self.config.hometax_host,
+            HOMETAX_AGENT_REFUND,
+            payload,
+            tuple(encrypted_paths),
+        )
+        return _collected_refund_json(
+            response,
+            start_date=selected_start_date,
+            end_date=selected_end_date,
+        )
+
+    def collect_comwel_worker_status(
+        self,
+        *,
+        identity_number: str,
+        user_name: str,
+        cellphone: str,
+        session: dict[str, str],
+        management_number: str,
+    ) -> CollectedClaimDocument:
+        endpoint = _validated_worker_status_endpoint(
+            self.config.comwel_worker_status_endpoint
+        )
+        if not self.comwel_worker_status_ready or not endpoint:
+            raise ClaimProviderError(
+                "근로자 고용정보 현황용 Tilko 계약 API가 설정되지 않았습니다.",
+                error_code="COMWEL_WORKER_STATUS_API_NOT_CONFIGURED",
+            )
+        selected_management_number = _safe_management_number(
+            management_number
+        )
+        if not selected_management_number:
+            raise ClaimProviderError(
+                "근로자 고용정보 현황 조회에는 사업장관리번호가 필요합니다."
+            )
+        response = self._post(
+            self.config.comwel_host,
+            endpoint,
+            {
+                "Auth": self._comwel_auth(
+                    identity_number=identity_number,
+                    user_name=user_name,
+                    cellphone=cellphone,
+                    session=session,
+                ),
+                "UserGroupFlag": "1",
+                "IndividualFlag": "1",
+                "GwanriNo": selected_management_number,
+                "IsBusinessClosed": "1",
+            },
+            (
+                "Auth.IdentityNumber",
+                "Auth.UserName",
+                "Auth.UserCellphoneNumber",
+            ),
+        )
+        rows = _worker_status_rows(response)
+        if _first_response_value(response, "ExcelData") and rows is None:
+            # 근로자 원본 엑셀에는 주민등록번호 등 제3자 개인정보가 포함될
+            # 수 있습니다. 안전한 구조화 행이 없으면 저장하지 않습니다.
+            raise ClaimProviderError(
+                "근로자 원본 엑셀은 개인정보 보호를 위해 저장할 수 없습니다.",
+                error_code="COMWEL_WORKER_STATUS_UNSAFE_EXCEL",
+            )
+        # 구조화 행과 원본 엑셀이 함께 오면 원본 엑셀은 버리고 검토된
+        # 비식별 필드만 JSON으로 저장합니다.
+        return _collected_worker_status_json(response)
 
     def request_hometax_kakao(
         self,
