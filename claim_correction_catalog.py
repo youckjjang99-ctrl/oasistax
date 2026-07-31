@@ -52,11 +52,11 @@ DOCUMENT_SPECS: tuple[ClaimDocumentSpec, ...] = (
     ),
     ClaimDocumentSpec(
         code="hometax_business_registration_list",
-        name="홈택스 사업자정보 조회",
+        name="사업자등록번호명세서",
         source="홈택스",
         period="현재",
         endpoint_hint="MyBizInfo",
-        description="홈택스 응답에서 확인한 사업자정보의 마스킹 조회본",
+        description="홈택스에서 확인한 전체 사업자등록번호의 마스킹 명세",
     ),
     ClaimDocumentSpec(
         code="comwel_management_number_list",

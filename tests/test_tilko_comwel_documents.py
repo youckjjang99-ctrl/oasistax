@@ -243,7 +243,7 @@ class TilkoComwelDocumentTests(unittest.TestCase):
                 "ApiTxKey": "mybiz-reference",
                 "Result": [
                     {
-                        "GwanriNo": "111-22-33333",
+                        "GWANRI_NO": "111-22-33333",
                         "BusinessName": "테스트 사업장",
                         "IdentityNumber": "9010191234567",
                         "UserCellphoneNumber": "01012345678",
@@ -293,6 +293,33 @@ class TilkoComwelDocumentTests(unittest.TestCase):
         facts = json.dumps(document.facts, ensure_ascii=False)
         self.assertNotIn("9010191234567", facts)
         self.assertNotIn("01012345678", facts)
+
+    @patch("tilko_claim_client.requests.post")
+    def test_nonempty_management_response_without_number_is_parse_failure(
+        self,
+        post,
+    ):
+        post.return_value = _JsonResponse(
+            {
+                "ErrorCode": 0,
+                "ApiTxKey": "changed-contract-reference",
+                "Result": [{"UNKNOWN_FIELD": "value"}],
+            }
+        )
+
+        with self.assertRaises(ClaimProviderError) as raised:
+            _client().collect_comwel_management_numbers(
+                identity_number="9010191234567",
+                user_name="홍길동",
+                cellphone="01012345678",
+                session=_session(),
+                business_number="2208162517",
+            )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "COMWEL_MANAGEMENT_NUMBER_PARSE_FAILED",
+        )
 
     @patch("tilko_claim_client.requests.post")
     def test_empty_management_numbers_are_marked_as_no_data(self, post):

@@ -885,8 +885,8 @@ class ClaimCorrectionTests(unittest.TestCase):
         self.assertEqual(target_count, 43)
         self.assertEqual(ready_count, 43)
         self.assertEqual(percentage, 100)
-        self.assertIn("수집 완료 27건", text)
-        self.assertIn("해당없음 16건", text)
+        self.assertIn("다운로드 파일 27건", text)
+        self.assertIn("기관 조회 결과 없음 16건", text)
 
     def test_collection_progress_keeps_unresolved_rates_visible(self):
         documents = [
@@ -926,6 +926,42 @@ class ClaimCorrectionTests(unittest.TestCase):
         self.assertEqual(target_count, 4)
         self.assertEqual(ready_count, 2)
         self.assertEqual(percentage, 50)
+
+    def test_collection_progress_does_not_count_unqueried_rate_as_no_data(
+        self,
+    ):
+        documents = [
+            {
+                "source": "comwel",
+                "document_code": "comwel_workplace_rate",
+                "period_year": 2025,
+                "status": "ready",
+                "facts": {
+                    "no_data": True,
+                    "no_data_reason": "no_management_number",
+                },
+            },
+            {
+                "source": "comwel",
+                "document_code": "comwel_total_remuneration",
+                "period_year": 2025,
+                "status": "ready",
+                "facts": {
+                    "no_data": True,
+                    "no_data_reason": "no_remuneration_report",
+                },
+            },
+        ]
+
+        percentage, text, ready_count, target_count = (
+            _claim_collection_progress(documents)
+        )
+
+        self.assertEqual(target_count, 2)
+        self.assertEqual(ready_count, 1)
+        self.assertEqual(percentage, 50)
+        self.assertIn("기관 조회 결과 없음 1건", text)
+        self.assertIn("API 미호출/선행정보 부족 1건", text)
 
     def test_old_empty_income_tax_returns_require_recollection(self):
         documents = [
@@ -980,6 +1016,42 @@ class ClaimCorrectionTests(unittest.TestCase):
         self.assertEqual(percentage, 0)
         self.assertFalse(_claim_document_is_downloadable(old_document))
 
+    def test_taxpayer_income_return_supersedes_old_business_no_data(self):
+        documents = [
+            {
+                "source": "hometax",
+                "document_code": "hometax_income_tax_return",
+                "period_year": 2025,
+                "collection_key": "default",
+                "status": "ready",
+                "facts": {
+                    "no_data": True,
+                    "query_strategy": "filing_year_taxpayer_v3",
+                    "tax_year_verified": True,
+                },
+            },
+            *[
+                {
+                    "source": "hometax",
+                    "document_code": "hometax_income_tax_return",
+                    "period_year": 2025,
+                    "collection_key": f"v_business_{index}",
+                    "status": "ready",
+                    "facts": {
+                        "no_data": True,
+                        "query_strategy": "filing_year_v2",
+                        "tax_year_verified": True,
+                    },
+                }
+                for index in range(2)
+            ],
+        ]
+
+        active = _claim_active_collection_documents(documents)
+
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["collection_key"], "default")
+
     def test_actual_rate_scope_supersedes_empty_management_scope(self):
         shared_facts = {
             "business_name": "오아시스",
@@ -1001,6 +1073,43 @@ class ClaimCorrectionTests(unittest.TestCase):
             {
                 "source": "comwel",
                 "document_code": "comwel_workplace_rate",
+                "period_year": 2025,
+                "collection_key": "v_actual",
+                "status": "ready",
+                "facts": {
+                    **shared_facts,
+                    "management_number_masked": "123-*******",
+                },
+            },
+        ]
+
+        active = _claim_active_collection_documents(documents)
+
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["collection_key"], "v_actual")
+
+    def test_actual_remuneration_scope_supersedes_empty_business_scope(self):
+        shared_facts = {
+            "business_name": "오아시스",
+            "business_number_masked": "120-**-*****",
+            "business_scope_fingerprint": "s_" + ("a" * 32),
+        }
+        documents = [
+            {
+                "source": "comwel",
+                "document_code": "comwel_total_remuneration",
+                "period_year": 2025,
+                "collection_key": "v_empty",
+                "status": "ready",
+                "facts": {
+                    **shared_facts,
+                    "no_data": True,
+                    "no_data_reason": "no_remuneration_report",
+                },
+            },
+            {
+                "source": "comwel",
+                "document_code": "comwel_total_remuneration",
                 "period_year": 2025,
                 "collection_key": "v_actual",
                 "status": "ready",
