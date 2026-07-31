@@ -709,10 +709,10 @@ class ClaimCorrectionTests(unittest.TestCase):
             _claim_collection_progress(documents)
         )
 
-        self.assertEqual(target_count, 4)
-        self.assertEqual(ready_count, 2)
-        self.assertEqual(percentage, 50)
-        self.assertIn("4건 중 2건", text)
+        self.assertEqual(target_count, 5)
+        self.assertEqual(ready_count, 3)
+        self.assertEqual(percentage, 60)
+        self.assertIn("5건 중 3건", text)
 
     def test_collection_progress_excludes_rates_when_no_workplace_exists(self):
         documents = [

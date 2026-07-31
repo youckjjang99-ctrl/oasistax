@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import io
 import json
 import os
 from dataclasses import dataclass, field
@@ -16,6 +17,7 @@ from cryptography.hazmat.primitives.serialization import (
     load_der_public_key,
     load_pem_public_key,
 )
+from pypdf import PdfReader, PdfWriter
 
 
 HOMETAX_HOST = "https://api.tilko.net"
@@ -25,11 +27,24 @@ HOMETAX_SIMPLE_AUTH_REQUEST = (
 )
 HOMETAX_SIMPLE_AUTH_CHECK = "/api/v2.0/HometaxSimpleAuth/LoginCheck"
 HOMETAX_BUSINESS_INFO = "/api/v2.0/HometaxSimpleAuth/MyBizInfo"
+HOMETAX_BUSINESS_REGISTRATIONS = (
+    "/api/v2.0/HometaxSimpleAuth/MyBusinessRegistrations2"
+)
 HOMETAX_TAX_PAYMENT_CERTIFICATE = (
     "/api/v2.0/HometaxSimpleAuth/UTERDAAA04"
 )
 HOMETAX_BUSINESS_REGISTRATION_CERTIFICATE = (
     "/api/v2.0/HometaxSimpleAuth/UTEABGAA21"
+)
+HOMETAX_CLOSURE_CERTIFICATE = (
+    "/api/v2.0/HometaxSimpleAuth/UTEABDAA03"
+)
+HOMETAX_INCOME_TAX_HELP = (
+    "/api/v2.0/HometaxSimpleAuth/UTERNAAT32"
+)
+HOMETAX_INCOME_TAX_RETURN = (
+    "/api/v1.0/hometaxsimpleauth/uternaaz110/"
+    "jonghabsodeugse/singo"
 )
 COMWEL_SIMPLE_AUTH_REQUEST = (
     "/api/v2.0/KcomwelSimpleAuth/SimpleAuthRequest"
@@ -117,6 +132,7 @@ class HometaxBusinessDiscovery:
 
 _HOMETAX_BUSINESS_NUMBER_FIELDS = (
     "txprDscmNo",
+    "txprDscmNoEncCntn",
     "BusinessNumber",
 )
 _HOMETAX_BUSINESS_NAME_FIELDS = (
@@ -906,11 +922,12 @@ def _collected_private_json(
     *,
     fallback_name: str,
     facts: dict[str, Any],
+    document_label: str = "기관 조회",
 ) -> CollectedClaimDocument:
     result = _response_result(response_data)
     if not isinstance(result, (dict, list)):
         raise ClaimProviderError(
-            "근로복지공단 사업장 응답 형식을 확인해주세요."
+            f"{document_label} 응답 형식을 확인해주세요."
         )
     redacted = _redact_private_json(result)
     content = json.dumps(
@@ -921,7 +938,7 @@ def _collected_private_json(
     ).encode("utf-8")
     if len(content) > MAX_COLLECTED_DOCUMENT_BYTES:
         raise ClaimProviderError(
-            "근로복지공단 사업장 응답이 허용 크기를 초과했습니다."
+            f"{document_label} 응답이 허용 크기를 초과했습니다."
         )
     return CollectedClaimDocument(
         content=content,
@@ -941,6 +958,111 @@ def _collected_private_json(
     )
 
 
+def _collected_hometax_income_tax_return(
+    response_data: dict[str, Any],
+    *,
+    year: str,
+) -> CollectedClaimDocument:
+    raw_binary = response_data.get("BinaryResult")
+    binary_rows = (
+        raw_binary
+        if isinstance(raw_binary, list)
+        else [raw_binary]
+        if isinstance(raw_binary, dict)
+        else []
+    )
+    pdf_files: list[tuple[str, bytes]] = []
+    for index, row in enumerate(binary_rows, start=1):
+        if not isinstance(row, dict):
+            continue
+        encoded = str(row.get("Result", "") or "").strip()
+        if not encoded:
+            continue
+        extension = str(row.get("FileExtension", "") or "").strip().lower()
+        extension = extension.lstrip(".")
+        if extension and extension != "pdf":
+            raise ClaimProviderError(
+                "종합소득세 신고서 응답에 허용되지 않은 파일 형식이 포함되어 있습니다."
+            )
+        if encoded.casefold().startswith("data:application/pdf;base64,"):
+            encoded = encoded.split(",", 1)[1]
+        encoded = "".join(encoded.split())
+        content = _decode_provider_file(
+            encoded,
+            document_label="종합소득세 신고서",
+        )
+        if not content.startswith(b"%PDF-"):
+            raise ClaimProviderError(
+                "종합소득세 신고서 응답이 PDF 형식이 아닙니다."
+            )
+        raw_name = row.get("FileName") or f"income-tax-return-{year}-{index}"
+        pdf_files.append(
+            (
+                _safe_document_name(
+                    raw_name,
+                    fallback_stem=f"income-tax-return-{year}-{index}",
+                    extension="pdf",
+                ),
+                content,
+            )
+        )
+
+    if pdf_files:
+        if len(pdf_files) == 1:
+            content = pdf_files[0][1]
+            file_name = pdf_files[0][0]
+        else:
+            writer = PdfWriter()
+            try:
+                for _, pdf_content in pdf_files:
+                    reader = PdfReader(io.BytesIO(pdf_content), strict=False)
+                    for page in reader.pages:
+                        writer.add_page(page)
+                output = io.BytesIO()
+                writer.write(output)
+                content = output.getvalue()
+            except Exception as exc:
+                raise ClaimProviderError(
+                    "종합소득세 신고서 PDF를 하나의 파일로 묶지 못했습니다."
+                ) from exc
+            file_name = f"hometax-income-tax-return-{year}.pdf"
+        if (
+            not content.startswith(b"%PDF-")
+            or len(content) > MAX_COLLECTED_DOCUMENT_BYTES
+        ):
+            raise ClaimProviderError(
+                "종합소득세 신고서 PDF의 형식 또는 크기를 확인해 주세요."
+            )
+        result = response_data.get("Result")
+        return CollectedClaimDocument(
+            content=content,
+            file_name=file_name,
+            content_type="application/pdf",
+            provider_reference=str(
+                response_data.get("ApiTxKey", "") or ""
+            ).strip(),
+            facts={
+                "year": year,
+                "record_count": _structured_record_count(result),
+                "pdf_count": len(pdf_files),
+            },
+        )
+
+    result = response_data.get("Result")
+    if isinstance(result, (dict, list)) and bool(result):
+        return _collected_private_json(
+            response_data,
+            fallback_name=f"hometax-income-tax-return-{year}",
+            facts={"year": year},
+            document_label="종합소득세 신고서",
+        )
+    return _collected_no_data_json(
+        response_data,
+        fallback_name=f"hometax-income-tax-return-{year}-no-data",
+        year=year,
+    )
+
+
 class TilkoClaimClient:
     def __init__(self, config: TilkoClaimConfig | None = None):
         self.config = config or get_tilko_claim_config()
@@ -956,11 +1078,18 @@ class TilkoClaimClient:
         payload: dict[str, Any],
         encrypted_paths: Iterable[str],
     ) -> dict[str, Any]:
-        expected_host = (
-            HOMETAX_HOST
-            if endpoint.startswith("/api/v2.0/HometaxSimpleAuth/")
-            else COMWEL_HOST
-        )
+        normalized_endpoint = str(endpoint or "").strip().casefold()
+        if (
+            normalized_endpoint.startswith("/api/v1.0/hometaxsimpleauth/")
+            or normalized_endpoint.startswith("/api/v2.0/hometaxsimpleauth/")
+        ):
+            expected_host = HOMETAX_HOST
+        elif normalized_endpoint.startswith(
+            "/api/v2.0/kcomwelsimpleauth/"
+        ):
+            expected_host = COMWEL_HOST
+        else:
+            raise ClaimProviderError("허용되지 않은 Tilko API 경로입니다.")
         if host.rstrip("/") != expected_host:
             raise ClaimProviderError("공식 인증 중계 서버 주소를 확인해주세요.")
         aes_key = os.urandom(16)
@@ -1341,26 +1470,42 @@ class TilkoClaimClient:
         cellphone: str,
         session: dict[str, str],
     ) -> HometaxBusinessDiscovery:
-        response = self._post(
-            self.config.hometax_host,
-            HOMETAX_BUSINESS_INFO,
-            {
-                "Auth": self._hometax_auth(
-                    birth_date=birth_date,
-                    user_name=user_name,
-                    cellphone=cellphone,
-                    session=session,
-                )
-            },
-            tuple(
-                f"Auth.{key}"
-                for key in (
-                    "BirthDate",
-                    "UserName",
-                    "UserCellphoneNumber",
-                )
-            ),
+        payload = {
+            "Auth": self._hometax_auth(
+                birth_date=birth_date,
+                user_name=user_name,
+                cellphone=cellphone,
+                session=session,
+            )
+        }
+        encrypted_paths = tuple(
+            f"Auth.{key}"
+            for key in (
+                "BirthDate",
+                "UserName",
+                "UserCellphoneNumber",
+            )
         )
+        response: dict[str, Any] | None = None
+        last_error: ClaimProviderError | None = None
+        for endpoint in (
+            HOMETAX_BUSINESS_REGISTRATIONS,
+            HOMETAX_BUSINESS_INFO,
+        ):
+            try:
+                response = self._post(
+                    self.config.hometax_host,
+                    endpoint,
+                    payload,
+                    encrypted_paths,
+                )
+                break
+            except ClaimProviderError as exc:
+                last_error = exc
+        if response is None:
+            raise last_error or ClaimProviderError(
+                "홈택스 사업자 목록을 조회하지 못했습니다."
+            )
         candidates = _hometax_business_candidates(response)
         return HometaxBusinessDiscovery(
             document=_hometax_business_discovery_document(
@@ -1444,4 +1589,177 @@ class TilkoClaimClient:
             transient_facts={
                 "business_numbers": list(business_numbers),
             },
+        )
+
+    def collect_hometax_income_tax_help(
+        self,
+        *,
+        year: Any,
+        birth_date: str,
+        user_name: str,
+        cellphone: str,
+        session: dict[str, str],
+    ) -> CollectedClaimDocument:
+        selected_year = _document_year(year)
+        response = self._post(
+            self.config.hometax_host,
+            HOMETAX_INCOME_TAX_HELP,
+            {
+                "Auth": self._hometax_auth(
+                    birth_date=birth_date,
+                    user_name=user_name,
+                    cellphone=cellphone,
+                    session=session,
+                ),
+                "Year": selected_year,
+            },
+            (
+                "Auth.BirthDate",
+                "Auth.UserName",
+                "Auth.UserCellphoneNumber",
+            ),
+        )
+        result = _response_result(response)
+        response_for_document = response
+        notice = response.get("Notice")
+        if notice not in (None, ""):
+            response_for_document = {
+                **response,
+                "Result": {
+                    "data": result,
+                    "notice": notice,
+                },
+            }
+        return _collected_private_json(
+            response_for_document,
+            fallback_name=f"hometax-income-tax-help-{selected_year}",
+            facts={
+                "year": selected_year,
+                "no_data": not bool(result),
+            },
+            document_label="종합소득세 신고도움 서비스",
+        )
+
+    def collect_hometax_income_tax_return(
+        self,
+        *,
+        year: Any,
+        birth_date: str,
+        user_name: str,
+        cellphone: str,
+        business_number: str,
+        session: dict[str, str],
+    ) -> CollectedClaimDocument:
+        selected_year = _document_year(year)
+        selected_business_number = _valid_hometax_business_number(
+            business_number
+        )
+        if not selected_business_number:
+            raise ClaimProviderError(
+                "종합소득세 신고서 조회에는 유효한 사업자등록번호가 필요합니다."
+            )
+        payload = {
+            "CxId": str(session.get("CxId", "") or ""),
+            "PrivateAuthType": "0",
+            "ReqTxId": str(session.get("ReqTxId", "") or ""),
+            "Token": str(session.get("Token", "") or ""),
+            "TxId": str(session.get("TxId", "") or ""),
+            "UserName": user_name,
+            "BirthDate": birth_date,
+            "UserCellphoneNumber": cellphone,
+            "BusinessNumber": selected_business_number,
+            "StartDate": f"{selected_year}0101",
+            "EndDate": f"{selected_year}1231",
+        }
+        response = self._post(
+            self.config.hometax_host,
+            HOMETAX_INCOME_TAX_RETURN,
+            payload,
+            (
+                "UserName",
+                "BirthDate",
+                "UserCellphoneNumber",
+                "BusinessNumber",
+            ),
+        )
+        return _collected_hometax_income_tax_return(
+            response,
+            year=selected_year,
+        )
+
+    def collect_hometax_closure_certificate(
+        self,
+        *,
+        birth_date: str,
+        user_name: str,
+        cellphone: str,
+        business_number: str,
+        session: dict[str, str],
+    ) -> CollectedClaimDocument:
+        selected_business_number = _valid_hometax_business_number(
+            business_number
+        )
+        if not selected_business_number:
+            raise ClaimProviderError(
+                "폐업사실증명 조회에는 유효한 사업자등록번호가 필요합니다."
+            )
+        response = self._post(
+            self.config.hometax_host,
+            HOMETAX_CLOSURE_CERTIFICATE,
+            {
+                "Auth": self._hometax_auth(
+                    birth_date=birth_date,
+                    user_name=user_name,
+                    cellphone=cellphone,
+                    session=session,
+                ),
+                "BusinessNumber": selected_business_number,
+                "EnglCvaAplnYn": "N",
+                "ResnoOpYn": "N",
+                "IssueType": "99",
+                "Organization": "99",
+            },
+            (
+                "Auth.BirthDate",
+                "Auth.UserName",
+                "Auth.UserCellphoneNumber",
+                "BusinessNumber",
+            ),
+        )
+        raw_result = response.get("Result")
+        rows = (
+            raw_result
+            if isinstance(raw_result, list)
+            else [raw_result]
+            if isinstance(raw_result, dict)
+            else []
+        )
+        issued_values = {
+            str(row.get("Issued", "") or "").strip().upper()
+            for row in rows
+            if isinstance(row, dict)
+        }
+        if not rows or (
+            issued_values
+            and issued_values <= {"N"}
+            and not _first_response_value(response, "PdfData")
+        ):
+            facts = {"no_data": True, "record_count": 0}
+            return CollectedClaimDocument(
+                content=json.dumps(
+                    facts,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+                file_name="hometax-closure-certificate-no-data.json",
+                content_type="application/json",
+                provider_reference=str(
+                    response.get("ApiTxKey", "") or ""
+                ).strip(),
+                facts=facts,
+            )
+        return _collected_pdf(
+            response,
+            fallback_name="hometax-closure-certificate",
         )

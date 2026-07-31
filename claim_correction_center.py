@@ -835,7 +835,7 @@ def _collect_supported_hometax_documents(
     business_number: str,
     session: dict[str, str],
     force_tax_number_discovery: bool = False,
-    known_ready_codes: set[str] | None = None,
+    known_ready_keys: set[tuple[str, int]] | None = None,
     on_progress: Any | None = None,
     should_continue: Any | None = None,
 ) -> dict[str, Any]:
@@ -846,17 +846,13 @@ def _collect_supported_hometax_documents(
         if str(document.get("source", "")) == "hometax"
     ]
     existing = {
-        str(document.get("document_code", "")): str(
-            document.get("status", "")
-        )
+        (
+            str(document.get("document_code", "")),
+            int(document.get("period_year") or 0),
+        ): document
         for document in hometax_documents
     }
-    jobs: list[tuple[str, Any]] = []
-    supported_codes = {
-        "hometax_business_registration_list",
-        "hometax_business_registration_certificate",
-        "hometax_tax_payment_certificate",
-    }
+    jobs: list[tuple[str, int, Any]] = []
     skipped_codes: list[str] = [
         (
             f"{document.get('document_code')}:{document.get('period_year')}"
@@ -864,12 +860,20 @@ def _collect_supported_hometax_documents(
             else str(document.get("document_code", ""))
         )
         for document in hometax_documents
-        if str(document.get("document_code", "")) not in supported_codes
+        if not automatic_collection_supported(
+            str(document.get("document_code", ""))
+        )
     ]
-    if _is_valid_business_no(business_number):
+    business_valid = _is_valid_business_no(business_number)
+
+    if (
+        "hometax_business_registration_certificate",
+        0,
+    ) in existing and business_valid:
         jobs.append(
             (
                 "hometax_business_registration_certificate",
+                0,
                 lambda: client.collect_hometax_business_registration_certificate(
                     birth_date=birth_date,
                     user_name=representative,
@@ -879,30 +883,96 @@ def _collect_supported_hometax_documents(
                 ),
             )
         )
-    else:
+    elif (
+        "hometax_business_registration_certificate",
+        0,
+    ) in existing:
         skipped_codes.append("hometax_business_registration_certificate")
-    jobs.append(
-        (
-            "hometax_tax_payment_certificate",
-            lambda: client.collect_hometax_tax_payment_certificate(
-                birth_date=birth_date,
-                user_name=representative,
-                cellphone=cellphone,
-                session=session,
-            ),
+
+    if ("hometax_tax_payment_certificate", 0) in existing:
+        jobs.append(
+            (
+                "hometax_tax_payment_certificate",
+                0,
+                lambda: client.collect_hometax_tax_payment_certificate(
+                    birth_date=birth_date,
+                    user_name=representative,
+                    cellphone=cellphone,
+                    session=session,
+                ),
+            )
         )
-    )
+
+    for document in hometax_documents:
+        document_code = str(document.get("document_code", ""))
+        period_year = int(document.get("period_year") or 0)
+        if document_code == "hometax_income_tax_help" and period_year:
+            jobs.append(
+                (
+                    document_code,
+                    period_year,
+                    lambda year=period_year: client.collect_hometax_income_tax_help(
+                        year=year,
+                        birth_date=birth_date,
+                        user_name=representative,
+                        cellphone=cellphone,
+                        session=session,
+                    ),
+                )
+            )
+        elif document_code == "hometax_income_tax_return" and period_year:
+            if business_valid:
+                jobs.append(
+                    (
+                        document_code,
+                        period_year,
+                        lambda year=period_year: client.collect_hometax_income_tax_return(
+                            year=year,
+                            birth_date=birth_date,
+                            user_name=representative,
+                            cellphone=cellphone,
+                            business_number=business_number,
+                            session=session,
+                        ),
+                    )
+                )
+            else:
+                skipped_codes.append(f"{document_code}:{period_year}")
+
+    if ("hometax_closure_certificate", 0) in existing and business_valid:
+        jobs.append(
+            (
+                "hometax_closure_certificate",
+                0,
+                lambda: client.collect_hometax_closure_certificate(
+                    birth_date=birth_date,
+                    user_name=representative,
+                    cellphone=cellphone,
+                    business_number=business_number,
+                    session=session,
+                ),
+            )
+        )
+    elif ("hometax_closure_certificate", 0) in existing:
+        skipped_codes.append("hometax_closure_certificate")
+
+    jobs.sort(key=lambda item: (item[0], -item[1]))
     completed_count = 0
     failed_count = 0
     errors: list[dict[str, str]] = []
     transient_business_numbers: list[str] = []
-    ready_codes = set(known_ready_codes or set())
+    ready_keys = set(known_ready_keys or set())
     tax_number_discovery_attempted = False
     target_count = len(jobs)
-    for document_code, collector in jobs:
+    for document_code, period_year, collector in jobs:
+        key = (document_code, period_year)
+        current = existing.get(key)
         preexisting_ready = bool(
-            document_code in ready_codes
-            or existing.get(document_code) == "ready"
+            key in ready_keys
+            or (
+                current
+                and str(current.get("status", "")) == "ready"
+            )
         )
         force_refresh = bool(
             force_tax_number_discovery
@@ -910,7 +980,7 @@ def _collect_supported_hometax_documents(
         )
         if preexisting_ready and not force_refresh:
             completed_count += 1
-            ready_codes.add(document_code)
+            ready_keys.add(key)
             if on_progress:
                 on_progress(completed_count, target_count, document_code)
             continue
@@ -940,12 +1010,14 @@ def _collect_supported_hometax_documents(
             # A forced number-only refresh must never overwrite a previously
             # downloadable certificate. It is used only for transient facts.
             if not (force_refresh and preexisting_ready):
-                repository.store_collected_document(
-                    case_id,
-                    document_code=document_code,
-                    document=collected,
-                )
-            ready_codes.add(document_code)
+                store_kwargs: dict[str, Any] = {
+                    "document_code": document_code,
+                    "document": collected,
+                }
+                if period_year:
+                    store_kwargs["period_year"] = period_year
+                repository.store_collected_document(case_id, **store_kwargs)
+            ready_keys.add(key)
             completed_count += 1
         except (ClaimProviderError, ClaimRepositoryError) as exc:
             if isinstance(exc, ClaimProviderError):
@@ -958,6 +1030,7 @@ def _collect_supported_hometax_documents(
             errors.append(
                 {
                     "document_code": document_code,
+                    "period_year": str(period_year or ""),
                     "safe_error_code": safe_error_code,
                     "message": str(exc)[:240],
                 }
@@ -966,15 +1039,17 @@ def _collect_supported_hometax_documents(
                 # The refresh failed, but the previously stored document is
                 # still valid and must remain downloadable.
                 completed_count += 1
-                ready_codes.add(document_code)
+                ready_keys.add(key)
             else:
                 failed_count += 1
                 try:
-                    repository.fail_document(
-                        case_id,
-                        document_code=document_code,
-                        safe_error_code=safe_error_code,
-                    )
+                    fail_kwargs: dict[str, Any] = {
+                        "document_code": document_code,
+                        "safe_error_code": safe_error_code,
+                    }
+                    if period_year:
+                        fail_kwargs["period_year"] = period_year
+                    repository.fail_document(case_id, **fail_kwargs)
                 except ClaimRepositoryError:
                     pass
         if on_progress:
@@ -986,7 +1061,8 @@ def _collect_supported_hometax_documents(
         "skipped": skipped_codes,
         "errors": errors,
         "business_numbers": transient_business_numbers,
-        "ready_codes": sorted(ready_codes),
+        "ready_codes": sorted({code for code, _ in ready_keys}),
+        "ready_keys": sorted(ready_keys),
         "tax_number_discovery_attempted": tax_number_discovery_attempted,
     }
 
@@ -1249,15 +1325,9 @@ def _collect_case_documents(
         sum(
             1
             for document in planned_documents
-            if str(document.get("document_code", ""))
-            in {
-                "hometax_business_registration_list",
-                "hometax_business_registration_certificate",
-                "hometax_tax_payment_certificate",
-                "comwel_total_remuneration",
-                "comwel_management_number_list",
-                "comwel_workplace_rate",
-            }
+            if automatic_collection_supported(
+                str(document.get("document_code", ""))
+            )
         ),
     )
 
@@ -1384,9 +1454,14 @@ def _collect_case_documents(
                     cellphone=cellphone,
                     business_number=business_number,
                     session=transient["hometax"],
-                    known_ready_codes=set(
-                        hometax_summary.get("ready_codes", [])
-                    ),
+                    known_ready_keys={
+                        (str(code), int(year or 0))
+                        for code, year in hometax_summary.get(
+                            "ready_keys",
+                            [],
+                        )
+                        if str(code)
+                    },
                     on_progress=hometax_progress,
                     should_continue=should_continue,
                 )
@@ -1401,6 +1476,8 @@ def _collect_case_documents(
         if str(document.get("document_code", ""))
         in {
             "hometax_business_registration_certificate",
+            "hometax_income_tax_return",
+            "hometax_closure_certificate",
             "comwel_management_number_list",
             "comwel_workplace_rate",
         }
@@ -4498,8 +4575,9 @@ def _render_results_tab(
         )
     st.caption(
         "현재 자동수집 지원: 홈택스 사업자정보 조회·사업자등록증명원·"
-        "국세납세증명서, 근로복지공단 보수총액·사업장관리번호·사업장요율. "
-        "그 밖의 항목은 결과 오류가 아니라 공급사 API 연동 예정 항목입니다."
+        "국세납세증명서·종합소득세 신고도움·종합소득세 신고서·"
+        "폐업사실증명, 근로복지공단 보수총액·사업장관리번호·사업장요율. "
+        "환급금은 세무대리인 공동인증서 API가 필요해 별도 연동 예정입니다."
     )
 
 
