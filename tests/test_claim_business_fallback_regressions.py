@@ -115,6 +115,14 @@ class _CapturingDatabase:
         return []
 
 
+@patch.dict(
+    "os.environ",
+    {
+        "CLAIM_DOCUMENT_VARIANT_KEY": (
+            "claim-scope-test-secret-" + ("x" * 32)
+        )
+    },
+)
 class ClaimBusinessFallbackRegressionTests(unittest.TestCase):
     @patch("tilko_claim_client.requests.post")
     def test_tax_certificate_exposes_business_number_only_transiently(
@@ -451,8 +459,8 @@ class ClaimBusinessFallbackRegressionTests(unittest.TestCase):
             force_tax_number_discovery=True,
         )
 
-        self.assertEqual(summary["ready"], 1)
-        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(summary["ready"], 0)
+        self.assertEqual(summary["failed"], 1)
         self.assertFalse(summary["tax_number_discovery_attempted"])
         repository.store_collected_document.assert_not_called()
         repository.fail_document.assert_not_called()

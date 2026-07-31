@@ -4,11 +4,13 @@ import hashlib
 import hmac
 import html
 import json
+import os
 import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from typing import Any, Callable, Mapping
 
 import pandas as pd
@@ -21,6 +23,7 @@ from claim_correction_catalog import (
     automatic_collection_supported,
 )
 from claim_correction_repository import (
+    CLAIM_DEFAULT_COLLECTION_KEY,
     CLAIM_DOWNLOAD_EXTENSION_BY_CONTENT_TYPE,
     CLAIM_DOWNLOAD_URL_TTL_SECONDS,
     CLAIM_STORAGE_BUCKET,
@@ -33,6 +36,7 @@ from registered_policy_match import (
 )
 from tilko_claim_client import (
     ClaimProviderError,
+    CollectedClaimDocument,
     TilkoClaimClient,
     provider_readiness,
 )
@@ -542,26 +546,75 @@ def _claim_auth_stage(case: dict[str, Any]) -> tuple[int, str]:
 def _claim_collection_progress(
     documents: list[dict[str, Any]],
 ) -> tuple[int, str, int, int]:
-    management_document = next(
+    variant_groups = {
         (
-            document
-            for document in documents
-            if str(document.get("document_code", "")).strip()
-            == "comwel_management_number_list"
-            and str(document.get("status", "")).strip().lower() == "ready"
-        ),
-        {},
-    )
-    management_facts = (
-        management_document.get("facts")
-        if isinstance(management_document, dict)
-        else {}
-    )
+            str(document.get("source", "")).strip(),
+            str(document.get("document_code", "")).strip(),
+            int(document.get("period_year") or 0),
+        )
+        for document in documents
+        if str(
+            document.get(
+                "collection_key",
+                CLAIM_DEFAULT_COLLECTION_KEY,
+            )
+            or CLAIM_DEFAULT_COLLECTION_KEY
+        ).strip().lower()
+        != CLAIM_DEFAULT_COLLECTION_KEY
+    }
+
+    def is_superseded_default(document: dict[str, Any]) -> bool:
+        collection_key = str(
+            document.get(
+                "collection_key",
+                CLAIM_DEFAULT_COLLECTION_KEY,
+            )
+            or CLAIM_DEFAULT_COLLECTION_KEY
+        ).strip().lower()
+        if collection_key != CLAIM_DEFAULT_COLLECTION_KEY:
+            return False
+        group = (
+            str(document.get("source", "")).strip(),
+            str(document.get("document_code", "")).strip(),
+            int(document.get("period_year") or 0),
+        )
+        facts = document.get("facts")
+        legacy_scoped_file = bool(
+            isinstance(facts, dict)
+            and (
+                _document_scope_fingerprint(document)
+                or str(facts.get("collection_scope", "")).strip().lower()
+                in {"business", "management"}
+            )
+        )
+        return group in variant_groups or legacy_scoped_file
+
+    management_documents = [
+        document
+        for document in documents
+        if str(document.get("document_code", "")).strip()
+        == "comwel_management_number_list"
+        and str(document.get("status", "")).strip().lower() == "ready"
+    ]
+
+    def has_no_management_number(document: dict[str, Any]) -> bool:
+        facts = document.get("facts")
+        if not isinstance(facts, dict):
+            return False
+        return bool(
+            str(facts.get("record_count", "")) == "0"
+            or facts.get("management_numbers") == []
+            or (
+                "management_number_count" in facts
+                and int(facts.get("management_number_count") or 0) == 0
+            )
+        )
+
     no_management_workplaces = bool(
-        isinstance(management_facts, dict)
-        and (
-            str(management_facts.get("record_count", "")) == "0"
-            or management_facts.get("management_numbers") == []
+        management_documents
+        and all(
+            has_no_management_number(document)
+            for document in management_documents
         )
     )
     targets = [
@@ -570,6 +623,7 @@ def _claim_collection_progress(
         if automatic_collection_supported(
             str(document.get("document_code", "")).strip()
         )
+        and not is_superseded_default(document)
         and not (
             no_management_workplaces
             and str(document.get("document_code", "")).strip()
@@ -846,6 +900,232 @@ def _business_candidate_token(case_id: str, business_number: str) -> str:
     ).hexdigest()[:24]
 
 
+def _claim_collection_variant_key(
+    case_id: str,
+    scope: str,
+    *values: Any,
+) -> str:
+    secret = _claim_collection_hmac_secret()
+    payload = "|".join(
+        (
+            str(case_id or "").strip(),
+            str(scope or "").strip().lower(),
+            *(_digits(value) for value in values),
+        )
+    ).encode("utf-8")
+    return f"v_{hmac.new(secret, payload, hashlib.sha256).hexdigest()[:32]}"
+
+
+def _claim_collection_hmac_secret() -> bytes:
+    for name in (
+        "CLAIM_DOCUMENT_VARIANT_KEY",
+        "CLAIM_JOB_ENCRYPTION_KEY",
+    ):
+        value = str(os.environ.get(name, "") or "").strip()
+        if not value:
+            try:
+                value = str(st.secrets.get(name, "") or "").strip()
+            except Exception:
+                value = ""
+        if not value:
+            continue
+        if len(value) < 32:
+            raise ClaimRepositoryError(
+                f"{name} must contain at least 32 characters."
+            )
+        return value.encode("utf-8")
+    raise ClaimRepositoryError(
+        "A durable claim document variant secret is required."
+    )
+
+
+def _claim_collection_scope_fingerprint(
+    case_id: str,
+    scope: str,
+    *values: Any,
+) -> str:
+    payload = "|".join(
+        (
+            str(case_id or "").strip(),
+            str(scope or "").strip().lower(),
+            *(_digits(value) for value in values),
+        )
+    ).encode("utf-8")
+    digest = hmac.new(
+        _claim_collection_hmac_secret(),
+        payload,
+        hashlib.sha256,
+    ).hexdigest()
+    return f"s_{digest[:32]}"
+
+
+def _document_scope_fingerprint(document: Any) -> str:
+    facts = document.get("facts") if isinstance(document, dict) else {}
+    if not isinstance(facts, dict):
+        return ""
+    value = str(
+        facts.get("collection_scope_fingerprint", "") or ""
+    ).strip().lower()
+    return value if re.fullmatch(r"s_[0-9a-f]{32}", value) else ""
+
+
+def _scope_fingerprint_matches(
+    document: Any,
+    expected_fingerprint: Any,
+) -> bool:
+    expected = str(expected_fingerprint or "").strip().lower()
+    if not re.fullmatch(r"s_[0-9a-f]{32}", expected):
+        return False
+    stored = _document_scope_fingerprint(document)
+    return bool(stored) and hmac.compare_digest(stored, expected)
+
+
+def _masked_management_number(value: Any) -> str:
+    digits = _digits(value)
+    if len(digits) < 6:
+        return ""
+    return f"{digits[:3]}-{'*' * max(3, len(digits) - 3)}"
+
+
+def _collection_scope_label(
+    *,
+    business_name: Any = "",
+    business_number: Any = "",
+    management_number: Any = "",
+) -> str:
+    parts = [
+        part
+        for part in (
+            _clean(business_name)[:120],
+            _masked_business_no(business_number),
+            (
+                f"관리번호 {_masked_management_number(management_number)}"
+                if _masked_management_number(management_number)
+                else ""
+            ),
+        )
+        if part
+    ]
+    return " · ".join(parts)
+
+
+def _scoped_claim_document(
+    document: CollectedClaimDocument,
+    *,
+    scope_index: int,
+    scope_count: int,
+    collection_scope: str,
+    business_name: str = "",
+    business_number: str = "",
+    management_number: str = "",
+    scope_fingerprint: str = "",
+) -> CollectedClaimDocument:
+    facts = dict(document.facts or {})
+    facts.update(
+        {
+            "collection_scope": str(collection_scope or "").strip(),
+            "scope_index": max(1, int(scope_index)),
+            "scope_count": max(1, int(scope_count)),
+            "collection_scope_fingerprint": str(
+                scope_fingerprint or ""
+            ).strip(),
+        }
+    )
+    clean_business_name = _clean(business_name)
+    if clean_business_name:
+        facts["business_name"] = clean_business_name[:120]
+    masked_business_number = _masked_business_no(business_number)
+    if masked_business_number:
+        facts["business_number_masked"] = masked_business_number
+    masked_management_number = _masked_management_number(
+        management_number
+    )
+    if masked_management_number:
+        facts["management_number_masked"] = masked_management_number
+    scope_label = _collection_scope_label(
+        business_name=clean_business_name,
+        business_number=business_number,
+        management_number=management_number,
+    )
+    if scope_label:
+        facts["collection_scope_label"] = scope_label
+
+    original_name = str(document.file_name or "")
+    stem, extension = os.path.splitext(original_name)
+    scoped_name = (
+        original_name
+        if int(scope_count) <= 1
+        else (
+            f"{stem or 'claim-document'}-scope-"
+            f"{max(1, int(scope_index)):02d}{extension}"
+        )
+    )
+    return CollectedClaimDocument(
+        content=document.content,
+        file_name=scoped_name,
+        content_type=document.content_type,
+        provider_reference=document.provider_reference,
+        facts=facts,
+        transient_facts=dict(document.transient_facts or {}),
+    )
+
+
+def _business_collection_scopes(
+    case_id: str,
+    candidates: list[dict[str, Any]],
+    fallback_business_number: str = "",
+) -> list[dict[str, str]]:
+    by_number: dict[str, dict[str, str]] = {}
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        business_number = _digits(candidate.get("business_number"))
+        if not _is_valid_business_no(business_number):
+            continue
+        current = by_number.get(business_number, {})
+        by_number[business_number] = {
+            "business_number": business_number,
+            "business_name": (
+                current.get("business_name")
+                or _clean(candidate.get("business_name"))[:120]
+            ),
+            "business_status": (
+                current.get("business_status")
+                or _clean(candidate.get("business_status"))[:120]
+            ),
+        }
+    fallback = _digits(fallback_business_number)
+    if _is_valid_business_no(fallback) and fallback not in by_number:
+        by_number[fallback] = {
+            "business_number": fallback,
+            "business_name": "",
+            "business_status": "",
+        }
+
+    scopes: list[dict[str, str]] = []
+    for business_number in sorted(by_number):
+        candidate = by_number[business_number]
+        collection_key = _claim_collection_variant_key(
+            case_id,
+            "business",
+            business_number,
+        )
+        scopes.append(
+            {
+                **candidate,
+                "collection_key": collection_key,
+                "collection_scope_fingerprint": (
+                    _claim_collection_scope_fingerprint(
+                        case_id,
+                        "business",
+                        business_number,
+                    )
+                ),
+            }
+        )
+    return scopes
+
+
 def _discover_hometax_business_number(
     repository: ClaimRepository,
     client: TilkoClaimClient,
@@ -932,11 +1212,12 @@ def _discover_hometax_business_number(
                 or _provider_error_code(exc) == "AUTH_SESSION_EXPIRED"
             ):
                 raise
-            # A previous successful, downloadable snapshot must not be
-            # downgraded just because the short-lived auth session had to
-            # rediscover the raw number and that retry failed.
-            failed_count = 0 if existing_ready else 1
-            ready_count = 1 if existing_ready else 0
+            # Keep a previous downloadable snapshot intact, but do not count
+            # it as a successful discovery for this authenticated run. Without
+            # the current raw business set we cannot prove that every business
+            # scope was collected.
+            failed_count = 1
+            ready_count = 0
             safe_error_code = _safe_provider_error_code(
                 exc,
                 "HOMETAX_BUSINESS_DISCOVERY",
@@ -976,8 +1257,8 @@ def _discover_hometax_business_number(
             not allowed_numbers
             or requested_number in allowed_numbers
         )
-        else next(iter(allowed_numbers))
-        if len(allowed_numbers) == 1
+        else sorted(allowed_numbers)[0]
+        if allowed_numbers
         else ""
     )
     if business_number:
@@ -990,9 +1271,7 @@ def _discover_hometax_business_number(
         "errors": errors,
         "business_number": business_number,
         "candidates": candidates,
-        "selection_required": bool(
-            len(allowed_numbers) > 1 and not business_number
-        ),
+        "selection_required": False,
     }
 
 
@@ -1006,8 +1285,9 @@ def _collect_supported_hometax_documents(
     cellphone: str,
     business_number: str,
     session: dict[str, str],
+    businesses: list[dict[str, Any]] | None = None,
     force_tax_number_discovery: bool = False,
-    known_ready_keys: set[tuple[str, int]] | None = None,
+    known_ready_keys: set[tuple[Any, ...]] | None = None,
     on_progress: Any | None = None,
     should_continue: Any | None = None,
 ) -> dict[str, Any]:
@@ -1017,55 +1297,164 @@ def _collect_supported_hometax_documents(
         for document in repository.list_documents(case_id)
         if str(document.get("source", "")) == "hometax"
     ]
+    planned_hometax_documents = [
+        document
+        for document in hometax_documents
+        if str(
+            document.get(
+                "collection_key",
+                CLAIM_DEFAULT_COLLECTION_KEY,
+            )
+            or CLAIM_DEFAULT_COLLECTION_KEY
+        )
+        == CLAIM_DEFAULT_COLLECTION_KEY
+    ]
     existing = {
         (
             str(document.get("document_code", "")),
             int(document.get("period_year") or 0),
+            str(
+                document.get(
+                    "collection_key",
+                    CLAIM_DEFAULT_COLLECTION_KEY,
+                )
+                or CLAIM_DEFAULT_COLLECTION_KEY
+            ),
         ): document
         for document in hometax_documents
     }
-    jobs: list[tuple[str, int, Any]] = []
+    jobs: list[
+        tuple[str, int, str, dict[str, Any], Any]
+    ] = []
     skipped_codes: list[str] = [
         (
             f"{document.get('document_code')}:{document.get('period_year')}"
             if document.get("period_year")
             else str(document.get("document_code", ""))
         )
-        for document in hometax_documents
+        for document in planned_hometax_documents
         if not automatic_collection_supported(
             str(document.get("document_code", ""))
         )
     ]
-    business_valid = _is_valid_business_no(business_number)
+    business_scopes = _business_collection_scopes(
+        case_id,
+        list(businesses or []),
+        business_number,
+    )
+    scope_count = len(business_scopes)
+
+    def add_business_jobs(
+        document_code: str,
+        period_year: int,
+        collector_factory: Any,
+    ) -> None:
+        for scope_index, scope in enumerate(
+            business_scopes,
+            start=1,
+        ):
+            selected_business_number = str(
+                scope.get("business_number", "")
+            )
+            collection_key = str(
+                scope.get(
+                    "collection_key",
+                    CLAIM_DEFAULT_COLLECTION_KEY,
+                )
+            )
+            scope_fingerprint = str(
+                scope.get("collection_scope_fingerprint", "")
+            )
+            scope_facts = {
+                "collection_scope": "business",
+                "scope_index": scope_index,
+                "scope_count": scope_count,
+                "collection_scope_fingerprint": scope_fingerprint,
+                "business_name": str(
+                    scope.get("business_name", "")
+                )[:120],
+                "business_number_masked": _masked_business_no(
+                    selected_business_number
+                ),
+                "collection_scope_label": _collection_scope_label(
+                    business_name=scope.get("business_name", ""),
+                    business_number=selected_business_number,
+                ),
+            }
+
+            def collect_scoped(
+                *,
+                factory: Any = collector_factory,
+                selected_scope: dict[str, str] = scope,
+                index: int = scope_index,
+            ) -> CollectedClaimDocument:
+                return _scoped_claim_document(
+                    factory(
+                        str(selected_scope.get("business_number", ""))
+                    ),
+                    scope_index=index,
+                    scope_count=scope_count,
+                    collection_scope="business",
+                    business_name=str(
+                        selected_scope.get("business_name", "")
+                    ),
+                    business_number=str(
+                        selected_scope.get("business_number", "")
+                    ),
+                    scope_fingerprint=str(
+                        selected_scope.get(
+                            "collection_scope_fingerprint",
+                            "",
+                        )
+                    ),
+                )
+
+            jobs.append(
+                (
+                    document_code,
+                    period_year,
+                    collection_key,
+                    scope_facts,
+                    collect_scoped,
+                )
+            )
 
     if (
         "hometax_business_registration_certificate",
         0,
-    ) in existing and business_valid:
-        jobs.append(
-            (
-                "hometax_business_registration_certificate",
-                0,
-                lambda: client.collect_hometax_business_registration_certificate(
+        CLAIM_DEFAULT_COLLECTION_KEY,
+    ) in existing and business_scopes:
+        add_business_jobs(
+            "hometax_business_registration_certificate",
+            0,
+            lambda selected_business_number: (
+                client.collect_hometax_business_registration_certificate(
                     birth_date=birth_date,
                     user_name=representative,
                     cellphone=cellphone,
-                    business_number=business_number,
+                    business_number=selected_business_number,
                     session=session,
-                ),
-            )
+                )
+            ),
         )
     elif (
         "hometax_business_registration_certificate",
         0,
+        CLAIM_DEFAULT_COLLECTION_KEY,
     ) in existing:
         skipped_codes.append("hometax_business_registration_certificate")
 
-    if ("hometax_tax_payment_certificate", 0) in existing:
+    if (
+        "hometax_tax_payment_certificate",
+        0,
+        CLAIM_DEFAULT_COLLECTION_KEY,
+    ) in existing:
         jobs.append(
             (
                 "hometax_tax_payment_certificate",
                 0,
+                CLAIM_DEFAULT_COLLECTION_KEY,
+                {},
                 lambda: client.collect_hometax_tax_payment_certificate(
                     birth_date=birth_date,
                     user_name=representative,
@@ -1075,7 +1464,7 @@ def _collect_supported_hometax_documents(
             )
         )
 
-    for document in hometax_documents:
+    for document in planned_hometax_documents:
         document_code = str(document.get("document_code", ""))
         period_year = int(document.get("period_year") or 0)
         if document_code == "hometax_income_tax_help" and period_year:
@@ -1083,6 +1472,8 @@ def _collect_supported_hometax_documents(
                 (
                     document_code,
                     period_year,
+                    CLAIM_DEFAULT_COLLECTION_KEY,
+                    {},
                     lambda year=period_year: client.collect_hometax_income_tax_help(
                         year=year,
                         birth_date=birth_date,
@@ -1093,64 +1484,108 @@ def _collect_supported_hometax_documents(
                 )
             )
         elif document_code == "hometax_income_tax_return" and period_year:
-            if business_valid:
-                jobs.append(
-                    (
-                        document_code,
-                        period_year,
-                        lambda year=period_year: client.collect_hometax_income_tax_return(
+            if business_scopes:
+                add_business_jobs(
+                    document_code,
+                    period_year,
+                    lambda selected_business_number, year=period_year: (
+                        client.collect_hometax_income_tax_return(
                             year=year,
                             birth_date=birth_date,
                             user_name=representative,
                             cellphone=cellphone,
-                            business_number=business_number,
+                            business_number=selected_business_number,
                             session=session,
-                        ),
-                    )
+                        )
+                    ),
                 )
             else:
                 skipped_codes.append(f"{document_code}:{period_year}")
 
-    if ("hometax_closure_certificate", 0) in existing and business_valid:
-        jobs.append(
-            (
-                "hometax_closure_certificate",
-                0,
-                lambda: client.collect_hometax_closure_certificate(
+    if (
+        "hometax_closure_certificate",
+        0,
+        CLAIM_DEFAULT_COLLECTION_KEY,
+    ) in existing and business_scopes:
+        add_business_jobs(
+            "hometax_closure_certificate",
+            0,
+            lambda selected_business_number: (
+                client.collect_hometax_closure_certificate(
                     birth_date=birth_date,
                     user_name=representative,
                     cellphone=cellphone,
-                    business_number=business_number,
+                    business_number=selected_business_number,
                     session=session,
-                ),
-            )
+                )
+            ),
         )
-    elif ("hometax_closure_certificate", 0) in existing:
+    elif (
+        "hometax_closure_certificate",
+        0,
+        CLAIM_DEFAULT_COLLECTION_KEY,
+    ) in existing:
         skipped_codes.append("hometax_closure_certificate")
 
-    jobs.sort(key=lambda item: (item[0], -item[1]))
+    jobs.sort(key=lambda item: (item[0], -item[1], item[2]))
     completed_count = 0
     failed_count = 0
     errors: list[dict[str, str]] = []
     transient_business_numbers: list[str] = []
-    ready_keys = set(known_ready_keys or set())
+    ready_keys: set[tuple[str, int, str]] = set()
+    for raw_key in known_ready_keys or set():
+        if len(raw_key) < 2:
+            continue
+        ready_keys.add(
+            (
+                str(raw_key[0]),
+                int(raw_key[1] or 0),
+                (
+                    str(raw_key[2])
+                    if len(raw_key) >= 3 and raw_key[2]
+                    else CLAIM_DEFAULT_COLLECTION_KEY
+                ),
+            )
+        )
     tax_number_discovery_attempted = False
     target_count = len(jobs)
-    for document_code, period_year, collector in jobs:
-        key = (document_code, period_year)
+    for (
+        document_code,
+        period_year,
+        collection_key,
+        scope_facts,
+        collector,
+    ) in jobs:
+        key = (document_code, period_year, collection_key)
         current = existing.get(key)
-        preexisting_ready = bool(
-            key in ready_keys
-            or (
-                current
-                and str(current.get("status", "")) == "ready"
+        current_ready = bool(
+            current and str(current.get("status", "")) == "ready"
+        )
+        expected_scope_fingerprint = str(
+            scope_facts.get("collection_scope_fingerprint", "")
+        )
+        scope_matches = bool(
+            expected_scope_fingerprint
+            and _scope_fingerprint_matches(
+                current,
+                expected_scope_fingerprint,
             )
+        )
+        scoped_job = bool(expected_scope_fingerprint)
+        preexisting_ready = bool(
+            current_ready
+            if scoped_job
+            else (key in ready_keys or current_ready)
         )
         force_refresh = bool(
             force_tax_number_discovery
             and document_code == "hometax_tax_payment_certificate"
         )
-        if preexisting_ready and not force_refresh:
+        if (
+            preexisting_ready
+            and (not scoped_job or scope_matches)
+            and not force_refresh
+        ):
             completed_count += 1
             ready_keys.add(key)
             if on_progress:
@@ -1188,6 +1623,8 @@ def _collect_supported_hometax_documents(
                 }
                 if period_year:
                     store_kwargs["period_year"] = period_year
+                if collection_key != CLAIM_DEFAULT_COLLECTION_KEY:
+                    store_kwargs["collection_key"] = collection_key
                 repository.store_collected_document(case_id, **store_kwargs)
             ready_keys.add(key)
             completed_count += 1
@@ -1207,11 +1644,14 @@ def _collect_supported_hometax_documents(
                     "message": str(exc)[:240],
                 }
             )
-            if force_refresh and preexisting_ready:
-                # The refresh failed, but the previously stored document is
-                # still valid and must remain downloadable.
-                completed_count += 1
-                ready_keys.add(key)
+            if preexisting_ready and (
+                force_refresh
+                or (scoped_job and not scope_matches)
+            ):
+                # The previous file remains downloadable, but it does not
+                # satisfy the current scope. Count this run as failed without
+                # downgrading or deleting the preserved file.
+                failed_count += 1
             else:
                 failed_count += 1
                 try:
@@ -1221,6 +1661,9 @@ def _collect_supported_hometax_documents(
                     }
                     if period_year:
                         fail_kwargs["period_year"] = period_year
+                    if collection_key != CLAIM_DEFAULT_COLLECTION_KEY:
+                        fail_kwargs["collection_key"] = collection_key
+                        fail_kwargs["facts"] = scope_facts
                     repository.fail_document(case_id, **fail_kwargs)
                 except ClaimRepositoryError:
                     pass
@@ -1233,7 +1676,7 @@ def _collect_supported_hometax_documents(
         "skipped": skipped_codes,
         "errors": errors,
         "business_numbers": transient_business_numbers,
-        "ready_codes": sorted({code for code, _ in ready_keys}),
+        "ready_codes": sorted({code for code, _, _ in ready_keys}),
         "ready_keys": sorted(ready_keys),
         "tax_number_discovery_attempted": tax_number_discovery_attempted,
     }
@@ -1249,27 +1692,49 @@ def _collect_supported_comwel_documents(
     cellphone: str,
     business_number: str,
     session: dict[str, str],
+    businesses: list[dict[str, Any]] | None = None,
+    management_cache: dict[str, list[str]] | None = None,
     selected_management_number: str = "",
     on_progress: Any | None = None,
     should_continue: Any | None = None,
 ) -> dict[str, Any]:
+    del selected_management_number
     _ensure_claim_operation_active(should_continue)
     documents = [
         document
         for document in repository.list_documents(case_id)
         if str(document.get("source", "")) == "comwel"
     ]
+    planned_documents = [
+        document
+        for document in documents
+        if str(
+            document.get(
+                "collection_key",
+                CLAIM_DEFAULT_COLLECTION_KEY,
+            )
+            or CLAIM_DEFAULT_COLLECTION_KEY
+        )
+        == CLAIM_DEFAULT_COLLECTION_KEY
+    ]
     existing = {
         (
             str(document.get("document_code", "")),
             int(document.get("period_year") or 0),
+            str(
+                document.get(
+                    "collection_key",
+                    CLAIM_DEFAULT_COLLECTION_KEY,
+                )
+                or CLAIM_DEFAULT_COLLECTION_KEY
+            ),
         ): document
         for document in documents
     }
     remuneration_years = sorted(
         {
             int(document.get("period_year") or 0)
-            for document in documents
+            for document in planned_documents
             if str(document.get("document_code", ""))
             == "comwel_total_remuneration"
             and int(document.get("period_year") or 0) > 0
@@ -1279,27 +1744,36 @@ def _collect_supported_comwel_documents(
     rate_years = sorted(
         {
             int(document.get("period_year") or 0)
-            for document in documents
+            for document in planned_documents
             if str(document.get("document_code", ""))
             == "comwel_workplace_rate"
             and int(document.get("period_year") or 0) > 0
         },
         reverse=True,
     )
-    business_valid = _is_valid_business_no(business_number)
+    business_scopes = _business_collection_scopes(
+        case_id,
+        list(businesses or []),
+        business_number,
+    )
     has_management_document = (
         "comwel_management_number_list",
         0,
+        CLAIM_DEFAULT_COLLECTION_KEY,
     ) in existing
-    management_numbers: list[str] = []
+    safe_cache = (
+        management_cache
+        if isinstance(management_cache, dict)
+        else {}
+    )
+    management_number_count = 0
     completed_count = 0
     failed_count = 0
     errors: list[dict[str, str]] = []
     skipped_codes: list[str] = []
-    target_count = len(remuneration_years)
-    if business_valid and has_management_document:
-        target_count += 1 + len(rate_years)
-    else:
+    target_count = 0
+    if not business_scopes:
+        target_count = len(remuneration_years)
         skipped_codes.extend(
             (
                 ["comwel_management_number_list"]
@@ -1325,11 +1799,42 @@ def _collect_supported_comwel_documents(
         collector: Any,
         *,
         period_year: int | None = None,
+        collection_key: str = CLAIM_DEFAULT_COLLECTION_KEY,
+        scope_facts: dict[str, Any] | None = None,
+        refresh_ready: bool = False,
     ) -> Any | None:
         nonlocal completed_count, failed_count
-        key = (document_code, int(period_year or 0))
+        key = (
+            document_code,
+            int(period_year or 0),
+            collection_key,
+        )
         current = existing.get(key)
-        if current and str(current.get("status", "")) == "ready":
+        preexisting_ready = bool(
+            current and str(current.get("status", "")) == "ready"
+        )
+        expected_scope_fingerprint = str(
+            (scope_facts or {}).get(
+                "collection_scope_fingerprint",
+                "",
+            )
+        )
+        scoped_job = bool(expected_scope_fingerprint)
+        scope_matches = bool(
+            scoped_job
+            and _scope_fingerprint_matches(
+                current,
+                expected_scope_fingerprint,
+            )
+        )
+        scope_refresh = bool(
+            preexisting_ready and scoped_job and not scope_matches
+        )
+        if (
+            preexisting_ready
+            and (not scoped_job or scope_matches)
+            and not refresh_ready
+        ):
             completed_count += 1
             report(document_code)
             return current
@@ -1338,12 +1843,24 @@ def _collect_supported_comwel_documents(
             _ensure_claim_operation_active(should_continue)
             collected = collector()
             _ensure_claim_operation_active(should_continue)
-            stored = repository.store_collected_document(
-                case_id,
-                document_code=document_code,
-                document=collected,
-                period_year=period_year,
-            )
+            if (
+                preexisting_ready
+                and refresh_ready
+                and not scope_refresh
+            ):
+                stored = current
+            else:
+                store_kwargs: dict[str, Any] = {
+                    "document_code": document_code,
+                    "document": collected,
+                    "period_year": period_year,
+                }
+                if collection_key != CLAIM_DEFAULT_COLLECTION_KEY:
+                    store_kwargs["collection_key"] = collection_key
+                stored = repository.store_collected_document(
+                    case_id,
+                    **store_kwargs,
+                )
             completed_count += 1
             report(document_code)
             return {
@@ -1357,7 +1874,6 @@ def _collect_supported_comwel_documents(
                     or _provider_error_code(exc) == "AUTH_SESSION_EXPIRED"
                 ):
                     raise
-            failed_count += 1
             safe_error_code = _safe_provider_error_code(exc, "COMWEL")
             errors.append(
                 {
@@ -1367,103 +1883,352 @@ def _collect_supported_comwel_documents(
                     "message": str(exc)[:240],
                 }
             )
+            if preexisting_ready:
+                # Preserve the old downloadable file, but the current refresh
+                # did not produce a verified document for this scope.
+                failed_count += 1
+                report(document_code)
+                return current
+            failed_count += 1
             try:
+                fail_kwargs: dict[str, Any] = {
+                    "document_code": document_code,
+                    "period_year": period_year,
+                    "safe_error_code": safe_error_code,
+                }
+                if collection_key != CLAIM_DEFAULT_COLLECTION_KEY:
+                    fail_kwargs["collection_key"] = collection_key
+                    fail_kwargs["facts"] = dict(scope_facts or {})
                 repository.fail_document(
                     case_id,
-                    document_code=document_code,
-                    period_year=period_year,
-                    safe_error_code=safe_error_code,
+                    **fail_kwargs,
                 )
             except ClaimRepositoryError:
                 pass
             report(document_code)
             return None
 
-    if business_valid and has_management_document:
-        management_document = store_one(
-            "comwel_management_number_list",
-            lambda: client.collect_comwel_management_numbers(
-                identity_number=identity_number,
-                user_name=representative,
-                cellphone=cellphone,
-                business_number=business_number,
-                session=session,
-            ),
-        )
-        management_facts = (
-            management_document.get("facts")
-            if isinstance(management_document, dict)
-            else {}
-        )
-        if isinstance(management_facts, dict):
-            numbers = management_facts.get("management_numbers")
-            if isinstance(numbers, list):
-                management_numbers = [
+    data_scopes: list[dict[str, str]] = []
+    if business_scopes:
+        if has_management_document:
+            target_count = len(business_scopes)
+            for business_index, business_scope in enumerate(
+                business_scopes,
+                start=1,
+            ):
+                selected_business_number = str(
+                    business_scope.get("business_number", "")
+                )
+                business_collection_key = str(
+                    business_scope.get(
+                        "collection_key",
+                        CLAIM_DEFAULT_COLLECTION_KEY,
+                    )
+                )
+                business_scope_fingerprint = str(
+                    business_scope.get(
+                        "collection_scope_fingerprint",
+                        "",
+                    )
+                )
+                cached_numbers = [
                     _digits(number)
-                    for number in numbers
+                    for number in safe_cache.get(
+                        business_collection_key,
+                        [],
+                    )
                     if _digits(number)
                 ]
-    requested_management_number = _digits(selected_management_number)
-    management_number = (
-        requested_management_number
-        if requested_management_number in {
-            _digits(number) for number in management_numbers
-        }
-        else management_numbers[0]
-        if len(management_numbers) == 1
-        else ""
-    )
-    selection_required = bool(
-        business_valid
-        and has_management_document
-        and len(management_numbers) > 1
-        and not management_number
-        and rate_years
-    )
+                scope_facts = {
+                    "collection_scope": "business",
+                    "scope_index": business_index,
+                    "scope_count": len(business_scopes),
+                    "collection_scope_fingerprint": (
+                        business_scope_fingerprint
+                    ),
+                    "business_name": str(
+                        business_scope.get("business_name", "")
+                    )[:120],
+                    "business_number_masked": _masked_business_no(
+                        selected_business_number
+                    ),
+                    "collection_scope_label": _collection_scope_label(
+                        business_name=business_scope.get(
+                            "business_name",
+                            "",
+                        ),
+                        business_number=selected_business_number,
+                    ),
+                }
 
-    for year in remuneration_years:
-        store_one(
-            "comwel_total_remuneration",
-            lambda year=year: client.collect_comwel_total_remuneration(
-                year=year,
-                identity_number=identity_number,
-                user_name=representative,
-                cellphone=cellphone,
-                business_number=business_number,
-                management_number=management_number,
-                session=session,
-            ),
-            period_year=year,
-        )
+                def collect_management(
+                    *,
+                    selected_scope: dict[str, str] = business_scope,
+                    index: int = business_index,
+                ) -> CollectedClaimDocument:
+                    collected = client.collect_comwel_management_numbers(
+                        identity_number=identity_number,
+                        user_name=representative,
+                        cellphone=cellphone,
+                        business_number=str(
+                            selected_scope.get(
+                                "business_number",
+                                "",
+                            )
+                        ),
+                        session=session,
+                    )
+                    raw_management_numbers = (
+                        collected.facts.get("management_numbers")
+                        if isinstance(collected.facts, dict)
+                        else []
+                    )
+                    collected_with_count = CollectedClaimDocument(
+                        content=collected.content,
+                        file_name=collected.file_name,
+                        content_type=collected.content_type,
+                        provider_reference=(
+                            collected.provider_reference
+                        ),
+                        facts={
+                            **dict(collected.facts or {}),
+                            "management_number_count": len(
+                                raw_management_numbers
+                                if isinstance(
+                                    raw_management_numbers,
+                                    list,
+                                )
+                                else []
+                            ),
+                        },
+                        transient_facts=dict(
+                            collected.transient_facts or {}
+                        ),
+                    )
+                    return _scoped_claim_document(
+                        collected_with_count,
+                        scope_index=index,
+                        scope_count=len(business_scopes),
+                        collection_scope="business",
+                        business_name=str(
+                            selected_scope.get("business_name", "")
+                        ),
+                        business_number=str(
+                            selected_scope.get("business_number", "")
+                        ),
+                        scope_fingerprint=str(
+                            selected_scope.get(
+                                "collection_scope_fingerprint",
+                                "",
+                            )
+                        ),
+                    )
 
-    if business_valid and has_management_document and management_number:
-        for year in rate_years:
+                management_document = store_one(
+                    "comwel_management_number_list",
+                    collect_management,
+                    collection_key=business_collection_key,
+                    scope_facts=scope_facts,
+                    refresh_ready=not bool(cached_numbers),
+                )
+                management_facts = (
+                    management_document.get("facts")
+                    if isinstance(management_document, dict)
+                    else {}
+                )
+                numbers = (
+                    management_facts.get("management_numbers")
+                    if isinstance(management_facts, dict)
+                    else []
+                )
+                discovered_numbers = [
+                    _digits(number)
+                    for number in (
+                        numbers if isinstance(numbers, list) else []
+                    )
+                    if _digits(number)
+                ]
+                selected_numbers = sorted(
+                    set(cached_numbers + discovered_numbers)
+                )
+                safe_cache[business_collection_key] = selected_numbers
+                management_number_count += len(selected_numbers)
+                for management_number in selected_numbers or [""]:
+                    data_scopes.append(
+                        {
+                            **business_scope,
+                            "management_number": management_number,
+                        }
+                    )
+        else:
+            data_scopes = [
+                {**business_scope, "management_number": ""}
+                for business_scope in business_scopes
+            ]
+    else:
+        data_scopes = []
+
+    if business_scopes:
+        target_count += len(data_scopes) * len(remuneration_years)
+        for scope_index, data_scope in enumerate(
+            data_scopes,
+            start=1,
+        ):
+            selected_business_number = str(
+                data_scope.get("business_number", "")
+            )
+            management_number = str(
+                data_scope.get("management_number", "")
+            )
+            collection_key = _claim_collection_variant_key(
+                case_id,
+                "management",
+                selected_business_number,
+                management_number or "0",
+            )
+            scope_fingerprint = _claim_collection_scope_fingerprint(
+                case_id,
+                "management",
+                selected_business_number,
+                management_number or "0",
+            )
+            scope_facts = {
+                "collection_scope": "management",
+                "scope_index": scope_index,
+                "scope_count": len(data_scopes),
+                "collection_scope_fingerprint": scope_fingerprint,
+                "business_name": str(
+                    data_scope.get("business_name", "")
+                )[:120],
+                "business_number_masked": _masked_business_no(
+                    selected_business_number
+                ),
+                "management_number_masked": (
+                    _masked_management_number(management_number)
+                ),
+                "collection_scope_label": _collection_scope_label(
+                    business_name=data_scope.get("business_name", ""),
+                    business_number=selected_business_number,
+                    management_number=management_number,
+                ),
+            }
+
+            for year in remuneration_years:
+                store_one(
+                    "comwel_total_remuneration",
+                    lambda year=year, selected_business_number=selected_business_number, management_number=management_number, scope_index=scope_index, data_scope=data_scope: _scoped_claim_document(
+                        client.collect_comwel_total_remuneration(
+                            year=year,
+                            identity_number=identity_number,
+                            user_name=representative,
+                            cellphone=cellphone,
+                            business_number=selected_business_number,
+                            management_number=management_number,
+                            session=session,
+                        ),
+                        scope_index=scope_index,
+                        scope_count=len(data_scopes),
+                        collection_scope="management",
+                        business_name=str(
+                            data_scope.get("business_name", "")
+                        ),
+                        business_number=selected_business_number,
+                        management_number=management_number,
+                        scope_fingerprint=scope_fingerprint,
+                    ),
+                    period_year=year,
+                    collection_key=collection_key,
+                    scope_facts=scope_facts,
+                )
+        rate_scopes = [
+            data_scope
+            for data_scope in data_scopes
+            if _digits(data_scope.get("management_number"))
+        ]
+        target_count += len(rate_scopes) * len(rate_years)
+        for scope_index, data_scope in enumerate(
+            rate_scopes,
+            start=1,
+        ):
+            selected_business_number = str(
+                data_scope.get("business_number", "")
+            )
+            management_number = str(
+                data_scope.get("management_number", "")
+            )
+            collection_key = _claim_collection_variant_key(
+                case_id,
+                "workplace-rate",
+                selected_business_number,
+                management_number,
+            )
+            scope_fingerprint = _claim_collection_scope_fingerprint(
+                case_id,
+                "management",
+                selected_business_number,
+                management_number,
+            )
+            scope_facts = {
+                "collection_scope": "management",
+                "scope_index": scope_index,
+                "scope_count": len(rate_scopes),
+                "collection_scope_fingerprint": scope_fingerprint,
+                "business_name": str(
+                    data_scope.get("business_name", "")
+                )[:120],
+                "business_number_masked": _masked_business_no(
+                    selected_business_number
+                ),
+                "management_number_masked": (
+                    _masked_management_number(management_number)
+                ),
+                "collection_scope_label": _collection_scope_label(
+                    business_name=data_scope.get("business_name", ""),
+                    business_number=selected_business_number,
+                    management_number=management_number,
+                ),
+            }
+            for year in rate_years:
+                store_one(
+                    "comwel_workplace_rate",
+                    lambda year=year, management_number=management_number, scope_index=scope_index, data_scope=data_scope, selected_business_number=selected_business_number: _scoped_claim_document(
+                        client.collect_comwel_workplace_rate(
+                            year=year,
+                            identity_number=identity_number,
+                            user_name=representative,
+                            cellphone=cellphone,
+                            management_number=management_number,
+                            session=session,
+                        ),
+                        scope_index=scope_index,
+                        scope_count=len(data_scopes),
+                        collection_scope="management",
+                        business_name=str(
+                            data_scope.get("business_name", "")
+                        ),
+                        business_number=selected_business_number,
+                        management_number=management_number,
+                        scope_fingerprint=scope_fingerprint,
+                    ),
+                    period_year=year,
+                    collection_key=collection_key,
+                    scope_facts=scope_facts,
+                )
+    else:
+        for year in remuneration_years:
             store_one(
-                "comwel_workplace_rate",
-                lambda year=year: client.collect_comwel_workplace_rate(
+                "comwel_total_remuneration",
+                lambda year=year: client.collect_comwel_total_remuneration(
                     year=year,
                     identity_number=identity_number,
                     user_name=representative,
                     cellphone=cellphone,
-                    management_number=management_number,
+                    business_number="",
+                    management_number="",
                     session=session,
                 ),
                 period_year=year,
             )
-    elif business_valid and has_management_document:
-        skipped_codes.extend(
-            [
-                (
-                    f"comwel_workplace_rate:{year}:"
-                    "management_number_selection_required"
-                    if selection_required
-                    else f"comwel_workplace_rate:{year}:"
-                    "management_number_missing"
-                )
-                for year in rate_years
-            ]
-        )
-        target_count -= len(rate_years)
 
     skipped_codes.append("comwel_worker_status:certificate_required")
     return {
@@ -1472,8 +2237,9 @@ def _collect_supported_comwel_documents(
         "failed": failed_count,
         "skipped": skipped_codes,
         "errors": errors,
-        "management_numbers": management_numbers,
-        "selection_required": selection_required,
+        "management_numbers": [],
+        "management_number_count": management_number_count,
+        "selection_required": False,
     }
 
 
@@ -1524,6 +2290,14 @@ def _collect_case_documents(
         should_continue=should_continue,
     )
     business_number = _digits(business_discovery.get("business_number"))
+    business_scopes = _business_collection_scopes(
+        case_id,
+        list(business_discovery.get("candidates", [])),
+        business_number,
+    )
+    if business_scopes:
+        transient["business_candidates"] = business_scopes
+        business_discovery["candidates"] = business_scopes
     if business_number:
         transient["business_number"] = business_number
     discovery_target = int(business_discovery.get("target", 0) or 0)
@@ -1551,6 +2325,7 @@ def _collect_case_documents(
         cellphone=cellphone,
         business_number=business_number,
         session=transient["hometax"],
+        businesses=business_scopes,
         force_tax_number_discovery=bool(
             not business_valid
             and not business_discovery.get("candidates")
@@ -1595,23 +2370,16 @@ def _collect_case_documents(
             for candidate in fallback_numbers
         ]
         if fallback_candidates:
-            business_discovery["candidates"] = fallback_candidates
-            transient["business_candidates"] = fallback_candidates
-            requested_number = _digits(
-                transient.get("selected_business_number")
-                or transient.get("business_number")
+            business_number = sorted(fallback_numbers)[0]
+            business_scopes = _business_collection_scopes(
+                case_id,
+                fallback_candidates,
+                business_number,
             )
-            if (
-                _is_valid_business_no(requested_number)
-                and requested_number in fallback_numbers
-            ):
-                business_number = requested_number
-            elif len(fallback_numbers) == 1:
-                business_number = fallback_numbers[0]
+            business_discovery["candidates"] = business_scopes
+            transient["business_candidates"] = business_scopes
             business_discovery["business_number"] = business_number
-            business_discovery["selection_required"] = bool(
-                len(fallback_numbers) > 1 and not business_number
-            )
+            business_discovery["selection_required"] = False
             business_valid = _is_valid_business_no(business_number)
             if business_valid:
                 transient["business_number"] = business_number
@@ -1626,22 +2394,35 @@ def _collect_case_documents(
                     cellphone=cellphone,
                     business_number=business_number,
                     session=transient["hometax"],
+                    businesses=business_scopes,
                     known_ready_keys={
-                        (str(code), int(year or 0))
-                        for code, year in hometax_summary.get(
+                        (
+                            str(key[0]),
+                            int(key[1] or 0),
+                            (
+                                str(key[2])
+                                if len(key) >= 3 and key[2]
+                                else CLAIM_DEFAULT_COLLECTION_KEY
+                            ),
+                        )
+                        for key in hometax_summary.get(
                             "ready_keys",
                             [],
                         )
-                        if str(code)
+                        if len(key) >= 2 and str(key[0])
                     },
                     on_progress=hometax_progress,
                     should_continue=should_continue,
                 )
                 _ensure_claim_operation_active(should_continue)
 
-    business_selection_required = bool(
-        business_discovery.get("selection_required")
+    business_scopes = _business_collection_scopes(
+        case_id,
+        list(business_discovery.get("candidates", [])),
+        business_number,
     )
+    business_selection_required = False
+    business_valid = bool(business_scopes)
     business_dependent_documents = [
         document
         for document in planned_documents
@@ -1734,35 +2515,56 @@ def _collect_case_documents(
                 document_code,
             )
 
-    if not business_selection_required:
-        comwel_summary = _collect_supported_comwel_documents(
-            repository,
-            client,
-            case_id=case_id,
-            identity_number=identity_number,
-            representative=representative,
-            cellphone=cellphone,
-            business_number=business_number,
-            session=transient["comwel"],
-            selected_management_number=str(
-                transient.get("selected_management_number", "")
-            ),
-            on_progress=comwel_progress,
-            should_continue=should_continue,
+    management_cache = transient.get(
+        "comwel_management_numbers_by_business"
+    )
+    if not isinstance(management_cache, dict):
+        management_cache = {}
+        transient["comwel_management_numbers_by_business"] = (
+            management_cache
         )
-    else:
-        comwel_summary = {
-            "target": 0,
-            "ready": 0,
-            "failed": 0,
-            "skipped": [
-                "comwel_documents:business_number_selection_required"
-            ],
-            "errors": [],
-            "management_numbers": [],
-            "selection_required": False,
-        }
+    comwel_summary = _collect_supported_comwel_documents(
+        repository,
+        client,
+        case_id=case_id,
+        identity_number=identity_number,
+        representative=representative,
+        cellphone=cellphone,
+        business_number=business_number,
+        session=transient["comwel"],
+        businesses=business_scopes,
+        management_cache=management_cache,
+        on_progress=comwel_progress,
+        should_continue=should_continue,
+    )
     _ensure_claim_operation_active(should_continue)
+    safe_business_candidates = [
+        {
+            "business_name": str(scope.get("business_name", ""))[:120],
+            "business_status": str(
+                scope.get("business_status", "")
+            )[:120],
+            "business_number_masked": _masked_business_no(
+                scope.get("business_number", "")
+            ),
+            "collection_scope_label": _collection_scope_label(
+                business_name=scope.get("business_name", ""),
+                business_number=scope.get("business_number", ""),
+            ),
+        }
+        for scope in business_scopes
+    ]
+    safe_business_discovery = {
+        key: value
+        for key, value in business_discovery.items()
+        if key not in {"business_number", "candidates"}
+    }
+    safe_business_discovery["candidates"] = safe_business_candidates
+    safe_hometax_summary = {
+        key: value
+        for key, value in hometax_summary.items()
+        if key != "business_numbers"
+    }
     summary = {
         "target": discovery_target
         + int(hometax_summary["target"])
@@ -1780,8 +2582,8 @@ def _collect_case_documents(
         + list(comwel_summary["errors"])
         + blocked_status_errors,
         "sources": {
-            "hometax_business_discovery": business_discovery,
-            "hometax": hometax_summary,
+            "hometax_business_discovery": safe_business_discovery,
+            "hometax": safe_hometax_summary,
             "comwel": comwel_summary,
         },
         "management_numbers": list(
@@ -1790,9 +2592,7 @@ def _collect_case_documents(
         "selection_required": bool(
             comwel_summary.get("selection_required")
         ),
-        "business_candidates": list(
-            business_discovery.get("candidates", [])
-        ),
+        "business_candidates": safe_business_candidates,
         "business_selection_required": business_selection_required,
         "business_number_missing": business_number_missing,
         "business_blocked_count": business_blocked_count,
@@ -1809,6 +2609,7 @@ def _collect_case_documents(
         summary["target"] > 0
         and summary["ready"] == summary["target"]
         and summary["failed"] == 0
+        and not summary["errors"]
         and not summary["selection_required"]
         and not business_selection_required
         and not business_number_missing
@@ -3122,15 +3923,12 @@ def _retry_authenticated_claim_collection(
             if isinstance(wake_event, threading.Event):
                 wake_event.set()
             return True, "자료수집이 이미 진행 중입니다."
-        elif previous_status in {
+        elif previous_status not in {
+            "paused",
+            "collection_partial",
             "awaiting_business_selection",
             "awaiting_management_selection",
         }:
-            return (
-                False,
-                "화면에 표시된 사업장 선택을 먼저 완료해야 자료수집을 계속할 수 있습니다.",
-            )
-        elif previous_status not in {"paused", "collection_partial"}:
             return False, "현재 상태에서는 자료 재수집을 시작할 수 없습니다."
         else:
             transient: dict[str, Any] | None = None
@@ -3274,15 +4072,15 @@ def _claim_collection_retry_state(
         )
 
     job_status = str(job_snapshot.get("status", "") or "")
-    if job_status in {"paused", "collection_partial"}:
-        return "retryable" if provider_ready else "provider_unavailable"
-    if job_status in {"running", "queued"}:
-        return "running"
     if job_status in {
+        "paused",
+        "collection_partial",
         "awaiting_business_selection",
         "awaiting_management_selection",
     }:
-        return "selection_required"
+        return "retryable" if provider_ready else "provider_unavailable"
+    if job_status in {"running", "queued"}:
+        return "running"
     if job_status == "complete":
         return "complete"
     if (
@@ -3736,7 +4534,7 @@ def _render_personal_request(
         )
         return
 
-    suffix = "kakao" if remote_input else "manual"
+    suffix = "manual"
     company_name = ""
     business_no = ""
     identity_front = ""
@@ -3744,50 +4542,12 @@ def _render_personal_request(
 
     form_key = f"claim_personal_request_{suffix}"
     with st.form(form_key, clear_on_submit=True):
-        st.markdown(
-            "#### 개인사업자 카카오 인증 직접발송"
-            if remote_input
-            else "#### 개인사업자 카카오 인증 요청"
+        st.markdown("#### 개인사업자 카카오 인증 요청")
+        st.caption(
+            "홈택스 인증을 먼저 발송합니다. 고객이 홈택스 인증을 마치면 "
+            "약 1초 후 근로복지공단 인증 발송을 시작합니다. "
+            "사업자정보는 홈택스에서 자동으로 확인합니다."
         )
-        if remote_input:
-            st.caption(
-                "담당자가 고객정보를 입력해 홈택스 인증을 먼저 발송합니다. "
-                "고객은 카카오톡에서 인증만 승인하면 됩니다."
-            )
-            with st.expander(
-                "사업장관리번호·사업장요율까지 수집하려면 (선택)"
-            ):
-                business_no = st.text_input(
-                    "사업자등록번호 (선택)",
-                    placeholder="000-00-00000",
-                    key=f"claim_business_no_{suffix}",
-                    help=(
-                        "인증 발송에는 필요하지 않습니다. 입력하지 않아도 "
-                        "보수총액신고내역은 수집되지만, 사업장관리번호와 "
-                        "사업장요율은 수집할 수 없습니다."
-                    ),
-                )
-        else:
-            st.caption(
-                "홈택스 인증을 먼저 발송합니다. 고객이 홈택스 인증을 마치면 "
-                "약 1초 후 근로복지공단 인증 발송을 시작합니다."
-            )
-            company_col, business_col = st.columns(2)
-            with company_col:
-                company_name = st.text_input(
-                    "상호명 (선택)",
-                    key=f"claim_company_{suffix}",
-                )
-            with business_col:
-                business_no = st.text_input(
-                    "사업자등록번호 (선택)",
-                    placeholder="000-00-00000",
-                    key=f"claim_business_no_{suffix}",
-                    help=(
-                        "인증 자체에는 선택값이지만, 사업장관리번호와 "
-                        "사업장요율 수집에는 필요합니다."
-                    ),
-                )
 
         name_col, phone_col = st.columns(2)
         with name_col:
@@ -3844,11 +4604,7 @@ def _render_personal_request(
             key=f"claim_legal_basis_{suffix}",
         )
         submitted = st.form_submit_button(
-            (
-                "홈택스 카카오 인증 직접발송"
-                if remote_input
-                else "홈택스 카카오 인증 발송"
-            ),
+            "홈택스 카카오 인증 발송",
             use_container_width=True,
             type="primary",
             disabled=not (repository and provider_ready),
@@ -4234,95 +4990,6 @@ def _render_auto_claim_monitor(
     if job_snapshot:
         job_status = str(job_snapshot.get("status", "") or "")
         summary = dict(job_snapshot.get("summary") or {})
-        if job_status == "awaiting_business_selection":
-            business_choices = [
-                dict(choice)
-                for choice in summary.get("business_choices", [])
-                if isinstance(choice, dict)
-                and _clean(choice.get("token"))
-                and _clean(choice.get("label"))
-            ]
-            st.info(
-                "홈택스에서 여러 사업자가 확인됐습니다. "
-                "근로복지공단 자료를 수집할 사업자를 선택해 주세요."
-            )
-            if not business_choices:
-                st.warning(
-                    "선택 가능한 사업자정보를 확인하지 못했습니다. "
-                    "새 인증 요청을 시작해 주세요."
-                )
-                return
-            labels = {
-                str(choice["token"]): str(choice["label"])
-                for choice in business_choices
-            }
-            selected_business_token = st.selectbox(
-                "사업자 선택",
-                list(labels),
-                format_func=lambda token: labels.get(token, "사업자"),
-                key=f"claim_business_number_{case_id}",
-            )
-            if st.button(
-                "선택 사업자로 자료수집 계속",
-                type="primary",
-                use_container_width=True,
-                key=f"claim_business_number_continue_{case_id}",
-            ):
-                if _select_claim_business_number(
-                    user_id,
-                    case_id,
-                    selected_business_token,
-                ):
-                    st.toast(
-                        "선택한 사업자로 근로복지공단 자료수집을 시작합니다."
-                    )
-                    st.rerun(scope="app")
-                else:
-                    st.warning(
-                        "임시 인증정보가 만료됐습니다. "
-                        "새 인증 요청을 시작해 주세요."
-                    )
-            return
-        if job_status == "awaiting_management_selection":
-            management_numbers = [
-                str(number)
-                for number in summary.get("management_numbers", [])
-                if str(number).strip()
-            ]
-            st.info(
-                "여러 사업장이 확인됐습니다. 사업장요율을 수집할 "
-                "사업장관리번호를 선택해 주세요."
-            )
-            if not management_numbers:
-                st.warning(
-                    "선택 가능한 사업장관리번호를 확인하지 못했습니다. "
-                    "새 인증 요청을 시작해 주세요."
-                )
-                return
-            selected_management_number = st.selectbox(
-                "사업장관리번호",
-                management_numbers,
-                key=f"claim_management_number_{case_id}",
-            )
-            if st.button(
-                "선택 사업장 요율 수집 계속",
-                type="primary",
-                use_container_width=True,
-                key=f"claim_management_number_continue_{case_id}",
-            ):
-                if _select_claim_management_number(
-                    user_id,
-                    case_id,
-                    selected_management_number,
-                ):
-                    st.toast("선택한 사업장의 요율 수집을 시작합니다.")
-                    st.rerun(scope="app")
-                else:
-                    st.warning(
-                        "임시 인증정보가 만료됐습니다. "
-                        "새 인증 요청을 시작해 주세요."
-                    )
-            return
         verified_complete = bool(
             progress_verified
             and target_count > 0
@@ -4462,52 +5129,766 @@ def _render_status_tab(
     job_snapshot = _claim_job_snapshot(user_id, case_id)
     if job_snapshot:
         if st.session_state.get("_claim_active_case_v1") == case_id:
-            st.info("이 요청은 화면 상단의 파란 진행창에서 자동 확인 중입니다.")
+            st.info("이 요청은 화면 상단에서 자동 확인 중입니다.")
         else:
-            _render_auto_claim_monitor(
-                user_id,
-                case_id,
-                repository,
-                provider_ready,
+            st.info(
+                "이 요청은 서버에서 자동 처리 중입니다. 최신 상태는 "
+                "위 목록에서 확인할 수 있습니다."
             )
         return
 
-    st.markdown("#### 인증 진행")
-    _render_claim_auth_stage(selected_case)
-    st.markdown("#### 자료수집 진행률")
-    (
-        progress_percent,
-        progress_text,
-        ready_count,
-        target_count,
-        progress_verified,
-    ) = _claim_collection_progress_from_repository(
-        repository,
-        case_id,
-    )
-    st.progress(progress_percent, text=progress_text)
-    if not progress_verified:
-        st.caption(
-            "Supabase의 실제 수집 상태가 확인되면 진행률을 표시합니다."
-        )
-    if (
-        progress_verified
-        and target_count > 0
-        and ready_count == target_count
-        and str(selected_case.get("overall_status", "") or "")
-        in {"ready", "collected"}
-    ):
+    if str(selected_case.get("overall_status", "") or "") in {
+        "ready",
+        "collected",
+    }:
         st.success(
-            "현재 연결된 서류 수집이 완료되었습니다. "
-            "‘수집결과’에서 확인해 주세요."
+            "자료수집이 완료되었습니다. ‘수집결과’에서 서류를 확인해 주세요."
         )
     elif selected_case.get("business_type") == "corporation":
         st.caption("법인 공동인증 완료 상태는 인증 모듈 콜백으로 갱신됩니다.")
     else:
         st.caption(
-            "이 요청은 현재 Railway 자동 작업에 연결되어 있지 않습니다. "
-            "배포 전 요청이거나 인증 유효시간이 지난 건은 새로 요청해 주세요."
+            f"현재 상태: {_source_status(selected_case.get('overall_status'))}"
         )
+
+
+def _claim_result_status_group(case: dict[str, Any]) -> str:
+    overall_status = str(case.get("overall_status", "") or "")
+    if overall_status in {"collected", "ready"}:
+        return "수집 완료"
+    if (
+        overall_status == "auth_complete_collection_pending"
+        and bool(case.get("last_safe_error_code"))
+    ):
+        return "일부 수집 실패"
+    if overall_status in {
+        "auth_complete",
+        "auth_complete_collection_pending",
+        "collection_queued",
+        "collecting",
+    }:
+        return "인증 완료"
+    if overall_status in {"failed", "auth_partial"}:
+        return "실패"
+    return "인증 대기"
+
+
+def _claim_result_customer_name(case: dict[str, Any]) -> str:
+    company_name = _clean(case.get("company_name"))
+    if company_name and company_name != "상호명 미입력":
+        return company_name
+    return (
+        _clean(case.get("representative_name_masked"))
+        or company_name
+        or "고객정보 확인 중"
+    )
+
+
+def _claim_downloadable_documents(
+    documents: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    return [
+        document
+        for document in documents
+        if _claim_document_is_downloadable(document, now=now)
+    ]
+
+
+def _claim_download_cache_fingerprint(
+    documents: list[dict[str, Any]],
+) -> str:
+    """Return a stable version fingerprint for downloadable document caches."""
+    versions = sorted(
+        (
+            _clean(document.get("id")),
+            _clean(document.get("storage_path")),
+            _clean(document.get("content_sha256")).lower(),
+            _clean(document.get("retention_until")),
+        )
+        for document in documents
+        if isinstance(document, dict)
+    )
+    payload = json.dumps(
+        versions,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _claim_result_case_view(
+    case: dict[str, Any],
+    documents: list[dict[str, Any]] | None = None,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    return {
+        "customer_name": _claim_result_customer_name(case),
+        "business_no": _clean(case.get("business_no_masked")) or "-",
+        "phone": _clean(case.get("phone_masked")) or "-",
+        "business_type": (
+            "개인"
+            if case.get("business_type") == "individual"
+            else "법인"
+        ),
+        "hometax_status": _source_status(case.get("hometax_status")),
+        "comwel_status": _source_status(case.get("comwel_status")),
+        "overall_status": _claim_result_status_group(case),
+        "requested_at": (
+            _clean(case.get("requested_at"))[:16].replace("T", " ") or "-"
+        ),
+        "requested_by": _clean(case.get("requested_by")) or "-",
+        "downloadable_document_count": len(
+            _claim_downloadable_documents(documents or [], now=now)
+        ),
+    }
+
+
+_CLAIM_RESULTS_EXCEL_NOTE = (
+    "수집 서류는 OASIS CRM의 수집결과 화면에서 고객별 ‘서류조회’를 "
+    "눌러 확인하고 다운로드하세요."
+)
+_CLAIM_RESULTS_EXCEL_COLUMNS = (
+    "번호",
+    "고객 / 상호",
+    "구분",
+    "사업자번호",
+    "휴대전화",
+    "홈택스",
+    "근로복지공단",
+    "수집 상태",
+    "등록일",
+    "담당자",
+)
+
+
+def _build_claim_results_excel(cases: list[dict[str, Any]]) -> bytes:
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    rows: list[dict[str, Any]] = []
+    for row_number, case in enumerate(cases, start=1):
+        case_view = _claim_result_case_view(case)
+        rows.append(
+            {
+                "번호": row_number,
+                "고객 / 상호": case_view["customer_name"],
+                "구분": case_view["business_type"],
+                "사업자번호": case_view["business_no"],
+                "휴대전화": case_view["phone"],
+                "홈택스": case_view["hometax_status"],
+                "근로복지공단": case_view["comwel_status"],
+                "수집 상태": case_view["overall_status"],
+                "등록일": case_view["requested_at"],
+                "담당자": case_view["requested_by"],
+            }
+        )
+
+    output = BytesIO()
+    dataframe = pd.DataFrame(
+        rows,
+        columns=list(_CLAIM_RESULTS_EXCEL_COLUMNS),
+    )
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        dataframe.to_excel(
+            writer,
+            sheet_name="수집결과",
+            index=False,
+            startrow=2,
+        )
+        worksheet = writer.sheets["수집결과"]
+        last_column = len(_CLAIM_RESULTS_EXCEL_COLUMNS)
+        worksheet.merge_cells(
+            start_row=1,
+            start_column=1,
+            end_row=1,
+            end_column=last_column,
+        )
+        note_cell = worksheet.cell(row=1, column=1)
+        note_cell.value = _CLAIM_RESULTS_EXCEL_NOTE
+        note_cell.font = Font(color="1F4E78", bold=True, size=11)
+        note_cell.fill = PatternFill("solid", fgColor="DDEBF7")
+        note_cell.alignment = Alignment(
+            horizontal="left",
+            vertical="center",
+            wrap_text=True,
+        )
+        worksheet.row_dimensions[1].height = 34
+
+        header_fill = PatternFill("solid", fgColor="1F4E78")
+        header_font = Font(color="FFFFFF", bold=True)
+        border_side = Side(style="thin", color="D9E2F3")
+        cell_border = Border(
+            left=border_side,
+            right=border_side,
+            top=border_side,
+            bottom=border_side,
+        )
+        for cell in worksheet[3]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+            )
+            cell.border = cell_border
+        worksheet.row_dimensions[3].height = 26
+
+        alternate_fill = PatternFill("solid", fgColor="F7FAFC")
+        for row_index in range(4, 4 + len(dataframe)):
+            for column_index in range(1, last_column + 1):
+                cell = worksheet.cell(row=row_index, column=column_index)
+                cell.border = cell_border
+                cell.alignment = Alignment(
+                    horizontal=(
+                        "left" if column_index in {2, 10} else "center"
+                    ),
+                    vertical="center",
+                )
+                if row_index % 2 == 0:
+                    cell.fill = alternate_fill
+
+        column_widths = (8, 24, 10, 17, 17, 16, 18, 18, 19, 18)
+        for column_index, width in enumerate(column_widths, start=1):
+            worksheet.column_dimensions[
+                get_column_letter(column_index)
+            ].width = width
+        worksheet.freeze_panes = "A4"
+        worksheet.auto_filter.ref = (
+            f"A3:{get_column_letter(last_column)}"
+            f"{max(3, 3 + len(dataframe))}"
+        )
+        worksheet.sheet_view.showGridLines = False
+
+    output.seek(0)
+    return output.getvalue()
+
+
+def _claim_document_source_label(document: dict[str, Any]) -> str:
+    return (
+        "홈택스"
+        if str(document.get("source", "")) in {"hometax", "홈택스"}
+        else "근로복지공단"
+    )
+
+
+def _mask_business_numbers_in_text(value: Any) -> str:
+    text = _clean(value)
+    return re.sub(
+        r"(?<!\d)(\d{3})[- ]?(\d{2})[- ]?(\d{3})(\d{2})(?!\d)",
+        lambda match: (
+            f"{match.group(1)}-**-***{match.group(4)}"
+        ),
+        text,
+    )
+
+
+def _claim_document_scope_label(document: dict[str, Any]) -> str:
+    facts = document.get("facts")
+    if not isinstance(facts, dict):
+        return ""
+    label = _mask_business_numbers_in_text(
+        facts.get("collection_scope_label")
+    )
+    label = re.sub(r"[\x00-\x1f<>]", " ", label)
+    return re.sub(r"\s+", " ", label).strip()[:100]
+
+
+def _claim_document_download_name(document: dict[str, Any]) -> str:
+    facts = document.get("facts")
+    raw_name = (
+        _mask_business_numbers_in_text(facts.get("download_file_name"))
+        if isinstance(facts, dict)
+        else ""
+    )
+    content_type = str(document.get("content_type", "") or "").lower()
+    extension = CLAIM_DOWNLOAD_EXTENSION_BY_CONTENT_TYPE.get(
+        content_type,
+        ".bin",
+    )
+    if not raw_name:
+        document_code = _clean(document.get("document_code")) or "수집서류"
+        raw_name = f"{document_code}{extension}"
+    raw_name = raw_name.replace("\\", "/").split("/")[-1]
+    safe_name = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "_", raw_name).strip(" .")
+    if not safe_name:
+        safe_name = f"수집서류{extension}"
+    if extension and not safe_name.lower().endswith(extension):
+        safe_name = (
+            f"{_clean(document.get('document_code')) or '수집서류'}"
+            f"{extension}"
+        )
+    scope_label = _claim_document_scope_label(document)
+    safe_scope = re.sub(
+        r'[\x00-\x1f<>:"/\\|?*]',
+        "_",
+        scope_label,
+    ).strip(" .")
+    if safe_scope:
+        safe_name = f"{safe_scope}_{safe_name}"
+    maximum_length = 180
+    if len(safe_name) <= maximum_length:
+        return safe_name
+    preserved_extension = (
+        extension
+        if extension and safe_name.lower().endswith(extension)
+        else ""
+    )
+    if not preserved_extension:
+        return safe_name[:maximum_length]
+    stem_limit = maximum_length - len(preserved_extension)
+    safe_stem = safe_name[:-len(preserved_extension)]
+    safe_stem = safe_stem[:stem_limit].rstrip(" ._") or "수집서류"
+    return f"{safe_stem}{preserved_extension}"
+
+
+_CLAIM_ZIP_PART_MAX_FILES = 75
+_CLAIM_ZIP_PART_TARGET_BYTES = 60 * 1024 * 1024
+_CLAIM_ZIP_UNKNOWN_DOCUMENT_BYTES = 5 * 1024 * 1024
+_CLAIM_ZIP_HARD_MAX_BYTES = 80 * 1024 * 1024
+
+
+def _claim_document_estimated_zip_bytes(
+    document: dict[str, Any],
+) -> int:
+    try:
+        size_bytes = int(document.get("size_bytes") or 0)
+    except (TypeError, ValueError):
+        size_bytes = 0
+    return (
+        size_bytes
+        if size_bytes > 0
+        else _CLAIM_ZIP_UNKNOWN_DOCUMENT_BYTES
+    )
+
+
+def _claim_document_zip_sort_key(
+    document: dict[str, Any],
+) -> tuple[Any, ...]:
+    try:
+        period_year = int(document.get("period_year") or 0)
+    except (TypeError, ValueError):
+        period_year = 0
+    return (
+        _clean(document.get("source")),
+        _clean(document.get("document_code")),
+        -period_year,
+        _clean(document.get("collection_key")),
+        _clean(document.get("id")),
+        _clean(document.get("storage_path")),
+    )
+
+
+def _plan_claim_document_zip_parts(
+    documents: list[dict[str, Any]],
+) -> list[list[dict[str, Any]]]:
+    """Split every document into one deterministic, bounded ZIP part."""
+    ordered_documents = sorted(
+        (
+            document
+            for document in documents
+            if isinstance(document, dict)
+        ),
+        key=_claim_document_zip_sort_key,
+    )
+    parts: list[list[dict[str, Any]]] = []
+    current_part: list[dict[str, Any]] = []
+    current_estimated_bytes = 0
+    for document in ordered_documents:
+        estimated_bytes = _claim_document_estimated_zip_bytes(document)
+        exceeds_file_target = (
+            len(current_part) >= _CLAIM_ZIP_PART_MAX_FILES
+        )
+        exceeds_size_target = bool(
+            current_part
+            and current_estimated_bytes + estimated_bytes
+            > _CLAIM_ZIP_PART_TARGET_BYTES
+        )
+        if exceeds_file_target or exceeds_size_target:
+            parts.append(current_part)
+            current_part = []
+            current_estimated_bytes = 0
+        current_part.append(document)
+        current_estimated_bytes += estimated_bytes
+    if current_part:
+        parts.append(current_part)
+    return parts
+
+
+def _build_claim_documents_zip(
+    repository: ClaimRepository,
+    case_id: str,
+    documents: list[dict[str, Any]],
+) -> bytes:
+    from io import BytesIO
+    from zipfile import ZIP_DEFLATED, ZipFile
+
+    import requests
+
+    archive = BytesIO()
+    used_names: set[str] = set()
+    total_bytes = 0
+    try:
+        with ZipFile(archive, "w", compression=ZIP_DEFLATED) as zip_file:
+            for index, document in enumerate(documents, start=1):
+                document_id = str(document.get("id", "") or "")
+                download_url = repository.document_download_url(
+                    case_id,
+                    document_id,
+                )
+                response = requests.get(
+                    download_url,
+                    timeout=(5, 45),
+                    stream=True,
+                    allow_redirects=True,
+                )
+                with response:
+                    response.raise_for_status()
+                    document_content = BytesIO()
+                    for chunk in response.iter_content(chunk_size=64 * 1024):
+                        if not chunk:
+                            continue
+                        total_bytes += len(chunk)
+                        if total_bytes > _CLAIM_ZIP_HARD_MAX_BYTES:
+                            raise ClaimRepositoryError(
+                                "선택한 ZIP 묶음의 실제 용량이 80MB를 "
+                                "초과했습니다. "
+                                "개별 다운로드를 이용해 주세요."
+                            )
+                        document_content.write(chunk)
+                    content = document_content.getvalue()
+
+                archive_name = _claim_document_download_name(document)
+                if archive_name in used_names:
+                    if "." in archive_name:
+                        stem, suffix = archive_name.rsplit(".", 1)
+                        archive_name = f"{stem}_{index}.{suffix}"
+                    else:
+                        archive_name = f"{archive_name}_{index}"
+                used_names.add(archive_name)
+                zip_file.writestr(archive_name, content)
+    except ClaimRepositoryError:
+        raise
+    except requests.RequestException as exc:
+        raise ClaimRepositoryError(
+            "전체 서류를 준비하지 못했습니다. 잠시 후 다시 시도해 주세요."
+        ) from exc
+    except Exception as exc:
+        raise ClaimRepositoryError(
+            "전체 서류 파일을 만들지 못했습니다. 개별 다운로드를 이용해 주세요."
+        ) from exc
+    return archive.getvalue()
+
+
+@st.dialog("서류조회", width="large")
+def _show_claim_documents_dialog(
+    user_id: str,
+    repository: ClaimRepository,
+    selected_case: dict[str, Any],
+    provider_ready: bool,
+) -> None:
+    case_id = str(selected_case.get("id", "") or "")
+    customer_name = _claim_result_customer_name(selected_case)
+    st.markdown(f"### {html.escape(customer_name)} 고객 자료 목록")
+    st.caption(
+        f"{_clean(selected_case.get('business_no_masked')) or '사업자번호 확인 중'}"
+        f" · {_source_status(selected_case.get('overall_status'))}"
+    )
+
+    selected_job_snapshot = _claim_job_snapshot(user_id, case_id)
+    _render_claim_collection_retry_action(
+        user_id,
+        selected_case,
+        selected_job_snapshot,
+        provider_ready=provider_ready,
+        key_prefix="claim_result_dialog_retry",
+    )
+
+    try:
+        documents = repository.list_documents(case_id)
+    except ClaimRepositoryError as exc:
+        st.error(str(exc))
+        return
+    if not documents:
+        st.info("이 고객에게 등록된 수집 항목이 없습니다.")
+        return
+
+    ready_documents = _claim_downloadable_documents(documents)
+    failed_count = sum(
+        1
+        for document in documents
+        if str(document.get("status", "") or "") == "failed"
+    )
+    planned_count = sum(
+        1
+        for document in documents
+        if str(document.get("status", "") or "") == "integration_required"
+        or not automatic_collection_supported(
+            str(document.get("document_code", "") or "")
+        )
+    )
+    no_data_count = sum(
+        1
+        for document in documents
+        if isinstance(document.get("facts"), dict)
+        and document["facts"].get("no_data") is True
+    )
+    expired_count = sum(
+        1
+        for document in documents
+        if str(document.get("status", "") or "") == "ready"
+        and bool(document.get("storage_path"))
+        and not _claim_document_is_downloadable(document)
+        and not (
+            isinstance(document.get("facts"), dict)
+            and document["facts"].get("no_data") is True
+        )
+    )
+    summary_parts = [f"수집 완료 {len(ready_documents):,}건"]
+    if no_data_count:
+        summary_parts.append(f"조회 내역 없음 {no_data_count:,}건")
+    if failed_count:
+        summary_parts.append(f"수집 실패 {failed_count:,}건")
+    if expired_count:
+        summary_parts.append(f"보관 만료 {expired_count:,}건")
+    if planned_count:
+        summary_parts.append(f"지원 예정 {planned_count:,}건")
+    st.caption(" · ".join(summary_parts))
+    if not ready_documents:
+        st.info(
+            "아직 다운로드 가능한 수집 완료 서류가 없습니다. "
+            "수집이 끝나면 이 창에 다운로드 버튼이 표시됩니다."
+        )
+        return
+
+    document_rows = []
+    for number, document in enumerate(ready_documents, start=1):
+        size_bytes = int(document.get("size_bytes") or 0)
+        size_label = (
+            f"{size_bytes / (1024 * 1024):.1f}MB"
+            if size_bytes >= 1024 * 1024
+            else f"{max(1, round(size_bytes / 1024)):,}KB"
+            if size_bytes
+            else "-"
+        )
+        document_rows.append(
+            {
+                "번호": number,
+                "자료명": (
+                    _clean(document.get("document_name"))
+                    or _clean(document.get("document_code"))
+                    or "수집자료"
+                ),
+                "기관": _claim_document_source_label(document),
+                "사업자": _claim_document_scope_label(document) or "공통",
+                "연도": document.get("period_year") or "-",
+                "수집일": _clean(document.get("collected_at"))[:10] or "-",
+                "파일": size_label,
+            }
+        )
+    st.dataframe(
+        pd.DataFrame(document_rows),
+        use_container_width=True,
+        hide_index=True,
+        height=min(620, 38 + len(document_rows) * 35),
+    )
+
+    st.markdown(f"#### 다운로드 가능한 서류 {len(ready_documents):,}건")
+    zip_parts = _plan_claim_document_zip_parts(ready_documents)
+    part_count = len(zip_parts)
+    selected_part_index = 0
+    if part_count > 1:
+        st.info(
+            f"전체 서류 {len(ready_documents):,}건을 빠짐없이 "
+            f"{part_count:,}개 ZIP 묶음으로 나눴습니다. "
+            "묶음을 하나씩 선택해 내려받아 주세요."
+        )
+        selected_part_index = int(
+            st.selectbox(
+                "ZIP 묶음 선택",
+                options=list(range(part_count)),
+                format_func=lambda index: (
+                    f"ZIP {index + 1}/{part_count} · "
+                    f"서류 {len(zip_parts[index]):,}건 · "
+                    "예상 "
+                    f"{sum(_claim_document_estimated_zip_bytes(item) for item in zip_parts[index]) / (1024 * 1024):.1f}MB"
+                ),
+                key=f"claim_zip_part_selector_{case_id}",
+            )
+        )
+    else:
+        st.caption(
+            "전체 서류를 ZIP 파일 하나로 받거나, 필요한 서류만 개별로 "
+            "받을 수 있습니다."
+        )
+    selected_part = zip_parts[selected_part_index]
+    part_label = f"{selected_part_index + 1}/{part_count}"
+    st.caption(
+        f"현재 선택: ZIP {part_label} · 서류 {len(selected_part):,}건. "
+        "개별 링크는 생성 후 1분간 유효합니다."
+    )
+    all_documents_fingerprint = _claim_download_cache_fingerprint(
+        ready_documents
+    )
+    selected_documents_fingerprint = _claim_download_cache_fingerprint(
+        selected_part
+    )
+    download_fingerprint = hashlib.sha256(
+        "|".join(
+            (
+                all_documents_fingerprint,
+                selected_documents_fingerprint,
+                str(selected_part_index),
+                str(part_count),
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+    archive_key = f"_claim_bulk_download_{case_id}"
+    cached_archive = st.session_state.get(archive_key)
+    if not (
+        isinstance(cached_archive, dict)
+        and isinstance(cached_archive.get("data"), bytes)
+        and str(cached_archive.get("fingerprint", ""))
+        == download_fingerprint
+        and float(cached_archive.get("expires_at") or 0) > time.time()
+    ):
+        st.session_state.pop(archive_key, None)
+        cached_archive = None
+
+    bulk_col, guide_col = st.columns([1.35, 3.65])
+    with bulk_col:
+        if st.button(
+            (
+                "전체 서류 ZIP 만들기"
+                if part_count == 1
+                else f"ZIP {part_label} 만들기"
+            ),
+            type="primary",
+            use_container_width=True,
+            key=f"claim_bulk_prepare_{case_id}",
+        ):
+            try:
+                with st.spinner(
+                    f"ZIP {part_label} 묶음을 안전하게 만들고 있습니다."
+                ):
+                    archive_data = _build_claim_documents_zip(
+                        repository,
+                        case_id,
+                        selected_part,
+                    )
+                cached_archive = {
+                    "data": archive_data,
+                    "fingerprint": download_fingerprint,
+                    "expires_at": time.time() + 5 * 60,
+                }
+                st.session_state[archive_key] = cached_archive
+            except ClaimRepositoryError as exc:
+                st.error(str(exc))
+    with guide_col:
+        st.caption(
+            f"ZIP {part_label}만 현재 로그인 화면에서 5분간 준비 상태로 "
+            "유지됩니다. 다른 묶음을 선택하면 이 캐시는 교체됩니다."
+        )
+    if cached_archive:
+        safe_customer_name = re.sub(
+            r'[\x00-\x1f<>:"/\\|?*]',
+            "_",
+            customer_name,
+        ).strip(" .") or "고객"
+        st.download_button(
+            (
+                "전체 ZIP 다운로드"
+                if part_count == 1
+                else f"ZIP {part_label} 다운로드"
+            ),
+            data=bytes(cached_archive["data"]),
+            file_name=(
+                f"{safe_customer_name}_수집서류_"
+                + (
+                    ""
+                    if part_count == 1
+                    else f"{selected_part_index + 1}of{part_count}_"
+                )
+                + f"{datetime.now(_KOREA_TIMEZONE):%Y%m%d}.zip"
+            ),
+            mime="application/zip",
+            use_container_width=True,
+            key=f"claim_bulk_download_button_{case_id}",
+        )
+
+    st.markdown("##### 개별 서류")
+    for document in ready_documents:
+        document_id = str(document.get("id", "") or "")
+        document_name = (
+            _clean(document.get("document_name"))
+            or _clean(document.get("document_code"))
+            or "수집자료"
+        )
+        scope_label = _claim_document_scope_label(document)
+        year_label = str(document.get("period_year") or "공통")
+        size_bytes = int(document.get("size_bytes") or 0)
+        size_label = (
+            f"{size_bytes / (1024 * 1024):.1f}MB"
+            if size_bytes >= 1024 * 1024
+            else f"{max(1, round(size_bytes / 1024)):,}KB"
+            if size_bytes
+            else "크기 미확인"
+        )
+        state_key = f"_claim_download_link_{case_id}_{document_id}"
+        document_fingerprint = _claim_download_cache_fingerprint(
+            [document]
+        )
+        cached_link = st.session_state.get(state_key)
+        if not (
+            isinstance(cached_link, dict)
+            and _clean(cached_link.get("url"))
+            and str(cached_link.get("fingerprint", ""))
+            == document_fingerprint
+            and float(cached_link.get("expires_at") or 0) > time.time()
+        ):
+            st.session_state.pop(state_key, None)
+            cached_link = None
+
+        with st.container(border=True):
+            info_col, action_col = st.columns([4.7, 1.3])
+            with info_col:
+                st.markdown(f"**{html.escape(document_name)}**")
+                st.caption(
+                    f"{_claim_document_source_label(document)} · "
+                    + (f"{scope_label} · " if scope_label else "")
+                    + f"{year_label} · {size_label}"
+                )
+            with action_col:
+                if not cached_link and st.button(
+                    "다운로드 준비",
+                    key=f"claim_download_prepare_{case_id}_{document_id}",
+                    use_container_width=True,
+                ):
+                    try:
+                        download_url = repository.document_download_url(
+                            case_id,
+                            document_id,
+                        )
+                        cached_link = {
+                            "url": download_url,
+                            "fingerprint": document_fingerprint,
+                            "expires_at": (
+                                time.time()
+                                + CLAIM_DOWNLOAD_URL_TTL_SECONDS
+                                - 5
+                            ),
+                        }
+                        st.session_state[state_key] = cached_link
+                    except ClaimRepositoryError as exc:
+                        st.error(str(exc))
+                if cached_link:
+                    st.link_button(
+                        "파일 다운로드",
+                        str(cached_link["url"]),
+                        use_container_width=True,
+                    )
 
 
 def _render_results_tab(
@@ -4527,18 +5908,19 @@ def _render_results_tab(
         st.info("수집결과를 확인할 경정청구 요청이 없습니다.")
         return
 
-    filter_cols = st.columns([1.4, 1, 1])
+    st.markdown("### 진행상황 확인")
+    filter_cols = st.columns([1.5, 1, 1])
     with filter_cols[0]:
         search_text = st.text_input(
-            "상호명 검색",
+            "고객 검색",
             placeholder="성명 또는 상호명을 입력하세요",
-            key="claim_result_search_v1",
+            key="claim_result_search_v2",
         )
     with filter_cols[1]:
         business_filter = st.selectbox(
             "사업자 구분",
             ["전체", "개인사업자", "법인사업자"],
-            key="claim_result_business_filter_v1",
+            key="claim_result_business_filter_v2",
         )
     with filter_cols[2]:
         status_filter = st.selectbox(
@@ -4551,16 +5933,17 @@ def _render_results_tab(
                 "수집 완료",
                 "실패",
             ],
-            key="claim_result_status_filter_v1",
+            key="claim_result_status_filter_v2",
         )
 
     filtered_cases = []
     search_key = search_text.strip().lower()
     for case in cases:
-        company_name = _clean(case.get("company_name"))
-        business_type = str(case.get("business_type", ""))
-        overall_status = str(case.get("overall_status", ""))
-        if search_key and search_key not in company_name.lower():
+        case_view = _claim_result_case_view(case)
+        customer_name = str(case_view["customer_name"])
+        business_type = str(case.get("business_type", "") or "")
+        status_group = str(case_view["overall_status"])
+        if search_key and search_key not in customer_name.lower():
             continue
         if (
             business_filter == "개인사업자"
@@ -4572,289 +5955,109 @@ def _render_results_tab(
             and business_type != "corporation"
         ):
             continue
-        status_group = (
-            "수집 완료"
-            if overall_status in {"collected", "ready"}
-            else "일부 수집 실패"
-            if (
-                overall_status == "auth_complete_collection_pending"
-                and bool(case.get("last_safe_error_code"))
-            )
-            else "인증 완료"
-            if overall_status
-            in {
-                "auth_complete",
-                "auth_complete_collection_pending",
-                "collection_queued",
-                "collecting",
-            }
-            else "실패"
-            if overall_status in {"failed", "auth_partial"}
-            else "인증 대기"
-        )
         if status_filter != "전체" and status_group != status_filter:
             continue
         filtered_cases.append(case)
 
-    st.caption(f"TOTAL {len(filtered_cases):,}건")
     if not filtered_cases:
+        st.caption("TOTAL 0건")
         st.info("조건에 맞는 경정청구 요청이 없습니다.")
         return
 
-    st.dataframe(
-        _cases_dataframe(filtered_cases),
-        use_container_width=True,
-        hide_index=True,
-    )
-    labels = [_case_label(case) for case in filtered_cases]
-    selected_label = st.selectbox(
-        "서류를 확인할 고객",
-        labels,
-        key="claim_result_case_selector_v1",
-    )
-    selected_case = filtered_cases[labels.index(selected_label)]
-    st.markdown(
-        f"#### {html.escape(_clean(selected_case.get('company_name')))} 자료 목록"
-    )
-    metric_cols = st.columns(3)
-    with metric_cols[0]:
-        st.metric("홈택스", _source_status(selected_case.get("hometax_status")))
-    with metric_cols[1]:
-        st.metric("근로복지공단", _source_status(selected_case.get("comwel_status")))
-    with metric_cols[2]:
-        st.metric("전체 상태", _source_status(selected_case.get("overall_status")))
-
-    selected_case_id = str(selected_case.get("id", "") or "")
-    selected_job_snapshot = _claim_job_snapshot(user_id, selected_case_id)
-    _render_claim_collection_retry_action(
-        user_id,
-        selected_case,
-        selected_job_snapshot,
-        provider_ready=provider_ready,
-        key_prefix="claim_result_collection_retry",
-    )
-
-    try:
-        documents = repository.list_documents(selected_case_id)
-    except ClaimRepositoryError as exc:
-        st.error(str(exc))
-        return
-    if not documents:
-        st.info("이 요청에 등록된 수집 항목이 없습니다.")
-        return
-    management_document = next(
-        (
-            document
-            for document in documents
-            if str(document.get("document_code", ""))
-            == "comwel_management_number_list"
-            and str(document.get("status", "")) == "ready"
-        ),
-        {},
-    )
-    management_facts = (
-        management_document.get("facts")
-        if isinstance(management_document, dict)
-        else {}
-    )
-    management_numbers = (
-        management_facts.get("management_numbers")
-        if isinstance(management_facts, dict)
-        else []
-    )
-    multiple_management_numbers = (
-        isinstance(management_numbers, list)
-        and len(management_numbers) > 1
-    )
-    no_management_workplaces = bool(
-        isinstance(management_document, dict)
-        and str(management_document.get("status", "")) == "ready"
-        and isinstance(management_facts, dict)
-        and (
-            str(management_facts.get("record_count", "")) == "0"
-            or management_facts.get("management_numbers") == []
-        )
-    )
-    source_filter = st.segmented_control(
-        "기관",
-        ["전체", "홈택스", "근로복지공단"],
-        default="전체",
-        key="claim_result_source_filter_v1",
-    )
-    rows = []
-    for document in documents:
-        source = str(document.get("source", ""))
-        document_code = str(document.get("document_code", ""))
-        status = str(document.get("status", ""))
-        source_label = (
-            "홈택스"
-            if source in {"hometax", "홈택스"}
-            else "근로복지공단"
-        )
-        if source_filter not in {None, "전체", source_label}:
-            continue
-        rows.append(
-            {
-                "자료명": _clean(document.get("document_name")),
-                "기관": source_label,
-                "연도": document.get("period_year") or "-",
-                "상태": _claim_result_document_status(
-                    document,
-                    selected_case,
-                    multiple_management_numbers=(
-                        multiple_management_numbers
-                    ),
-                    no_management_workplaces=no_management_workplaces,
-                ),
-                "수집일": _clean(document.get("collected_at"))[:10] or "-",
-                "출력": (
-                    "준비"
-                    if _claim_document_is_downloadable(document)
-                    else "보관기간 만료"
-                    if status == "ready"
-                    and document.get("storage_path")
-                    else "-"
-                ),
-            }
-        )
-    st.dataframe(
-        pd.DataFrame(rows),
-        use_container_width=True,
-        hide_index=True,
-    )
-    ready_documents = [
-        document
-        for document in documents
-        if _claim_document_is_downloadable(document)
-        and (
-            source_filter in {None, "전체"}
-            or (
-                source_filter == "홈택스"
-                and str(document.get("source", "")) in {"hometax", "홈택스"}
-            )
-            or (
-                source_filter == "근로복지공단"
-                and str(document.get("source", ""))
-                not in {"hometax", "홈택스"}
-            )
-        )
-    ]
-    if ready_documents:
-        st.markdown("#### 수집자료 다운로드")
+    result_summary_col, excel_col = st.columns([4.5, 1.2])
+    with result_summary_col:
         st.caption(
-            f"현재 선택한 기관의 수집 완료 자료 {len(ready_documents):,}건입니다. "
-            "링크는 현재 로그인 계정에서 생성되며 1분간 유효합니다. "
-            "민감한 자료이므로 링크를 공유하지 마세요."
+            f"TOTAL {len(filtered_cases):,}건 · "
+            "수집 서류는 고객별 ‘서류조회’에서 다운로드합니다."
         )
-        selected_case_id = str(selected_case.get("id", ""))
-        for document in ready_documents:
-            document_id = str(document.get("id", ""))
-            source = str(document.get("source", ""))
-            source_label = (
-                "홈택스"
-                if source in {"hometax", "홈택스"}
-                else "근로복지공단"
-            )
-            content_type = str(
-                document.get("content_type", "") or ""
-            ).lower()
-            file_label = (
-                "PDF"
-                if content_type == "application/pdf"
-                else "엑셀"
-                if "spreadsheet" in content_type or "excel" in content_type
-                else "JSON"
-                if content_type == "application/json"
-                else "파일"
-            )
-            size_bytes = int(document.get("size_bytes") or 0)
-            size_label = (
-                f"{size_bytes / (1024 * 1024):.1f}MB"
-                if size_bytes >= 1024 * 1024
-                else f"{max(1, round(size_bytes / 1024)):,}KB"
-                if size_bytes
-                else "크기 미확인"
-            )
-            document_name = (
-                _clean(document.get("document_name"))
-                or _clean(document.get("document_code"))
-                or "수집자료"
-            )
-            year_label = str(document.get("period_year") or "공통")
-            state_key = (
-                f"_claim_download_link_{selected_case_id}_{document_id}"
-            )
-            cached_link = st.session_state.get(state_key)
-            if not (
-                isinstance(cached_link, dict)
-                and _clean(cached_link.get("url"))
-                and float(cached_link.get("expires_at") or 0) > time.time()
-            ):
-                st.session_state.pop(state_key, None)
-                cached_link = None
+    with excel_col:
+        st.download_button(
+            "Excel 다운로드",
+            data=_build_claim_results_excel(filtered_cases),
+            file_name=(
+                "OASIS_수집결과_"
+                f"{datetime.now(_KOREA_TIMEZONE):%Y%m%d}.xlsx"
+            ),
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+            key="claim_result_excel_download_v1",
+            use_container_width=True,
+        )
 
-            with st.container(border=True):
-                info_col, action_col = st.columns([4.6, 1.4])
-                with info_col:
-                    st.markdown(f"**{html.escape(document_name)}**")
-                    st.caption(
-                        f"{source_label} · {year_label} · "
-                        f"{file_label} · {size_label} · "
-                        f"수집일 {_clean(document.get('collected_at'))[:10] or '-'}"
-                    )
-                with action_col:
-                    if cached_link:
-                        st.link_button(
-                            "파일 다운로드",
-                            str(cached_link["url"]),
-                            use_container_width=True,
-                        )
-                        if st.button(
-                            "링크 다시 생성",
-                            key=(
-                                "claim_download_refresh_"
-                                f"{selected_case_id}_{document_id}"
-                            ),
-                            use_container_width=True,
-                        ):
-                            st.session_state.pop(state_key, None)
-                            st.rerun()
-                    elif st.button(
-                        "다운로드 준비",
-                        key=(
-                            "claim_download_prepare_"
-                            f"{selected_case_id}_{document_id}"
-                        ),
-                        use_container_width=True,
-                        type="primary",
-                    ):
-                        try:
-                            download_url = repository.document_download_url(
-                                selected_case_id,
-                                document_id,
-                            )
-                            st.session_state[state_key] = {
-                                "url": download_url,
-                                "expires_at": (
-                                    time.time()
-                                    + CLAIM_DOWNLOAD_URL_TTL_SECONDS
-                                    - 5
-                                ),
-                            }
-                            st.rerun()
-                        except ClaimRepositoryError as exc:
-                            st.error(str(exc))
-    else:
-        st.info(
-            "현재 선택한 기관에는 다운로드 가능한 수집 완료 자료가 없습니다. "
-            "자료수집이 끝나면 이곳에 다운로드 버튼이 표시됩니다."
+    page_size = 20
+    page_count = max(1, (len(filtered_cases) + page_size - 1) // page_size)
+    page_number = 1
+    if page_count > 1:
+        page_number = st.selectbox(
+            "페이지",
+            list(range(1, page_count + 1)),
+            format_func=lambda page: f"{page:,} / {page_count:,}",
+            key="claim_result_page_v2",
         )
-    st.caption(
-        "현재 자동수집 지원: 홈택스 사업자정보 조회·사업자등록증명원·"
-        "국세납세증명서·종합소득세 신고도움·종합소득세 신고서·"
-        "폐업사실증명, 근로복지공단 보수총액·사업장관리번호·사업장요율. "
-        "환급금은 세무대리인 공동인증서 API가 필요해 별도 연동 예정입니다."
-    )
+    start_index = (int(page_number) - 1) * page_size
+    visible_cases = filtered_cases[start_index : start_index + page_size]
+
+    widths = [
+        0.4,
+        1.45,
+        0.75,
+        0.65,
+        1.0,
+        1.05,
+        0.9,
+        1.05,
+        1.0,
+        1.15,
+        0.9,
+    ]
+    headers = [
+        "번호",
+        "고객 / 상호",
+        "서류 조회",
+        "구분",
+        "사업자번호",
+        "휴대전화",
+        "홈택스",
+        "근로복지공단",
+        "수집 상태",
+        "등록일",
+        "담당자",
+    ]
+    header_cols = st.columns(widths)
+    for column, label in zip(header_cols, headers):
+        column.markdown(f"**{label}**")
+
+    for offset, case in enumerate(visible_cases, start=start_index + 1):
+        case_id = str(case.get("id", "") or "")
+        case_view = _claim_result_case_view(case)
+        customer_name = str(case_view["customer_name"])
+        with st.container(border=True):
+            row_cols = st.columns(widths)
+            row_cols[0].write(offset)
+            row_cols[1].markdown(f"**{html.escape(customer_name)}**")
+            if row_cols[2].button(
+                "서류조회",
+                key=f"claim_result_documents_{case_id}",
+                use_container_width=True,
+            ):
+                _show_claim_documents_dialog(
+                    user_id,
+                    repository,
+                    case,
+                    provider_ready,
+                )
+            row_cols[3].write(
+                str(case_view["business_type"])
+            )
+            row_cols[4].write(str(case_view["business_no"]))
+            row_cols[5].write(str(case_view["phone"]))
+            row_cols[6].write(str(case_view["hometax_status"]))
+            row_cols[7].write(str(case_view["comwel_status"]))
+            row_cols[8].write(str(case_view["overall_status"]))
+            row_cols[9].write(str(case_view["requested_at"]))
+            row_cols[10].write(str(case_view["requested_by"]))
 
 
 def _render_catalog_tab() -> None:

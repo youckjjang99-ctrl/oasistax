@@ -469,11 +469,20 @@ def test_remote_invite_readiness_fails_closed_without_required_config(
     assert missing["ready"] is False
     assert "public_url" in missing["missing_components"]
     assert "solapi" in missing["missing_components"]
+    assert missing["variant_key_ready"] is False
+    assert "variant_key" in missing["missing_components"]
+
+    monkeypatch.setenv("CLAIM_DOCUMENT_VARIANT_KEY", "too-short")
+    short_key = remote_invite_environment_readiness()
+    assert short_key["variant_key_ready"] is False
+    assert "variant_key" in short_key["missing_components"]
+    monkeypatch.delenv("CLAIM_DOCUMENT_VARIANT_KEY", raising=False)
 
     for name, value in required.items():
         monkeypatch.setenv(name, value)
     ready = remote_invite_environment_readiness()
     assert ready["ready"] is True
+    assert ready["variant_key_ready"] is True
     serialized = repr(ready)
     for value in required.values():
         assert value not in serialized

@@ -11,7 +11,11 @@ from cryptography.hazmat.primitives.serialization import (
     PublicFormat,
 )
 
-from claim_correction_center import _collect_supported_hometax_documents
+from claim_correction_center import (
+    _claim_collection_scope_fingerprint,
+    _claim_collection_variant_key,
+    _collect_supported_hometax_documents,
+)
 from tilko_claim_client import (
     HOMETAX_CLOSURE_CERTIFICATE,
     HOMETAX_HOST,
@@ -284,12 +288,30 @@ class TilkoHometaxDocumentClientTests(unittest.TestCase):
         )
 
 
+@patch.dict(
+    "os.environ",
+    {
+        "CLAIM_DOCUMENT_VARIANT_KEY": (
+            "claim-scope-test-secret-" + ("x" * 32)
+        )
+    },
+)
 class TilkoHometaxAnnualCollectionTests(unittest.TestCase):
     def test_seven_year_rows_are_stored_by_year_and_ready_years_are_skipped(
         self,
     ):
         years = list(range(2019, 2026))
+        scope_fingerprint = _claim_collection_scope_fingerprint(
+            "case-1",
+            "business",
+            "2208162517",
+        )
         repository = MagicMock()
+        collection_key = _claim_collection_variant_key(
+            "case-1",
+            "business",
+            "2208162517",
+        )
         repository.list_documents.return_value = [
             {
                 "source": "hometax",
@@ -303,7 +325,7 @@ class TilkoHometaxAnnualCollectionTests(unittest.TestCase):
                 "source": "hometax",
                 "document_code": "hometax_income_tax_return",
                 "period_year": year,
-                "status": "ready" if year == 2024 else "auth_pending",
+                "status": "auth_pending",
             }
             for year in years
         ] + [
@@ -311,12 +333,32 @@ class TilkoHometaxAnnualCollectionTests(unittest.TestCase):
                 "source": "hometax",
                 "document_code": code,
                 "period_year": None,
-                "status": "ready",
+                "status": (
+                    "ready"
+                    if code == "hometax_tax_payment_certificate"
+                    else "auth_pending"
+                ),
             }
             for code in (
                 "hometax_business_registration_certificate",
                 "hometax_tax_payment_certificate",
                 "hometax_closure_certificate",
+            )
+        ] + [
+            {
+                "source": "hometax",
+                "document_code": document_code,
+                "period_year": period_year,
+                "collection_key": collection_key,
+                "status": "ready",
+                "facts": {
+                    "collection_scope_fingerprint": scope_fingerprint,
+                },
+            }
+            for document_code, period_year in (
+                ("hometax_income_tax_return", 2024),
+                ("hometax_business_registration_certificate", None),
+                ("hometax_closure_certificate", None),
             )
         ]
         repository.store_collected_document.return_value = {

@@ -215,6 +215,13 @@ def remote_invite_environment_readiness() -> dict[str, Any]:
         os.environ.get("CLAIM_PUBLIC_BASE_URL", "") or ""
     ).strip().startswith("https://")
     crypto_ready, _crypto_message = remote_claim_crypto_readiness()
+    variant_key_ready = len(
+        str(
+            os.environ.get("CLAIM_DOCUMENT_VARIANT_KEY", "")
+            or os.environ.get("CLAIM_JOB_ENCRYPTION_KEY", "")
+            or ""
+        ).strip()
+    ) >= 32
     solapi = solapi_environment_readiness(
         required_template_env_names=tuple(TEMPLATE_ENV_BY_CODE.values()),
     )
@@ -223,12 +230,15 @@ def remote_invite_environment_readiness() -> dict[str, Any]:
         missing_components.append("public_url")
     if not crypto_ready:
         missing_components.append("crypto")
+    if not variant_key_ready:
+        missing_components.append("variant_key")
     if not bool(solapi.get("ready")):
         missing_components.append("solapi")
     return {
         "ready": not missing_components,
         "public_url_ready": public_url_ready,
         "crypto_ready": crypto_ready,
+        "variant_key_ready": variant_key_ready,
         "solapi_ready": bool(solapi.get("ready")),
         "missing_components": missing_components,
         "missing_env_names": list(solapi.get("missing_env_names") or []),

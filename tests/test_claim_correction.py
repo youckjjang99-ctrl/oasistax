@@ -62,6 +62,7 @@ from tilko_claim_client import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+TEST_VARIANT_SECRET = "claim-scope-test-secret-" + ("x" * 32)
 
 
 class _Response:
@@ -258,17 +259,82 @@ class _BackgroundFlowRepository(_FlowRepository):
             if document["source"] == source:
                 document["status"] = status
 
-    def store_collected_document(self, _case_id, *, document_code, document):
-        for row in self.documents:
-            if row["document_code"] == document_code:
-                row["status"] = "ready"
+    def store_collected_document(
+        self,
+        _case_id,
+        *,
+        document_code,
+        document,
+        period_year=None,
+        collection_key="default",
+    ):
+        selected_year = int(period_year or 0)
+        selected_key = str(collection_key or "default")
+        row = next(
+            (
+                candidate
+                for candidate in self.documents
+                if candidate["document_code"] == document_code
+                and int(candidate.get("period_year") or 0) == selected_year
+                and str(candidate.get("collection_key") or "default")
+                == selected_key
+            ),
+            None,
+        )
+        if row is None:
+            row = {
+                "source": (
+                    "comwel"
+                    if str(document_code).startswith("comwel_")
+                    else "hometax"
+                ),
+                "document_code": document_code,
+                "period_year": period_year,
+                "collection_key": selected_key,
+            }
+            self.documents.append(row)
+        row["status"] = "ready"
+        row["facts"] = dict(document.facts or {})
         return {"status": "ready", "size_bytes": len(document.content)}
 
-    def fail_document(self, _case_id, *, document_code, safe_error_code):
-        for row in self.documents:
-            if row["document_code"] == document_code:
-                row["status"] = "failed"
-                row["last_safe_error_code"] = safe_error_code
+    def fail_document(
+        self,
+        _case_id,
+        *,
+        document_code,
+        safe_error_code,
+        period_year=None,
+        collection_key="default",
+        facts=None,
+    ):
+        selected_year = int(period_year or 0)
+        selected_key = str(collection_key or "default")
+        row = next(
+            (
+                candidate
+                for candidate in self.documents
+                if candidate["document_code"] == document_code
+                and int(candidate.get("period_year") or 0) == selected_year
+                and str(candidate.get("collection_key") or "default")
+                == selected_key
+            ),
+            None,
+        )
+        if row is None:
+            row = {
+                "source": (
+                    "comwel"
+                    if str(document_code).startswith("comwel_")
+                    else "hometax"
+                ),
+                "document_code": document_code,
+                "period_year": period_year,
+                "collection_key": selected_key,
+            }
+            self.documents.append(row)
+        row["status"] = "failed"
+        row["last_safe_error_code"] = safe_error_code
+        row["facts"] = dict(facts or {})
 
 
 class _ComwelStatusFailureRepository(_FlowRepository):
@@ -394,7 +460,7 @@ class _FakeDatabase:
                 and str(row.get("id")) == str(parameters["p_case_id"])
             ][:1]
         if function_name == "oasis_claim_list_documents":
-            return [
+            matches = [
                 row
                 for row in self.documents
                 if str(row.get("owner_user_id"))
@@ -402,6 +468,9 @@ class _FakeDatabase:
                 and str(row.get("case_id"))
                 == str(parameters["p_case_id"])
             ]
+            offset = int(parameters.get("p_offset", 0))
+            limit = int(parameters.get("p_limit", len(matches) or 1))
+            return matches[offset : offset + limit]
         if function_name == "oasis_claim_update_case_status":
             matches = [
                 row
@@ -417,6 +486,56 @@ class _FakeDatabase:
             return [updated]
         if function_name == "oasis_claim_update_document_status":
             return 0
+        if function_name == "oasis_claim_ensure_document_variant":
+            selected_year = int(parameters["p_period_year"] or 0)
+            selected_key = str(parameters["p_collection_key"])
+            existing = next(
+                (
+                    row
+                    for row in self.documents
+                    if str(row.get("owner_user_id"))
+                    == str(parameters["p_owner_user_id"])
+                    and str(row.get("case_id"))
+                    == str(parameters["p_case_id"])
+                    and str(row.get("document_code"))
+                    == str(parameters["p_document_code"])
+                    and int(row.get("period_year") or 0) == selected_year
+                    and str(row.get("collection_key") or "default")
+                    == selected_key
+                ),
+                None,
+            )
+            if existing is not None:
+                return [dict(existing)]
+            template = next(
+                (
+                    row
+                    for row in self.documents
+                    if str(row.get("owner_user_id"))
+                    == str(parameters["p_owner_user_id"])
+                    and str(row.get("case_id"))
+                    == str(parameters["p_case_id"])
+                    and str(row.get("document_code"))
+                    == str(parameters["p_document_code"])
+                    and int(row.get("period_year") or 0) == selected_year
+                    and str(row.get("collection_key") or "default")
+                    == "default"
+                ),
+                None,
+            )
+            if template is None:
+                return []
+            variant = {
+                **dict(template),
+                "id": str(parameters["p_document_id"]),
+                "collection_key": selected_key,
+                "status": "auth_pending",
+                "facts": dict(parameters["p_facts"] or {}),
+                "storage_bucket": None,
+                "storage_path": None,
+            }
+            self.documents.append(variant)
+            return [dict(variant)]
         if function_name == "oasis_claim_finalize_document":
             matches = [
                 row
@@ -494,6 +613,10 @@ def _public_key_b64() -> str:
     return base64.b64encode(der).decode("ascii")
 
 
+@patch.dict(
+    "os.environ",
+    {"CLAIM_DOCUMENT_VARIANT_KEY": TEST_VARIANT_SECRET},
+)
 class ClaimCorrectionTests(unittest.TestCase):
     def test_seven_year_plan_uses_previous_seven_tax_years(self):
         self.assertEqual(
@@ -2293,7 +2416,7 @@ class ClaimCorrectionTests(unittest.TestCase):
         client.collect_comwel_management_numbers.assert_not_called()
         client.collect_comwel_workplace_rate.assert_not_called()
 
-    def test_comwel_multiple_management_numbers_require_selection(self):
+    def test_comwel_multiple_management_numbers_collect_every_rate(self):
         repository = MagicMock()
         repository.list_documents.return_value = [
             {
@@ -2327,6 +2450,15 @@ class ClaimCorrectionTests(unittest.TestCase):
                 },
             )
         )
+        client.collect_comwel_workplace_rate.return_value = (
+            CollectedClaimDocument(
+                content=b"%PDF-rate",
+                file_name="rate.pdf",
+                content_type="application/pdf",
+                provider_reference="rate-reference",
+                facts={"year": "2025"},
+            )
+        )
 
         summary = _collect_supported_comwel_documents(
             repository,
@@ -2344,18 +2476,22 @@ class ClaimCorrectionTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(summary["target"], 1)
-        self.assertEqual(summary["ready"], 1)
-        self.assertTrue(summary["selection_required"])
-        self.assertTrue(
-            any(
-                "management_number_selection_required" in code
-                for code in summary["skipped"]
-            )
+        self.assertEqual(summary["target"], 3)
+        self.assertEqual(summary["ready"], 3)
+        self.assertFalse(summary["selection_required"])
+        self.assertEqual(
+            {
+                call.kwargs["management_number"]
+                for call in (
+                    client.collect_comwel_workplace_rate.call_args_list
+                )
+            },
+            {"1112233333", "44455566666"},
         )
-        client.collect_comwel_workplace_rate.assert_not_called()
 
-    def test_comwel_selected_management_number_collects_rate(self):
+    def test_legacy_selected_management_number_does_not_narrow_collection(
+        self,
+    ):
         repository = MagicMock()
         repository.list_documents.return_value = [
             {
@@ -2417,14 +2553,20 @@ class ClaimCorrectionTests(unittest.TestCase):
         )
 
         self.assertFalse(summary["selection_required"])
-        self.assertEqual(summary["target"], 2)
-        self.assertEqual(summary["ready"], 2)
-        client.collect_comwel_workplace_rate.assert_called_once()
+        self.assertEqual(summary["target"], 3)
+        self.assertEqual(summary["ready"], 3)
         self.assertEqual(
-            client.collect_comwel_workplace_rate.call_args.kwargs[
-                "management_number"
-            ],
-            "44455566666",
+            client.collect_comwel_workplace_rate.call_count,
+            2,
+        )
+        self.assertEqual(
+            {
+                call.kwargs["management_number"]
+                for call in (
+                    client.collect_comwel_workplace_rate.call_args_list
+                )
+            },
+            {"1112233333", "44455566666"},
         )
 
     def test_management_number_selection_reseals_and_restarts_job(self):
@@ -2813,6 +2955,227 @@ class ClaimCorrectionTests(unittest.TestCase):
             "management-numbers.json",
         )
 
+    def test_repository_preserves_each_opaque_document_variant(self):
+        case = {
+            "id": "00000000-0000-0000-0000-000000000081",
+            "owner_user_id": "owner-user",
+        }
+        base_document = {
+            "id": "00000000-0000-0000-0000-000000000082",
+            "case_id": case["id"],
+            "owner_user_id": "owner-user",
+            "source": "hometax",
+            "document_code": "hometax_income_tax_return",
+            "document_name": "종합소득세 신고서",
+            "period_year": 2025,
+            "collection_key": "default",
+            "status": "auth_pending",
+            "facts": {},
+        }
+        fake = _FakeDatabase([case], [base_document])
+        repository = ClaimRepository("owner-user", database=fake)
+        first_key = f"v_{'a' * 32}"
+        second_key = f"v_{'b' * 32}"
+
+        def collected(scope_label: str, masked_number: str):
+            return CollectedClaimDocument(
+                content=b"%PDF-1.7\nclaim-document",
+                file_name="income-tax-return-2025.pdf",
+                content_type="application/pdf",
+                provider_reference=f"provider-{scope_label}",
+                facts={
+                    "scope_label": scope_label,
+                    "scope_masked": masked_number,
+                    "business_number": "1208800767",
+                    "business_numbers": [
+                        "1208800767",
+                        "2208162517",
+                    ],
+                    "management_number": "1112233333",
+                    "management_numbers": [
+                        "1112233333",
+                        "4445556666",
+                    ],
+                },
+            )
+
+        first = repository.store_collected_document(
+            case["id"],
+            document_code="hometax_income_tax_return",
+            period_year=2025,
+            collection_key=first_key,
+            document=collected("사업자 1", "120-**-***67"),
+        )
+        second = repository.store_collected_document(
+            case["id"],
+            document_code="hometax_income_tax_return",
+            period_year=2025,
+            collection_key=second_key,
+            document=collected("사업자 2", "220-**-***17"),
+        )
+
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertEqual(len(fake.uploads), 2)
+        self.assertNotEqual(fake.uploads[0][1], fake.uploads[1][1])
+        variant_rows = [
+            row
+            for row in fake.documents
+            if str(row.get("collection_key", "")).startswith("v_")
+        ]
+        self.assertEqual(
+            {row["collection_key"] for row in variant_rows},
+            {first_key, second_key},
+        )
+        ensure_calls = [
+            parameters
+            for name, parameters in fake.rpc_calls
+            if name == "oasis_claim_ensure_document_variant"
+        ]
+        finalize_calls = [
+            parameters
+            for name, parameters in fake.rpc_calls
+            if name == "oasis_claim_finalize_document"
+        ]
+        self.assertEqual(len(ensure_calls), 2)
+        self.assertEqual(len(finalize_calls), 2)
+        for parameters in ensure_calls:
+            self.assertEqual(parameters["p_facts"], {})
+        for parameters in finalize_calls:
+            facts = parameters["p_facts"]
+            self.assertNotIn("business_number", facts)
+            self.assertNotIn("business_numbers", facts)
+            self.assertNotIn("management_number", facts)
+            self.assertNotIn("management_numbers", facts)
+            self.assertIn("scope_label", facts)
+            self.assertIn("scope_masked", facts)
+
+        same_first = repository.ensure_document_variant(
+            case["id"],
+            document_code="hometax_income_tax_return",
+            period_year=2025,
+            collection_key=first_key,
+            facts={
+                "scope_label": "사업자 1",
+                "scope_masked": "120-**-***67",
+                "business_number": "1208800767",
+            },
+        )
+        self.assertEqual(same_first["id"], first["id"])
+        self.assertEqual(
+            len(
+                [
+                    row
+                    for row in fake.documents
+                    if row.get("collection_key") == first_key
+                ]
+            ),
+            1,
+        )
+
+    def test_failed_variant_refresh_keeps_old_ready_file_and_scope(self):
+        case = {
+            "id": "00000000-0000-0000-0000-000000000083",
+            "owner_user_id": "owner-user",
+        }
+        old_storage_path = (
+            "owner-folder/"
+            f"{case['id']}/00000000-0000-0000-0000-000000000084.pdf"
+        )
+        old_facts = {
+            "collection_scope_fingerprint": f"s_{'a' * 32}"
+        }
+        variant = {
+            "id": "00000000-0000-0000-0000-000000000084",
+            "case_id": case["id"],
+            "owner_user_id": "owner-user",
+            "source": "hometax",
+            "document_code": "hometax_income_tax_return",
+            "document_name": "종합소득세 신고서",
+            "period_year": 2025,
+            "collection_key": f"v_{'b' * 32}",
+            "status": "ready",
+            "facts": dict(old_facts),
+            "storage_bucket": "oasis-claim-documents",
+            "storage_path": old_storage_path,
+            "content_sha256": "c" * 64,
+            "content_type": "application/pdf",
+        }
+        base = {
+            **variant,
+            "id": "00000000-0000-0000-0000-000000000085",
+            "collection_key": "default",
+            "status": "auth_pending",
+            "facts": {},
+            "storage_bucket": None,
+            "storage_path": None,
+        }
+        fake = _FakeDatabase([case], [base, variant])
+        original_rpc = fake.rpc
+
+        def failing_finalize(function_name, parameters):
+            if function_name == "oasis_claim_finalize_document":
+                fake.rpc_calls.append((function_name, parameters))
+                raise RuntimeError("finalize unavailable")
+            return original_rpc(function_name, parameters)
+
+        fake.rpc = failing_finalize
+        repository = ClaimRepository("owner-user", database=fake)
+
+        with self.assertRaises(ClaimRepositoryError):
+            repository.store_collected_document(
+                case["id"],
+                document_code="hometax_income_tax_return",
+                period_year=2025,
+                collection_key=variant["collection_key"],
+                document=CollectedClaimDocument(
+                    content=b"%PDF-1.7\nreplacement",
+                    file_name="income-tax-return-2025.pdf",
+                    content_type="application/pdf",
+                    provider_reference="replacement-reference",
+                    facts={
+                        "collection_scope_fingerprint": (
+                            f"s_{'d' * 32}"
+                        )
+                    },
+                ),
+            )
+
+        ensure = next(
+            parameters
+            for name, parameters in fake.rpc_calls
+            if name == "oasis_claim_ensure_document_variant"
+        )
+        self.assertEqual(ensure["p_facts"], {})
+        self.assertEqual(variant["facts"], old_facts)
+        self.assertEqual(len(fake.uploads), 1)
+        replacement_path = fake.uploads[0][1]
+        self.assertNotEqual(replacement_path, old_storage_path)
+        self.assertIn(
+            ("oasis-claim-documents", replacement_path),
+            fake.deleted_objects,
+        )
+        self.assertNotIn(
+            ("oasis-claim-documents", old_storage_path),
+            fake.deleted_objects,
+        )
+
+    def test_repository_rejects_non_opaque_variant_key_before_writes(self):
+        case_id = "00000000-0000-0000-0000-000000000091"
+        fake = _FakeDatabase()
+        repository = ClaimRepository("owner-user", database=fake)
+
+        with self.assertRaises(ClaimRepositoryError):
+            repository.ensure_document_variant(
+                case_id,
+                document_code="hometax_income_tax_return",
+                period_year=2025,
+                collection_key="1208800767",
+                facts={"scope_label": "사업자 1"},
+            )
+
+        self.assertEqual(fake.rpc_calls, [])
+        self.assertEqual(fake.uploads, [])
+
     def test_repository_creates_owner_scoped_short_lived_download_url(self):
         owner_user_id = "owner-user"
         case_id = "00000000-0000-0000-0000-000000000031"
@@ -2874,6 +3237,86 @@ class ClaimCorrectionTests(unittest.TestCase):
             audit_calls[0]["p_metadata"]["document_id"],
             document_id,
         )
+
+    def test_repository_allows_versioned_replacement_document_download(self):
+        owner_user_id = "owner-user"
+        case_id = "00000000-0000-0000-0000-000000000033"
+        document_id = "00000000-0000-0000-0000-000000000034"
+        owner_folder = hashlib.sha256(
+            owner_user_id.encode("utf-8")
+        ).hexdigest()[:24]
+        versioned_path = (
+            f"{owner_folder}/{case_id}/{document_id}-"
+            "0123456789abcdef.pdf"
+        )
+        fake = _FakeDatabase(
+            documents=[
+                {
+                    "id": document_id,
+                    "case_id": case_id,
+                    "owner_user_id": owner_user_id,
+                    "document_code": "hometax_income_tax_return",
+                    "status": "ready",
+                    "storage_bucket": "oasis-claim-documents",
+                    "storage_path": versioned_path,
+                    "content_type": "application/pdf",
+                    "retention_until": "2099-01-01T00:00:00+00:00",
+                    "facts": {
+                        "download_file_name": "종합소득세신고서.pdf",
+                    },
+                }
+            ],
+        )
+        repository = ClaimRepository(owner_user_id, database=fake)
+
+        signed_url = repository.document_download_url(
+            case_id,
+            document_id,
+        )
+
+        self.assertIn("https://example.supabase.co/signed/", signed_url)
+        self.assertEqual(fake.signed_url_calls[0]["path"], versioned_path)
+
+    def test_repository_masks_business_number_in_download_file_name(self):
+        owner_user_id = "owner-user"
+        case_id = "00000000-0000-0000-0000-000000000035"
+        document_id = "00000000-0000-0000-0000-000000000036"
+        owner_folder = hashlib.sha256(
+            owner_user_id.encode("utf-8")
+        ).hexdigest()[:24]
+        fake = _FakeDatabase(
+            documents=[
+                {
+                    "id": document_id,
+                    "case_id": case_id,
+                    "owner_user_id": owner_user_id,
+                    "document_code": "hometax_income_tax_return",
+                    "status": "ready",
+                    "storage_bucket": "oasis-claim-documents",
+                    "storage_path": (
+                        f"{owner_folder}/{case_id}/{document_id}.pdf"
+                    ),
+                    "content_type": "application/pdf",
+                    "retention_until": "2099-01-01T00:00:00+00:00",
+                    "facts": {
+                        "download_file_name": (
+                            "2025_120-88-00767_종합소득세신고서.pdf"
+                        ),
+                    },
+                }
+            ],
+        )
+        repository = ClaimRepository(owner_user_id, database=fake)
+
+        repository.document_download_url(case_id, document_id)
+
+        download_name = fake.signed_url_calls[0]["download_name"]
+        self.assertEqual(
+            download_name,
+            "2025_120-XX-XXX67_종합소득세신고서.pdf",
+        )
+        self.assertNotIn("1208800767", download_name)
+        self.assertNotIn("120-88-00767", download_name)
 
     def test_repository_refuses_cross_owner_document_download(self):
         owner_user_id = "owner-user"
@@ -3073,6 +3516,161 @@ class ClaimCorrectionTests(unittest.TestCase):
         self.assertIn("'application/vnd.ms-excel'", source)
         self.assertIn("to service_role;", source)
 
+    def test_multi_business_variant_migration_is_private_and_idempotent(
+        self,
+    ):
+        source = (
+            ROOT / "supabase_v1029_claim_multi_business_documents.sql"
+        ).read_text(encoding="utf-8")
+        normalized = " ".join(source.lower().split())
+
+        self.assertIn(
+            "collection_key ~ '^v_[0-9a-f]{32}$'",
+            source,
+        )
+        self.assertIn("unique nulls not distinct", normalized)
+        self.assertIn(
+            "period_year, collection_key",
+            normalized,
+        )
+        self.assertIn(
+            "create or replace function "
+            "public.oasis_claim_ensure_document_variant",
+            normalized,
+        )
+        self.assertIn("security definer", normalized)
+        self.assertIn("set search_path = public, pg_temp", normalized)
+        self.assertIn(
+            "on conflict on constraint "
+            "oasis_claim_documents_variant_unique",
+            normalized,
+        )
+        for private_field in (
+            "identity_number",
+            "birth_date",
+            "cellphone",
+            "business_number",
+            "business_numbers",
+            "management_number",
+            "management_numbers",
+            "resident_number",
+        ):
+            self.assertIn(f"'{private_field}'", source)
+        self.assertIn(
+            "from public, anon, authenticated, service_role;",
+            normalized,
+        )
+        self.assertIn("to service_role;", normalized)
+        self.assertNotIn("to anon;", normalized)
+        self.assertNotIn("to authenticated;", normalized)
+
+    def test_multi_business_migration_lists_every_document_deterministically(
+        self,
+    ):
+        source = (
+            ROOT / "supabase_v1029_claim_multi_business_documents.sql"
+        ).read_text(encoding="utf-8")
+        normalized = " ".join(source.lower().split())
+        function_body = normalized.split(
+            "create or replace function "
+            "public.oasis_claim_list_documents",
+            1,
+        )[1].split(
+            "create or replace function "
+            "public.oasis_claim_ensure_document_variant",
+            1,
+        )[0]
+
+        self.assertIn("returns setof public.oasis_claim_documents", function_body)
+        self.assertIn("security definer", function_body)
+        self.assertIn("set search_path = public, pg_temp", function_body)
+        self.assertIn(
+            "where d.owner_user_id = lower(trim(p_owner_user_id)) "
+            "and d.case_id = p_case_id",
+            function_body,
+        )
+        self.assertIn(
+            "order by d.source asc, d.document_code asc, "
+            "d.period_year desc nulls last, d.collection_key asc, d.id asc",
+            function_body,
+        )
+        self.assertIn(
+            "p_limit integer default 500, p_offset integer default 0",
+            function_body,
+        )
+        self.assertIn(
+            "limit greatest(1, least(coalesce(p_limit, 500), 500))",
+            function_body,
+        )
+        self.assertIn(
+            "offset greatest(0, coalesce(p_offset, 0))",
+            function_body,
+        )
+        self.assertIn(
+            "drop function if exists "
+            "public.oasis_claim_list_documents( text, uuid );",
+            normalized,
+        )
+        self.assertIn(
+            "from public, anon, authenticated, service_role;",
+            function_body,
+        )
+        self.assertIn("to service_role;", function_body)
+
+    def test_repository_paginates_beyond_postgrest_max_rows(self):
+        documents = [
+            {
+                "id": f"document-{index}",
+                "case_id": "00000000-0000-0000-0000-000000000001",
+            }
+            for index in range(1250)
+        ]
+        database = MagicMock()
+
+        def rpc(_function_name, parameters):
+            offset = int(parameters["p_offset"])
+            limit = int(parameters["p_limit"])
+            return documents[offset : offset + limit]
+
+        database.rpc.side_effect = rpc
+        repository = ClaimRepository("owner-user", database=database)
+
+        result = repository.list_documents(
+            "00000000-0000-0000-0000-000000000001"
+        )
+
+        self.assertEqual(result, documents)
+        self.assertEqual(database.rpc.call_count, 3)
+        self.assertEqual(
+            [
+                call.args[1]["p_offset"]
+                for call in database.rpc.call_args_list
+            ],
+            [0, 500, 1000],
+        )
+
+    def test_repository_falls_back_during_paginated_rpc_rollout(self):
+        legacy_documents = [{"id": "legacy-document"}]
+        database = MagicMock()
+        database.rpc.side_effect = [
+            RuntimeError(
+                "PGRST202 Could not find the function "
+                "public.oasis_claim_list_documents"
+            ),
+            legacy_documents,
+        ]
+        repository = ClaimRepository("owner-user", database=database)
+
+        result = repository.list_documents(
+            "00000000-0000-0000-0000-000000000001"
+        )
+
+        self.assertEqual(result, legacy_documents)
+        self.assertEqual(database.rpc.call_count, 2)
+        fallback_parameters = database.rpc.call_args_list[1].args[1]
+        self.assertNotIn("p_limit", fallback_parameters)
+        self.assertNotIn("p_offset", fallback_parameters)
+
     def test_personal_flow_sends_hometax_before_comwel(self):
         source = (ROOT / "claim_correction_center.py").read_text(
             encoding="utf-8"
@@ -3098,7 +3696,9 @@ class ClaimCorrectionTests(unittest.TestCase):
         self.assertIn('transient["comwel"] = comwel_session', source)
         self.assertIn('remote_input = input_mode == "카카오톡 발송"', personal_flow)
         self.assertNotIn("_selected_customer(", personal_flow)
-        self.assertIn("홈택스 카카오 인증 직접발송", personal_flow)
+        self.assertNotIn("홈택스 카카오 인증 직접발송", personal_flow)
+        self.assertNotIn("상호명 (선택)", personal_flow)
+        self.assertNotIn("사업자등록번호 (선택)", personal_flow)
         self.assertNotIn("고객 본인입력 링크", personal_flow)
         self.assertNotIn("disabled=remote_input", personal_flow)
         self.assertIn('"주민등록번호 뒤 7자리"', personal_flow)

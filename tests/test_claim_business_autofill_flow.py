@@ -1,22 +1,16 @@
 from __future__ import annotations
 
-import json
-import threading
-import time
 import unittest
 from unittest.mock import MagicMock, patch
 
 from claim_correction_center import (
-    _CLAIM_JOBS,
-    _CLAIM_JOB_LOCK,
-    _business_candidate_token,
-    _claim_job_owner_ref,
+    _business_collection_scopes,
+    _claim_collection_scope_fingerprint,
     _collect_case_documents,
+    _collect_supported_comwel_documents,
+    _collect_supported_hometax_documents,
     _discover_hometax_business_number,
     _masked_business_choice_no,
-    _seal_claim_job_payload,
-    _select_claim_business_number,
-    _unseal_claim_job_payload,
 )
 from tilko_claim_client import (
     ClaimProviderError,
@@ -28,6 +22,7 @@ from tilko_claim_client import (
 
 VALID_BUSINESS_NUMBER = "1208800767"
 SECOND_VALID_BUSINESS_NUMBER = "2208162517"
+TEST_VARIANT_SECRET = "claim-scope-test-secret-" + ("x" * 32)
 
 
 def _document(
@@ -133,6 +128,10 @@ def _transient() -> dict:
     }
 
 
+@patch.dict(
+    "os.environ",
+    {"CLAIM_DOCUMENT_VARIANT_KEY": TEST_VARIANT_SECRET},
+)
 class ClaimBusinessAutofillFlowTests(unittest.TestCase):
     def test_single_hometax_business_is_forwarded_to_comwel_collectors(self):
         repository = _repository()
@@ -179,7 +178,9 @@ class ClaimBusinessAutofillFlowTests(unittest.TestCase):
             VALID_BUSINESS_NUMBER,
         )
 
-    def test_multiple_hometax_businesses_pause_before_comwel_collection(self):
+    def test_multiple_hometax_businesses_collect_every_scope_without_pause(
+        self,
+    ):
         repository = _repository()
         client = _client_with_discovery(
             (
@@ -191,6 +192,25 @@ class ClaimBusinessAutofillFlowTests(unittest.TestCase):
                     business_number=SECOND_VALID_BUSINESS_NUMBER,
                     business_name="오아시스 지점",
                 ),
+            )
+        )
+        management_by_business = {
+            VALID_BUSINESS_NUMBER: "1112233333",
+            SECOND_VALID_BUSINESS_NUMBER: "4445566666",
+        }
+        client.collect_comwel_management_numbers.side_effect = (
+            lambda **kwargs: _document(
+                (
+                    "comwel-management-"
+                    f"{management_by_business[kwargs['business_number']]}.json"
+                ),
+                facts={
+                    "management_numbers": [
+                        management_by_business[
+                            kwargs["business_number"]
+                        ]
+                    ]
+                },
             )
         )
         transient = _transient()
@@ -206,108 +226,350 @@ class ClaimBusinessAutofillFlowTests(unittest.TestCase):
             transient=transient,
         )
 
-        self.assertTrue(summary["business_selection_required"])
+        self.assertFalse(summary["business_selection_required"])
+        self.assertFalse(summary["selection_required"])
         self.assertFalse(summary["business_number_missing"])
-        self.assertNotIn("business_number", transient)
+        self.assertTrue(summary["complete"])
+        self.assertEqual(summary["failed"], 0)
         self.assertEqual(len(transient["business_candidates"]), 2)
-        client.collect_comwel_management_numbers.assert_not_called()
-        client.collect_comwel_total_remuneration.assert_not_called()
+        self.assertEqual(
+            {
+                call.kwargs["business_number"]
+                for call in (
+                    client
+                    .collect_hometax_business_registration_certificate
+                    .call_args_list
+                )
+            },
+            {VALID_BUSINESS_NUMBER, SECOND_VALID_BUSINESS_NUMBER},
+        )
+        self.assertEqual(
+            {
+                call.kwargs["business_number"]
+                for call in (
+                    client.collect_comwel_management_numbers.call_args_list
+                )
+            },
+            {VALID_BUSINESS_NUMBER, SECOND_VALID_BUSINESS_NUMBER},
+        )
+        self.assertEqual(
+            {
+                (
+                    call.kwargs["business_number"],
+                    call.kwargs["management_number"],
+                )
+                for call in (
+                    client.collect_comwel_total_remuneration.call_args_list
+                )
+            },
+            set(management_by_business.items()),
+        )
         client.collect_comwel_workplace_rate.assert_not_called()
+        scoped_store_calls = [
+            call
+            for call in repository.store_collected_document.call_args_list
+            if call.kwargs.get("document_code")
+            in {
+                "hometax_business_registration_certificate",
+                "comwel_management_number_list",
+                "comwel_total_remuneration",
+            }
+            and call.kwargs.get("collection_key")
+        ]
+        self.assertTrue(scoped_store_calls)
+        self.assertTrue(
+            all(
+                str(call.kwargs["collection_key"]).startswith("v_")
+                for call in scoped_store_calls
+            )
+        )
+        safe_summary = {
+            "complete": summary["complete"],
+            "ready": summary["ready"],
+            "failed": summary["failed"],
+            "target": summary["target"],
+        }
+        self.assertNotIn(
+            VALID_BUSINESS_NUMBER,
+            repr(safe_summary),
+        )
+        self.assertNotIn(
+            SECOND_VALID_BUSINESS_NUMBER,
+            repr(safe_summary),
+        )
 
-    def test_business_selection_token_reseals_and_requeues_without_raw_summary(
+    def test_business_variant_keys_are_deterministic_opaque_and_deduplicated(
         self,
     ):
-        case_id = "business-selection-case"
-        user_id = "business-selection-owner"
-        owner_ref = _claim_job_owner_ref(user_id)
-        selection_token = _business_candidate_token(
-            case_id,
-            VALID_BUSINESS_NUMBER,
+        candidates = [
+            {
+                "business_number": SECOND_VALID_BUSINESS_NUMBER,
+                "business_name": "오아시스 지점",
+            },
+            {
+                "business_number": VALID_BUSINESS_NUMBER,
+                "business_name": "오아시스 본점",
+            },
+            {
+                "business_number": SECOND_VALID_BUSINESS_NUMBER,
+                "business_name": "",
+            },
+        ]
+
+        first = _business_collection_scopes(
+            "multiple-business-case",
+            candidates,
         )
-        transient = {
-            **_transient(),
-            "expires_at": time.time() + 60,
-            "request_started_at": time.time(),
-            "business_candidates": [
+        reordered = _business_collection_scopes(
+            "multiple-business-case",
+            list(reversed(candidates)),
+        )
+
+        self.assertEqual(first, reordered)
+        self.assertEqual(len(first), 2)
+        self.assertNotEqual(
+            first[0]["collection_key"],
+            first[1]["collection_key"],
+        )
+        for scope in first:
+            self.assertRegex(
+                scope["collection_key"],
+                r"^v_[0-9a-f]{32}$",
+            )
+            self.assertNotIn(
+                scope["business_number"],
+                scope["collection_key"],
+            )
+
+        with_lower_business = _business_collection_scopes(
+            "multiple-business-case",
+            [
+                {"business_number": "1198800767"},
+                *candidates,
+            ],
+        )
+        keys_by_number = {
+            scope["business_number"]: scope["collection_key"]
+            for scope in with_lower_business
+        }
+        for scope in first:
+            self.assertEqual(
+                keys_by_number[scope["business_number"]],
+                scope["collection_key"],
+            )
+
+    def test_one_business_failure_preserves_other_business_document(self):
+        repository = MagicMock()
+        repository.list_documents.return_value = [
+            {
+                "source": "hometax",
+                "document_code": (
+                    "hometax_business_registration_certificate"
+                ),
+                "period_year": None,
+                "collection_key": "default",
+                "status": "auth_pending",
+            }
+        ]
+        repository.store_collected_document.return_value = {
+            "status": "ready"
+        }
+        client = MagicMock()
+
+        def collect_certificate(**kwargs):
+            if kwargs["business_number"] == SECOND_VALID_BUSINESS_NUMBER:
+                raise ClaimProviderError(
+                    "두 번째 사업자 조회 실패",
+                    error_code="SECOND_BUSINESS_FAILED",
+                )
+            return _document("business-registration-certificate.pdf")
+
+        client.collect_hometax_business_registration_certificate.side_effect = (
+            collect_certificate
+        )
+        businesses = [
+            {
+                "business_number": VALID_BUSINESS_NUMBER,
+                "business_name": "오아시스 본점",
+            },
+            {
+                "business_number": SECOND_VALID_BUSINESS_NUMBER,
+                "business_name": "오아시스 지점",
+            },
+        ]
+
+        summary = _collect_supported_hometax_documents(
+            repository,
+            client,
+            case_id="partial-business-case",
+            birth_date="19901019",
+            representative="홍길동",
+            cellphone="01012345678",
+            business_number=VALID_BUSINESS_NUMBER,
+            businesses=businesses,
+            session=_transient()["hometax"],
+        )
+
+        self.assertEqual(summary["target"], 2)
+        self.assertEqual(summary["ready"], 1)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(
+            repository.store_collected_document.call_count,
+            1,
+        )
+        stored_call = repository.store_collected_document.call_args
+        self.assertRegex(
+            stored_call.kwargs["collection_key"],
+            r"^v_[0-9a-f]{32}$",
+        )
+        repository.fail_document.assert_called_once()
+        failed_call = repository.fail_document.call_args
+        self.assertRegex(
+            failed_call.kwargs["collection_key"],
+            r"^v_[0-9a-f]{32}$",
+        )
+        self.assertNotIn(
+            SECOND_VALID_BUSINESS_NUMBER,
+            repr(failed_call.kwargs.get("facts", {})),
+        )
+        self.assertIn(
+            "220-**-*****",
+            repr(failed_call.kwargs.get("facts", {})),
+        )
+
+    def test_empty_management_numbers_collects_remuneration_without_rates(
+        self,
+    ):
+        repository = MagicMock()
+        repository.list_documents.return_value = [
+            {
+                "source": "comwel",
+                "document_code": "comwel_management_number_list",
+                "period_year": None,
+                "collection_key": "default",
+                "status": "auth_pending",
+            },
+            {
+                "source": "comwel",
+                "document_code": "comwel_total_remuneration",
+                "period_year": 2025,
+                "collection_key": "default",
+                "status": "auth_pending",
+            },
+            {
+                "source": "comwel",
+                "document_code": "comwel_workplace_rate",
+                "period_year": 2025,
+                "collection_key": "default",
+                "status": "auth_pending",
+            },
+        ]
+        repository.store_collected_document.return_value = {
+            "status": "ready"
+        }
+        client = MagicMock()
+        client.collect_comwel_management_numbers.return_value = _document(
+            "management-numbers.json",
+            facts={
+                "record_count": 0,
+                "management_numbers": [],
+                "no_data": True,
+            },
+        )
+        client.collect_comwel_total_remuneration.return_value = _document(
+            "remuneration-2025.xlsx",
+            facts={"year": 2025},
+        )
+
+        summary = _collect_supported_comwel_documents(
+            repository,
+            client,
+            case_id="no-management-number-case",
+            identity_number="9010191234567",
+            representative="홍길동",
+            cellphone="01012345678",
+            business_number=VALID_BUSINESS_NUMBER,
+            businesses=[
                 {
                     "business_number": VALID_BUSINESS_NUMBER,
                     "business_name": "오아시스",
-                    "business_status": "계속사업자",
-                },
-                {
-                    "business_number": SECOND_VALID_BUSINESS_NUMBER,
-                    "business_name": "오아시스 지점",
-                    "business_status": "계속사업자",
-                },
+                }
             ],
-        }
-        with _CLAIM_JOB_LOCK:
-            _CLAIM_JOBS[case_id] = {
-                "owner_ref": owner_ref,
-                "sealed_payload": _seal_claim_job_payload(transient),
-                "expires_at": transient["expires_at"],
-                "status": "awaiting_business_selection",
-                "progress": 80,
-                "safe_message": "",
-                "summary": {
-                    "business_choices": [
-                        {
-                            "token": selection_token,
-                            "label": "오아시스 · 120-**-*****",
-                        }
-                    ]
-                },
-                "wake_event": threading.Event(),
-            }
-        try:
-            with patch(
-                "claim_correction_center._activate_background_claim_job",
-                return_value=True,
-            ) as activate:
-                selected = _select_claim_business_number(
-                    user_id,
-                    case_id,
-                    selection_token,
-                )
+            session=_transient()["comwel"],
+        )
 
-            self.assertTrue(selected)
-            activate.assert_called_once_with(
-                user_id,
-                case_id,
-                initial_delay=0,
-            )
-            with _CLAIM_JOB_LOCK:
-                job = dict(_CLAIM_JOBS[case_id])
-            restored = _unseal_claim_job_payload(job["sealed_payload"])
-            self.assertEqual(
-                restored["selected_business_number"],
-                VALID_BUSINESS_NUMBER,
-            )
-            self.assertEqual(
-                restored["business_number"],
-                VALID_BUSINESS_NUMBER,
-            )
-            self.assertEqual(job["status"], "queued")
-            self.assertEqual(
-                job["summary"],
+        self.assertEqual(summary["target"], 2)
+        self.assertEqual(summary["ready"], 2)
+        self.assertEqual(summary["failed"], 0)
+        client.collect_comwel_management_numbers.assert_called_once()
+        client.collect_comwel_total_remuneration.assert_called_once()
+        client.collect_comwel_workplace_rate.assert_not_called()
+
+    def test_ready_business_variant_is_not_recollected_or_overwritten(self):
+        businesses = [
+            {
+                "business_number": VALID_BUSINESS_NUMBER,
+                "business_name": "오아시스 본점",
+            },
+            {
+                "business_number": SECOND_VALID_BUSINESS_NUMBER,
+                "business_name": "오아시스 지점",
+            },
+        ]
+        scopes = _business_collection_scopes(
+            "ready-variant-case",
+            businesses,
+        )
+        repository = MagicMock()
+        repository.list_documents.return_value = [
+            {
+                "source": "hometax",
+                "document_code": (
+                    "hometax_business_registration_certificate"
+                ),
+                "period_year": None,
+                "collection_key": "default",
+                "status": "auth_pending",
+                "facts": {},
+            },
+            *[
                 {
-                    "ready": 0,
-                    "target": 0,
-                },
-            )
+                    "source": "hometax",
+                    "document_code": (
+                        "hometax_business_registration_certificate"
+                    ),
+                    "period_year": None,
+                    "collection_key": scope["collection_key"],
+                    "status": "ready",
+                    "facts": {
+                        "collection_scope_fingerprint": scope[
+                            "collection_scope_fingerprint"
+                        ]
+                    },
+                }
+                for scope in scopes
+            ],
+        ]
+        client = MagicMock()
 
-            safe_job_view = {
-                key: value
-                for key, value in job.items()
-                if key not in {"sealed_payload", "wake_event"}
-            }
-            self.assertNotIn(
-                VALID_BUSINESS_NUMBER,
-                json.dumps(safe_job_view, ensure_ascii=False),
-            )
-        finally:
-            with _CLAIM_JOB_LOCK:
-                _CLAIM_JOBS.pop(case_id, None)
+        summary = _collect_supported_hometax_documents(
+            repository,
+            client,
+            case_id="ready-variant-case",
+            birth_date="19901019",
+            representative="홍길동",
+            cellphone="01012345678",
+            business_number=VALID_BUSINESS_NUMBER,
+            businesses=businesses,
+            session=_transient()["hometax"],
+        )
+
+        self.assertEqual(summary["target"], 2)
+        self.assertEqual(summary["ready"], 2)
+        self.assertEqual(summary["failed"], 0)
+        client.collect_hometax_business_registration_certificate.assert_not_called()
+        repository.store_collected_document.assert_not_called()
+        repository.fail_document.assert_not_called()
 
     def test_missing_business_collects_remuneration_and_blocks_dependent_docs(
         self,
@@ -385,10 +647,93 @@ class ClaimBusinessAutofillFlowTests(unittest.TestCase):
             transient={},
         )
 
-        self.assertEqual(summary["ready"], 1)
-        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(summary["ready"], 0)
+        self.assertEqual(summary["failed"], 1)
         self.assertTrue(summary["errors"])
         repository.fail_document.assert_not_called()
+
+    def test_any_collection_error_prevents_complete_status(self):
+        repository = MagicMock()
+        repository.list_documents.return_value = []
+        repository.update_case_status.return_value = {}
+        client = MagicMock()
+        discovery = {
+            "target": 1,
+            "ready": 1,
+            "failed": 0,
+            "errors": [],
+            "business_number": VALID_BUSINESS_NUMBER,
+            "candidates": [
+                {"business_number": VALID_BUSINESS_NUMBER}
+            ],
+            "selection_required": False,
+        }
+        hometax = {
+            "target": 1,
+            "ready": 1,
+            "failed": 0,
+            "skipped": [],
+            "errors": [
+                {
+                    "document_code": "hometax_income_tax_return",
+                    "safe_error_code": "STALE_SCOPE_REFRESH_FAILED",
+                }
+            ],
+            "business_numbers": [],
+            "ready_keys": [],
+        }
+        comwel = {
+            "target": 1,
+            "ready": 1,
+            "failed": 0,
+            "skipped": [],
+            "errors": [],
+            "management_numbers": [],
+            "management_number_count": 0,
+            "selection_required": False,
+        }
+
+        with (
+            patch(
+                "claim_correction_center._discover_hometax_business_number",
+                return_value=discovery,
+            ),
+            patch(
+                "claim_correction_center._collect_supported_hometax_documents",
+                return_value=hometax,
+            ),
+            patch(
+                "claim_correction_center._collect_supported_comwel_documents",
+                return_value=comwel,
+            ),
+        ):
+            summary = _collect_case_documents(
+                repository,
+                client,
+                case_id="summary-error-case",
+                birth_date="19901019",
+                identity_number="9010191234567",
+                representative="홍길동",
+                cellphone="01012345678",
+                transient={
+                    **_transient(),
+                    "business_candidates": [
+                        {"business_number": VALID_BUSINESS_NUMBER}
+                    ],
+                },
+            )
+
+        self.assertEqual(summary["ready"], summary["target"])
+        self.assertEqual(summary["failed"], 0)
+        self.assertTrue(summary["errors"])
+        self.assertFalse(summary["complete"])
+        self.assertTrue(
+            any(
+                call.kwargs.get("overall_status")
+                == "auth_complete_collection_pending"
+                for call in repository.update_case_status.call_args_list
+            )
+        )
 
 
 if __name__ == "__main__":
