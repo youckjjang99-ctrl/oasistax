@@ -137,13 +137,17 @@ def _clean(value: Any) -> str:
     return text
 
 
+def _claim_document_is_no_data(document: dict[str, Any]) -> bool:
+    facts = document.get("facts")
+    return bool(isinstance(facts, dict) and facts.get("no_data") is True)
+
+
 def _claim_document_is_downloadable(
     document: dict[str, Any],
     *,
     now: datetime | None = None,
 ) -> bool:
-    facts = document.get("facts")
-    if isinstance(facts, dict) and facts.get("no_data") is True:
+    if _claim_document_is_no_data(document):
         return False
     if (
         str(document.get("status", "") or "").strip().lower() != "ready"
@@ -416,7 +420,7 @@ def _claim_result_document_status(
         "comwel_workplace_rate",
     }
 
-    if isinstance(facts, dict) and facts.get("no_data") is True:
+    if _claim_document_is_no_data(document):
         return "조회된 신고내역 없음"
     if (
         document_code == "comwel_workplace_rate"
@@ -631,28 +635,57 @@ def _claim_collection_progress(
         )
     ]
     target_count = len(targets)
+    no_data_count = sum(
+        1
+        for document in targets
+        if str(document.get("status", "")).strip().lower() == "ready"
+        and _claim_document_is_no_data(document)
+    )
+    collected_count = sum(
+        1
+        for document in targets
+        if str(document.get("status", "")).strip().lower() == "ready"
+        and not _claim_document_is_no_data(document)
+    )
     ready_count = sum(
         1
         for document in targets
         if str(document.get("status", "")).strip().lower() == "ready"
     )
+    processed_count = collected_count + no_data_count
     if target_count:
-        calculated = round((ready_count / target_count) * 100)
+        calculated = round((processed_count / target_count) * 100)
         percentage = (
             100
-            if ready_count >= target_count
+            if processed_count >= target_count
             else min(99, calculated)
         )
     else:
         percentage = 0
+    if target_count:
+        progress_detail = (
+            f"수집 완료 {collected_count}건"
+            + (
+                f" · 해당없음 {no_data_count}건"
+                if no_data_count
+                else ""
+            )
+        )
+        if processed_count >= target_count:
+            progress_text = (
+                f"{percentage}% · 자동수집 대상 {target_count}건 처리 완료 "
+                f"({progress_detail})"
+            )
+        else:
+            progress_text = (
+                f"{percentage}% · 자동수집 대상 {target_count}건 중 "
+                f"{processed_count}건 처리 완료 ({progress_detail})"
+            )
+    else:
+        progress_text = "0% · 수집할 자동연동 자료를 확인하고 있습니다."
     return (
         percentage,
-        (
-            f"{percentage}% · 자동수집 대상 {target_count}건 중 "
-            f"{ready_count}건 수집 완료"
-            if target_count
-            else "0% · 수집할 자동연동 자료를 확인하고 있습니다."
-        ),
+        progress_text,
         ready_count,
         target_count,
     )
@@ -3209,7 +3242,7 @@ def _run_background_claim_job(
                     status="running",
                     safe_message=(
                         f"{_document_label(document_code)} 수집 중 · "
-                        f"{ready_count}/{target_count}건 수집 완료"
+                        f"{ready_count}/{target_count}건 처리 완료"
                         if target_count
                         else f"{_document_label(document_code)} 수집 중"
                     ),
@@ -3437,7 +3470,7 @@ def _run_background_claim_job(
                 if (
                     not progress_verified
                     or target_count <= 0
-                    or ready_count != target_count
+                    or percentage < 100
                 ):
                     verification_error_code = (
                         "COLLECTION_PROGRESS_UNVERIFIED"
@@ -3505,8 +3538,7 @@ def _run_background_claim_job(
                     status="complete",
                     progress=percentage,
                     safe_message=(
-                        f"현재 연결된 서류 "
-                        f"{ready_count}건 수집 완료"
+                        f"자동수집 대상 {target_count}건 처리가 완료되었습니다."
                         + (
                             f", 추가 정보·미지원 "
                             f"{len(summary.get('skipped', []))}건"
@@ -4048,6 +4080,7 @@ def _claim_collection_retry_state(
     job_snapshot: dict[str, Any] | None,
     *,
     provider_ready: bool,
+    collection_complete: bool = False,
 ) -> str:
     authentication_complete = (
         str(case.get("hometax_status", "") or "") == "auth_complete"
@@ -4055,6 +4088,8 @@ def _claim_collection_retry_state(
     )
     if not authentication_complete:
         return "hidden"
+    if collection_complete:
+        return "complete"
 
     if not job_snapshot:
         overall_status = str(case.get("overall_status", "") or "")
@@ -4098,11 +4133,13 @@ def _render_claim_collection_retry_action(
     *,
     provider_ready: bool,
     key_prefix: str,
+    collection_complete: bool = False,
 ) -> str:
     state = _claim_collection_retry_state(
         case,
         job_snapshot,
         provider_ready=provider_ready,
+        collection_complete=collection_complete,
     )
     case_id = str(case.get("id", "") or "")
     if state == "retryable":
@@ -4993,13 +5030,12 @@ def _render_auto_claim_monitor(
         verified_complete = bool(
             progress_verified
             and target_count > 0
-            and ready_count == target_count
+            and progress_percent == 100
         )
         if job_status == "complete" and verified_complete:
             skipped_count = int(summary.get("skipped_count", 0) or 0)
             completion_message = (
-                f"현재 연결된 서류 {ready_count}건 수집이 "
-                "완료되었습니다."
+                f"자동수집 대상 {target_count}건 처리가 완료되었습니다."
                 + (
                     f" 현재 인증방식 또는 필수 식별정보 제한으로 "
                     f"{skipped_count}건은 제외했습니다."
@@ -5038,6 +5074,7 @@ def _render_auto_claim_monitor(
             job_snapshot,
             provider_ready=provider_ready,
             key_prefix="claim_monitor_collection_retry",
+            collection_complete=verified_complete,
         )
         if retry_state in {
             "retryable",
@@ -5077,7 +5114,11 @@ def _render_auto_claim_monitor(
     if (
         progress_verified
         and target_count > 0
-        and ready_count == target_count
+        and progress_percent == 100
+        and str(current_case.get("hometax_status", "") or "")
+        == "auth_complete"
+        and str(current_case.get("comwel_status", "") or "")
+        == "auth_complete"
         and str(current_case.get("overall_status", "") or "")
         in {"ready", "collected"}
     ):
@@ -5597,15 +5638,6 @@ def _show_claim_documents_dialog(
         f" · {_source_status(selected_case.get('overall_status'))}"
     )
 
-    selected_job_snapshot = _claim_job_snapshot(user_id, case_id)
-    _render_claim_collection_retry_action(
-        user_id,
-        selected_case,
-        selected_job_snapshot,
-        provider_ready=provider_ready,
-        key_prefix="claim_result_dialog_retry",
-    )
-
     try:
         documents = repository.list_documents(case_id)
     except ClaimRepositoryError as exc:
@@ -5615,11 +5647,25 @@ def _show_claim_documents_dialog(
         st.info("이 고객에게 등록된 수집 항목이 없습니다.")
         return
 
+    progress_percent, _, _, target_count = _claim_collection_progress(
+        documents
+    )
+    selected_job_snapshot = _claim_job_snapshot(user_id, case_id)
+    _render_claim_collection_retry_action(
+        user_id,
+        selected_case,
+        selected_job_snapshot,
+        provider_ready=provider_ready,
+        key_prefix="claim_result_dialog_retry",
+        collection_complete=(target_count > 0 and progress_percent == 100),
+    )
+
     ready_documents = _claim_downloadable_documents(documents)
     failed_count = sum(
         1
         for document in documents
         if str(document.get("status", "") or "") == "failed"
+        and not _claim_document_is_no_data(document)
     )
     planned_count = sum(
         1
@@ -5632,8 +5678,7 @@ def _show_claim_documents_dialog(
     no_data_count = sum(
         1
         for document in documents
-        if isinstance(document.get("facts"), dict)
-        and document["facts"].get("no_data") is True
+        if _claim_document_is_no_data(document)
     )
     expired_count = sum(
         1
@@ -5641,10 +5686,7 @@ def _show_claim_documents_dialog(
         if str(document.get("status", "") or "") == "ready"
         and bool(document.get("storage_path"))
         and not _claim_document_is_downloadable(document)
-        and not (
-            isinstance(document.get("facts"), dict)
-            and document["facts"].get("no_data") is True
-        )
+        and not _claim_document_is_no_data(document)
     )
     summary_parts = [f"수집 완료 {len(ready_documents):,}건"]
     if no_data_count:

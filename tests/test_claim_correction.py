@@ -837,6 +837,50 @@ class ClaimCorrectionTests(unittest.TestCase):
         self.assertEqual(percentage, 60)
         self.assertIn("5건 중 3건", text)
 
+    def test_collection_progress_separates_no_data_from_collected(self):
+        ready_documents = [
+            {
+                "source": "hometax",
+                "document_code": "hometax_income_tax_return",
+                "period_year": 1900 + index,
+                "status": "ready",
+                "facts": {},
+            }
+            for index in range(27)
+        ]
+        no_data_documents = [
+            {
+                "source": "comwel",
+                "document_code": "comwel_total_remuneration",
+                "period_year": 2019 + (index % 7),
+                "collection_key": f"v_business_{index // 7}",
+                "status": "ready",
+                "facts": {"no_data": True, "record_count": 0},
+            }
+            for index in range(14)
+        ] + [
+            {
+                "source": "hometax",
+                "document_code": "hometax_closure_certificate",
+                "collection_key": f"v_business_{index}",
+                "status": "ready",
+                "facts": {"no_data": True, "record_count": 0},
+            }
+            for index in range(2)
+        ]
+
+        percentage, text, ready_count, target_count = (
+            _claim_collection_progress(
+                ready_documents + no_data_documents
+            )
+        )
+
+        self.assertEqual(target_count, 43)
+        self.assertEqual(ready_count, 43)
+        self.assertEqual(percentage, 100)
+        self.assertIn("수집 완료 27건", text)
+        self.assertIn("해당없음 16건", text)
+
     def test_collection_progress_excludes_rates_when_no_workplace_exists(self):
         documents = [
             {

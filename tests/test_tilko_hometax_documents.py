@@ -287,6 +287,49 @@ class TilkoHometaxDocumentClientTests(unittest.TestCase):
             document.facts,
         )
 
+    @patch("tilko_claim_client.requests.post")
+    def test_closure_certificate_8801015_returns_no_data_json(
+        self,
+        post,
+    ):
+        post.return_value = _JsonResponse(
+            {
+                "ErrorCode": 1,
+                "TargetCode": "8801015",
+                "ApiTxKey": "closure-no-data-reference",
+                "Result": [],
+            }
+        )
+
+        document = _client().collect_hometax_closure_certificate(
+            birth_date="901019",
+            user_name="홍길동",
+            cellphone="01012345678",
+            business_number="2208162517",
+            session=_session(),
+        )
+
+        self.assertEqual(
+            post.call_args.args[0],
+            f"{HOMETAX_HOST}{HOMETAX_CLOSURE_CERTIFICATE}",
+        )
+        self.assertEqual(document.content_type, "application/json")
+        self.assertEqual(
+            document.file_name,
+            "hometax-closure-certificate-no-data.json",
+        )
+        self.assertEqual(
+            document.facts,
+            {
+                "no_data": True,
+                "record_count": 0,
+            },
+        )
+        self.assertEqual(
+            json.loads(document.content.decode("utf-8")),
+            document.facts,
+        )
+
 
 @patch.dict(
     "os.environ",

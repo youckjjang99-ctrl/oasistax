@@ -57,6 +57,12 @@ COMWEL_MANAGEMENT_NUMBERS = "/api/v2.0/KcomwelSimpleAuth/MyBizInfo"
 COMWEL_WORKPLACE_RATE = "/api/v2.0/KcomwelSimpleAuth/T100110021005"
 SESSION_FIELDS = ("Token", "CxId", "TxId", "ReqTxId")
 TRANSIENT_PROVIDER_ERROR_CODES = frozenset({"OACX_NO_USER"})
+HOMETAX_CLOSURE_NO_DATA_ERROR_CODES = frozenset(
+    {"8801015", "HOMETAX_8801015"}
+)
+COMWEL_REMUNERATION_NO_DATA_ERROR_CODES = frozenset(
+    {"7701001", "COMWEL_7701001"}
+)
 MAX_COLLECTED_DOCUMENT_BYTES = 20 * 1024 * 1024
 
 
@@ -1310,12 +1316,23 @@ class TilkoClaimClient:
             encrypted_paths.append("BusinessNumber")
         if selected_management_number:
             payload["GwanriNo"] = selected_management_number
-        response = self._post(
-            self.config.comwel_host,
-            COMWEL_TOTAL_REMUNERATION,
-            payload,
-            tuple(encrypted_paths),
-        )
+        try:
+            response = self._post(
+                self.config.comwel_host,
+                COMWEL_TOTAL_REMUNERATION,
+                payload,
+                tuple(encrypted_paths),
+            )
+        except ClaimProviderError as exc:
+            if exc.error_code not in COMWEL_REMUNERATION_NO_DATA_ERROR_CODES:
+                raise
+            return _collected_no_data_json(
+                {},
+                fallback_name=(
+                    f"comwel-total-remuneration-{selected_year}-no-data"
+                ),
+                year=selected_year,
+            )
         if _empty_result_without_file(
             response,
             file_field="ExcelData",
@@ -1703,29 +1720,46 @@ class TilkoClaimClient:
             raise ClaimProviderError(
                 "폐업사실증명 조회에는 유효한 사업자등록번호가 필요합니다."
             )
-        response = self._post(
-            self.config.hometax_host,
-            HOMETAX_CLOSURE_CERTIFICATE,
-            {
-                "Auth": self._hometax_auth(
-                    birth_date=birth_date,
-                    user_name=user_name,
-                    cellphone=cellphone,
-                    session=session,
+        try:
+            response = self._post(
+                self.config.hometax_host,
+                HOMETAX_CLOSURE_CERTIFICATE,
+                {
+                    "Auth": self._hometax_auth(
+                        birth_date=birth_date,
+                        user_name=user_name,
+                        cellphone=cellphone,
+                        session=session,
+                    ),
+                    "BusinessNumber": selected_business_number,
+                    "EnglCvaAplnYn": "N",
+                    "ResnoOpYn": "N",
+                    "IssueType": "99",
+                    "Organization": "99",
+                },
+                (
+                    "Auth.BirthDate",
+                    "Auth.UserName",
+                    "Auth.UserCellphoneNumber",
+                    "BusinessNumber",
                 ),
-                "BusinessNumber": selected_business_number,
-                "EnglCvaAplnYn": "N",
-                "ResnoOpYn": "N",
-                "IssueType": "99",
-                "Organization": "99",
-            },
-            (
-                "Auth.BirthDate",
-                "Auth.UserName",
-                "Auth.UserCellphoneNumber",
-                "BusinessNumber",
-            ),
-        )
+            )
+        except ClaimProviderError as exc:
+            if exc.error_code not in HOMETAX_CLOSURE_NO_DATA_ERROR_CODES:
+                raise
+            facts = {"no_data": True, "record_count": 0}
+            return CollectedClaimDocument(
+                content=json.dumps(
+                    facts,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+                file_name="hometax-closure-certificate-no-data.json",
+                content_type="application/json",
+                provider_reference="",
+                facts=facts,
+            )
         raw_result = response.get("Result")
         rows = (
             raw_result
