@@ -22,6 +22,7 @@ from claim_correction_center import (
     _advance_personal_case,
     _birth_date_from_identity,
     _claim_auth_stage,
+    _claim_active_collection_documents,
     _claim_collection_progress,
     _claim_collection_progress_from_repository,
     _claim_document_is_downloadable,
@@ -824,7 +825,10 @@ class ClaimCorrectionTests(unittest.TestCase):
                 "document_code": "hometax_income_tax_return",
                 "period_year": 2025,
                 "status": "ready",
-                "facts": {},
+                "facts": {
+                    "query_strategy": "filing_year_v2",
+                    "tax_year_verified": True,
+                },
             },
         ]
 
@@ -844,7 +848,10 @@ class ClaimCorrectionTests(unittest.TestCase):
                 "document_code": "hometax_income_tax_return",
                 "period_year": 1900 + index,
                 "status": "ready",
-                "facts": {},
+                "facts": {
+                    "query_strategy": "filing_year_v2",
+                    "tax_year_verified": True,
+                },
             }
             for index in range(27)
         ]
@@ -881,7 +888,7 @@ class ClaimCorrectionTests(unittest.TestCase):
         self.assertIn("수집 완료 27건", text)
         self.assertIn("해당없음 16건", text)
 
-    def test_collection_progress_excludes_rates_when_no_workplace_exists(self):
+    def test_collection_progress_keeps_unresolved_rates_visible(self):
         documents = [
             {
                 "document_code": "comwel_management_number_list",
@@ -916,9 +923,134 @@ class ClaimCorrectionTests(unittest.TestCase):
             _claim_collection_progress(documents)
         )
 
-        self.assertEqual(target_count, 2)
+        self.assertEqual(target_count, 4)
         self.assertEqual(ready_count, 2)
-        self.assertEqual(percentage, 100)
+        self.assertEqual(percentage, 50)
+
+    def test_old_empty_income_tax_returns_require_recollection(self):
+        documents = [
+            {
+                "source": "hometax",
+                "document_code": "hometax_income_tax_return",
+                "period_year": 2025,
+                "status": "ready",
+                "facts": {"no_data": True, "record_count": 0},
+            },
+            {
+                "source": "hometax",
+                "document_code": "hometax_income_tax_return",
+                "period_year": 2024,
+                "status": "ready",
+                "facts": {
+                    "no_data": True,
+                    "record_count": 0,
+                    "query_strategy": "filing_year_v2",
+                    "tax_year_verified": True,
+                },
+            },
+        ]
+
+        percentage, _, ready_count, target_count = (
+            _claim_collection_progress(documents)
+        )
+
+        self.assertEqual(target_count, 2)
+        self.assertEqual(ready_count, 1)
+        self.assertEqual(percentage, 50)
+
+    def test_old_downloadable_income_tax_return_requires_recollection(self):
+        old_document = {
+            "source": "hometax",
+            "document_code": "hometax_income_tax_return",
+            "period_year": 2025,
+            "status": "ready",
+            "storage_bucket": "oasis-claim-documents",
+            "storage_path": "case/old-return.pdf",
+            "content_type": "application/pdf",
+            "retention_until": "2099-12-31T00:00:00+00:00",
+            "facts": {"record_count": 1},
+        }
+
+        percentage, _, ready_count, target_count = (
+            _claim_collection_progress([old_document])
+        )
+
+        self.assertEqual(target_count, 1)
+        self.assertEqual(ready_count, 0)
+        self.assertEqual(percentage, 0)
+        self.assertFalse(_claim_document_is_downloadable(old_document))
+
+    def test_actual_rate_scope_supersedes_empty_management_scope(self):
+        shared_facts = {
+            "business_name": "오아시스",
+            "business_number_masked": "120-**-*****",
+        }
+        documents = [
+            {
+                "source": "comwel",
+                "document_code": "comwel_workplace_rate",
+                "period_year": 2025,
+                "collection_key": "v_empty",
+                "status": "ready",
+                "facts": {
+                    **shared_facts,
+                    "no_data": True,
+                    "no_data_reason": "no_management_number",
+                },
+            },
+            {
+                "source": "comwel",
+                "document_code": "comwel_workplace_rate",
+                "period_year": 2025,
+                "collection_key": "v_actual",
+                "status": "ready",
+                "facts": {
+                    **shared_facts,
+                    "management_number_masked": "123-*******",
+                },
+            },
+        ]
+
+        active = _claim_active_collection_documents(documents)
+
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["collection_key"], "v_actual")
+
+    def test_rate_scope_fingerprint_prevents_masked_identity_collision(self):
+        shared_facts = {
+            "business_name": "동일상호",
+            "business_number_masked": "120-**-*****",
+        }
+        documents = [
+            {
+                "source": "comwel",
+                "document_code": "comwel_workplace_rate",
+                "period_year": 2025,
+                "collection_key": "v_empty_business_a",
+                "status": "ready",
+                "facts": {
+                    **shared_facts,
+                    "business_scope_fingerprint": "s_" + ("a" * 32),
+                    "no_data": True,
+                },
+            },
+            {
+                "source": "comwel",
+                "document_code": "comwel_workplace_rate",
+                "period_year": 2025,
+                "collection_key": "v_actual_business_b",
+                "status": "ready",
+                "facts": {
+                    **shared_facts,
+                    "business_scope_fingerprint": "s_" + ("b" * 32),
+                    "management_number_masked": "123-*******",
+                },
+            },
+        ]
+
+        active = _claim_active_collection_documents(documents)
+
+        self.assertEqual(len(active), 2)
 
     def test_collection_progress_caps_incomplete_ratio_at_ninety_nine(self):
         documents = [

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import unittest
+from datetime import date
 from unittest.mock import MagicMock, patch
 
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -21,6 +22,7 @@ from tilko_claim_client import (
     HOMETAX_HOST,
     HOMETAX_INCOME_TAX_HELP,
     HOMETAX_INCOME_TAX_RETURN,
+    ClaimProviderError,
     CollectedClaimDocument,
     TilkoClaimClient,
     TilkoClaimConfig,
@@ -112,8 +114,8 @@ class TilkoHometaxDocumentClientTests(unittest.TestCase):
         )
         payload = post.call_args.kwargs["json"]
         self.assertNotIn("Auth", payload)
-        self.assertEqual(payload["StartDate"], "20240101")
-        self.assertEqual(payload["EndDate"], "20241231")
+        self.assertEqual(payload["StartDate"], "20250101")
+        self.assertEqual(payload["EndDate"], "20251231")
         self.assertEqual(payload["PrivateAuthType"], "0")
         for field_name, plaintext in _session().items():
             self.assertEqual(payload[field_name], plaintext)
@@ -129,6 +131,8 @@ class TilkoHometaxDocumentClientTests(unittest.TestCase):
         self.assertEqual(document.content_type, "application/json")
         self.assertTrue(document.facts["no_data"])
         self.assertEqual(document.facts["year"], "2024")
+        self.assertEqual(document.facts["filing_year"], "2025")
+        self.assertEqual(document.facts["query_strategy"], "filing_year_v2")
 
     @patch("tilko_claim_client.requests.post")
     def test_income_tax_return_collects_downloadable_pdf(self, post):
@@ -137,7 +141,12 @@ class TilkoHometaxDocumentClientTests(unittest.TestCase):
             {
                 "ErrorCode": 0,
                 "ApiTxKey": "income-return-pdf-reference",
-                "Result": [{"TaxYear": "2024"}],
+                "Result": [
+                    {
+                        "txnrmStrtDt": "20240101",
+                        "txnrmEndDt": "20241231",
+                    }
+                ],
                 "BinaryResult": [
                     {
                         "FileName": "../income-return.pdf",
@@ -161,7 +170,121 @@ class TilkoHometaxDocumentClientTests(unittest.TestCase):
         self.assertEqual(document.content_type, "application/pdf")
         self.assertEqual(document.file_name, "income-return.pdf")
         self.assertEqual(document.facts["year"], "2024")
+        self.assertEqual(document.facts["filing_year"], "2025")
+        self.assertEqual(document.facts["query_strategy"], "filing_year_v2")
         self.assertEqual(document.facts["pdf_count"], 1)
+
+    @patch("tilko_claim_client.requests.post")
+    def test_income_tax_return_filters_other_tax_years(self, post):
+        selected_pdf = b"%PDF-1.7\nselected-tax-year"
+        other_pdf = b"%PDF-1.7\nother-tax-year"
+        post.return_value = _JsonResponse(
+            {
+                "ErrorCode": 0,
+                "ApiTxKey": "mixed-income-return-reference",
+                "Result": [
+                    {
+                        "txnrmStrtDt": "20240101",
+                        "txnrmEndDt": "20241231",
+                    },
+                    {
+                        "txnrmStrtDt": "20230101",
+                        "txnrmEndDt": "20231231",
+                    },
+                ],
+                "BinaryResult": [
+                    {
+                        "FileName": "selected.pdf",
+                        "FileExtension": "pdf",
+                        "Result": base64.b64encode(selected_pdf).decode(
+                            "ascii"
+                        ),
+                    },
+                    {
+                        "FileName": "other.pdf",
+                        "FileExtension": "pdf",
+                        "Result": base64.b64encode(other_pdf).decode("ascii"),
+                    },
+                ],
+            }
+        )
+
+        document = _client().collect_hometax_income_tax_return(
+            year=2024,
+            birth_date="19901019",
+            user_name="홍길동",
+            cellphone="01012345678",
+            business_number="2208162517",
+            session=_session(),
+        )
+
+        self.assertEqual(document.content, selected_pdf)
+        self.assertEqual(document.file_name, "selected.pdf")
+        self.assertTrue(document.facts["tax_year_verified"])
+        self.assertEqual(
+            document.facts["discarded_mismatched_records"],
+            1,
+        )
+
+    @patch("tilko_claim_client.requests.post")
+    def test_income_tax_return_rejects_unverified_tax_year(self, post):
+        pdf = b"%PDF-1.7\nunverified-tax-year"
+        post.return_value = _JsonResponse(
+            {
+                "ErrorCode": 0,
+                "Result": [{"TaxYear": "2024"}],
+                "BinaryResult": [
+                    {
+                        "FileName": "unverified.pdf",
+                        "FileExtension": "pdf",
+                        "Result": base64.b64encode(pdf).decode("ascii"),
+                    }
+                ],
+            }
+        )
+
+        with self.assertRaises(ClaimProviderError):
+            _client().collect_hometax_income_tax_return(
+                year=2024,
+                birth_date="19901019",
+                user_name="홍길동",
+                cellphone="01012345678",
+                business_number="2208162517",
+                session=_session(),
+            )
+
+    @patch("tilko_claim_client.date")
+    @patch("tilko_claim_client.requests.post")
+    def test_income_tax_return_caps_current_filing_year_at_today(
+        self,
+        post,
+        mocked_date,
+    ):
+        mocked_date.side_effect = lambda *args, **kwargs: date(
+            *args,
+            **kwargs,
+        )
+        mocked_date.today.return_value = date(2026, 7, 31)
+        post.return_value = _JsonResponse(
+            {
+                "ErrorCode": 0,
+                "Result": [],
+                "BinaryResult": [],
+            }
+        )
+
+        _client().collect_hometax_income_tax_return(
+            year=2025,
+            birth_date="19901019",
+            user_name="홍길동",
+            cellphone="01012345678",
+            business_number="2208162517",
+            session=_session(),
+        )
+
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["StartDate"], "20260101")
+        self.assertEqual(payload["EndDate"], "20260731")
 
     @patch("tilko_claim_client.requests.post")
     def test_income_tax_help_collects_redacted_year_json(self, post):
@@ -279,6 +402,7 @@ class TilkoHometaxDocumentClientTests(unittest.TestCase):
             document.facts,
             {
                 "no_data": True,
+                "no_data_reason": "active_business_no_closure",
                 "record_count": 0,
             },
         )
@@ -322,6 +446,7 @@ class TilkoHometaxDocumentClientTests(unittest.TestCase):
             document.facts,
             {
                 "no_data": True,
+                "no_data_reason": "active_business_no_closure",
                 "record_count": 0,
             },
         )
@@ -396,6 +521,14 @@ class TilkoHometaxAnnualCollectionTests(unittest.TestCase):
                 "status": "ready",
                 "facts": {
                     "collection_scope_fingerprint": scope_fingerprint,
+                    **(
+                        {
+                            "query_strategy": "filing_year_v2",
+                            "tax_year_verified": True,
+                        }
+                        if document_code == "hometax_income_tax_return"
+                        else {}
+                    ),
                 },
             }
             for document_code, period_year in (

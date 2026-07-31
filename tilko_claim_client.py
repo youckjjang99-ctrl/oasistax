@@ -6,6 +6,7 @@ import io
 import json
 import os
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any, Iterable
 
 import requests
@@ -426,11 +427,15 @@ def _collected_no_data_json(
     *,
     fallback_name: str,
     year: str,
+    reason: str = "provider_no_records",
+    extra_facts: dict[str, Any] | None = None,
 ) -> CollectedClaimDocument:
     facts = {
         "no_data": True,
+        "no_data_reason": str(reason or "provider_no_records")[:80],
         "record_count": 0,
         "year": year,
+        **dict(extra_facts or {}),
     }
     content = json.dumps(
         facts,
@@ -968,7 +973,42 @@ def _collected_hometax_income_tax_return(
     response_data: dict[str, Any],
     *,
     year: str,
+    filing_year: str,
 ) -> CollectedClaimDocument:
+    raw_result = response_data.get("Result")
+    result_rows = (
+        raw_result
+        if isinstance(raw_result, list)
+        else [raw_result]
+        if isinstance(raw_result, dict)
+        else []
+    )
+
+    def result_tax_year(row: Any) -> str:
+        if not isinstance(row, dict):
+            return ""
+        for field_name in ("txnrmEndDt", "txnrmStrtDt", "txnrmYm"):
+            digits = "".join(
+                character
+                for character in str(row.get(field_name, "") or "")
+                if character.isdigit()
+            )
+            if len(digits) >= 4:
+                return digits[:4]
+        return ""
+
+    result_years = [result_tax_year(row) for row in result_rows]
+    identified_years = [value for value in result_years if value]
+    mismatched_indexes = [
+        index
+        for index, value in enumerate(result_years)
+        if value and value != year
+    ]
+    matching_indexes = [
+        index
+        for index, value in enumerate(result_years)
+        if value == year
+    ]
     raw_binary = response_data.get("BinaryResult")
     binary_rows = (
         raw_binary
@@ -977,6 +1017,31 @@ def _collected_hometax_income_tax_return(
         if isinstance(raw_binary, dict)
         else []
     )
+    filtered_response = dict(response_data)
+    discarded_mismatched_records = 0
+    if result_rows and len(identified_years) != len(result_rows):
+        raise ClaimProviderError(
+            "종합소득세 신고서 응답의 귀속연도를 안전하게 확인하지 못했습니다."
+        )
+    if binary_rows and not result_rows:
+        raise ClaimProviderError(
+            "종합소득세 신고서 파일의 귀속연도 정보가 없습니다."
+        )
+    tax_year_verified = True
+    if mismatched_indexes:
+        if binary_rows and len(binary_rows) != len(result_rows):
+            raise ClaimProviderError(
+                "종합소득세 신고서 파일과 귀속연도 내역이 일치하지 않습니다."
+            )
+        discarded_mismatched_records = len(mismatched_indexes)
+        result_rows = [result_rows[index] for index in matching_indexes]
+        filtered_response["Result"] = result_rows
+        if binary_rows:
+            binary_rows = [
+                binary_rows[index] for index in matching_indexes
+            ]
+            filtered_response["BinaryResult"] = binary_rows
+
     pdf_files: list[tuple[str, bytes]] = []
     for index, row in enumerate(binary_rows, start=1):
         if not isinstance(row, dict):
@@ -1039,7 +1104,7 @@ def _collected_hometax_income_tax_return(
             raise ClaimProviderError(
                 "종합소득세 신고서 PDF의 형식 또는 크기를 확인해 주세요."
             )
-        result = response_data.get("Result")
+        result = filtered_response.get("Result")
         return CollectedClaimDocument(
             content=content,
             file_name=file_name,
@@ -1049,23 +1114,46 @@ def _collected_hometax_income_tax_return(
             ).strip(),
             facts={
                 "year": year,
+                "filing_year": filing_year,
+                "query_strategy": "filing_year_v2",
                 "record_count": _structured_record_count(result),
                 "pdf_count": len(pdf_files),
+                "tax_year_verified": tax_year_verified,
+                "discarded_mismatched_records": (
+                    discarded_mismatched_records
+                ),
             },
         )
 
-    result = response_data.get("Result")
+    result = filtered_response.get("Result")
     if isinstance(result, (dict, list)) and bool(result):
         return _collected_private_json(
-            response_data,
+            filtered_response,
             fallback_name=f"hometax-income-tax-return-{year}",
-            facts={"year": year},
+            facts={
+                "year": year,
+                "filing_year": filing_year,
+                "query_strategy": "filing_year_v2",
+                "tax_year_verified": tax_year_verified,
+                "discarded_mismatched_records": (
+                    discarded_mismatched_records
+                ),
+            },
             document_label="종합소득세 신고서",
         )
     return _collected_no_data_json(
         response_data,
         fallback_name=f"hometax-income-tax-return-{year}-no-data",
         year=year,
+        reason="no_income_tax_return",
+        extra_facts={
+            "filing_year": filing_year,
+            "query_strategy": "filing_year_v2",
+            "tax_year_verified": tax_year_verified,
+            "discarded_mismatched_records": (
+                discarded_mismatched_records
+            ),
+        },
     )
 
 
@@ -1332,6 +1420,7 @@ class TilkoClaimClient:
                     f"comwel-total-remuneration-{selected_year}-no-data"
                 ),
                 year=selected_year,
+                reason="no_remuneration_report",
             )
         if _empty_result_without_file(
             response,
@@ -1343,6 +1432,7 @@ class TilkoClaimClient:
                     f"comwel-total-remuneration-{selected_year}-no-data"
                 ),
                 year=selected_year,
+                reason="no_remuneration_report",
             )
         facts: dict[str, Any] = {"year": selected_year}
         if selected_management_number:
@@ -1394,7 +1484,15 @@ class TilkoClaimClient:
         return _collected_private_json(
             response,
             fallback_name="comwel-management-numbers",
-            facts={"management_numbers": management_numbers},
+            facts={
+                "management_numbers": management_numbers,
+                "no_data": not bool(management_numbers),
+                "no_data_reason": (
+                    "no_management_number"
+                    if not management_numbers
+                    else ""
+                ),
+            },
         )
 
     def collect_comwel_workplace_rate(
@@ -1444,6 +1542,7 @@ class TilkoClaimClient:
                     f"comwel-workplace-rate-{selected_year}-no-data"
                 ),
                 year=selected_year,
+                reason="no_workplace_rate",
             )
         document = _collected_pdf(
             response,
@@ -1668,6 +1767,15 @@ class TilkoClaimClient:
         session: dict[str, str],
     ) -> CollectedClaimDocument:
         selected_year = _document_year(year)
+        # 종합소득세 신고서는 귀속연도의 다음 해에 제출됩니다.
+        # Tilko의 StartDate/EndDate는 귀속기간이 아니라 신고일 검색기간이고,
+        # 응답은 txnrmStrtDt/txnrmEndDt(귀속기간)와 rtnDt(신고일)를 별도로
+        # 제공합니다. 예: 2025년 귀속 신고서는 2026년 신고기간에서 조회합니다.
+        filing_year = str(int(selected_year) + 1)
+        filing_end = min(
+            date(int(filing_year), 12, 31),
+            date.today(),
+        ).strftime("%Y%m%d")
         selected_business_number = _valid_hometax_business_number(
             business_number
         )
@@ -1685,8 +1793,8 @@ class TilkoClaimClient:
             "BirthDate": birth_date,
             "UserCellphoneNumber": cellphone,
             "BusinessNumber": selected_business_number,
-            "StartDate": f"{selected_year}0101",
-            "EndDate": f"{selected_year}1231",
+            "StartDate": f"{filing_year}0101",
+            "EndDate": filing_end,
         }
         response = self._post(
             self.config.hometax_host,
@@ -1702,6 +1810,7 @@ class TilkoClaimClient:
         return _collected_hometax_income_tax_return(
             response,
             year=selected_year,
+            filing_year=filing_year,
         )
 
     def collect_hometax_closure_certificate(
@@ -1747,7 +1856,11 @@ class TilkoClaimClient:
         except ClaimProviderError as exc:
             if exc.error_code not in HOMETAX_CLOSURE_NO_DATA_ERROR_CODES:
                 raise
-            facts = {"no_data": True, "record_count": 0}
+            facts = {
+                "no_data": True,
+                "no_data_reason": "active_business_no_closure",
+                "record_count": 0,
+            }
             return CollectedClaimDocument(
                 content=json.dumps(
                     facts,
@@ -1778,7 +1891,11 @@ class TilkoClaimClient:
             and issued_values <= {"N"}
             and not _first_response_value(response, "PdfData")
         ):
-            facts = {"no_data": True, "record_count": 0}
+            facts = {
+                "no_data": True,
+                "no_data_reason": "active_business_no_closure",
+                "record_count": 0,
+            }
             return CollectedClaimDocument(
                 content=json.dumps(
                     facts,
