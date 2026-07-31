@@ -8,8 +8,8 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
-from typing import Any
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Mapping
 
 import pandas as pd
 import streamlit as st
@@ -90,6 +90,39 @@ STATUS_LABELS = {
     "not_requested": "제외",
 }
 
+_REMOTE_INVITE_NOTICE_KEY = "claim_remote_invite_notice_v1"
+_REMOTE_INVITE_NAME_PATTERN = re.compile(r"^[가-힣]+(?:[ ·][가-힣]+)*$")
+_REMOTE_INVITE_PHONE_PATTERN = re.compile(r"^010\d{8}$")
+_KOREA_TIMEZONE = timezone(timedelta(hours=9))
+_REMOTE_INVITE_ERROR_MESSAGES = {
+    "PUBLIC_BASE_URL_REQUIRED": (
+        "고객 인증 주소 설정이 완료되지 않았습니다. 관리자에게 문의해주세요."
+    ),
+    "REMOTE_STORAGE_NOT_CONFIGURED": (
+        "원격 인증 저장소 연결이 준비되지 않았습니다. 관리자에게 문의해주세요."
+    ),
+    "REMOTE_CRYPTO_NOT_CONFIGURED": (
+        "원격 인증 보안 설정이 준비되지 않았습니다. 관리자에게 문의해주세요."
+    ),
+    "REMOTE_REPOSITORY_UNAVAILABLE": (
+        "원격 인증 저장소에 연결하지 못했습니다. 잠시 후 다시 시도해주세요."
+    ),
+    "REMOTE_INVITE_CREATE_FAILED": (
+        "고객 인증 요청을 저장하지 못했습니다. 잠시 후 다시 시도해주세요."
+    ),
+    "REMOTE_INVITE_NOT_READY": (
+        "카카오톡 원격 인증 발송 설정이 완료되지 않았습니다. "
+        "관리자에게 문의해주세요."
+    ),
+    "REMOTE_OWNER_REQUIRED": "로그인 정보를 다시 확인해주세요.",
+    "INVALID_CUSTOMER_NAME": "고객 이름을 한글로 정확히 입력해주세요.",
+    "INVALID_CUSTOMER_PHONE": "010으로 시작하는 휴대전화번호를 확인해주세요.",
+}
+
+
+class RemoteInviteUIError(RuntimeError):
+    """A redacted remote-invite error that is safe to render."""
+
 
 def _clean(value: Any) -> str:
     if value is None:
@@ -148,6 +181,145 @@ def _claim_document_is_downloadable(
 
 def _digits(value: Any) -> str:
     return re.sub(r"[^0-9]", "", str(value or ""))
+
+
+def _validate_remote_invite_input(
+    customer_name: Any,
+    customer_phone: Any,
+) -> tuple[str, str, list[str]]:
+    name = re.sub(r"\s+", " ", str(customer_name or "")).strip()
+    phone = _digits(customer_phone)
+    errors: list[str] = []
+    hangul_count = len(re.sub(r"[^가-힣]", "", name))
+    if (
+        not _REMOTE_INVITE_NAME_PATTERN.fullmatch(name)
+        or not 2 <= hangul_count <= 20
+    ):
+        errors.append("고객 이름은 한글 2~20자로 입력해주세요.")
+    if not _REMOTE_INVITE_PHONE_PATTERN.fullmatch(phone):
+        errors.append("010으로 시작하는 휴대전화번호 11자리를 입력해주세요.")
+    return name, phone, errors
+
+
+def _remote_invite_safe_error(exc: BaseException) -> str:
+    error_code = str(
+        getattr(exc, "error_code", "")
+        or getattr(exc, "code", "")
+        or ""
+    ).strip().upper()
+    return _REMOTE_INVITE_ERROR_MESSAGES.get(
+        error_code,
+        "인증 링크 발송 준비 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.",
+    )
+
+
+def _remote_invite_runtime_readiness(
+    checker: Callable[[], Mapping[str, Any]] | None = None,
+) -> tuple[bool, str]:
+    selected_checker = checker
+    if selected_checker is None:
+        try:
+            from claim_remote_service import (  # noqa: PLC0415
+                remote_invite_environment_readiness,
+            )
+        except (ImportError, ModuleNotFoundError):
+            return (
+                False,
+                "카카오톡 원격 인증 발송 기능을 준비하지 못했습니다. "
+                "관리자에게 문의해주세요.",
+            )
+        selected_checker = remote_invite_environment_readiness
+    try:
+        readiness = dict(selected_checker() or {})
+    except Exception:
+        return (
+            False,
+            "카카오톡 원격 인증 발송 설정을 확인하지 못했습니다. "
+            "관리자에게 문의해주세요.",
+        )
+    if bool(readiness.get("ready")):
+        return True, ""
+    return (
+        False,
+        "카카오톡 원격 인증 발송 설정이 완료되지 않았습니다. "
+        "관리자에게 문의해주세요.",
+    )
+
+
+def _create_remote_claim_invite(
+    *,
+    owner_user_id: str,
+    requested_by: str,
+    customer_name: str,
+    customer_phone: str,
+    invite_creator: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    name, phone, errors = _validate_remote_invite_input(
+        customer_name,
+        customer_phone,
+    )
+    if errors:
+        raise RemoteInviteUIError(errors[0])
+
+    creator = invite_creator
+    if creator is None:
+        try:
+            from claim_remote_service import (  # noqa: PLC0415
+                create_staff_claim_invite,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            raise RemoteInviteUIError(
+                "카카오톡 인증 발송 기능을 불러오지 못했습니다. "
+                "관리자에게 문의해주세요."
+            ) from exc
+        creator = create_staff_claim_invite
+
+    try:
+        result = creator(
+            owner_user_id=str(owner_user_id or "").strip().lower(),
+            requested_by=str(requested_by or owner_user_id).strip(),
+            customer_name=name,
+            customer_phone=phone,
+        )
+    except Exception as exc:
+        raise RemoteInviteUIError(_remote_invite_safe_error(exc)) from None
+
+    if not isinstance(result, dict) or not result.get("invite_id"):
+        raise RemoteInviteUIError(
+            "고객 인증 요청의 저장 결과를 확인하지 못했습니다. "
+            "잠시 후 다시 시도해주세요."
+        )
+    if result.get("message_queued") is not True:
+        raise RemoteInviteUIError(
+            "카카오톡 발송 대기열 등록 결과를 확인하지 못했습니다. "
+            "잠시 후 다시 시도해주세요."
+        )
+    return dict(result)
+
+
+def _format_remote_invite_expiry(value: Any) -> str:
+    selected: datetime | None = None
+    if isinstance(value, datetime):
+        selected = value
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            selected = datetime.fromtimestamp(float(value), timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            selected = None
+    else:
+        text = str(value or "").strip()
+        if text:
+            try:
+                selected = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                selected = None
+    if selected is None:
+        return ""
+    if selected.tzinfo is None:
+        selected = selected.replace(tzinfo=timezone.utc)
+    return selected.astimezone(_KOREA_TIMEZONE).strftime(
+        "%Y년 %m월 %d일 %H:%M"
+    )
 
 
 def _format_business_no(value: Any) -> str:
@@ -3442,6 +3614,101 @@ def _render_intro(
         )
 
 
+def _render_remote_personal_invite(
+    *,
+    user_id: str,
+    user_name: str,
+    repository_ready: bool,
+    provider_ready: bool,
+) -> None:
+    st.markdown("#### 고객 카카오톡 인증 링크 발송")
+    st.caption(
+        "고객에게 안전한 입력 링크를 보냅니다. 고객이 링크에서 본인정보와 "
+        "동의 내용을 직접 입력한 뒤 홈택스·근로복지공단 인증을 진행합니다."
+    )
+
+    notice = st.session_state.get(_REMOTE_INVITE_NOTICE_KEY)
+    if isinstance(notice, dict):
+        expiry_text = _format_remote_invite_expiry(notice.get("expires_at"))
+        success_message = "카카오톡 인증 링크 발송 요청을 등록했습니다."
+        if expiry_text:
+            success_message += f" 링크 유효시간: {expiry_text}까지"
+        st.success(success_message)
+
+    readiness_messages: list[str] = []
+    if not repository_ready:
+        readiness_messages.append(
+            "원격 인증 저장소 연결이 준비되지 않았습니다. 관리자에게 문의해주세요."
+        )
+    if not provider_ready:
+        readiness_messages.append(
+            "홈택스·근로복지공단 인증 연동 설정이 완료되지 않았습니다. "
+            "관리자에게 문의해주세요."
+        )
+    remote_runtime_ready, remote_runtime_message = (
+        _remote_invite_runtime_readiness()
+    )
+    if not remote_runtime_ready:
+        readiness_messages.append(remote_runtime_message)
+    for message in readiness_messages:
+        st.warning(message)
+
+    with st.form("claim_remote_personal_invite_v1", clear_on_submit=True):
+        name_col, phone_col = st.columns(2)
+        with name_col:
+            customer_name = st.text_input(
+                "고객 이름",
+                placeholder="홍길동",
+                key="claim_remote_customer_name_v1",
+            )
+        with phone_col:
+            customer_phone = st.text_input(
+                "고객 휴대전화",
+                placeholder="010-0000-0000",
+                key="claim_remote_customer_phone_v1",
+            )
+        submitted = st.form_submit_button(
+            "카카오톡 인증 링크 발송",
+            use_container_width=True,
+            type="primary",
+            disabled=bool(readiness_messages),
+        )
+
+    if not submitted:
+        return
+
+    name, phone, errors = _validate_remote_invite_input(
+        customer_name,
+        customer_phone,
+    )
+    if errors:
+        for error in errors:
+            st.error(error)
+        return
+
+    try:
+        result = _create_remote_claim_invite(
+            owner_user_id=user_id,
+            requested_by=user_name or user_id,
+            customer_name=name,
+            customer_phone=phone,
+        )
+    except RemoteInviteUIError as exc:
+        st.error(str(exc))
+        return
+
+    notice = {
+        "expires_at": result.get("expires_at"),
+        "status": result.get("status"),
+    }
+    st.session_state[_REMOTE_INVITE_NOTICE_KEY] = notice
+    expiry_text = _format_remote_invite_expiry(notice.get("expires_at"))
+    success_message = "카카오톡 인증 링크 발송 요청을 등록했습니다."
+    if expiry_text:
+        success_message += f" 링크 유효시간: {expiry_text}까지"
+    st.success(success_message)
+
+
 def _render_personal_request(
     user_id: str,
     user_name: str,
@@ -3454,12 +3721,21 @@ def _render_personal_request(
         horizontal=True,
         key="claim_personal_input_mode_v2",
         help=(
-            "카카오톡 발송은 담당자가 고객 이름·주민등록번호·휴대전화를 "
-            "입력해 바로 인증을 보내는 방식입니다. 고객은 카카오톡에서 "
-            "기관 인증만 승인합니다."
+            "카카오톡 발송은 고객 이름과 휴대전화만 입력해 안전한 본인정보 "
+            "입력 링크를 보내는 방식입니다. 직접입력은 담당자가 고객의 "
+            "인증정보를 입력해 바로 기관 인증을 요청하는 방식입니다."
         ),
     )
     remote_input = input_mode == "카카오톡 발송"
+    if remote_input:
+        _render_remote_personal_invite(
+            user_id=user_id,
+            user_name=user_name,
+            repository_ready=repository is not None,
+            provider_ready=provider_ready,
+        )
+        return
+
     suffix = "kakao" if remote_input else "manual"
     company_name = ""
     business_no = ""

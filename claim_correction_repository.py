@@ -162,12 +162,22 @@ class ClaimRepository:
         consent_channel: str,
         retention_policy_version: str,
         collection_authority_confirmed: bool,
+        case_id: str | None = None,
     ) -> dict[str, Any]:
         if not collection_authority_confirmed:
             raise ClaimRepositoryError(
                 "고객 동의와 자료조회 권한 확인이 필요합니다."
             )
-        case_id = str(uuid.uuid4())
+        try:
+            case_id = (
+                str(uuid.UUID(str(case_id).strip()))
+                if case_id
+                else str(uuid.uuid4())
+            )
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ClaimRepositoryError(
+                "경정청구 요청 식별값을 확인하지 못했습니다."
+            ) from exc
         now = _now()
         source_set = {str(source or "").strip().lower() for source in selected_sources}
         case = {
