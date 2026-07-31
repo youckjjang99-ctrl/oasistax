@@ -148,6 +148,7 @@ class TilkoComwelDocumentTests(unittest.TestCase):
             document.facts,
             {
                 "no_data": True,
+                "no_data_reason": "no_remuneration_report",
                 "record_count": 0,
                 "year": "2025",
             },
@@ -190,6 +191,7 @@ class TilkoComwelDocumentTests(unittest.TestCase):
             document.facts,
             {
                 "no_data": True,
+                "no_data_reason": "no_remuneration_report",
                 "record_count": 0,
                 "year": "2025",
             },
@@ -293,6 +295,32 @@ class TilkoComwelDocumentTests(unittest.TestCase):
         self.assertNotIn("01012345678", facts)
 
     @patch("tilko_claim_client.requests.post")
+    def test_empty_management_numbers_are_marked_as_no_data(self, post):
+        post.return_value = _JsonResponse(
+            {
+                "ErrorCode": 0,
+                "ApiTxKey": "empty-management-reference",
+                "Result": [],
+            }
+        )
+
+        document = _client().collect_comwel_management_numbers(
+            identity_number="9010191234567",
+            user_name="홍길동",
+            cellphone="01012345678",
+            session=_session(),
+            business_number="2208162517",
+        )
+
+        self.assertTrue(document.facts["no_data"])
+        self.assertEqual(
+            document.facts["no_data_reason"],
+            "no_management_number",
+        )
+        self.assertEqual(document.facts["record_count"], 0)
+        self.assertEqual(document.facts["management_numbers"], [])
+
+    @patch("tilko_claim_client.requests.post")
     def test_workplace_rate_returns_pdf_and_safe_facts(self, post):
         pdf = b"%PDF-1.7\nworkplace-rate"
         post.return_value = _JsonResponse(
@@ -366,6 +394,7 @@ class TilkoComwelDocumentTests(unittest.TestCase):
             document.facts,
             {
                 "no_data": True,
+                "no_data_reason": "no_workplace_rate",
                 "record_count": 0,
                 "year": "2024",
             },

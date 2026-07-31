@@ -437,7 +437,7 @@ class ClaimBusinessAutofillFlowTests(unittest.TestCase):
             repr(failed_call.kwargs.get("facts", {})),
         )
 
-    def test_empty_management_numbers_collects_remuneration_without_rates(
+    def test_empty_management_numbers_finalize_rate_as_no_data(
         self,
     ):
         repository = MagicMock()
@@ -498,12 +498,101 @@ class ClaimBusinessAutofillFlowTests(unittest.TestCase):
             session=_transient()["comwel"],
         )
 
-        self.assertEqual(summary["target"], 2)
-        self.assertEqual(summary["ready"], 2)
+        self.assertEqual(summary["target"], 3)
+        self.assertEqual(summary["ready"], 3)
         self.assertEqual(summary["failed"], 0)
         client.collect_comwel_management_numbers.assert_called_once()
         client.collect_comwel_total_remuneration.assert_called_once()
         client.collect_comwel_workplace_rate.assert_not_called()
+        rate_store_call = next(
+            call
+            for call in repository.store_collected_document.call_args_list
+            if call.kwargs["document_code"] == "comwel_workplace_rate"
+        )
+        self.assertTrue(rate_store_call.kwargs["document"].facts["no_data"])
+        self.assertEqual(
+            rate_store_call.kwargs["document"].facts["no_data_reason"],
+            "no_management_number",
+        )
+
+    def test_management_lookup_failure_does_not_become_no_data(self):
+        repository = MagicMock()
+        repository.list_documents.return_value = [
+            {
+                "source": "comwel",
+                "document_code": "comwel_management_number_list",
+                "period_year": None,
+                "collection_key": "default",
+                "status": "auth_pending",
+            },
+            {
+                "source": "comwel",
+                "document_code": "comwel_total_remuneration",
+                "period_year": 2025,
+                "collection_key": "default",
+                "status": "auth_pending",
+            },
+            {
+                "source": "comwel",
+                "document_code": "comwel_workplace_rate",
+                "period_year": 2025,
+                "collection_key": "default",
+                "status": "auth_pending",
+            },
+        ]
+        repository.store_collected_document.return_value = {
+            "status": "ready"
+        }
+        client = MagicMock()
+        client.collect_comwel_management_numbers.side_effect = (
+            ClaimProviderError(
+                "관리번호 조회 실패",
+                error_code="MANAGEMENT_LOOKUP_FAILED",
+            )
+        )
+        client.collect_comwel_total_remuneration.return_value = _document(
+            "remuneration-2025.xlsx",
+            facts={"year": 2025},
+        )
+
+        summary = _collect_supported_comwel_documents(
+            repository,
+            client,
+            case_id="management-lookup-failed-case",
+            identity_number="9010191234567",
+            representative="홍길동",
+            cellphone="01012345678",
+            business_number=VALID_BUSINESS_NUMBER,
+            businesses=[
+                {
+                    "business_number": VALID_BUSINESS_NUMBER,
+                    "business_name": "오아시스",
+                }
+            ],
+            session=_transient()["comwel"],
+        )
+
+        self.assertEqual(summary["target"], 3)
+        self.assertEqual(summary["ready"], 1)
+        self.assertEqual(summary["failed"], 2)
+        client.collect_comwel_total_remuneration.assert_called_once()
+        client.collect_comwel_workplace_rate.assert_not_called()
+        rate_failures = [
+            call
+            for call in repository.fail_document.call_args_list
+            if call.kwargs["document_code"] == "comwel_workplace_rate"
+        ]
+        self.assertEqual(len(rate_failures), 1)
+        self.assertEqual(
+            rate_failures[0].kwargs["safe_error_code"],
+            "COMWEL_MANAGEMENT_NUMBER_LOOKUP_FAILED",
+        )
+        self.assertFalse(
+            any(
+                call.kwargs["document_code"] == "comwel_workplace_rate"
+                for call in repository.store_collected_document.call_args_list
+            )
+        )
 
     def test_ready_business_variant_is_not_recollected_or_overwritten(self):
         businesses = [

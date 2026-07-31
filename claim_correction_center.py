@@ -142,12 +142,33 @@ def _claim_document_is_no_data(document: dict[str, Any]) -> bool:
     return bool(isinstance(facts, dict) and facts.get("no_data") is True)
 
 
+def _claim_document_needs_recollection(document: dict[str, Any]) -> bool:
+    """Return True for successful-looking rows created by an obsolete query."""
+    if (
+        str(document.get("document_code", "")).strip()
+        != "hometax_income_tax_return"
+        or str(document.get("status", "") or "").strip().lower()
+        != "ready"
+    ):
+        return False
+    facts = document.get("facts")
+    return not (
+        isinstance(facts, dict)
+        and str(facts.get("query_strategy", "")).strip()
+        == "filing_year_v2"
+        and facts.get("tax_year_verified") is True
+    )
+
+
 def _claim_document_is_downloadable(
     document: dict[str, Any],
     *,
     now: datetime | None = None,
 ) -> bool:
-    if _claim_document_is_no_data(document):
+    if (
+        _claim_document_is_no_data(document)
+        or _claim_document_needs_recollection(document)
+    ):
         return False
     if (
         str(document.get("status", "") or "").strip().lower() != "ready"
@@ -547,9 +568,9 @@ def _claim_auth_stage(case: dict[str, Any]) -> tuple[int, str]:
     return 0, "국세청 홈택스 인증요청을 준비하고 있습니다."
 
 
-def _claim_collection_progress(
+def _claim_active_collection_documents(
     documents: list[dict[str, Any]],
-) -> tuple[int, str, int, int]:
+) -> list[dict[str, Any]]:
     variant_groups = {
         (
             str(document.get("source", "")).strip(),
@@ -593,64 +614,108 @@ def _claim_collection_progress(
         )
         return group in variant_groups or legacy_scoped_file
 
-    management_documents = [
-        document
-        for document in documents
-        if str(document.get("document_code", "")).strip()
-        == "comwel_management_number_list"
-        and str(document.get("status", "")).strip().lower() == "ready"
-    ]
-
-    def has_no_management_number(document: dict[str, Any]) -> bool:
+    def business_identity(
+        document: dict[str, Any],
+    ) -> tuple[str, str]:
         facts = document.get("facts")
         if not isinstance(facts, dict):
-            return False
-        return bool(
-            str(facts.get("record_count", "")) == "0"
-            or facts.get("management_numbers") == []
-            or (
-                "management_number_count" in facts
-                and int(facts.get("management_number_count") or 0) == 0
+            return "", ""
+        fingerprint = str(
+            facts.get("business_scope_fingerprint", "") or ""
+        ).strip().lower()
+        if not re.fullmatch(r"s_[0-9a-f]{32}", fingerprint):
+            fingerprint = ""
+        masked_number = str(
+            facts.get("business_number_masked", "") or ""
+        ).strip()
+        business_name = str(facts.get("business_name", "") or "").strip()
+        label = (
+            f"{business_name}|{masked_number}"
+            if masked_number or business_name
+            else ""
+        )
+        return fingerprint, label
+
+    actual_rate_scope_fingerprints: dict[int, set[str]] = {}
+    actual_rate_scope_labels: dict[int, set[str]] = {}
+    for document in documents:
+        if (
+            str(document.get("document_code", "")).strip()
+            != "comwel_workplace_rate"
+        ):
+            continue
+        facts = document.get("facts")
+        if not (
+            isinstance(facts, dict)
+            and str(facts.get("management_number_masked", "") or "").strip()
+        ):
+            continue
+        year = int(document.get("period_year") or 0)
+        fingerprint, label = business_identity(document)
+        if fingerprint:
+            actual_rate_scope_fingerprints.setdefault(year, set()).add(
+                fingerprint
             )
+        if label:
+            actual_rate_scope_labels.setdefault(year, set()).add(label)
+
+    def is_superseded_empty_rate_scope(document: dict[str, Any]) -> bool:
+        if (
+            str(document.get("document_code", "")).strip()
+            != "comwel_workplace_rate"
+        ):
+            return False
+        facts = document.get("facts")
+        if isinstance(facts, dict) and str(
+            facts.get("management_number_masked", "") or ""
+        ).strip():
+            return False
+        year = int(document.get("period_year") or 0)
+        fingerprint, label = business_identity(document)
+        if fingerprint:
+            return fingerprint in actual_rate_scope_fingerprints.get(
+                year,
+                set(),
+            )
+        return bool(
+            label and label in actual_rate_scope_labels.get(year, set())
         )
 
-    no_management_workplaces = bool(
-        management_documents
-        and all(
-            has_no_management_number(document)
-            for document in management_documents
-        )
-    )
-    targets = [
+    return [
         document
         for document in documents
         if automatic_collection_supported(
             str(document.get("document_code", "")).strip()
         )
         and not is_superseded_default(document)
-        and not (
-            no_management_workplaces
-            and str(document.get("document_code", "")).strip()
-            == "comwel_workplace_rate"
-        )
+        and not is_superseded_empty_rate_scope(document)
     ]
+
+
+def _claim_collection_progress(
+    documents: list[dict[str, Any]],
+) -> tuple[int, str, int, int]:
+    targets = _claim_active_collection_documents(documents)
     target_count = len(targets)
     no_data_count = sum(
         1
         for document in targets
         if str(document.get("status", "")).strip().lower() == "ready"
         and _claim_document_is_no_data(document)
+        and not _claim_document_needs_recollection(document)
     )
     collected_count = sum(
         1
         for document in targets
         if str(document.get("status", "")).strip().lower() == "ready"
         and not _claim_document_is_no_data(document)
+        and not _claim_document_needs_recollection(document)
     )
     ready_count = sum(
         1
         for document in targets
         if str(document.get("status", "")).strip().lower() == "ready"
+        and not _claim_document_needs_recollection(document)
     )
     processed_count = collected_count + no_data_count
     if target_count:
@@ -1052,6 +1117,7 @@ def _scoped_claim_document(
     business_number: str = "",
     management_number: str = "",
     scope_fingerprint: str = "",
+    business_scope_fingerprint: str = "",
 ) -> CollectedClaimDocument:
     facts = dict(document.facts or {})
     facts.update(
@@ -1070,6 +1136,13 @@ def _scoped_claim_document(
     masked_business_number = _masked_business_no(business_number)
     if masked_business_number:
         facts["business_number_masked"] = masked_business_number
+    safe_business_scope_fingerprint = str(
+        business_scope_fingerprint or ""
+    ).strip().lower()
+    if re.fullmatch(r"s_[0-9a-f]{32}", safe_business_scope_fingerprint):
+        facts["business_scope_fingerprint"] = (
+            safe_business_scope_fingerprint
+        )
     masked_management_number = _masked_management_number(
         management_number
     )
@@ -1100,6 +1173,41 @@ def _scoped_claim_document(
         provider_reference=document.provider_reference,
         facts=facts,
         transient_facts=dict(document.transient_facts or {}),
+    )
+
+
+def _claim_no_data_document(
+    *,
+    document_code: str,
+    year: int | None = None,
+    reason: str = "provider_no_records",
+) -> CollectedClaimDocument:
+    """Build a non-downloadable, PII-free result for a verified empty scope."""
+    facts: dict[str, Any] = {
+        "no_data": True,
+        "no_data_reason": str(reason or "provider_no_records")[:80],
+        "record_count": 0,
+    }
+    if year:
+        facts["year"] = str(int(year))
+    content = json.dumps(
+        facts,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    safe_code = re.sub(
+        r"[^a-z0-9_-]+",
+        "-",
+        str(document_code or "claim-document").strip().lower(),
+    ).strip("-")
+    suffix = f"-{int(year)}" if year else ""
+    return CollectedClaimDocument(
+        content=content,
+        file_name=f"{safe_code or 'claim-document'}{suffix}-no-data.json",
+        content_type="application/json",
+        provider_reference="",
+        facts=facts,
     )
 
 
@@ -1610,9 +1718,18 @@ def _collect_supported_hometax_documents(
             if scoped_job
             else (key in ready_keys or current_ready)
         )
-        force_refresh = bool(
+        number_discovery_refresh = bool(
             force_tax_number_discovery
             and document_code == "hometax_tax_payment_certificate"
+        )
+        stale_income_return_refresh = bool(
+            current_ready
+            and document_code == "hometax_income_tax_return"
+            and current
+            and _claim_document_needs_recollection(current)
+        )
+        force_refresh = bool(
+            number_discovery_refresh or stale_income_return_refresh
         )
         if (
             preexisting_ready
@@ -1649,7 +1766,7 @@ def _collect_supported_hometax_documents(
                 tax_number_discovery_attempted = True
             # A forced number-only refresh must never overwrite a previously
             # downloadable certificate. It is used only for transient facts.
-            if not (force_refresh and preexisting_ready):
+            if not (number_discovery_refresh and preexisting_ready):
                 store_kwargs: dict[str, Any] = {
                     "document_code": document_code,
                     "document": collected,
@@ -2057,12 +2174,17 @@ def _collect_supported_comwel_documents(
                         ),
                     )
 
+                management_error_count = len(errors)
                 management_document = store_one(
                     "comwel_management_number_list",
                     collect_management,
                     collection_key=business_collection_key,
                     scope_facts=scope_facts,
                     refresh_ready=not bool(cached_numbers),
+                )
+                management_lookup_failed = bool(
+                    len(errors) > management_error_count
+                    and not cached_numbers
                 )
                 management_facts = (
                     management_document.get("facts")
@@ -2084,6 +2206,9 @@ def _collect_supported_comwel_documents(
                 selected_numbers = sorted(
                     set(cached_numbers + discovered_numbers)
                 )
+                management_lookup_failed = bool(
+                    management_lookup_failed and not selected_numbers
+                )
                 safe_cache[business_collection_key] = selected_numbers
                 management_number_count += len(selected_numbers)
                 for management_number in selected_numbers or [""]:
@@ -2091,6 +2216,9 @@ def _collect_supported_comwel_documents(
                         {
                             **business_scope,
                             "management_number": management_number,
+                            "management_lookup_failed": (
+                                management_lookup_failed
+                            ),
                         }
                     )
         else:
@@ -2126,10 +2254,15 @@ def _collect_supported_comwel_documents(
                 management_number or "0",
             )
             scope_facts = {
-                "collection_scope": "management",
+                "collection_scope": (
+                    "management" if management_number else "business"
+                ),
                 "scope_index": scope_index,
                 "scope_count": len(data_scopes),
                 "collection_scope_fingerprint": scope_fingerprint,
+                "business_scope_fingerprint": str(
+                    data_scope.get("collection_scope_fingerprint", "")
+                ),
                 "business_name": str(
                     data_scope.get("business_name", "")
                 )[:120],
@@ -2161,23 +2294,31 @@ def _collect_supported_comwel_documents(
                         ),
                         scope_index=scope_index,
                         scope_count=len(data_scopes),
-                        collection_scope="management",
+                        collection_scope=(
+                            "management" if management_number else "business"
+                        ),
                         business_name=str(
                             data_scope.get("business_name", "")
                         ),
                         business_number=selected_business_number,
                         management_number=management_number,
                         scope_fingerprint=scope_fingerprint,
+                        business_scope_fingerprint=str(
+                            data_scope.get(
+                                "collection_scope_fingerprint",
+                                "",
+                            )
+                        ),
                     ),
                     period_year=year,
                     collection_key=collection_key,
                     scope_facts=scope_facts,
                 )
-        rate_scopes = [
-            data_scope
-            for data_scope in data_scopes
-            if _digits(data_scope.get("management_number"))
-        ]
+        # 사업장요율은 관리번호가 있어야 Tilko에 조회할 수 있습니다.
+        # 관리번호가 없는 사업자도 조용히 계획행으로 남겨두지 않고,
+        # 사업자별 '조회 불가/해당 없음' 결과로 확정해 화면과 진행률에
+        # 정확히 드러나게 합니다.
+        rate_scopes = list(data_scopes)
         target_count += len(rate_scopes) * len(rate_years)
         for scope_index, data_scope in enumerate(
             rate_scopes,
@@ -2193,19 +2334,24 @@ def _collect_supported_comwel_documents(
                 case_id,
                 "workplace-rate",
                 selected_business_number,
-                management_number,
+                management_number or "none",
             )
             scope_fingerprint = _claim_collection_scope_fingerprint(
                 case_id,
                 "management",
                 selected_business_number,
-                management_number,
+                management_number or "0",
             )
             scope_facts = {
-                "collection_scope": "management",
+                "collection_scope": (
+                    "management" if management_number else "business"
+                ),
                 "scope_index": scope_index,
                 "scope_count": len(rate_scopes),
                 "collection_scope_fingerprint": scope_fingerprint,
+                "business_scope_fingerprint": str(
+                    data_scope.get("collection_scope_fingerprint", "")
+                ),
                 "business_name": str(
                     data_scope.get("business_name", "")
                 )[:120],
@@ -2222,27 +2368,78 @@ def _collect_supported_comwel_documents(
                 ),
             }
             for year in rate_years:
+                if bool(data_scope.get("management_lookup_failed")):
+                    failed_count += 1
+                    try:
+                        repository.fail_document(
+                            case_id,
+                            document_code="comwel_workplace_rate",
+                            period_year=year,
+                            collection_key=collection_key,
+                            facts=scope_facts,
+                            safe_error_code=(
+                                "COMWEL_MANAGEMENT_NUMBER_LOOKUP_FAILED"
+                            ),
+                        )
+                    except ClaimRepositoryError:
+                        pass
+                    report("comwel_workplace_rate")
+                    continue
+                if management_number:
+                    collector = (
+                        lambda year=year, management_number=management_number, scope_index=scope_index, data_scope=data_scope, selected_business_number=selected_business_number: _scoped_claim_document(
+                            client.collect_comwel_workplace_rate(
+                                year=year,
+                                identity_number=identity_number,
+                                user_name=representative,
+                                cellphone=cellphone,
+                                management_number=management_number,
+                                session=session,
+                            ),
+                            scope_index=scope_index,
+                            scope_count=len(data_scopes),
+                            collection_scope="management",
+                            business_name=str(
+                                data_scope.get("business_name", "")
+                            ),
+                            business_number=selected_business_number,
+                            management_number=management_number,
+                            scope_fingerprint=scope_fingerprint,
+                            business_scope_fingerprint=str(
+                                data_scope.get(
+                                    "collection_scope_fingerprint",
+                                    "",
+                                )
+                            ),
+                        )
+                    )
+                else:
+                    collector = (
+                        lambda year=year, scope_index=scope_index, data_scope=data_scope, selected_business_number=selected_business_number: _scoped_claim_document(
+                            _claim_no_data_document(
+                                document_code="comwel_workplace_rate",
+                                year=year,
+                                reason="no_management_number",
+                            ),
+                            scope_index=scope_index,
+                            scope_count=len(data_scopes),
+                            collection_scope="business",
+                            business_name=str(
+                                data_scope.get("business_name", "")
+                            ),
+                            business_number=selected_business_number,
+                            scope_fingerprint=scope_fingerprint,
+                            business_scope_fingerprint=str(
+                                data_scope.get(
+                                    "collection_scope_fingerprint",
+                                    "",
+                                )
+                            ),
+                        )
+                    )
                 store_one(
                     "comwel_workplace_rate",
-                    lambda year=year, management_number=management_number, scope_index=scope_index, data_scope=data_scope, selected_business_number=selected_business_number: _scoped_claim_document(
-                        client.collect_comwel_workplace_rate(
-                            year=year,
-                            identity_number=identity_number,
-                            user_name=representative,
-                            cellphone=cellphone,
-                            management_number=management_number,
-                            session=session,
-                        ),
-                        scope_index=scope_index,
-                        scope_count=len(data_scopes),
-                        collection_scope="management",
-                        business_name=str(
-                            data_scope.get("business_name", "")
-                        ),
-                        business_number=selected_business_number,
-                        management_number=management_number,
-                        scope_fingerprint=scope_fingerprint,
-                    ),
+                    collector,
                     period_year=year,
                     collection_key=collection_key,
                     scope_facts=scope_facts,
@@ -4094,7 +4291,11 @@ def _claim_collection_retry_state(
     if not job_snapshot:
         overall_status = str(case.get("overall_status", "") or "")
         if overall_status in {"collected", "ready"}:
-            return "complete"
+            # The persisted case may predate a corrected collection strategy
+            # or still contain active pending rows. The caller already proved
+            # collection_complete=False from the live document rows, so a new
+            # authentication is required instead of hiding the retry notice.
+            return "reauth_required"
         return (
             "reauth_required"
             if overall_status
@@ -5635,6 +5836,57 @@ def _build_claim_documents_zip(
     return archive.getvalue()
 
 
+_CLAIM_NO_DATA_REASON_LABELS = {
+    "active_business_no_closure": "계속사업자로 확인되어 폐업사실증명 발급 대상이 아닙니다.",
+    "no_income_tax_return": "해당 귀속연도의 종합소득세 신고서가 확인되지 않았습니다.",
+    "no_management_number": "사업장관리번호가 확인되지 않아 사업장요율을 조회할 수 없습니다.",
+    "no_remuneration_report": "해당 연도의 보수총액 신고내역이 확인되지 않았습니다.",
+    "no_workplace_rate": "해당 연도의 사업장요율 자료가 확인되지 않았습니다.",
+    "provider_no_records": "기관 조회 결과 해당 자료가 없습니다.",
+}
+
+
+def _claim_no_data_reason_label(document: dict[str, Any]) -> str:
+    if _claim_document_needs_recollection(document):
+        return "이전 신고일 조회기준으로 확인된 항목입니다. 새 인증 후 다시 조회해 주세요."
+    facts = document.get("facts")
+    reason = (
+        str(facts.get("no_data_reason", "")).strip()
+        if isinstance(facts, dict)
+        else ""
+    )
+    if reason in _CLAIM_NO_DATA_REASON_LABELS:
+        return _CLAIM_NO_DATA_REASON_LABELS[reason]
+    document_code = str(document.get("document_code", "")).strip()
+    fallback_by_code = {
+        "hometax_closure_certificate": _CLAIM_NO_DATA_REASON_LABELS[
+            "active_business_no_closure"
+        ],
+        "hometax_income_tax_return": _CLAIM_NO_DATA_REASON_LABELS[
+            "no_income_tax_return"
+        ],
+        "comwel_total_remuneration": _CLAIM_NO_DATA_REASON_LABELS[
+            "no_remuneration_report"
+        ],
+        "comwel_management_number_list": _CLAIM_NO_DATA_REASON_LABELS[
+            "no_management_number"
+        ],
+        "comwel_workplace_rate": _CLAIM_NO_DATA_REASON_LABELS[
+            "no_workplace_rate"
+        ],
+    }
+    return fallback_by_code.get(
+        document_code,
+        _CLAIM_NO_DATA_REASON_LABELS["provider_no_records"],
+    )
+
+
+def _claim_pending_reason_label(document: dict[str, Any]) -> str:
+    if str(document.get("document_code", "")).strip() == "comwel_workplace_rate":
+        return "사업장관리번호 확인 후 조회할 항목입니다."
+    return "아직 자동조회가 완료되지 않았습니다."
+
+
 @st.dialog("서류조회", width="large")
 def _show_claim_documents_dialog(
     user_id: str,
@@ -5672,10 +5924,11 @@ def _show_claim_documents_dialog(
         collection_complete=(target_count > 0 and progress_percent == 100),
     )
 
+    active_documents = _claim_active_collection_documents(documents)
     ready_documents = _claim_downloadable_documents(documents)
     failed_count = sum(
         1
-        for document in documents
+        for document in active_documents
         if str(document.get("status", "") or "") == "failed"
         and not _claim_document_is_no_data(document)
     )
@@ -5687,10 +5940,28 @@ def _show_claim_documents_dialog(
             str(document.get("document_code", "") or "")
         )
     )
-    no_data_count = sum(
-        1
-        for document in documents
+    stale_documents = [
+        document
+        for document in active_documents
+        if _claim_document_needs_recollection(document)
+    ]
+    no_data_documents = [
+        document
+        for document in active_documents
         if _claim_document_is_no_data(document)
+        and not _claim_document_needs_recollection(document)
+    ]
+    pending_documents = [
+        document
+        for document in active_documents
+        if str(document.get("status", "") or "").strip().lower()
+        not in {"ready", "failed"}
+    ]
+    processed_count = sum(
+        1
+        for document in active_documents
+        if str(document.get("status", "") or "").strip().lower() == "ready"
+        and not _claim_document_needs_recollection(document)
     )
     expired_count = sum(
         1
@@ -5699,10 +5970,18 @@ def _show_claim_documents_dialog(
         and bool(document.get("storage_path"))
         and not _claim_document_is_downloadable(document)
         and not _claim_document_is_no_data(document)
+        and not _claim_document_needs_recollection(document)
     )
-    summary_parts = [f"수집 완료 {len(ready_documents):,}건"]
-    if no_data_count:
-        summary_parts.append(f"조회 내역 없음 {no_data_count:,}건")
+    summary_parts = [
+        f"자동조회 {processed_count:,}/{len(active_documents):,}건 처리",
+        f"다운로드 가능 {len(ready_documents):,}건",
+    ]
+    if no_data_documents:
+        summary_parts.append(f"조회 내역 없음 {len(no_data_documents):,}건")
+    if stale_documents:
+        summary_parts.append(f"조회기준 수정 후 재확인 {len(stale_documents):,}건")
+    if pending_documents:
+        summary_parts.append(f"아직 조회되지 않음 {len(pending_documents):,}건")
     if failed_count:
         summary_parts.append(f"수집 실패 {failed_count:,}건")
     if expired_count:
@@ -5710,6 +5989,62 @@ def _show_claim_documents_dialog(
     if planned_count:
         summary_parts.append(f"지원 예정 {planned_count:,}건")
     st.caption(" · ".join(summary_parts))
+
+    detail_documents = no_data_documents + stale_documents
+    if detail_documents:
+        with st.expander(
+            f"조회 내역 없음·재확인 상세 {len(detail_documents):,}건",
+            expanded=False,
+        ):
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "자료명": (
+                                _clean(document.get("document_name"))
+                                or _clean(document.get("document_code"))
+                                or "수집자료"
+                            ),
+                            "기관": _claim_document_source_label(document),
+                            "사업자": (
+                                _claim_document_scope_label(document) or "공통"
+                            ),
+                            "연도": document.get("period_year") or "-",
+                            "확인 결과": _claim_no_data_reason_label(document),
+                        }
+                        for document in detail_documents
+                    ]
+                ),
+                use_container_width=True,
+                hide_index=True,
+                height=min(520, 38 + len(detail_documents) * 35),
+            )
+
+    if pending_documents:
+        with st.expander(
+            f"아직 조회되지 않은 항목 {len(pending_documents):,}건",
+            expanded=False,
+        ):
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "자료명": (
+                                _clean(document.get("document_name"))
+                                or _clean(document.get("document_code"))
+                                or "수집자료"
+                            ),
+                            "기관": _claim_document_source_label(document),
+                            "연도": document.get("period_year") or "-",
+                            "상태": _claim_pending_reason_label(document),
+                        }
+                        for document in pending_documents
+                    ]
+                ),
+                use_container_width=True,
+                hide_index=True,
+                height=min(420, 38 + len(pending_documents) * 35),
+            )
     if not ready_documents:
         st.info(
             "아직 다운로드 가능한 수집 완료 서류가 없습니다. "
