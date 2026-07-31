@@ -23,6 +23,7 @@ supabase_v1025_claim_download_storage.sql
 supabase_v1026_claim_remote_invites.sql
 supabase_v1027_claim_remote_resume_exchange.sql
 supabase_v1028_claim_remote_submission_reservation.sql
+supabase_v1029_claim_multi_business_documents.sql
 ```
 
 원격 인증용 테이블과 함수는 `service_role`만 사용할 수 있으며 RLS가 활성화되어야 합니다.
@@ -47,6 +48,25 @@ TILKO_API_KEY=<Tilko 일반 API 키>
 TILKO_RSA_PUBLIC_KEY=<Tilko RSA 공개키>
 TILKO_HOMETAX_HOST=https://api.tilko.net
 TILKO_COMWEL_HOST=https://api24.tilko.net
+
+# Optional: tax-agent refund collection (official HometaxAgent API)
+CLAIM_HOMETAX_REFUND_ENABLED=false
+TILKO_HOMETAX_AGENT_CERT_FILE_B64=<Base64 of certificate file bytes>
+TILKO_HOMETAX_AGENT_KEY_FILE_B64=<Base64 of private-key file bytes>
+TILKO_HOMETAX_AGENT_CERT_PASSWORD=<certificate password>
+TILKO_HOMETAX_AGENT_ID=<optional; set together with password>
+TILKO_HOMETAX_AGENT_PASSWORD=<optional; set together with ID>
+TILKO_HOMETAX_AGENT_DEPT_USER_ID=<optional; set together with password>
+TILKO_HOMETAX_AGENT_DEPT_USER_PASSWORD=<optional; set together with ID>
+
+# Optional: contracted simple-auth worker-status endpoint
+CLAIM_COMWEL_WORKER_STATUS_ENABLED=false
+TILKO_COMWEL_WORKER_STATUS_ENDPOINT=<exact endpoint supplied by Tilko>
+
+# Refund collection requires tax-agent authority, a valid engagement/consent,
+# and a joint certificate. Keep decoded certificate/key files and passwords
+# out of Git, logs, and the UI. Configure the worker endpoint only from the
+# exact Tilko contract specification; never reuse a competitor proxy URL.
 
 SOLAPI_API_KEY=<Solapi API 키>
 SOLAPI_API_SECRET=<Solapi API Secret>

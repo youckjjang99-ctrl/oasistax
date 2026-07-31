@@ -29,21 +29,134 @@ CLAIM_DOWNLOAD_EXTENSION_BY_CONTENT_TYPE = {
 }
 CLAIM_DEFAULT_COLLECTION_KEY = "default"
 _CLAIM_COLLECTION_KEY_PATTERN = re.compile(r"^v_[0-9a-f]{32}$")
+_PRIVATE_RESIDENT_NUMBER_PATTERN = re.compile(
+    r"(?<!\d)(\d{6})[- _]?(\d{7})(?!\d)"
+)
+_PRIVATE_MOBILE_NUMBER_PATTERN = re.compile(
+    r"(?<!\d)(01[016789])[- _]?(\d{3,4})[- _]?(\d{4})(?!\d)"
+)
+_PRIVATE_BUSINESS_NUMBER_PATTERN = re.compile(
+    r"(?<!\d)(\d{3})[- _]?(\d{2})[- _]?(\d{3})(\d{2})(?!\d)"
+)
+_PRIVATE_METADATA_KEY_FRAGMENTS = (
+    "apikey",
+    "apitxkey",
+    "authorization",
+    "birthdate",
+    "businessnumber",
+    "cellphone",
+    "certificate",
+    "cookie",
+    "credential",
+    "cxid",
+    "identitynumber",
+    "jumin",
+    "managementnumber",
+    "mobilenumber",
+    "password",
+    "phonenumber",
+    "reqtxid",
+    "residentnumber",
+    "residentregistration",
+    "rgno",
+    "secret",
+    "session",
+    "ssn",
+    "token",
+    "txid",
+    "wonbuno",
+)
+_SAFE_AGGREGATE_KEY_SUFFIXES = (
+    "amount",
+    "available",
+    "bytes",
+    "count",
+    "exists",
+    "flag",
+    "masked",
+    "present",
+    "size",
+    "status",
+    "sum",
+    "total",
+)
 
 
 def _owner_storage_folder(owner_user_id: str) -> str:
     return hashlib.sha256(owner_user_id.encode("utf-8")).hexdigest()[:24]
 
 
+def _normalized_metadata_key(value: Any) -> str:
+    return "".join(
+        character
+        for character in str(value or "").casefold()
+        if character.isalnum()
+    )
+
+
+def _private_metadata_key(value: Any) -> bool:
+    normalized = _normalized_metadata_key(value)
+    if not normalized:
+        return False
+    if normalized.endswith(_SAFE_AGGREGATE_KEY_SUFFIXES):
+        return False
+    return any(
+        fragment in normalized
+        for fragment in _PRIVATE_METADATA_KEY_FRAGMENTS
+    )
+
+
+def _mask_private_text(value: Any, *, mask_business_number: bool = False) -> str:
+    text = str(value or "")
+
+    def mask_resident_number(match: re.Match[str]) -> str:
+        try:
+            datetime.strptime(match.group(1), "%y%m%d")
+        except ValueError:
+            return match.group(0)
+        return "ID-REDACTED"
+
+    text = _PRIVATE_RESIDENT_NUMBER_PATTERN.sub(mask_resident_number, text)
+    text = _PRIVATE_MOBILE_NUMBER_PATTERN.sub(
+        lambda match: f"{match.group(1)}-****-{match.group(3)}",
+        text,
+    )
+    if mask_business_number:
+        text = _PRIVATE_BUSINESS_NUMBER_PATTERN.sub(
+            lambda match: (
+                f"{match.group(1)}-XX-XXX{match.group(4)}"
+            ),
+            text,
+        )
+    return text
+
+
+def _sanitize_private_metadata(value: Any) -> Any:
+    """Recursively remove secret fields and mask private scalar patterns."""
+    if isinstance(value, dict):
+        sanitized: dict[str, Any] = {}
+        for key, candidate in value.items():
+            safe_key = str(key)
+            if _private_metadata_key(safe_key):
+                continue
+            sanitized[safe_key] = _sanitize_private_metadata(candidate)
+        return sanitized
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_private_metadata(candidate) for candidate in value]
+    if isinstance(value, str):
+        return _mask_private_text(value)
+    if isinstance(value, int) and not isinstance(value, bool):
+        masked = _mask_private_text(value)
+        return value if masked == str(value) else masked
+    return value
+
+
 def _safe_download_file_name(value: Any, fallback: str) -> str:
     raw_name = str(value or "").replace("\\", "/").split("/")[-1].strip()
-    raw_name = re.sub(
-        r"(?<!\d)(\d{3})[- _]?(\d{2})[- _]?(\d{3})(\d{2})(?!\d)",
-        lambda match: (
-            f"{match.group(1)}-XX-XXX{match.group(4)}"
-        ),
+    raw_name = _mask_private_text(
         raw_name,
-    )
+        mask_business_number=True,
+    ).replace("-****-", "-XXXX-")
     clean_name = "".join(
         character
         for character in raw_name
@@ -51,7 +164,10 @@ def _safe_download_file_name(value: Any, fallback: str) -> str:
         and character not in {'"', "*", ":", "<", ">", "?", "|"}
     ).strip(" .")
     if not clean_name:
-        clean_name = str(fallback or "claim-document.bin").strip()
+        clean_name = _mask_private_text(
+            str(fallback or "claim-document.bin").strip(),
+            mask_business_number=True,
+        ).replace("-****-", "-XXXX-")
     return clean_name[:180]
 
 
@@ -148,21 +264,8 @@ def _collection_key(value: Any) -> str:
 def _safe_variant_facts(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
-    blocked = {
-        "identity_number",
-        "birth_date",
-        "cellphone",
-        "business_number",
-        "business_numbers",
-        "management_number",
-        "management_numbers",
-        "resident_number",
-    }
-    return {
-        str(key): candidate
-        for key, candidate in value.items()
-        if str(key) not in blocked
-    }
+    sanitized = _sanitize_private_metadata(value)
+    return sanitized if isinstance(sanitized, dict) else {}
 
 
 def _rpc_signature_unavailable(exc: Exception) -> bool:
@@ -331,19 +434,7 @@ class ClaimRepository:
         outcome: str,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        safe_metadata = {
-            key: value
-            for key, value in dict(metadata or {}).items()
-            if key
-            not in {
-                "identity_number",
-                "birth_date",
-                "cellphone",
-                "token",
-                "certificate",
-                "password",
-            }
-        }
+        safe_metadata = _safe_variant_facts(metadata)
         try:
             self.database.rpc(
                 "oasis_claim_append_audit",
@@ -675,24 +766,10 @@ class ClaimRepository:
             if document.provider_reference
             else ""
         )
-        facts = {
-            key: value
-            for key, value in dict(document.facts or {}).items()
-            if key
-            not in {
-                "identity_number",
-                "birth_date",
-                "cellphone",
-                "business_number",
-                "business_numbers",
-                "management_number",
-                "management_numbers",
-                "resident_number",
-            }
-        }
-        facts["download_file_name"] = (
-            str(document.file_name or "").strip()
-            or f"{document_code}{extension}"
+        facts = _safe_variant_facts(document.facts)
+        facts["download_file_name"] = _safe_download_file_name(
+            str(document.file_name or "").strip(),
+            f"{document_code}{extension}",
         )
         if provider_reference_hash:
             facts["provider_reference_sha256"] = provider_reference_hash

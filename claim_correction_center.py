@@ -469,7 +469,7 @@ def _claim_result_document_status(
         document_code == "comwel_worker_status"
         and status == "integration_required"
     ):
-        return "공동인증서 필요"
+        return "Tilko 계약 API 설정 필요"
     if (
         document_code == "comwel_workplace_rate"
         and status == "integration_required"
@@ -588,6 +588,39 @@ def _claim_auth_stage(case: dict[str, Any]) -> tuple[int, str]:
 def _claim_active_collection_documents(
     documents: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    optional_readiness_keys = {
+        "hometax_refund": "hometax_refund_ready",
+        "comwel_worker_status": "comwel_worker_status_ready",
+    }
+    try:
+        readiness = dict(provider_readiness())
+    except Exception:
+        # Progress rendering must remain available during a temporary provider
+        # configuration/readiness error. Fail closed for optional targets.
+        readiness = {}
+
+    def is_unconfigured_optional_document(
+        document: dict[str, Any],
+    ) -> bool:
+        """Do not inflate progress for optional providers not configured yet.
+
+        Optional documents enter the plan before Railway/provider credentials
+        are necessarily available. Configured providers count immediately;
+        unconfigured providers count only after an actual terminal result so
+        historical ready/failed rows remain visible in progress.
+        """
+
+        document_code = str(
+            document.get("document_code", "") or ""
+        ).strip()
+        readiness_key = optional_readiness_keys.get(document_code)
+        if not readiness_key:
+            return False
+        status = str(document.get("status", "") or "").strip().lower()
+        if status in {"ready", "failed"}:
+            return False
+        return readiness.get(readiness_key) is not True
+
     taxpayer_returns_by_year = {
         int(document.get("period_year") or 0): document
         for document in documents
@@ -765,6 +798,7 @@ def _claim_active_collection_documents(
         if automatic_collection_supported(
             str(document.get("document_code", "")).strip()
         )
+        and not is_unconfigured_optional_document(document)
         and not is_superseded_default(document)
         and not is_superseded_income_tax_business_scope(document)
         and not is_superseded_empty_management_scope(document)
@@ -1581,6 +1615,9 @@ def _collect_supported_hometax_documents(
         business_number,
     )
     scope_count = len(business_scopes)
+    refund_ready = (
+        getattr(client, "hometax_refund_ready", False) is True
+    )
 
     def add_business_jobs(
         document_code: str,
@@ -1701,6 +1738,41 @@ def _collect_supported_hometax_documents(
                 ),
             )
         )
+
+    refund_key = (
+        "hometax_refund",
+        0,
+        CLAIM_DEFAULT_COLLECTION_KEY,
+    )
+    if refund_key in existing:
+        taxpayer_number = _digits(identity_number)
+        if len(taxpayer_number) not in {10, 13}:
+            taxpayer_number = _digits(business_number)
+        if not refund_ready:
+            skipped_codes.append(
+                "hometax_refund:agent_credentials_required"
+            )
+        elif len(taxpayer_number) in {10, 13}:
+            jobs.append(
+                (
+                    "hometax_refund",
+                    0,
+                    CLAIM_DEFAULT_COLLECTION_KEY,
+                    {
+                        "collection_scope": "taxpayer",
+                        "query_strategy": "agent_refund_recent_5_years_v1",
+                    },
+                    lambda taxpayer_number=taxpayer_number: (
+                        client.collect_hometax_refund(
+                            taxpayer_number=taxpayer_number,
+                        )
+                    ),
+                )
+            )
+        else:
+            skipped_codes.append(
+                "hometax_refund:taxpayer_number_required"
+            )
 
     for document in planned_hometax_documents:
         document_code = str(document.get("document_code", ""))
@@ -2029,6 +2101,14 @@ def _collect_supported_comwel_documents(
         0,
         CLAIM_DEFAULT_COLLECTION_KEY,
     ) in existing
+    has_worker_status_document = (
+        "comwel_worker_status",
+        0,
+        CLAIM_DEFAULT_COLLECTION_KEY,
+    ) in existing
+    worker_status_ready = (
+        getattr(client, "comwel_worker_status_ready", False) is True
+    )
     safe_cache = (
         management_cache
         if isinstance(management_cache, dict)
@@ -2053,6 +2133,10 @@ def _collect_supported_comwel_documents(
                 for year in rate_years
             ]
         )
+        if has_worker_status_document:
+            skipped_codes.append(
+                "comwel_worker_status:business_scope_required"
+            )
 
     def report(document_code: str) -> None:
         if on_progress:
@@ -2433,6 +2517,138 @@ def _collect_supported_comwel_documents(
                     collection_key=collection_key,
                     scope_facts=scope_facts,
                 )
+
+        if has_worker_status_document and not worker_status_ready:
+            skipped_codes.append(
+                "comwel_worker_status:contract_endpoint_required"
+            )
+        elif has_worker_status_document and not has_management_document:
+            skipped_codes.append(
+                "comwel_worker_status:management_lookup_required"
+            )
+        elif has_worker_status_document:
+            target_count += len(data_scopes)
+            for scope_index, data_scope in enumerate(
+                data_scopes,
+                start=1,
+            ):
+                selected_business_number = str(
+                    data_scope.get("business_number", "")
+                )
+                management_number = str(
+                    data_scope.get("management_number", "")
+                )
+                collection_key = _claim_collection_variant_key(
+                    case_id,
+                    "worker-status",
+                    selected_business_number,
+                    management_number or "none",
+                )
+                scope_fingerprint = _claim_collection_scope_fingerprint(
+                    case_id,
+                    "management",
+                    selected_business_number,
+                    management_number or "0",
+                )
+                scope_facts = {
+                    "collection_scope": (
+                        "management" if management_number else "business"
+                    ),
+                    "scope_index": scope_index,
+                    "scope_count": len(data_scopes),
+                    "collection_scope_fingerprint": scope_fingerprint,
+                    "business_scope_fingerprint": str(
+                        data_scope.get(
+                            "collection_scope_fingerprint",
+                            "",
+                        )
+                    ),
+                    "business_name": str(
+                        data_scope.get("business_name", "")
+                    )[:120],
+                    "business_number_masked": _masked_business_no(
+                        selected_business_number
+                    ),
+                    "management_number_masked": (
+                        _masked_management_number(management_number)
+                    ),
+                    "collection_scope_label": _collection_scope_label(
+                        business_name=data_scope.get("business_name", ""),
+                        business_number=selected_business_number,
+                        management_number=management_number,
+                    ),
+                }
+                if bool(data_scope.get("management_lookup_failed")):
+                    failed_count += 1
+                    try:
+                        repository.fail_document(
+                            case_id,
+                            document_code="comwel_worker_status",
+                            collection_key=collection_key,
+                            facts=scope_facts,
+                            safe_error_code=(
+                                "COMWEL_MANAGEMENT_NUMBER_LOOKUP_FAILED"
+                            ),
+                        )
+                    except ClaimRepositoryError:
+                        pass
+                    report("comwel_worker_status")
+                    continue
+
+                if not management_number:
+                    collector = lambda: _scoped_claim_document(
+                        _claim_no_data_document(
+                            document_code="comwel_worker_status",
+                            reason="no_management_workplace",
+                        ),
+                        scope_index=scope_index,
+                        scope_count=len(data_scopes),
+                        collection_scope="business",
+                        business_name=str(
+                            data_scope.get("business_name", "")
+                        ),
+                        business_number=selected_business_number,
+                        scope_fingerprint=scope_fingerprint,
+                        business_scope_fingerprint=str(
+                            data_scope.get(
+                                "collection_scope_fingerprint",
+                                "",
+                            )
+                        ),
+                    )
+                else:
+                    collector = (
+                        lambda management_number=management_number, scope_index=scope_index, data_scope=data_scope, selected_business_number=selected_business_number, scope_fingerprint=scope_fingerprint: _scoped_claim_document(
+                            client.collect_comwel_worker_status(
+                                identity_number=identity_number,
+                                user_name=representative,
+                                cellphone=cellphone,
+                                session=session,
+                                management_number=management_number,
+                            ),
+                            scope_index=scope_index,
+                            scope_count=len(data_scopes),
+                            collection_scope="management",
+                            business_name=str(
+                                data_scope.get("business_name", "")
+                            ),
+                            business_number=selected_business_number,
+                            management_number=management_number,
+                            scope_fingerprint=scope_fingerprint,
+                            business_scope_fingerprint=str(
+                                data_scope.get(
+                                    "collection_scope_fingerprint",
+                                    "",
+                                )
+                            ),
+                        )
+                    )
+                store_one(
+                    "comwel_worker_status",
+                    collector,
+                    collection_key=collection_key,
+                    scope_facts=scope_facts,
+                )
         # Tilko 공식 계약에서 관리번호는 법인인 경우 필수이고 개인은
         # 선택값입니다. 관리번호를 찾지 못했더라도 개인 간편인증 요청은
         # 실제 기관 API까지 보내며, API 응답이 빈 경우에만 no_data로
@@ -2556,7 +2772,6 @@ def _collect_supported_comwel_documents(
                 period_year=year,
             )
 
-    skipped_codes.append("comwel_worker_status:certificate_required")
     return {
         "target": max(0, target_count),
         "ready": completed_count,
@@ -2584,6 +2799,12 @@ def _collect_case_documents(
 ) -> dict[str, Any]:
     _ensure_claim_operation_active(should_continue)
     planned_documents = repository.list_documents(case_id)
+    refund_ready = (
+        getattr(client, "hometax_refund_ready", False) is True
+    )
+    worker_status_ready = (
+        getattr(client, "comwel_worker_status_ready", False) is True
+    )
     estimated_target = max(
         1,
         sum(
@@ -2591,6 +2812,16 @@ def _collect_case_documents(
             for document in planned_documents
             if automatic_collection_supported(
                 str(document.get("document_code", ""))
+            )
+            and (
+                str(document.get("document_code", ""))
+                != "hometax_refund"
+                or refund_ready
+            )
+            and (
+                str(document.get("document_code", ""))
+                != "comwel_worker_status"
+                or worker_status_ready
             )
         ),
     )
@@ -2761,7 +2992,13 @@ def _collect_case_documents(
             "hometax_closure_certificate",
             "comwel_management_number_list",
             "comwel_workplace_rate",
+            "comwel_worker_status",
         }
+        and (
+            str(document.get("document_code", ""))
+            != "comwel_worker_status"
+            or worker_status_ready
+        )
         and str(document.get("status", "")) != "ready"
     ]
     comwel_business_dependent_documents = [
@@ -6548,16 +6785,33 @@ def _render_results_tab(
 
 
 def _render_catalog_tab() -> None:
+    readiness = provider_readiness()
+
+    def support_label(document_code: str) -> str:
+        if document_code == "hometax_refund":
+            return (
+                "지원"
+                if bool(readiness.get("hometax_refund_ready"))
+                else "세무대리인 인증서 설정 필요"
+            )
+        if document_code == "comwel_worker_status":
+            return (
+                "지원"
+                if bool(readiness.get("comwel_worker_status_ready"))
+                else "Tilko 계약 API 설정 필요"
+            )
+        return (
+            "지원"
+            if document_code in AUTOMATIC_COLLECTION_CODES
+            else "연동 예정"
+        )
+
     rows = [
         {
             "자료명": spec.name,
             "기관": spec.source,
             "기간": spec.period,
-            "자동수집": (
-                "지원"
-                if spec.code in AUTOMATIC_COLLECTION_CODES
-                else "연동 예정"
-            ),
+            "자동수집": support_label(spec.code),
             "설명": spec.description,
         }
         for spec in DOCUMENT_SPECS

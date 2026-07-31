@@ -810,14 +810,13 @@ class ClaimBusinessFallbackRegressionTests(unittest.TestCase):
             "hometax_income_tax_help",
             "hometax_income_tax_return",
             "hometax_closure_certificate",
+            "hometax_refund",
             "comwel_total_remuneration",
             "comwel_management_number_list",
             "comwel_workplace_rate",
-        }
-        unsupported_codes = {
-            "hometax_refund",
             "comwel_worker_status",
         }
+        unsupported_codes: set[str] = set()
         self.assertTrue(supported_codes <= statuses_by_code.keys())
         self.assertTrue(unsupported_codes <= statuses_by_code.keys())
         for document_code in supported_codes:

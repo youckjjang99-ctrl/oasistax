@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import threading
 import time
 import unittest
@@ -840,6 +841,91 @@ class ClaimCorrectionTests(unittest.TestCase):
         self.assertEqual(ready_count, 3)
         self.assertEqual(percentage, 60)
         self.assertIn("5건 중 3건", text)
+
+    def test_collection_progress_excludes_unconfigured_optional_providers(
+        self,
+    ):
+        documents = [
+            {
+                "document_code": "hometax_tax_payment_certificate",
+                "status": "ready",
+                "facts": {},
+            },
+            {
+                "document_code": "hometax_refund",
+                "status": "auth_pending",
+                "facts": {},
+            },
+            {
+                "document_code": "comwel_worker_status",
+                "status": "integration_required",
+                "facts": {},
+            },
+        ]
+
+        with patch(
+            "claim_correction_center.provider_readiness",
+            return_value={
+                "hometax_refund_ready": False,
+                "comwel_worker_status_ready": False,
+            },
+        ):
+            percentage, _, ready_count, target_count = (
+                _claim_collection_progress(documents)
+            )
+
+        self.assertEqual(target_count, 1)
+        self.assertEqual(ready_count, 1)
+        self.assertEqual(percentage, 100)
+
+        documents[1]["status"] = "failed"
+        with patch(
+            "claim_correction_center.provider_readiness",
+            return_value={
+                "hometax_refund_ready": False,
+                "comwel_worker_status_ready": False,
+            },
+        ):
+            percentage, _, ready_count, target_count = (
+                _claim_collection_progress(documents)
+            )
+        self.assertEqual(target_count, 2)
+        self.assertEqual(ready_count, 1)
+        self.assertEqual(percentage, 50)
+
+    def test_collection_progress_includes_configured_optional_providers(self):
+        documents = [
+            {
+                "document_code": "hometax_tax_payment_certificate",
+                "status": "ready",
+                "facts": {},
+            },
+            {
+                "document_code": "hometax_refund",
+                "status": "auth_pending",
+                "facts": {},
+            },
+            {
+                "document_code": "comwel_worker_status",
+                "status": "integration_required",
+                "facts": {},
+            },
+        ]
+
+        with patch(
+            "claim_correction_center.provider_readiness",
+            return_value={
+                "hometax_refund_ready": True,
+                "comwel_worker_status_ready": True,
+            },
+        ):
+            percentage, _, ready_count, target_count = (
+                _claim_collection_progress(documents)
+            )
+
+        self.assertEqual(target_count, 3)
+        self.assertEqual(ready_count, 1)
+        self.assertEqual(percentage, 33)
 
     def test_collection_progress_separates_no_data_from_collected(self):
         ready_documents = [
@@ -3240,6 +3326,140 @@ class ClaimCorrectionTests(unittest.TestCase):
             "management-numbers.json",
         )
 
+    def test_repository_recursively_sanitizes_private_document_facts(self):
+        case_id = "00000000-0000-0000-0000-000000000151"
+        document_id = "00000000-0000-0000-0000-000000000152"
+        synthetic_resident_number = "000101-0000000"
+        synthetic_phone = "010-0000-0000"
+        fake = _FakeDatabase(
+            rows=[{"id": case_id, "owner_user_id": "owner-user"}],
+            documents=[
+                {
+                    "id": document_id,
+                    "case_id": case_id,
+                    "owner_user_id": "owner-user",
+                    "source": "comwel",
+                    "document_code": "comwel_worker_status",
+                    "status": "integration_required",
+                }
+            ],
+        )
+        repository = ClaimRepository("owner-user", database=fake)
+
+        repository.store_collected_document(
+            case_id,
+            document_code="comwel_worker_status",
+            document=CollectedClaimDocument(
+                content=b'{"workers":[]}',
+                file_name=(
+                    f"workers_{synthetic_resident_number}_{synthetic_phone}.json"
+                ),
+                content_type="application/json",
+                provider_reference="synthetic-provider-reference",
+                facts={
+                    "record_count": 7,
+                    "business_number_count": 2,
+                    "refund_amount": 123456,
+                    "provider": {
+                        "Token": "synthetic-token",
+                        "ApiTxKey": "synthetic-api-transaction",
+                        "CookieCollection": ["synthetic-cookie"],
+                        "Credential": {"secret": "synthetic-credential"},
+                        "CxId": "synthetic-cx",
+                        "TxId": "synthetic-tx",
+                        "ReqTxId": "synthetic-request-tx",
+                    },
+                    "workers": [
+                        {
+                            "GEUNROJA_RGNO": synthetic_resident_number,
+                            "GEUNROJA_WONBU_NO": "synthetic-ledger-number",
+                            "note": (
+                                f"contact {synthetic_phone}; id "
+                                f"{synthetic_resident_number}"
+                            ),
+                        }
+                    ],
+                },
+            ),
+        )
+
+        finalize = next(
+            parameters
+            for name, parameters in fake.rpc_calls
+            if name == "oasis_claim_finalize_document"
+        )
+        facts = finalize["p_facts"]
+        serialized = json.dumps(facts, ensure_ascii=False)
+        self.assertEqual(facts["record_count"], 7)
+        self.assertEqual(facts["business_number_count"], 2)
+        self.assertEqual(facts["refund_amount"], 123456)
+        self.assertEqual(facts["provider"], {})
+        self.assertNotIn("GEUNROJA_RGNO", facts["workers"][0])
+        self.assertNotIn("GEUNROJA_WONBU_NO", facts["workers"][0])
+        self.assertNotIn(synthetic_resident_number, serialized)
+        self.assertNotIn(synthetic_resident_number.replace("-", ""), serialized)
+        self.assertNotIn(synthetic_phone, serialized)
+        self.assertNotIn(synthetic_phone.replace("-", ""), serialized)
+        self.assertIn("ID-REDACTED", facts["workers"][0]["note"])
+        self.assertIn("010-****-0000", facts["workers"][0]["note"])
+        self.assertNotIn(
+            synthetic_resident_number,
+            facts["download_file_name"],
+        )
+        self.assertNotIn(synthetic_phone, facts["download_file_name"])
+
+    def test_repository_recursively_sanitizes_audit_metadata(self):
+        case_id = "00000000-0000-0000-0000-000000000153"
+        synthetic_resident_number = "0001010000000"
+        synthetic_phone = "01000000000"
+        fake = _FakeDatabase()
+        repository = ClaimRepository("owner-user", database=fake)
+
+        repository.append_audit_event(
+            case_id=case_id,
+            action="collection_checked",
+            source="comwel",
+            outcome="success",
+            metadata={
+                "record_count": 4,
+                "phone_count": 3,
+                "refund_amount": 99999,
+                "nested": {
+                    "auth_token": "synthetic-token",
+                    "api_tx_key": "synthetic-api-transaction",
+                    "cookie": "synthetic-cookie",
+                    "credential": "synthetic-credential",
+                    "cxid": "synthetic-cx",
+                    "txid": "synthetic-tx",
+                    "reqtxid": "synthetic-request-tx",
+                    "rgno": synthetic_resident_number,
+                    "wonbuno": "synthetic-ledger-number",
+                    "message": (
+                        f"phone {synthetic_phone}, id "
+                        f"{synthetic_resident_number}"
+                    ),
+                },
+            },
+        )
+
+        audit = next(
+            parameters
+            for name, parameters in fake.rpc_calls
+            if name == "oasis_claim_append_audit"
+        )["p_metadata"]
+        serialized = json.dumps(audit, ensure_ascii=False)
+        self.assertEqual(audit["record_count"], 4)
+        self.assertEqual(audit["phone_count"], 3)
+        self.assertEqual(audit["refund_amount"], 99999)
+        self.assertEqual(
+            set(audit["nested"]),
+            {"message"},
+        )
+        self.assertNotIn(synthetic_resident_number, serialized)
+        self.assertNotIn(synthetic_phone, serialized)
+        self.assertIn("ID-REDACTED", audit["nested"]["message"])
+        self.assertIn("010-****-0000", audit["nested"]["message"])
+
     def test_repository_preserves_each_opaque_document_variant(self):
         case = {
             "id": "00000000-0000-0000-0000-000000000081",
@@ -3680,6 +3900,48 @@ class ClaimCorrectionTests(unittest.TestCase):
         )
         self.assertNotIn("1208800767", download_name)
         self.assertNotIn("120-88-00767", download_name)
+
+    def test_repository_masks_private_patterns_in_legacy_download_name(self):
+        owner_user_id = "owner-user"
+        case_id = "00000000-0000-0000-0000-000000000155"
+        document_id = "00000000-0000-0000-0000-000000000156"
+        synthetic_resident_number = "000101-0000000"
+        synthetic_phone = "010-0000-0000"
+        owner_folder = hashlib.sha256(
+            owner_user_id.encode("utf-8")
+        ).hexdigest()[:24]
+        fake = _FakeDatabase(
+            documents=[
+                {
+                    "id": document_id,
+                    "case_id": case_id,
+                    "owner_user_id": owner_user_id,
+                    "document_code": "comwel_worker_status",
+                    "status": "ready",
+                    "storage_bucket": "oasis-claim-documents",
+                    "storage_path": (
+                        f"{owner_folder}/{case_id}/{document_id}.json"
+                    ),
+                    "content_type": "application/json",
+                    "retention_until": "2099-01-01T00:00:00+00:00",
+                    "facts": {
+                        "download_file_name": (
+                            f"workers_{synthetic_resident_number}_"
+                            f"{synthetic_phone}.json"
+                        ),
+                    },
+                }
+            ],
+        )
+        repository = ClaimRepository(owner_user_id, database=fake)
+
+        repository.document_download_url(case_id, document_id)
+
+        download_name = fake.signed_url_calls[0]["download_name"]
+        self.assertNotIn(synthetic_resident_number, download_name)
+        self.assertNotIn(synthetic_phone, download_name)
+        self.assertIn("ID-REDACTED", download_name)
+        self.assertIn("010-XXXX-0000", download_name)
 
     def test_repository_refuses_cross_owner_document_download(self):
         owner_user_id = "owner-user"

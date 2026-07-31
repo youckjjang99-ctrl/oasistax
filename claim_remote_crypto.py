@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -37,11 +38,27 @@ def _urlsafe_b64(data: bytes) -> str:
 
 def _urlsafe_unb64(value: str) -> bytes:
     text = str(value or "").strip()
+    if not text or any(
+        not character.isascii()
+        or not (character.isalnum() or character in "-_")
+        for character in text
+    ):
+        raise ClaimRemoteCryptoError("인증 링크 형식이 올바르지 않습니다.")
     padding = "=" * ((4 - len(text) % 4) % 4)
     try:
-        return base64.urlsafe_b64decode(f"{text}{padding}".encode("ascii"))
-    except (ValueError, TypeError) as exc:
+        decoded = base64.b64decode(
+            f"{text}{padding}".encode("ascii"),
+            altchars=b"-_",
+            validate=True,
+        )
+    except (binascii.Error, UnicodeEncodeError, ValueError, TypeError) as exc:
         raise ClaimRemoteCryptoError("인증 링크 형식이 올바르지 않습니다.") from exc
+    # Reject alternate/non-canonical encodings whose decoded bytes happen to
+    # match a valid signature. This prevents last-character substitution from
+    # being accepted when only unused Base64 pad bits differ.
+    if _urlsafe_b64(decoded) != text:
+        raise ClaimRemoteCryptoError("인증 링크 형식이 올바르지 않습니다.")
+    return decoded
 
 
 def _fernet_key(raw_secret: str) -> bytes:
