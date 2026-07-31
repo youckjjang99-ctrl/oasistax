@@ -12,6 +12,7 @@ from pathlib import Path
 import streamlit as st
 
 from cloud_db import CloudDatabase, cloud_is_configured
+from performance_cache import cache_generation, invalidate_cache
 
 
 ROOT_DIR = Path(__file__).parent
@@ -23,6 +24,9 @@ LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
 LOGIN_LOCK_SECONDS = 15 * 60
 _LOGIN_ATTEMPTS: dict[str, dict[str, float | int]] = {}
 _LOGIN_ATTEMPTS_LOCK = threading.Lock()
+_DEFAULT_ADMIN_ENSURED = False
+_DEFAULT_ADMIN_LOCK = threading.Lock()
+AUTH_RECHECK_SECONDS = 10.0
 
 
 # ================================
@@ -238,9 +242,45 @@ def save_users(users):
         CloudDatabase().upsert(TABLE_USERS, rows, "user_id")
 
     _save_local_users(normalized)
+    invalidate_cache("auth_users", "all")
 
 
-def ensure_default_admin():
+@st.cache_data(
+    ttl=15,
+    max_entries=8,
+    show_spinner=False,
+    scope="session",
+)
+def _load_admin_user_rows_cached(generation: int) -> list[dict]:
+    """Load non-secret account fields for the admin screen once per TTL."""
+    del generation
+    if cloud_is_configured():
+        try:
+            return CloudDatabase().select(
+                TABLE_USERS,
+                columns=(
+                    "user_id,name,role,status,created_at,approved_at,approved_by"
+                ),
+                order="created_at.asc",
+            )
+        except Exception:
+            return []
+    return [
+        {
+            "user_id": user_id,
+            "name": user.get("name", ""),
+            "role": user.get("role", "member"),
+            "status": user.get("status", "approved"),
+            "created_at": user.get("created_at", ""),
+            "approved_at": user.get("approved_at", ""),
+            "approved_by": user.get("approved_by", ""),
+        }
+        for user_id, user in _load_local_users().items()
+        if isinstance(user, dict)
+    ]
+
+
+def _ensure_default_admin_once():
     """기존 v2 로그인 방식과의 호환을 위해 기본 관리자 계정을 자동 생성한다."""
     users = load_users()
     login_id = _safe_user_id(get_secret("APP_LOGIN_ID", ""))
@@ -289,6 +329,18 @@ def ensure_default_admin():
             save_users(users)
         except Exception:
             _save_local_users(users)
+
+
+def ensure_default_admin():
+    """Run legacy account migration once per application process."""
+    global _DEFAULT_ADMIN_ENSURED
+    if _DEFAULT_ADMIN_ENSURED:
+        return
+    with _DEFAULT_ADMIN_LOCK:
+        if _DEFAULT_ADMIN_ENSURED:
+            return
+        _ensure_default_admin_once()
+        _DEFAULT_ADMIN_ENSURED = True
 
 
 def create_user(user_id, password, name):
@@ -362,6 +414,25 @@ def _load_authoritative_user_for_login(user_id: str):
     return _load_local_users().get(safe_id), ""
 
 
+def _load_current_user_access(user_id: str) -> dict:
+    """Load only fields needed for an already authenticated session."""
+    safe_id = _safe_user_id(user_id)
+    if not safe_id:
+        return {}
+    if cloud_is_configured():
+        try:
+            rows = CloudDatabase().select(
+                TABLE_USERS,
+                filters={"user_id": safe_id},
+                columns="user_id,name,role,status",
+                limit=1,
+            )
+        except Exception:
+            return {}
+        return _cloud_row_to_user(rows[0]) if rows else {}
+    return _load_local_users().get(safe_id, {})
+
+
 def authenticate_user(user_id, password):
     ok, user, _msg = authenticate_user_with_message(user_id, password)
     return user if ok else None
@@ -410,15 +481,16 @@ def authenticate_user_with_message(user_id, password):
 
 
 def is_admin(user_id=None):
-    ensure_default_admin()
     user_id = _safe_user_id(user_id or st.session_state.get("current_user_id", ""))
-    if cloud_is_configured():
-        user, load_error = _load_authoritative_user_for_login(user_id)
-        if load_error:
-            return False
-        user = user or {}
-    else:
-        user = _load_local_users().get(user_id, {})
+    current_user_id = _safe_user_id(st.session_state.get("current_user_id", ""))
+    if (
+        st.session_state.get("logged_in")
+        and user_id
+        and user_id == current_user_id
+    ):
+        return st.session_state.get("current_user_role") == "admin"
+    ensure_default_admin()
+    user = _load_current_user_access(user_id)
     return user.get("role") == "admin" and user.get("status", "approved") == "approved"
 
 
@@ -430,16 +502,23 @@ def can_view_mobile_numbers(user_id=None) -> bool:
         get_secret("MOBILE_PHONE_OWNER_ID", "")
         or get_secret("APP_LOGIN_ID", "")
     )
-    return bool(owner_id and user_id == owner_id and is_admin(user_id))
+    if not owner_id or user_id != owner_id:
+        return False
+    current_user_id = _safe_user_id(st.session_state.get("current_user_id", ""))
+    if st.session_state.get("logged_in") and user_id == current_user_id:
+        return st.session_state.get("current_user_role") == "admin"
+    return is_admin(user_id)
 
 
 def list_pending_users(requested_by=""):
     if not is_admin(requested_by):
         return []
-    ensure_default_admin()
-    users = load_users()
+    users = _load_admin_user_rows_cached(
+        cache_generation("auth_users", "all")
+    )
     rows = []
-    for uid, user in users.items():
+    for user in users:
+        uid = _safe_user_id(user.get("user_id", ""))
         if isinstance(user, dict) and user.get("status") == "pending":
             rows.append({
                 "아이디": uid,
@@ -453,10 +532,12 @@ def list_pending_users(requested_by=""):
 def list_all_users_for_admin(requested_by=""):
     if not is_admin(requested_by):
         return []
-    ensure_default_admin()
-    users = load_users()
+    users = _load_admin_user_rows_cached(
+        cache_generation("auth_users", "all")
+    )
     rows = []
-    for uid, user in users.items():
+    for user in users:
+        uid = _safe_user_id(user.get("user_id", ""))
         if isinstance(user, dict):
             rows.append({
                 "아이디": uid,
@@ -555,9 +636,10 @@ def _session_is_current(user_id: str, token: str) -> bool:
 
 
 def _clear_local_login_state() -> None:
+    # A browser session may be reused by another account. Remove all user data,
+    # uploaded document handles and generated download bytes on logout.
     for key in list(st.session_state.keys()):
-        if str(key).startswith(("claim_", "_claim_")):
-            st.session_state.pop(key, None)
+        st.session_state.pop(key, None)
     st.session_state.logged_in = False
     st.session_state.current_user_id = ""
     st.session_state.current_user_name = ""
@@ -615,28 +697,29 @@ def change_password(
 
 def render_password_change(user_id: str) -> None:
     with st.expander("비밀번호 변경", expanded=False):
-        current_password = st.text_input(
-            "현재 비밀번호",
-            type="password",
-            key="password_change_current_v740",
-        )
-        new_password = st.text_input(
-            "새 비밀번호",
-            type="password",
-            placeholder="12자리 이상 · 문자와 숫자 포함",
-            key="password_change_new_v740",
-        )
-        new_password_confirm = st.text_input(
-            "새 비밀번호 확인",
-            type="password",
-            key="password_change_confirm_v740",
-        )
+        with st.form("password_change_form_v1030", clear_on_submit=False):
+            current_password = st.text_input(
+                "현재 비밀번호",
+                type="password",
+                key="password_change_current_v740",
+            )
+            new_password = st.text_input(
+                "새 비밀번호",
+                type="password",
+                placeholder="12자리 이상 · 문자와 숫자 포함",
+                key="password_change_new_v740",
+            )
+            new_password_confirm = st.text_input(
+                "새 비밀번호 확인",
+                type="password",
+                key="password_change_confirm_v740",
+            )
+            submitted = st.form_submit_button(
+                "비밀번호 변경",
+                use_container_width=True,
+            )
 
-        if st.button(
-            "비밀번호 변경",
-            use_container_width=True,
-            key="password_change_button_v740",
-        ):
+        if submitted:
             if new_password != new_password_confirm:
                 st.error("새 비밀번호 확인이 일치하지 않습니다.")
                 return
@@ -691,23 +774,43 @@ def check_login():
     ensure_default_admin()
 
     if st.session_state.logged_in:
-        if not _session_is_current(
-            st.session_state.current_user_id,
-            st.session_state.login_session_token,
-        ):
+        current_user_id = _safe_user_id(st.session_state.current_user_id)
+        session_token = str(st.session_state.login_session_token or "")
+        verification_key = hashlib.sha256(
+            f"{current_user_id}\0{session_token}".encode("utf-8")
+        ).hexdigest()
+        now = time.monotonic()
+        last_verified_at = float(
+            st.session_state.get("_auth_last_verified_at", 0.0) or 0.0
+        )
+        verification_is_fresh = (
+            st.session_state.get("_auth_last_verified_key")
+            == verification_key
+            and now - last_verified_at < AUTH_RECHECK_SECONDS
+        )
+
+        if verification_is_fresh:
+            return True
+
+        if not _session_is_current(current_user_id, session_token):
             _clear_local_login_state()
             st.warning(
                 "동일 계정으로 새 로그인이 확인되어 현재 기기에서 자동 로그아웃되었습니다."
             )
             return False
-        current_user = load_users().get(
-            _safe_user_id(st.session_state.current_user_id),
-            {},
-        )
+        current_user = _load_current_user_access(current_user_id)
         if str(current_user.get("status", "")).strip() != "approved":
             _clear_local_login_state()
             st.warning("승인된 계정만 이용할 수 있습니다.")
             return False
+        st.session_state.current_user_name = str(
+            current_user.get("name", st.session_state.current_user_name) or ""
+        )
+        st.session_state.current_user_role = str(
+            current_user.get("role", st.session_state.current_user_role) or "member"
+        )
+        st.session_state["_auth_last_verified_key"] = verification_key
+        st.session_state["_auth_last_verified_at"] = now
 
     return st.session_state.logged_in
 
@@ -729,10 +832,24 @@ def login_form(logo_html_func):
     login_tab, signup_tab = st.tabs(["로그인", "회원가입"])
 
     with login_tab:
-        user_id = st.text_input("아이디", placeholder="아이디를 입력하세요", key="login_user_id")
-        user_pw = st.text_input("비밀번호", type="password", placeholder="비밀번호를 입력하세요", key="login_user_pw")
+        with st.form("login_form_v1030"):
+            user_id = st.text_input(
+                "아이디",
+                placeholder="아이디를 입력하세요",
+                key="login_user_id",
+            )
+            user_pw = st.text_input(
+                "비밀번호",
+                type="password",
+                placeholder="비밀번호를 입력하세요",
+                key="login_user_pw",
+            )
+            login_submitted = st.form_submit_button(
+                "로그인",
+                use_container_width=True,
+            )
 
-        if st.button("로그인", use_container_width=True):
+        if login_submitted:
             ok, user, msg = authenticate_user_with_message(user_id, user_pw)
             if ok and user:
                 st.session_state.logged_in = True
@@ -749,17 +866,35 @@ def login_form(logo_html_func):
                 st.error(msg)
 
     with signup_tab:
-        new_name = st.text_input("이름", placeholder="예: 임주형", key="signup_name")
-        new_id = st.text_input("아이디", placeholder="영문/숫자/한글 사용 가능", key="signup_user_id")
-        new_pw = st.text_input(
-            "비밀번호",
-            type="password",
-            placeholder="12자리 이상 · 문자와 숫자 포함",
-            key="signup_user_pw",
-        )
-        new_pw2 = st.text_input("비밀번호 확인", type="password", placeholder="비밀번호 재입력", key="signup_user_pw2")
+        with st.form("signup_form_v1030"):
+            new_name = st.text_input(
+                "이름",
+                placeholder="예: 임주형",
+                key="signup_name",
+            )
+            new_id = st.text_input(
+                "아이디",
+                placeholder="영문/숫자/한글 사용 가능",
+                key="signup_user_id",
+            )
+            new_pw = st.text_input(
+                "비밀번호",
+                type="password",
+                placeholder="12자리 이상 · 문자와 숫자 포함",
+                key="signup_user_pw",
+            )
+            new_pw2 = st.text_input(
+                "비밀번호 확인",
+                type="password",
+                placeholder="비밀번호 재입력",
+                key="signup_user_pw2",
+            )
+            signup_submitted = st.form_submit_button(
+                "회원가입",
+                use_container_width=True,
+            )
 
-        if st.button("회원가입", use_container_width=True):
+        if signup_submitted:
             if new_pw != new_pw2:
                 st.error("비밀번호 확인이 일치하지 않습니다.")
             else:

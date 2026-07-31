@@ -9,12 +9,11 @@ from cloud_db import (
     cloud_is_configured,
 )
 from crm import (
-    append_timeline_event,
-    get_customer_record,
+    load_crm_data,
     make_customer_key,
-    upsert_customer_record,
+    save_crm_data,
 )
-from crm_enhancements import save_crm_profile
+from crm_enhancements import save_crm_profiles_bulk
 
 
 def _clean(value: Any) -> str:
@@ -30,7 +29,7 @@ def _timeline_signature(item: dict[str, Any]) -> tuple[str, str, str]:
     return (
         _clean(item.get("title", item.get("제목", ""))),
         _clean(item.get("detail", item.get("내용", ""))),
-        _clean(item.get("created_at", item.get("일시", ""))),
+        _clean(item.get("created_at", item.get("at", item.get("일시", "")))),
     )
 
 
@@ -53,21 +52,31 @@ def restore_crm_from_cloud(user_id: str) -> dict[str, Any]:
         result["message"] = "사용자 ID가 없습니다."
         return result
 
+    local_data = load_crm_data(user_id)
+    local_customers = local_data.get("customers", {})
+    if isinstance(local_customers, dict) and local_customers:
+        result["message"] = "기존 로컬 CRM 자료를 사용합니다."
+        return result
+
     if not cloud_is_configured():
         result["message"] = "Supabase가 설정되지 않아 CRM 자동복원을 건너뛰었습니다."
         return result
 
     try:
         database = CloudDatabase()
-        customer_rows = database.select(
+        customer_rows = database.select_all(
             TABLE_CUSTOMERS,
             filters={"owner_user_id": user_id},
             columns="business_no,company_name,customer_data",
+            order="id.asc",
+            max_rows=50000,
         )
-        crm_rows = database.select(
+        crm_rows = database.select_all(
             TABLE_CRM,
             filters={"owner_user_id": user_id},
             columns="business_no,crm_data,updated_at",
+            order="id.asc",
+            max_rows=50000,
         )
     except Exception as exc:
         result["message"] = f"Supabase CRM 조회 실패: {exc}"
@@ -85,6 +94,9 @@ def restore_crm_from_cloud(user_id: str) -> dict[str, Any]:
         )
         if business_no:
             company_map[business_no] = company_name
+
+    local_customers = local_data.setdefault("customers", {})
+    profile_updates: dict[str, dict[str, Any]] = {}
 
     for row in crm_rows:
         business_no = _clean(row.get("business_no"))
@@ -106,28 +118,24 @@ def restore_crm_from_cloud(user_id: str) -> dict[str, Any]:
         )
         memo = _clean(crm_data.get("memo"))
 
-        ok, _ = upsert_customer_record(
-            user_id,
-            customer_key,
-            company_name,
-            business_no,
-            status,
-            next_action,
-            next_date,
-            memo,
-        )
-        if ok:
-            result["restored"] += 1
+        local_record = local_customers.get(customer_key, {})
+        if not isinstance(local_record, dict):
+            local_record = {}
+        local_record.update({
+            "company_name": company_name,
+            "business_no": business_no,
+            "status": status,
+            "next_action": next_action,
+            "next_date": next_date,
+            "memo": memo,
+            "updated_at": _clean(row.get("updated_at")),
+        })
+        local_customers[customer_key] = local_record
+        result["restored"] += 1
 
         profile = crm_data.get("_v44_profile", {})
         if isinstance(profile, dict) and profile:
-            save_crm_profile(
-                user_id,
-                customer_key,
-                profile.get("pipeline_stage", "신규"),
-                str(profile.get("priority", "3")),
-                profile.get("assigned_manager", ""),
-            )
+            profile_updates[customer_key] = dict(profile)
             result["profiles"] += 1
 
         cloud_timeline = crm_data.get(
@@ -137,7 +145,6 @@ def restore_crm_from_cloud(user_id: str) -> dict[str, Any]:
         if not isinstance(cloud_timeline, list):
             continue
 
-        local_record = get_customer_record(user_id, customer_key)
         local_timeline = local_record.get(
             "timeline",
             local_record.get("timelines", []),
@@ -163,15 +170,21 @@ def restore_crm_from_cloud(user_id: str) -> dict[str, Any]:
             if not detail:
                 continue
 
-            appended, _ = append_timeline_event(
-                user_id,
-                customer_key,
-                title,
-                detail,
-            )
-            if appended:
-                result["timelines"] += 1
-                existing_signatures.add(signature)
+            local_timeline.insert(0, {
+                "at": signature[2],
+                "title": title,
+                "detail": detail,
+            })
+            result["timelines"] += 1
+            existing_signatures.add(signature)
+
+        local_record["timeline"] = local_timeline[:80]
+        local_customers[customer_key] = local_record
+
+    if crm_rows:
+        save_crm_data(user_id, local_data)
+    if profile_updates:
+        save_crm_profiles_bulk(user_id, profile_updates)
 
     result["message"] = (
         f"Supabase CRM {result['restored']}건, "

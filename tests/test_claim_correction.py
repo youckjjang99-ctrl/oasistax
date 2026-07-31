@@ -3282,6 +3282,84 @@ class ClaimCorrectionTests(unittest.TestCase):
             document_id,
         )
 
+    def test_repository_batches_download_urls_with_one_document_read(self):
+        owner_user_id = "owner-user"
+        case_id = "00000000-0000-0000-0000-000000000131"
+        owner_folder = hashlib.sha256(
+            owner_user_id.encode("utf-8")
+        ).hexdigest()[:24]
+        document_ids = [
+            "00000000-0000-0000-0000-000000000132",
+            "00000000-0000-0000-0000-000000000133",
+            "00000000-0000-0000-0000-000000000134",
+        ]
+        fake = _FakeDatabase(
+            documents=[
+                {
+                    "id": document_id,
+                    "case_id": case_id,
+                    "owner_user_id": owner_user_id,
+                    "document_code": "hometax_tax_payment_certificate",
+                    "status": "ready",
+                    "storage_bucket": "oasis-claim-documents",
+                    "storage_path": (
+                        f"{owner_folder}/{case_id}/{document_id}.pdf"
+                    ),
+                    "content_type": "application/pdf",
+                    "retention_until": "2099-01-01T00:00:00+00:00",
+                }
+                for document_id in document_ids
+            ]
+        )
+        repository = ClaimRepository(owner_user_id, database=fake)
+
+        urls = repository.document_download_urls(case_id, document_ids)
+
+        self.assertEqual(len(urls), len(document_ids))
+        document_list_calls = [
+            parameters
+            for function_name, parameters in fake.rpc_calls
+            if function_name == "oasis_claim_list_documents"
+        ]
+        self.assertEqual(len(document_list_calls), 1)
+        self.assertEqual(len(fake.signed_url_calls), len(document_ids))
+        audit_calls = [
+            parameters
+            for function_name, parameters in fake.rpc_calls
+            if function_name == "oasis_claim_append_audit"
+        ]
+        self.assertEqual(len(audit_calls), len(document_ids))
+        self.assertEqual(
+            [call["p_metadata"]["document_id"] for call in audit_calls],
+            document_ids,
+        )
+
+    def test_repository_batch_download_rejects_cross_owner_document(self):
+        owner_user_id = "owner-user"
+        case_id = "00000000-0000-0000-0000-000000000141"
+        document_id = "00000000-0000-0000-0000-000000000142"
+        fake = _FakeDatabase(
+            documents=[
+                {
+                    "id": document_id,
+                    "case_id": case_id,
+                    "owner_user_id": "another-owner",
+                    "document_code": "hometax_tax_payment_certificate",
+                    "status": "ready",
+                    "storage_bucket": "oasis-claim-documents",
+                    "storage_path": "untrusted/path/document.pdf",
+                    "content_type": "application/pdf",
+                    "retention_until": "2099-01-01T00:00:00+00:00",
+                }
+            ]
+        )
+        repository = ClaimRepository(owner_user_id, database=fake)
+
+        with self.assertRaises(ClaimRepositoryError):
+            repository.document_download_urls(case_id, [document_id])
+
+        self.assertEqual(fake.signed_url_calls, [])
+
     def test_repository_allows_versioned_replacement_document_download(self):
         owner_user_id = "owner-user"
         case_id = "00000000-0000-0000-0000-000000000033"

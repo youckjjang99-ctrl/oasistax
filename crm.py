@@ -6,9 +6,15 @@ OASIS CRM utilities (v3.2.0)
 from __future__ import annotations
 
 import json
+import os
+import uuid
+from copy import deepcopy
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+
+from performance_cache import cache_generation, invalidate_cache
 
 ROOT_DIR = Path(__file__).parent
 USER_DATA_DIR = ROOT_DIR / "user_data"
@@ -51,12 +57,17 @@ def get_crm_file_path(user_id: str) -> Path:
     return user_dir / "crm_data.json"
 
 
-def load_crm_data(user_id: str) -> Dict[str, Any]:
-    path = get_crm_file_path(user_id)
-    if not path.exists():
-        return {"customers": {}}
+@lru_cache(maxsize=256)
+def _load_crm_data_cached(
+    path_str: str,
+    mtime_ns: int,
+    file_size: int,
+    generation: int,
+) -> Dict[str, Any]:
+    """Read one immutable CRM snapshot keyed by the exact file revision."""
+    del mtime_ns, file_size, generation
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path_str, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
             return {"customers": {}}
@@ -66,11 +77,35 @@ def load_crm_data(user_id: str) -> Dict[str, Any]:
         return {"customers": {}}
 
 
+def load_crm_data(user_id: str) -> Dict[str, Any]:
+    path = get_crm_file_path(user_id)
+    if not path.exists():
+        return {"customers": {}}
+    try:
+        stat = path.stat()
+        cached = _load_crm_data_cached(
+            str(path),
+            int(stat.st_mtime_ns),
+            int(stat.st_size),
+            cache_generation("crm", _safe_user_id(user_id)),
+        )
+        # Callers update nested records, so never expose the cached object.
+        return deepcopy(cached)
+    except Exception:
+        return {"customers": {}}
+
+
 def save_crm_data(user_id: str, data: Dict[str, Any]) -> None:
     path = get_crm_file_path(user_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+    invalidate_cache("crm", _safe_user_id(user_id))
 
 
 def make_customer_key(company_name: Any = "", business_no: Any = "") -> str:
@@ -220,3 +255,53 @@ def get_due_action_summary(user_id: str, today: str | None = None) -> Dict[str, 
             result["week"].append(item)
 
     return result
+
+
+def get_home_dashboard_summary(
+    user_id: str,
+    today: str | None = None,
+) -> tuple[Dict[str, int], Dict[str, Any]]:
+    """Build both home summaries from one CRM snapshot."""
+    from datetime import date, datetime, timedelta
+
+    data = load_crm_data(user_id)
+    summary: Dict[str, int] = {status: 0 for status in STATUS_OPTIONS}
+    due_result: Dict[str, Any] = {"today": [], "overdue": [], "week": []}
+
+    base_date = date.today()
+    if today:
+        try:
+            base_date = datetime.strptime(today, "%Y-%m-%d").date()
+        except ValueError:
+            pass
+
+    for customer_key, record in data.get("customers", {}).items():
+        if not isinstance(record, dict):
+            continue
+        status = record.get("status", "신규") or "신규"
+        summary[status] = summary.get(status, 0) + 1
+
+        raw_date = str(record.get("next_date", "") or "").strip()
+        if not raw_date:
+            continue
+        try:
+            due = datetime.strptime(raw_date[:10], "%Y-%m-%d").date()
+        except ValueError:
+            continue
+
+        item = {
+            "customer_key": customer_key,
+            "company_name": record.get("company_name", ""),
+            "business_no": record.get("business_no", ""),
+            "next_action": record.get("next_action", "없음"),
+            "next_date": raw_date[:10],
+            "status": status,
+        }
+        if due == base_date:
+            due_result["today"].append(item)
+        elif due < base_date:
+            due_result["overdue"].append(item)
+        elif due <= base_date + timedelta(days=7):
+            due_result["week"].append(item)
+
+    return summary, due_result

@@ -8,6 +8,8 @@ from pathlib import Path
 from io import BytesIO
 import shutil
 from copy import copy
+from functools import lru_cache
+import uuid
 
 
 
@@ -74,15 +76,12 @@ def find_customer_template():
     """
     candidates = [
         TEMPLATE_DIR / "고객DB_양식v2.xlsx",
-        ROOT_DIR / "고객DB_양식v2.xlsx",
-        ROOT_DIR / "고객DB.xlsx",
-        ROOT_DIR / "고객DB(16).xlsx",
     ]
 
-    # 일부 환경에서 한글 파일명이 깨져 들어온 경우까지 대비해 xlsx 전체를 탐색한다.
-    for folder in [TEMPLATE_DIR, ROOT_DIR]:
-        if folder.exists():
-            candidates.extend(folder.glob("*.xlsx"))
+    # 템플릿 디렉터리만 탐색한다. 루트의 고객DB.xlsx는 실제 고객자료일 수
+    # 있으므로 다운로드 양식의 대체 파일로 절대 사용하지 않는다.
+    if TEMPLATE_DIR.exists():
+        candidates.extend(TEMPLATE_DIR.glob("*.xlsx"))
 
     seen = set()
     for path in candidates:
@@ -91,9 +90,9 @@ def find_customer_template():
             continue
         seen.add(path)
         try:
-            xls = pd.ExcelFile(path)
-            if "고객DB" in xls.sheet_names:
-                return path
+            with pd.ExcelFile(path) as xls:
+                if "고객DB" in xls.sheet_names:
+                    return path
         except Exception:
             continue
 
@@ -217,8 +216,10 @@ def extract_company_previews(result_file):
     previews = {}
 
     try:
-        xls = pd.ExcelFile(result_file)
-        company_sheets = [s for s in xls.sheet_names if s.startswith("업체별_")]
+        with pd.ExcelFile(result_file) as xls:
+            company_sheets = [
+                s for s in xls.sheet_names if s.startswith("업체별_")
+            ]
 
         for sheet in company_sheets:
             df_raw = pd.read_excel(result_file, sheet_name=sheet, header=None)
@@ -294,6 +295,13 @@ def get_user_cumulative_db_path(user_id):
 CUSTOMER_DB_SHEET_NAME = "고객DB"
 LEGACY_CUMULATIVE_SHEET_NAME = "고객DB누적"
 CUMULATIVE_META_COLUMNS = ["누적저장일시", "회원ID", "담당자명"]
+
+
+def _is_blank_cumulative_value(value) -> bool:
+    if value is None:
+        return True
+    text = str(value).strip().lower()
+    return text in {"", "nan", "none", "nat"}
 
 
 def _normalize_customer_db_frame(df, columns=None):
@@ -452,8 +460,96 @@ def _write_cumulative_customer_db(cumulative_path, df, columns=None):
 
     cumulative_path = Path(cumulative_path)
     cumulative_path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(cumulative_path)
+    temp_path = cumulative_path.with_name(
+        f".{cumulative_path.name}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        wb.save(temp_path)
+        os.replace(temp_path, cumulative_path)
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
     return df
+
+
+@lru_cache(maxsize=256)
+def _inspect_cumulative_customer_db_format(
+    path_str: str,
+    mtime_ns: int,
+    file_size: int,
+    expected_columns: tuple[str, ...],
+) -> tuple[bool, int]:
+    """Inspect one exact workbook revision without rewriting it."""
+    del mtime_ns, file_size
+    from openpyxl import load_workbook
+
+    workbook = None
+    try:
+        workbook = load_workbook(path_str, read_only=True, data_only=True)
+        required_sheets = {
+            CUSTOMER_DB_SHEET_NAME,
+            "상시정책자금DB",
+            "고용지원금DB",
+            "코드표",
+            "사용가이드",
+        }
+        if not required_sheets.issubset(set(workbook.sheetnames)):
+            return False, 0
+
+        worksheet = workbook[CUSTOMER_DB_SHEET_NAME]
+        header_row = None
+        headers: list[str] = []
+        for row_number in range(1, min(worksheet.max_row, 10) + 1):
+            values = [
+                str(
+                    worksheet.cell(row=row_number, column=column_number).value
+                    or ""
+                ).strip()
+                for column_number in range(1, worksheet.max_column + 1)
+            ]
+            if "업체명" in values:
+                header_row = row_number
+                headers = values
+                break
+
+        if header_row is None:
+            return False, 0
+        if any(column in headers for column in CUMULATIVE_META_COLUMNS):
+            return False, 0
+        if any(column not in headers for column in expected_columns):
+            return False, 0
+
+        company_column = headers.index("업체명") + 1
+        business_column = (
+            headers.index("사업자등록번호") + 1
+            if "사업자등록번호" in headers
+            else None
+        )
+        row_count = 0
+        for row_number in range(header_row + 1, worksheet.max_row + 1):
+            company = worksheet.cell(row_number, company_column).value
+            business_no = (
+                worksheet.cell(row_number, business_column).value
+                if business_column
+                else None
+            )
+            if not _is_blank_cumulative_value(company) or not _is_blank_cumulative_value(
+                business_no
+            ):
+                row_count += 1
+        return True, row_count
+    except Exception:
+        return False, 0
+    finally:
+        if workbook is not None:
+            try:
+                workbook.close()
+            except Exception:
+                pass
 
 
 
@@ -466,13 +562,26 @@ def ensure_user_cumulative_db_format(user_id):
     - 고객DB 시트명으로 저장
     - 상시정책자금DB/고용지원금DB/코드표/사용가이드 유지
     - 누적저장일시/회원ID/담당자명 제거
-    - 이미 최신 형식이어도 템플릿 기반으로 다시 저장해 서식/시트 구조를 보정
+    - 최신 형식이면 파일을 다시 쓰지 않아 읽기 캐시와 파일 mtime을 유지
     """
     cumulative_path = get_user_cumulative_db_path(user_id)
     if not cumulative_path.exists():
         return cumulative_path, 0, False
 
     columns = get_customer_db_columns()
+    try:
+        stat = cumulative_path.stat()
+        is_current, row_count = _inspect_cumulative_customer_db_format(
+            str(cumulative_path),
+            int(stat.st_mtime_ns),
+            int(stat.st_size),
+            tuple(columns),
+        )
+        if is_current:
+            return cumulative_path, row_count, False
+    except Exception:
+        pass
+
     df = _read_cumulative_customer_db(cumulative_path, columns)
     _write_cumulative_customer_db(cumulative_path, df, columns)
     return cumulative_path, len(df), True

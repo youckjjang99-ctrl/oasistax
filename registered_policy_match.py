@@ -8,7 +8,10 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import streamlit as st
 from openpyxl import load_workbook
+
+from performance_cache import cache_generation
 
 
 def normalize_business_no(value: Any) -> str:
@@ -51,7 +54,6 @@ def _load_registered_customers_from_cloud(
     """Supabase에서 로그인 회원 소유 고객을 조회한다."""
     owner_user_id = str(owner_user_id or "").strip().lower()
     if not owner_user_id:
-        print("[OASIS_CUSTOMERS_ERROR] owner_user_id is empty", flush=True)
         return None
 
     try:
@@ -61,44 +63,19 @@ def _load_registered_customers_from_cloud(
             cloud_is_configured,
         )
 
-        configured = cloud_is_configured()
-        print(
-            f"[OASIS_CUSTOMERS] configured={configured} "
-            f"table={TABLE_CUSTOMERS} owner={owner_user_id}",
-            flush=True,
-        )
-        if not configured:
+        if not cloud_is_configured():
             return None
 
         database = CloudDatabase()
-        rows = database.select(
+        rows = database.select_all(
             TABLE_CUSTOMERS,
             filters={"owner_user_id": owner_user_id},
-            order="company_name.asc",
+            order="company_name.asc,id.asc",
+            max_rows=50000,
         )
 
-        # 과거 데이터에 대소문자 또는 앞뒤 공백이 섞인 경우도 복구한다.
-        if not rows:
-            all_rows = database.select(
-                TABLE_CUSTOMERS,
-                order="company_name.asc",
-            )
-            rows = [
-                row for row in all_rows
-                if str(row.get("owner_user_id", "")).strip().lower()
-                == owner_user_id
-            ]
-            print(
-                f"[OASIS_CUSTOMERS] exact_count=0 "
-                f"all_count={len(all_rows)} recovered_count={len(rows)}",
-                flush=True,
-            )
-    except Exception as exc:
-        print(
-            f"[OASIS_CUSTOMERS_ERROR] owner={owner_user_id} "
-            f"type={type(exc).__name__} error={exc}",
-            flush=True,
-        )
+        # Service-role 조회는 소유자 조건을 절대 제거하지 않는다.
+    except Exception:
         return None
 
     records: list[dict[str, Any]] = []
@@ -123,11 +100,6 @@ def _load_registered_customers_from_cloud(
             records.append(record)
 
     df = pd.DataFrame(records)
-    print(
-        f"[OASIS_CUSTOMERS] owner={owner_user_id} "
-        f"row_count={len(rows)} dataframe_count={len(df)}",
-        flush=True,
-    )
     if df.empty:
         return df
 
@@ -158,6 +130,27 @@ def _load_registered_customers_from_excel(
     return df.reset_index(drop=True)
 
 
+@st.cache_data(
+    ttl=45,
+    max_entries=128,
+    show_spinner=False,
+    scope="session",
+)
+def _load_registered_customers_cached(
+    cumulative_path_str: str,
+    file_mtime_ns: int,
+    file_size: int,
+    owner_user_id: str,
+    generation: int,
+) -> pd.DataFrame:
+    """Cache one user-scoped customer list for a short, bounded period."""
+    del file_mtime_ns, file_size, generation
+    cloud_df = _load_registered_customers_from_cloud(owner_user_id)
+    if cloud_df is not None:
+        return cloud_df
+    return _load_registered_customers_from_excel(Path(cumulative_path_str))
+
+
 def load_registered_customers(
     cumulative_path: Path,
     owner_user_id: str | None = None,
@@ -167,18 +160,22 @@ def load_registered_customers(
         explicit_owner
         or _owner_user_id_from_cumulative_path(cumulative_path).lower()
     )
-    cloud_df = _load_registered_customers_from_cloud(resolved_owner)
-
-    if cloud_df is not None:
-        return cloud_df
-
-    excel_df = _load_registered_customers_from_excel(cumulative_path)
-    print(
-        f"[OASIS_CUSTOMERS] source=excel owner={resolved_owner} "
-        f"count={len(excel_df)} path={cumulative_path}",
-        flush=True,
+    cumulative_path = Path(cumulative_path)
+    try:
+        stat = cumulative_path.stat()
+        mtime_ns = int(stat.st_mtime_ns)
+        file_size = int(stat.st_size)
+    except OSError:
+        mtime_ns = 0
+        file_size = 0
+    cached = _load_registered_customers_cached(
+        str(cumulative_path),
+        mtime_ns,
+        file_size,
+        resolved_owner,
+        cache_generation("registered_customers", resolved_owner),
     )
-    return excel_df
+    return cached.copy()
 
 
 def build_customer_labels(df: pd.DataFrame) -> tuple[list[str], dict[str, int]]:

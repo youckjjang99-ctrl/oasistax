@@ -9,25 +9,6 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from consulting_report import (
-    build_consulting_analysis,
-    build_consulting_excel_report,
-)
-from articles_review import (
-    get_latest_articles_review,
-    render_articles_review,
-)
-from employee_status import render_employee_status
-from enterprise_consulting_engine import (
-    reconcile_enterprise_consulting_context,
-)
-from consultation_journal import (
-    get_company_consultation_context,
-    render_audio_consultation_journal,
-    render_saved_consultation_journals,
-)
-
-from cloud_sync import sync_crm_record
 from crm import (
     ACTION_OPTIONS,
     STATUS_OPTIONS,
@@ -42,19 +23,6 @@ from crm_enhancements import (
     merge_profile_into_crm_record,
     save_crm_profile,
 )
-from customer_history import (
-    build_change_summary,
-    build_history_table,
-    get_customer_history,
-)
-from matching_preferences import (
-    INTEREST_OPTIONS,
-    get_matching_preferences,
-    save_matching_preferences,
-)
-from multi_source_policy import render_multi_source_match
-from stock_valuation import render_stock_valuation_page
-from temporary_advance_ui import render_temporary_advance_calculator
 from registered_policy_match import (
     build_customer_labels,
     load_registered_customers,
@@ -489,15 +457,7 @@ def render_enterprise_management_center(
     customer_key = make_customer_key(company_name, business_no)
     crm_widget_suffix = f"{user_id}:{customer_key}"
 
-    integration = reconcile_enterprise_consulting_context(
-        user_id=user_id,
-        business_no=business_no,
-        company_name=company_name,
-    )
     financial = _financial_snapshot(user_id, business_no)
-    registry = _registry_snapshot(user_id, business_no)
-    stock = _stock_record(user_id, business_no)
-    preferences = integration.get("preferences", {}) or {}
     crm_record = get_customer_record(
         user_id,
         customer_key,
@@ -507,11 +467,6 @@ def render_enterprise_management_center(
         customer_key,
         business_no,
     )
-    history = get_customer_history(
-        user_id,
-        business_no,
-    )
-
     _render_enterprise_dashboard_styles()
 
     importance = str(crm_profile.get("priority", "3") or "3")
@@ -536,16 +491,19 @@ def render_enterprise_management_center(
         unsafe_allow_html=True,
     )
 
-    if st.button(
+    def _open_selected_company_in_copilot() -> None:
+        st.session_state["_oasis_copilot_business_no"] = business_no
+        st.session_state["_oasis_copilot_company_name"] = company_name
+        st.session_state["sidebar_menu_group_v1020"] = "주요업무"
+        st.session_state["active_main_menu_v1020"] = "AI 코파일럿"
+
+    st.button(
         "이 기업 AI 코파일럿으로 분석하기",
         type="primary",
         use_container_width=True,
         key=f"enterprise_open_copilot_{business_no or company_name}",
-    ):
-        st.session_state["_oasis_copilot_business_no"] = business_no
-        st.session_state["_oasis_copilot_company_name"] = company_name
-        st.session_state["_oasis_pending_main_menu"] = "AI 코파일럿"
-        st.rerun()
+        on_click=_open_selected_company_in_copilot,
+    )
 
     sales = _first_value(
         selected_row,
@@ -580,29 +538,27 @@ def render_enterprise_management_center(
         ),
     )
 
-    (
-        tab_overview,
-        tab_crm,
-        tab_policy,
-        tab_stock,
-        tab_articles,
-        tab_history,
-        tab_employees,
-        tab_temporary_advance,
-    ) = st.tabs(
-        [
-            "기업정보",
-            "CRM",
-            "정책자금",
-            "주가평가·등기",
-            "정관검토",
-            "기업히스토리",
-            "직원현황",
-            "가지급금 계산기",
-        ]
+    section_options = [
+        "기업정보",
+        "CRM",
+        "정책자금",
+        "주가평가·등기",
+        "정관검토",
+        "기업히스토리",
+        "직원현황",
+        "가지급금 계산기",
+    ]
+    selected_section = st.pills(
+        "기업컨설팅 세부메뉴",
+        section_options,
+        default="기업정보",
+        selection_mode="single",
+        key="enterprise_section_v1030",
+        label_visibility="collapsed",
     )
+    selected_section = selected_section or "기업정보"
 
-    with tab_overview:
+    if selected_section == "기업정보":
         left, right = st.columns(2)
         with left:
             st.markdown("#### 기본정보")
@@ -766,12 +722,24 @@ def render_enterprise_management_center(
                 use_container_width=True,
             )
 
-    with tab_crm:
-        crm_manage_tab, journal_view_tab = st.tabs(
-            ["CRM 관리", "녹음파일 상담일지 보기"]
+    elif selected_section == "CRM":
+        from cloud_sync import sync_crm_record
+        from consultation_journal import (
+            render_audio_consultation_journal,
+            render_saved_consultation_journals,
         )
 
-        with crm_manage_tab:
+        crm_section = st.segmented_control(
+            "CRM 세부메뉴",
+            ["CRM 관리", "녹음파일 상담일지 보기"],
+            default="CRM 관리",
+            selection_mode="single",
+            key="enterprise_crm_section_v1030",
+            label_visibility="collapsed",
+        )
+        crm_section = crm_section or "CRM 관리"
+
+        if crm_section == "CRM 관리":
             c1, c2, c3 = st.columns(3)
             with c1:
                 current_status = crm_record.get("status", "신규")
@@ -910,10 +878,14 @@ def render_enterprise_management_center(
                         business_no,
                         updated_crm,
                     )
+                    # The save button already caused Streamlit's normal rerun.
+                    # Keep the fresh record available to the audio section below
+                    # instead of starting a second full-page rerun.
+                    crm_record = updated_crm
+                    crm_profile = profile
                     st.success(
                         "CRM 내용을 로컬과 Supabase에 저장했습니다."
                     )
-                    st.rerun()
                 else:
                     st.error(message)
 
@@ -932,7 +904,7 @@ def render_enterprise_management_center(
             )
 
 
-        with journal_view_tab:
+        else:
             render_saved_consultation_journals(
                 user_id=user_id,
                 business_no=business_no,
@@ -943,7 +915,22 @@ def render_enterprise_management_center(
                 "최신 키워드와 추천 결과가 반영됩니다."
             )
 
-    with tab_policy:
+    elif selected_section == "정책자금":
+        from enterprise_consulting_engine import (
+            reconcile_enterprise_consulting_context,
+        )
+        from matching_preferences import (
+            INTEREST_OPTIONS,
+            save_matching_preferences,
+        )
+        from multi_source_policy import render_multi_source_match
+
+        integration = reconcile_enterprise_consulting_context(
+            user_id=user_id,
+            business_no=business_no,
+            company_name=company_name,
+        )
+        preferences = integration.get("preferences", {}) or {}
         st.markdown("#### 고객별 정책자금 매칭설정")
         added_keywords = integration.get("added_keywords", []) or []
         added_interests = integration.get("added_interests", []) or []
@@ -1062,7 +1049,9 @@ def render_enterprise_management_center(
             current_policy_preferences,
         )
 
-    with tab_stock:
+    elif selected_section == "주가평가·등기":
+        from stock_valuation import render_stock_valuation_page
+
         selected_stock_label = (
             f"{company_name} · {business_no}"
             if business_no
@@ -1078,14 +1067,26 @@ def render_enterprise_management_center(
             user_name=user_name,
         )
 
-    with tab_articles:
+    elif selected_section == "정관검토":
+        from articles_review import render_articles_review
+
         render_articles_review(
             user_id=user_id,
             business_no=business_no,
             company_name=company_name,
         )
 
-    with tab_history:
+    elif selected_section == "기업히스토리":
+        from customer_history import (
+            build_change_summary,
+            build_history_table,
+            get_customer_history,
+        )
+
+        history = get_customer_history(
+            user_id,
+            business_no,
+        )
         if history:
             st.markdown("#### 직전 자료 대비 변화")
             for message in build_change_summary(history):
@@ -1102,7 +1103,9 @@ def render_enterprise_management_center(
                 "기업 히스토리가 없습니다. 크레탑 PDF를 다시 분석하면 기록됩니다."
             )
 
-    with tab_employees:
+    elif selected_section == "직원현황":
+        from employee_status import render_employee_status
+
         company_address = _first_value(
             selected_row,
             {},
@@ -1119,7 +1122,20 @@ def render_enterprise_management_center(
             company_address=company_address,
         )
 
-    with tab_temporary_advance:
+    elif selected_section == "가지급금 계산기":
+        from enterprise_consulting_engine import (
+            reconcile_enterprise_consulting_context,
+        )
+        from temporary_advance_ui import (
+            render_temporary_advance_calculator,
+        )
+
+        integration = reconcile_enterprise_consulting_context(
+            user_id=user_id,
+            business_no=business_no,
+            company_name=company_name,
+        )
+        preferences = integration.get("preferences", {}) or {}
         render_temporary_advance_calculator(
             user_id=user_id,
             user_name=user_name,

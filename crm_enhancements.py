@@ -110,6 +110,31 @@ def save_crm_profile(
     return record
 
 
+def save_crm_profiles_bulk(
+    user_id: str,
+    profiles: dict[str, dict[str, Any]],
+) -> int:
+    """Merge several profile updates and write the local file once."""
+    if not profiles:
+        return 0
+    data = _load_all(user_id)
+    updated = 0
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for customer_key, profile in profiles.items():
+        if not customer_key or not isinstance(profile, dict):
+            continue
+        record = dict(profile)
+        record.setdefault("pipeline_stage", "신규")
+        record.setdefault("priority", "3")
+        record.setdefault("assigned_manager", "")
+        record.setdefault("updated_at", now)
+        data[customer_key] = record
+        updated += 1
+    if updated:
+        _save_all(user_id, data)
+    return updated
+
+
 def merge_profile_into_crm_record(
     crm_record: dict[str, Any],
     profile: dict[str, Any],

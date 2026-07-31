@@ -4809,6 +4809,7 @@ def _render_personal_request(
                 )
                 message += f" {failed_labels} 요청은 실패해 다시 요청해야 합니다."
             st.session_state["_claim_flash_v1"] = message
+            # Reload the case/job state after the provider request starts.
             st.rerun()
         transient.clear()
         for label, message in provider_failures:
@@ -4986,7 +4987,7 @@ def _cases_dataframe(cases: list[dict[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-@st.fragment(run_every="2s")
+@st.fragment(run_every="3s")
 def _render_auto_claim_monitor(
     user_id: str,
     case_id: str,
@@ -5572,13 +5573,24 @@ def _build_claim_documents_zip(
     used_names: set[str] = set()
     total_bytes = 0
     try:
+        document_ids = [
+            str(document.get("id", "") or "")
+            for document in documents
+        ]
+        download_urls = repository.document_download_urls(
+            case_id,
+            document_ids,
+        )
+        if len(download_urls) != len(documents):
+            raise ClaimRepositoryError(
+                "전체 서류의 다운로드 링크를 준비하지 못했습니다. "
+                "잠시 후 다시 시도해 주세요."
+            )
         with ZipFile(archive, "w", compression=ZIP_DEFLATED) as zip_file:
-            for index, document in enumerate(documents, start=1):
-                document_id = str(document.get("id", "") or "")
-                download_url = repository.document_download_url(
-                    case_id,
-                    document_id,
-                )
+            for index, (document, download_url) in enumerate(
+                zip(documents, download_urls),
+                start=1,
+            ):
                 response = requests.get(
                     download_url,
                     timeout=(5, 45),
@@ -6138,6 +6150,7 @@ def _show_collection_complete_dialog(message: str) -> None:
         type="primary",
         key="claim_collection_complete_dialog_close",
     ):
+        # Streamlit dialogs close on a rerun; this refresh is intentional.
         st.rerun()
 
 
@@ -6174,27 +6187,34 @@ def render_claim_correction_center(
             bool(readiness.get("simple_auth_ready")),
         )
 
-    request_tab, status_tab, result_tab, catalog_tab = st.tabs(
-        ["인증 요청", "진행상황", "수집결과", "수집 항목"]
+    active_section = (
+        st.segmented_control(
+            "경정청구 화면",
+            ["인증 요청", "진행상황", "수집결과", "수집 항목"],
+            default="인증 요청",
+            key="claim_correction_section_v1032",
+            label_visibility="collapsed",
+        )
+        or "인증 요청"
     )
-    with request_tab:
+    if active_section == "인증 요청":
         _render_request_tab(
             user_id,
             user_name,
             repository,
             readiness,
         )
-    with status_tab:
+    elif active_section == "진행상황":
         _render_status_tab(
             user_id,
             repository,
             bool(readiness.get("simple_auth_ready")),
         )
-    with result_tab:
+    elif active_section == "수집결과":
         _render_results_tab(
             user_id,
             repository,
             bool(readiness.get("simple_auth_ready")),
         )
-    with catalog_tab:
+    else:
         _render_catalog_tab()
