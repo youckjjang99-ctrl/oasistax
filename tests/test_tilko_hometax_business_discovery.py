@@ -95,7 +95,7 @@ class TilkoHometaxBusinessDiscoveryTests(unittest.TestCase):
 
         self.assertTrue(
             post.call_args.args[0].endswith(
-                "/api/v2.0/HometaxSimpleAuth/MyBizInfo"
+                "/api/v2.0/HometaxSimpleAuth/MyBusinessRegistrations2"
             )
         )
         self.assertEqual(

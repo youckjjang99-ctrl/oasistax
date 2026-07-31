@@ -530,7 +530,7 @@ class ClaimBusinessFallbackRegressionTests(unittest.TestCase):
                 "safe_error_code": "BUSINESS_NUMBER_NOT_FOUND"
             },
         }
-        legacy_unsupported = {
+        newly_supported = {
             "document_code": "hometax_income_tax_return",
             "status": "auth_pending",
             "facts": {},
@@ -542,10 +542,10 @@ class ClaimBusinessFallbackRegressionTests(unittest.TestCase):
         )
         self.assertEqual(
             _claim_result_document_status(
-                legacy_unsupported,
+                newly_supported,
                 {},
             ),
-            "자동수집 연동 예정",
+            "고객 인증 대기",
         )
 
     def test_no_data_status_is_not_presented_as_downloadable_document(self):
@@ -799,14 +799,14 @@ class ClaimBusinessFallbackRegressionTests(unittest.TestCase):
             "hometax_business_registration_list",
             "hometax_business_registration_certificate",
             "hometax_tax_payment_certificate",
+            "hometax_income_tax_help",
+            "hometax_income_tax_return",
+            "hometax_closure_certificate",
             "comwel_total_remuneration",
             "comwel_management_number_list",
             "comwel_workplace_rate",
         }
         unsupported_codes = {
-            "hometax_income_tax_help",
-            "hometax_income_tax_return",
-            "hometax_closure_certificate",
             "hometax_refund",
             "comwel_worker_status",
         }
