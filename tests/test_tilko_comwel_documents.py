@@ -162,6 +162,44 @@ class TilkoComwelDocumentTests(unittest.TestCase):
         self.assertNotIn("홍길동", stored)
 
     @patch("tilko_claim_client.requests.post")
+    def test_total_remuneration_7701001_returns_no_data_json(self, post):
+        post.return_value = _JsonResponse(
+            {
+                "ErrorCode": 1,
+                "TargetCode": "7701001",
+                "ApiTxKey": "remuneration-no-data-reference",
+                "Result": [],
+            }
+        )
+
+        document = _client().collect_comwel_total_remuneration(
+            year=2025,
+            identity_number="9010191234567",
+            user_name="홍길동",
+            cellphone="01012345678",
+            session=_session(),
+            business_number="2208162517",
+        )
+
+        self.assertEqual(document.content_type, "application/json")
+        self.assertEqual(
+            document.file_name,
+            "comwel-total-remuneration-2025-no-data.json",
+        )
+        self.assertEqual(
+            document.facts,
+            {
+                "no_data": True,
+                "record_count": 0,
+                "year": "2025",
+            },
+        )
+        self.assertEqual(
+            json.loads(document.content.decode("utf-8")),
+            document.facts,
+        )
+
+    @patch("tilko_claim_client.requests.post")
     def test_total_remuneration_nonempty_result_without_file_still_fails(
         self,
         post,
