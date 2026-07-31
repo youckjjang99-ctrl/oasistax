@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -18,6 +19,7 @@ from tilko_claim_client import CollectedClaimDocument
 
 CLAIM_STORAGE_BUCKET = "oasis-claim-documents"
 CLAIM_DOWNLOAD_URL_TTL_SECONDS = 60
+CLAIM_DOCUMENT_PAGE_SIZE = 500
 CLAIM_DOWNLOAD_EXTENSION_BY_CONTENT_TYPE = {
     "application/pdf": ".pdf",
     "application/json": ".json",
@@ -25,6 +27,8 @@ CLAIM_DOWNLOAD_EXTENSION_BY_CONTENT_TYPE = {
     "application/vnd.ms-excel": ".xls",
     "text/csv": ".csv",
 }
+CLAIM_DEFAULT_COLLECTION_KEY = "default"
+_CLAIM_COLLECTION_KEY_PATTERN = re.compile(r"^v_[0-9a-f]{32}$")
 
 
 def _owner_storage_folder(owner_user_id: str) -> str:
@@ -33,6 +37,13 @@ def _owner_storage_folder(owner_user_id: str) -> str:
 
 def _safe_download_file_name(value: Any, fallback: str) -> str:
     raw_name = str(value or "").replace("\\", "/").split("/")[-1].strip()
+    raw_name = re.sub(
+        r"(?<!\d)(\d{3})[- _]?(\d{2})[- _]?(\d{3})(\d{2})(?!\d)",
+        lambda match: (
+            f"{match.group(1)}-XX-XXX{match.group(4)}"
+        ),
+        raw_name,
+    )
     clean_name = "".join(
         character
         for character in raw_name
@@ -122,6 +133,51 @@ def _safe_storage_error(exc: Exception) -> ClaimRepositoryError:
     )
 
 
+def _collection_key(value: Any) -> str:
+    selected = str(value or CLAIM_DEFAULT_COLLECTION_KEY).strip().lower()
+    if (
+        selected != CLAIM_DEFAULT_COLLECTION_KEY
+        and not _CLAIM_COLLECTION_KEY_PATTERN.fullmatch(selected)
+    ):
+        raise ClaimRepositoryError(
+            "수집 자료 구분값을 확인하지 못했습니다."
+        )
+    return selected
+
+
+def _safe_variant_facts(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    blocked = {
+        "identity_number",
+        "birth_date",
+        "cellphone",
+        "business_number",
+        "business_numbers",
+        "management_number",
+        "management_numbers",
+        "resident_number",
+    }
+    return {
+        str(key): candidate
+        for key, candidate in value.items()
+        if str(key) not in blocked
+    }
+
+
+def _rpc_signature_unavailable(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "pgrst202",
+            "could not find the function",
+            "function public.oasis_claim_list_documents",
+            "oasis_claim_list_documents(p_case_id",
+        )
+    )
+
+
 class ClaimRepository:
     def __init__(
         self,
@@ -162,12 +218,22 @@ class ClaimRepository:
         consent_channel: str,
         retention_policy_version: str,
         collection_authority_confirmed: bool,
+        case_id: str | None = None,
     ) -> dict[str, Any]:
         if not collection_authority_confirmed:
             raise ClaimRepositoryError(
                 "고객 동의와 자료조회 권한 확인이 필요합니다."
             )
-        case_id = str(uuid.uuid4())
+        try:
+            case_id = (
+                str(uuid.UUID(str(case_id).strip()))
+                if case_id
+                else str(uuid.uuid4())
+            )
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ClaimRepositoryError(
+                "경정청구 요청 식별값을 확인하지 못했습니다."
+            ) from exc
         now = _now()
         source_set = {str(source or "").strip().lower() for source in selected_sources}
         case = {
@@ -222,6 +288,7 @@ class ClaimRepository:
                         "document_code": row["document_code"],
                         "document_name": row["document_name"],
                         "period_year": row["period_year"],
+                        "collection_key": CLAIM_DEFAULT_COLLECTION_KEY,
                         "status": (
                             "auth_pending"
                             if automatic_collection_supported(
@@ -321,15 +388,46 @@ class ClaimRepository:
             raise _safe_storage_error(exc) from exc
 
     def list_documents(self, case_id: str) -> list[dict[str, Any]]:
+        safe_case_id = str(case_id)
+        collected: list[dict[str, Any]] = []
+        offset = 0
         try:
-            rows = self.database.rpc(
-                "oasis_claim_list_documents",
-                {
-                    "p_owner_user_id": self.owner_user_id,
-                    "p_case_id": str(case_id),
-                },
-            )
-            return rows if isinstance(rows, list) else []
+            while True:
+                try:
+                    rows = self.database.rpc(
+                        "oasis_claim_list_documents",
+                        {
+                            "p_owner_user_id": self.owner_user_id,
+                            "p_case_id": safe_case_id,
+                            "p_limit": CLAIM_DOCUMENT_PAGE_SIZE,
+                            "p_offset": offset,
+                        },
+                    )
+                except Exception as exc:
+                    if offset != 0 or not _rpc_signature_unavailable(exc):
+                        raise
+                    # Rolling-deploy compatibility: an app release can reach
+                    # the legacy two-argument RPC before v10.2.9 is applied.
+                    # Once the migration lands, all reads use paginated calls.
+                    legacy_rows = self.database.rpc(
+                        "oasis_claim_list_documents",
+                        {
+                            "p_owner_user_id": self.owner_user_id,
+                            "p_case_id": safe_case_id,
+                        },
+                    )
+                    return (
+                        legacy_rows
+                        if isinstance(legacy_rows, list)
+                        else []
+                    )
+                page = rows if isinstance(rows, list) else []
+                collected.extend(
+                    row for row in page if isinstance(row, dict)
+                )
+                if len(page) < CLAIM_DOCUMENT_PAGE_SIZE:
+                    return collected
+                offset += CLAIM_DOCUMENT_PAGE_SIZE
         except Exception as exc:
             raise _safe_storage_error(exc) from exc
 
@@ -407,7 +505,9 @@ class ClaimRepository:
         case_id: str,
         document_code: str,
         period_year: int | None = None,
+        collection_key: str = CLAIM_DEFAULT_COLLECTION_KEY,
     ) -> dict[str, Any]:
+        selected_collection_key = _collection_key(collection_key)
         documents = self.list_documents(case_id)
         matches = [
             document
@@ -417,12 +517,57 @@ class ClaimRepository:
                 period_year is None
                 or int(document.get("period_year") or 0) == int(period_year)
             )
+            and str(
+                document.get(
+                    "collection_key",
+                    CLAIM_DEFAULT_COLLECTION_KEY,
+                )
+                or CLAIM_DEFAULT_COLLECTION_KEY
+            ).strip().lower()
+            == selected_collection_key
         ]
         if len(matches) != 1:
             raise ClaimRepositoryError(
                 "수집할 경정청구 서류 항목을 확인하지 못했습니다."
             )
         return matches[0]
+
+    def ensure_document_variant(
+        self,
+        case_id: str,
+        *,
+        document_code: str,
+        collection_key: str,
+        period_year: int | None = None,
+        facts: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        selected_collection_key = _collection_key(collection_key)
+        safe_facts = _safe_variant_facts(facts)
+        try:
+            rows = self.database.rpc(
+                "oasis_claim_ensure_document_variant",
+                {
+                    "p_owner_user_id": self.owner_user_id,
+                    "p_case_id": str(case_id),
+                    "p_document_code": str(document_code or "").strip(),
+                    "p_period_year": (
+                        int(period_year) if period_year is not None else None
+                    ),
+                    "p_collection_key": selected_collection_key,
+                    "p_document_id": str(uuid.uuid4()),
+                    "p_facts": safe_facts,
+                },
+            )
+        except Exception as exc:
+            raise _safe_storage_error(exc) from exc
+        if isinstance(rows, list) and rows:
+            return rows[0]
+        return self._document_by_code(
+            case_id,
+            document_code,
+            period_year,
+            selected_collection_key,
+        )
 
     def store_collected_document(
         self,
@@ -431,12 +576,28 @@ class ClaimRepository:
         document_code: str,
         document: CollectedClaimDocument,
         period_year: int | None = None,
+        collection_key: str = CLAIM_DEFAULT_COLLECTION_KEY,
     ) -> dict[str, Any]:
-        target = self._document_by_code(
-            case_id,
-            document_code,
-            period_year,
-        )
+        selected_collection_key = _collection_key(collection_key)
+        if selected_collection_key == CLAIM_DEFAULT_COLLECTION_KEY:
+            target = self._document_by_code(
+                case_id,
+                document_code,
+                period_year,
+                selected_collection_key,
+            )
+        else:
+            target = self.ensure_document_variant(
+                case_id,
+                document_code=document_code,
+                period_year=period_year,
+                collection_key=selected_collection_key,
+                # Facts are finalized only after the replacement object is
+                # safely uploaded. Updating an existing ready variant here
+                # could make an old file appear to belong to a new scope if
+                # the upload or finalize step later failed.
+                facts={},
+            )
         document_id = str(target.get("id", "")).strip()
         if not document_id:
             raise ClaimRepositoryError("서류 저장 식별값이 없습니다.")
@@ -466,8 +627,37 @@ class ClaimRepository:
             raise ClaimRepositoryError(
                 "저장할 서류 파일 형식을 확인할 수 없습니다."
             )
-        storage_path = f"{owner_folder}/{case_id}/{document_id}{extension}"
         content_sha256 = hashlib.sha256(document.content).hexdigest()
+        previous_storage_bucket = str(
+            target.get("storage_bucket", "") or ""
+        ).strip()
+        previous_storage_path = str(
+            target.get("storage_path", "") or ""
+        ).strip()
+        previous_content_sha256 = str(
+            target.get("content_sha256", "") or ""
+        ).strip().lower()
+        previous_content_type = str(
+            target.get("content_type", "") or ""
+        ).strip().lower()
+        reusable_previous_object = bool(
+            str(target.get("status", "")) == "ready"
+            and previous_storage_bucket == CLAIM_STORAGE_BUCKET
+            and previous_storage_path
+            and previous_content_sha256 == content_sha256
+            and previous_content_type
+            == str(document.content_type or "").strip().lower()
+        )
+        storage_path = (
+            previous_storage_path
+            if reusable_previous_object
+            else (
+                f"{owner_folder}/{case_id}/{document_id}-"
+                f"{uuid.uuid4().hex[:16]}{extension}"
+                if previous_storage_path
+                else f"{owner_folder}/{case_id}/{document_id}{extension}"
+            )
+        )
         retention_days = max(
             1,
             min(
@@ -488,7 +678,17 @@ class ClaimRepository:
         facts = {
             key: value
             for key, value in dict(document.facts or {}).items()
-            if key not in {"identity_number", "birth_date", "cellphone"}
+            if key
+            not in {
+                "identity_number",
+                "birth_date",
+                "cellphone",
+                "business_number",
+                "business_numbers",
+                "management_number",
+                "management_numbers",
+                "resident_number",
+            }
         }
         facts["download_file_name"] = (
             str(document.file_name or "").strip()
@@ -497,13 +697,16 @@ class ClaimRepository:
         if provider_reference_hash:
             facts["provider_reference_sha256"] = provider_reference_hash
 
+        uploaded_new_object = False
         try:
-            self.database.upload_private_object(
-                CLAIM_STORAGE_BUCKET,
-                storage_path,
-                document.content,
-                document.content_type,
-            )
+            if not reusable_previous_object:
+                self.database.upload_private_object(
+                    CLAIM_STORAGE_BUCKET,
+                    storage_path,
+                    document.content,
+                    document.content_type,
+                )
+                uploaded_new_object = True
             rows = self.database.rpc(
                 "oasis_claim_finalize_document",
                 {
@@ -522,14 +725,27 @@ class ClaimRepository:
                 },
             )
         except Exception as exc:
+            if uploaded_new_object:
+                try:
+                    self.database.delete_private_object(
+                        CLAIM_STORAGE_BUCKET,
+                        storage_path,
+                    )
+                except Exception:
+                    pass
+            raise _safe_storage_error(exc) from exc
+        if (
+            previous_storage_bucket == CLAIM_STORAGE_BUCKET
+            and previous_storage_path
+            and previous_storage_path != storage_path
+        ):
             try:
                 self.database.delete_private_object(
                     CLAIM_STORAGE_BUCKET,
-                    storage_path,
+                    previous_storage_path,
                 )
             except Exception:
                 pass
-            raise _safe_storage_error(exc) from exc
         if isinstance(rows, list) and rows:
             return rows[0]
         target.update(
@@ -552,12 +768,26 @@ class ClaimRepository:
         document_code: str,
         safe_error_code: str,
         period_year: int | None = None,
+        collection_key: str = CLAIM_DEFAULT_COLLECTION_KEY,
+        facts: dict[str, Any] | None = None,
     ) -> None:
-        target = self._document_by_code(
-            case_id,
-            document_code,
-            period_year,
-        )
+        selected_collection_key = _collection_key(collection_key)
+        if selected_collection_key == CLAIM_DEFAULT_COLLECTION_KEY:
+            target = self._document_by_code(
+                case_id,
+                document_code,
+                period_year,
+                selected_collection_key,
+            )
+        else:
+            target = self.ensure_document_variant(
+                case_id,
+                document_code=document_code,
+                period_year=period_year,
+                collection_key=selected_collection_key,
+                facts=facts,
+            )
+        safe_facts = _safe_variant_facts(facts)
         try:
             self.database.rpc(
                 "oasis_claim_finalize_document",
@@ -572,7 +802,7 @@ class ClaimRepository:
                     "p_content_type": None,
                     "p_size_bytes": None,
                     "p_retention_until": None,
-                    "p_facts": {},
+                    "p_facts": safe_facts,
                     "p_safe_error_code": str(safe_error_code or "")[:80],
                 },
             )
@@ -616,12 +846,24 @@ class ClaimRepository:
             content_type,
             "",
         )
+        storage_stem = (
+            PurePosixPath(storage_parts[2]).stem
+            if len(storage_parts) == 3
+            else ""
+        )
+        valid_document_stem = bool(
+            storage_stem == safe_document_id
+            or re.fullmatch(
+                rf"{re.escape(safe_document_id)}-[0-9a-f]{{16}}",
+                storage_stem,
+            )
+        )
         if (
             storage_bucket != CLAIM_STORAGE_BUCKET
             or len(storage_parts) != 3
             or storage_parts[0] != expected_owner_folder
             or storage_parts[1] != safe_case_id
-            or PurePosixPath(storage_parts[2]).stem != safe_document_id
+            or not valid_document_stem
             or PurePosixPath(storage_parts[2]).suffix.lower()
             != expected_extension
         ):

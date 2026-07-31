@@ -5,6 +5,9 @@ pyarrow==18.1.0
 openpyxl==3.1.5
 requests==2.32.3
 cryptography==49.0.0
+fastapi==0.116.1
+uvicorn==0.35.0
+python-multipart==0.0.20
 pillow==11.1.0
 python-dateutil==2.9.0.post0
 pypdf==5.9.0

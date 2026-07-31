@@ -1,75 +1,88 @@
-# 경정청구 연동 설정
+# 경정청구 원격 인증·자료수집 운영 설정
 
-경정청구 화면은 기본적으로 외부 인증 요청을 보내지 않습니다. 승인된
-중계 API 계약과 아래 Railway 변수가 모두 설정된 경우에만 개인사업자
-카카오 인증 발송이 활성화됩니다.
+## 운영 흐름
 
-- 개인사업자: 담당자가 고객정보를 입력해 홈택스·근로복지공단 카카오
-  인증을 요청하고, 고객이 각 기관 인증을 승인합니다.
-- 법인사업자: 고객 PC의 공동인증서 로컬 인증 모듈에서 인증합니다.
+- `직접입력` 방식은 기존 동작을 유지합니다.
+- `카카오톡 발송` 방식은 직원이 고객 이름과 휴대전화만 입력합니다.
+- 고객에게 1회용 보안 링크가 발송되고, 고객이 링크에서 주민등록번호와 필수 동의를 직접 입력합니다.
+- 국세청 홈택스 인증을 먼저 요청합니다.
+- 홈택스 인증 완료가 확인되면 1초 뒤 근로복지공단 인증을 이어서 요청합니다.
+- 고객이 화면을 닫아도 Railway 백그라운드 작업이 인증 확인과 자료수집을 계속합니다.
+- 인증 링크 원문과 주민등록번호는 평문으로 DB나 로그에 저장하지 않습니다.
+- 수집 진행률은 인증 단계가 아니라 실제 수집 완료 문서 수를 기준으로 표시합니다.
 
-```text
-CLAIM_COLLECTION_ENABLED=true
-TILKO_API_KEY=<발급받은 API KEY>
-TILKO_RSA_PUBLIC_KEY=<API KEY에 대응하는 RSA 공개키>
-TILKO_HOMETAX_HOST=https://api.tilko.net
-TILKO_COMWEL_HOST=https://api24.tilko.net
-CLAIM_DOCUMENT_RETENTION_DAYS=90
-```
+## Supabase 적용 순서
 
-법인 공동인증서는 단순 공용 링크만 설정하지 않습니다. 공급사 계약 후
-요청 건별 서명 상태값, 결과 콜백 검증, 고객 PC용 로컬 인증 모듈까지
-함께 구현·검증한 뒤 활성화합니다.
-
-홈택스와 근로복지공단 호스트는 위 공식 주소만 허용합니다. 리다이렉트와
-임의 호스트는 고객 인증정보 유출을 막기 위해 차단합니다.
-
-현재 구현 범위는 개인사업자 인증 요청·완료 확인, 요청별 문서계획,
-진행상황과 수집결과 화면, 전용 비공개 저장소, 홈택스 사업자정보·
-사업자등록증명원·국세 납세증명서·종합소득세 신고도움 7개년·
-종합소득세 신고서 7개년·폐업사실증명의 수집과 다운로드입니다.
-저장 파일은 기본 90일 보관하며 사용자가 다운로드할 때마다 짧은
-만료시간의 서명 URL을 발급합니다.
-
-홈택스 환급금은 간편인증 API가 아니라 세무대리인 공동인증서 전용
-API이므로 현재 개인사업자 카카오 인증 흐름에서는 수집하지 않습니다.
-법인 공동인증서와 나머지 기관 서류는 계약 계정에서 문서별 API 사용
-승인을 받고 공식 요청·응답 스키마를 확인한 뒤 순차적으로 활성화합니다.
-
-## Supabase
-
-운영 프로젝트의 SQL Editor에서 다음 파일을 한 번 실행합니다.
+운영 프로젝트에 아래 마이그레이션을 순서대로 적용합니다.
 
 ```text
 supabase_v1022_claim_correction.sql
 supabase_v1023_claim_document_delivery.sql
 supabase_v1024_claim_document_formats.sql
 supabase_v1025_claim_download_storage.sql
+supabase_v1026_claim_remote_invites.sql
+supabase_v1027_claim_remote_resume_exchange.sql
+supabase_v1028_claim_remote_submission_reservation.sql
 ```
 
-이 스크립트는 다음 항목을 만듭니다.
+원격 인증용 테이블과 함수는 `service_role`만 사용할 수 있으며 RLS가 활성화되어야 합니다.
 
-- `oasis_claim_cases`
-- `oasis_claim_documents`
-- `oasis_claim_audit_events`
-- 비공개 Storage 버킷 `oasis-claim-documents`
-- 서버 전용 문서 완료 처리 함수 `oasis_claim_finalize_document`
+## Railway 환경변수
 
-익명 사용자와 일반 인증 사용자의 직접 DB·Storage 접근은 허용하지
-않습니다. 현재 앱에서는 Railway 서버의 경정청구 전용 저장 계층만 이
-테이블에 접근합니다.
+기존 CRM 서비스와 공개 인증 게이트웨이 서비스에 동일한 보안 설정을 적용합니다.
 
-## 저장 금지 정보
+```text
+CLAIM_COLLECTION_ENABLED=true
+CLAIM_REMOTE_WORKER_ENABLED=true
+CLAIM_PUBLIC_BASE_URL=https://<공개-인증-게이트웨이-도메인>
+CLAIM_JOB_ENCRYPTION_KEY=<32바이트 이상 랜덤 키>
+CLAIM_LINK_PEPPER=<32바이트 이상 랜덤 키>
+CLAIM_SESSION_SECRET=<32바이트 이상 랜덤 키>
 
-다음 값은 Supabase, 로컬 파일, 재시도 큐, 오류 로그에 저장하지 않습니다.
+SUPABASE_URL=<운영 프로젝트 URL>
+SUPABASE_SECRET_KEY=<운영 서버 키>
+SUPABASE_SERVICE_ROLE_KEY=<운영 service_role 키>
 
-- 주민등록번호
-- 공동인증서 파일과 개인키
-- 공동인증서 비밀번호
-- 홈택스·근로복지공단 비밀번호
-- 간편인증 Token, CxId, TxId, ReqTxId 원문의 영구 저장
+TILKO_API_KEY=<Tilko 일반 API 키>
+TILKO_RSA_PUBLIC_KEY=<Tilko RSA 공개키>
+TILKO_HOMETAX_HOST=https://api.tilko.net
+TILKO_COMWEL_HOST=https://api24.tilko.net
 
-주민등록번호는 인증 요청 또는 완료 확인 호출이 끝나는 즉시 폐기합니다.
-간편인증 완료 확인용 Token, CxId, TxId, ReqTxId만 최대 10분 동안 현재
-Streamlit 서버 세션 메모리에 유지하며, 완료·만료·로그아웃·사용자 변경
-시 제거합니다.
+SOLAPI_API_KEY=<Solapi API 키>
+SOLAPI_API_SECRET=<Solapi API Secret>
+SOLAPI_KAKAO_CHANNEL_ID=KA01PF260730115605769C9BwhBLCw8n
+SOLAPI_TEMPLATE_AUTH_START_ID=KA01TP260730121012330HZah5tLMiZO
+SOLAPI_TEMPLATE_AUTH_RESUME_ID=KA01TP260731065756213mJ6ZDn6HsBI
+SOLAPI_TEMPLATE_NEXT_AUTH_ID=KA01TP2607310709054437Q7vJJc1fEy
+SOLAPI_TEMPLATE_COMPLETE_ID=KA01TP260731071813549LDzSAd0t0JA
+SOLAPI_TEMPLATE_FAILED_ID=KA01TP2607310720314767o6465D6po2
+```
+
+Solapi 템플릿은 카카오 검수 승인 후 실제 발송할 수 있습니다.
+검수 중에는 기존 CRM 서비스의 `SOLAPI_TEMPLATE_*` 5개 변수를 비워
+원격 발송 버튼을 비활성화합니다. 5개 템플릿이 모두 승인된 뒤에만
+동일한 템플릿 ID를 CRM 서비스에도 등록하고 다시 배포합니다.
+
+## 공개 인증 게이트웨이 서비스
+
+같은 GitHub 저장소로 Railway 서비스를 하나 더 만들고 시작 명령을 아래처럼 설정합니다.
+
+```text
+uvicorn claim_public_gateway:app --host 0.0.0.0 --port $PORT
+```
+
+배포 후 아래 주소가 정상 응답하는지 확인합니다.
+
+```text
+https://<공개-인증-게이트웨이-도메인>/health
+```
+
+원문 1회용 링크는 `/c/<token>`에서 즉시 HttpOnly 세션 쿠키로 교환되며, 접근 로그에는 토큰이 남지 않습니다.
+
+## 운영 보안
+
+- API 키와 주민등록번호를 화면, 로그, Git 저장소에 출력하지 않습니다.
+- 고객 입력 암호문은 수집 완료·실패·만료 시 삭제합니다.
+- 다운로드 문서는 비공개 Storage 버킷에 보관하고 짧은 만료시간의 서명 URL만 발급합니다.
+- 보존기간은 `CLAIM_DOCUMENT_RETENTION_DAYS`로 관리합니다. 기본값은 90일입니다.
+- Railway 재시작 후에도 미완료 작업은 lease 기반으로 다시 이어집니다.
