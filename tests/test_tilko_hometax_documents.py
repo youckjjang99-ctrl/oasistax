@@ -86,6 +86,36 @@ def _document(year: int | None = None) -> CollectedClaimDocument:
 
 class TilkoHometaxDocumentClientTests(unittest.TestCase):
     @patch("tilko_claim_client.requests.post")
+    def test_income_tax_return_accepts_transient_taxpayer_number(self, post):
+        post.return_value = _JsonResponse(
+            {
+                "ErrorCode": 0,
+                "ApiTxKey": "taxpayer-return-reference",
+                "Result": [],
+                "BinaryResult": [],
+            }
+        )
+        identity_number = "9010191234567"
+
+        document = _client().collect_hometax_income_tax_return(
+            year=2024,
+            birth_date="901019",
+            user_name="홍길동",
+            cellphone="01012345678",
+            business_number=identity_number,
+            session=_session(),
+        )
+
+        payload = post.call_args.kwargs["json"]
+        self.assertNotEqual(payload["BusinessNumber"], identity_number)
+        self.assertNotIn(identity_number, json.dumps(payload))
+        self.assertNotIn(identity_number, json.dumps(document.facts))
+        self.assertEqual(
+            document.facts["query_strategy"],
+            "filing_year_taxpayer_v3",
+        )
+
+    @patch("tilko_claim_client.requests.post")
     def test_income_tax_return_uses_hometax_v1_and_encrypts_payload(
         self,
         post,
@@ -598,6 +628,67 @@ class TilkoHometaxAnnualCollectionTests(unittest.TestCase):
         client.collect_hometax_business_registration_certificate.assert_not_called()
         client.collect_hometax_tax_payment_certificate.assert_not_called()
         client.collect_hometax_closure_certificate.assert_not_called()
+
+    def test_taxpayer_scope_collects_one_income_return_per_year(self):
+        years = list(range(2019, 2026))
+        repository = MagicMock()
+        repository.list_documents.return_value = [
+            {
+                "source": "hometax",
+                "document_code": "hometax_income_tax_return",
+                "period_year": year,
+                "status": "auth_pending",
+            }
+            for year in years
+        ]
+        repository.store_collected_document.return_value = {
+            "status": "ready"
+        }
+        client = MagicMock()
+        client.collect_hometax_income_tax_return.side_effect = (
+            lambda **kwargs: _document(int(kwargs["year"]))
+        )
+        identity_number = "9010191234567"
+
+        summary = _collect_supported_hometax_documents(
+            repository,
+            client,
+            case_id="taxpayer-scope-case",
+            birth_date="901019",
+            representative="홍길동",
+            cellphone="01012345678",
+            identity_number=identity_number,
+            business_number="2208162517",
+            businesses=[
+                {
+                    "business_number": "2208162517",
+                    "business_name": "본점",
+                },
+                {
+                    "business_number": "1208800767",
+                    "business_name": "지점",
+                },
+            ],
+            session=_session(),
+        )
+
+        self.assertEqual(summary["target"], len(years))
+        self.assertEqual(
+            client.collect_hometax_income_tax_return.call_count,
+            len(years),
+        )
+        self.assertTrue(
+            all(
+                call.kwargs["business_number"] == identity_number
+                for call in client.collect_hometax_income_tax_return.call_args_list
+            )
+        )
+        self.assertTrue(
+            all(
+                "collection_key" not in call.kwargs
+                for call in repository.store_collected_document.call_args_list
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -185,6 +185,20 @@ def _valid_hometax_business_number(value: Any) -> str:
     return digits if expected == int(digits[-1]) else ""
 
 
+def _valid_hometax_taxpayer_number(value: Any) -> str:
+    """Return a provider-supported business or resident taxpayer number."""
+    if isinstance(value, (bool, dict, list, tuple, set)):
+        return ""
+    digits = "".join(
+        character
+        for character in str(value or "").strip()
+        if character.isascii() and character.isdigit()
+    )
+    if len(digits) == 13:
+        return digits
+    return _valid_hometax_business_number(digits)
+
+
 def _hometax_tax_payment_business_numbers(
     response_data: dict[str, Any],
 ) -> tuple[str, ...]:
@@ -520,7 +534,17 @@ def _management_numbers(value: Any) -> list[str]:
     found: list[str] = []
     for mapping in _iter_response_mappings(value):
         for key, candidate in mapping.items():
-            if str(key).casefold() != "gwanrino":
+            # The official MyBizInfo response currently uses ``GWANRI_NO``.
+            # Older fixtures and some provider response variants use
+            # ``GwanriNo``.  Compare a punctuation-insensitive ASCII key so a
+            # provider casing/underscore variation cannot silently turn a
+            # valid management number into "no data".
+            normalized_key = "".join(
+                character
+                for character in str(key).casefold()
+                if character.isascii() and character.isalnum()
+            )
+            if normalized_key != "gwanrino":
                 continue
             management_number = _safe_management_number(candidate)
             if management_number and management_number not in found:
@@ -974,6 +998,7 @@ def _collected_hometax_income_tax_return(
     *,
     year: str,
     filing_year: str,
+    query_strategy: str = "filing_year_v2",
 ) -> CollectedClaimDocument:
     raw_result = response_data.get("Result")
     result_rows = (
@@ -1115,7 +1140,7 @@ def _collected_hometax_income_tax_return(
             facts={
                 "year": year,
                 "filing_year": filing_year,
-                "query_strategy": "filing_year_v2",
+                "query_strategy": query_strategy,
                 "record_count": _structured_record_count(result),
                 "pdf_count": len(pdf_files),
                 "tax_year_verified": tax_year_verified,
@@ -1133,7 +1158,7 @@ def _collected_hometax_income_tax_return(
             facts={
                 "year": year,
                 "filing_year": filing_year,
-                "query_strategy": "filing_year_v2",
+                "query_strategy": query_strategy,
                 "tax_year_verified": tax_year_verified,
                 "discarded_mismatched_records": (
                     discarded_mismatched_records
@@ -1148,7 +1173,7 @@ def _collected_hometax_income_tax_return(
         reason="no_income_tax_return",
         extra_facts={
             "filing_year": filing_year,
-            "query_strategy": "filing_year_v2",
+            "query_strategy": query_strategy,
             "tax_year_verified": tax_year_verified,
             "discarded_mismatched_records": (
                 discarded_mismatched_records
@@ -1481,6 +1506,11 @@ class TilkoClaimClient:
         )
         result = _response_result(response)
         management_numbers = _management_numbers(result)
+        if result and not management_numbers:
+            raise ClaimProviderError(
+                "사업장관리번호 응답은 수신했지만 번호 필드를 확인하지 못했습니다.",
+                error_code="COMWEL_MANAGEMENT_NUMBER_PARSE_FAILED",
+            )
         return _collected_private_json(
             response,
             fallback_name="comwel-management-numbers",
@@ -1776,13 +1806,18 @@ class TilkoClaimClient:
             date(int(filing_year), 12, 31),
             date.today(),
         ).strftime("%Y%m%d")
-        selected_business_number = _valid_hometax_business_number(
+        selected_business_number = _valid_hometax_taxpayer_number(
             business_number
         )
         if not selected_business_number:
             raise ClaimProviderError(
-                "종합소득세 신고서 조회에는 유효한 사업자등록번호가 필요합니다."
+                "종합소득세 신고서 조회에는 유효한 납세자 식별번호가 필요합니다."
             )
+        query_strategy = (
+            "filing_year_taxpayer_v3"
+            if len(selected_business_number) == 13
+            else "filing_year_v2"
+        )
         payload = {
             "CxId": str(session.get("CxId", "") or ""),
             "PrivateAuthType": "0",
@@ -1811,6 +1846,7 @@ class TilkoClaimClient:
             response,
             year=selected_year,
             filing_year=filing_year,
+            query_strategy=query_strategy,
         )
 
     def collect_hometax_closure_certificate(

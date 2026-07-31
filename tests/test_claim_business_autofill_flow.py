@@ -480,6 +480,14 @@ class ClaimBusinessAutofillFlowTests(unittest.TestCase):
             "remuneration-2025.xlsx",
             facts={"year": 2025},
         )
+        client.collect_comwel_workplace_rate.return_value = _document(
+            "rate-2025.json",
+            facts={
+                "year": 2025,
+                "no_data": True,
+                "no_data_reason": "no_workplace_rate",
+            },
+        )
 
         summary = _collect_supported_comwel_documents(
             repository,
@@ -503,7 +511,13 @@ class ClaimBusinessAutofillFlowTests(unittest.TestCase):
         self.assertEqual(summary["failed"], 0)
         client.collect_comwel_management_numbers.assert_called_once()
         client.collect_comwel_total_remuneration.assert_called_once()
-        client.collect_comwel_workplace_rate.assert_not_called()
+        client.collect_comwel_workplace_rate.assert_called_once()
+        self.assertEqual(
+            client.collect_comwel_workplace_rate.call_args.kwargs[
+                "management_number"
+            ],
+            "",
+        )
         rate_store_call = next(
             call
             for call in repository.store_collected_document.call_args_list
@@ -512,7 +526,7 @@ class ClaimBusinessAutofillFlowTests(unittest.TestCase):
         self.assertTrue(rate_store_call.kwargs["document"].facts["no_data"])
         self.assertEqual(
             rate_store_call.kwargs["document"].facts["no_data_reason"],
-            "no_management_number",
+            "no_workplace_rate",
         )
 
     def test_management_lookup_failure_does_not_become_no_data(self):
