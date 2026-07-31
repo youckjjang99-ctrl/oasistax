@@ -38,6 +38,25 @@ class NavigationVisibilityTests(unittest.TestCase):
         self.assertNotIn("tab_consulting_group", source)
         self.assertNotIn("tab_documents_group", source)
 
+    def test_enterprise_tools_render_only_the_selected_section(self):
+        source = (ROOT / "enterprise_center.py").read_text(encoding="utf-8")
+
+        self.assertIn("selected_section = st.pills(", source)
+        self.assertIn("crm_section = st.segmented_control(", source)
+        self.assertIn('if selected_section == "기업정보":', source)
+        for label in [
+            "CRM",
+            "정책자금",
+            "주가평가·등기",
+            "정관검토",
+            "기업히스토리",
+            "직원현황",
+            "가지급금 계산기",
+        ]:
+            self.assertIn(f'elif selected_section == "{label}":', source)
+
+        self.assertNotIn("tab_temporary_advance,", source)
+
 
 if __name__ == "__main__":
     unittest.main()

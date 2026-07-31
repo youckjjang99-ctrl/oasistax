@@ -80,6 +80,16 @@ select {
     transition: none !important;
 }
 
+/* Streamlit marks the previous tree as stale during a rerun. Its default
+   opacity fade looks like a full-page white veil on mobile, even for a quick
+   menu click. Keep the existing tree readable until the new tree is ready;
+   long operations still use their local status/progress components. */
+[data-stale="true"] {
+    opacity: 1 !important;
+    filter: none !important;
+    transition: none !important;
+}
+
 #MainMenu,
 footer,
 [data-testid="stDecoration"],

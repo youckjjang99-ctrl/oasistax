@@ -6,6 +6,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+from artifact_cache import content_digest
 from matching_preferences import save_temporary_advance_calculation
 from temporary_advance_calculator import (
     LEGAL_BASIS,
@@ -17,6 +18,31 @@ from temporary_advance_calculator import (
     representative_burden_text,
 )
 from temporary_advance_pdf import build_temporary_advance_pdf
+
+
+ADVANCE_PDF_CACHE_TTL_SECONDS = 30 * 60
+
+
+@st.cache_data(
+    ttl=ADVANCE_PDF_CACHE_TTL_SECONDS,
+    max_entries=32,
+    show_spinner=False,
+)
+def _cached_temporary_advance_pdf(
+    owner_id: str,
+    report_digest: str,
+    company_name: str,
+    business_no: str,
+    consultant_name: str,
+    _result: dict[str, Any],
+) -> bytes:
+    del owner_id, report_digest
+    return build_temporary_advance_pdf(
+        company_name=company_name,
+        business_no=business_no,
+        result=_result,
+        consultant_name=consultant_name,
+    )
 
 
 EXPLICIT_ADVANCE_KEYS = {
@@ -575,10 +601,18 @@ def render_temporary_advance_calculator(
             st.markdown(f"- {warning}")
 
     try:
-        pdf_bytes = build_temporary_advance_pdf(
+        report_digest = content_digest(
+            company_name,
+            business_no,
+            result,
+            user_name,
+        )
+        pdf_bytes = _cached_temporary_advance_pdf(
+            user_id,
+            report_digest,
             company_name=company_name,
             business_no=business_no,
-            result=result,
+            _result=result,
             consultant_name=user_name,
         )
     except Exception as exc:

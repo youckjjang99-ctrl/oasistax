@@ -5,26 +5,12 @@ import os
 import glob
 import html
 import shutil
+import time
 import pandas as pd
 from pathlib import Path
 from runtime_error_log import write_runtime_error
 
 from ui import apply_oasis_ui
-from maintenance import render_system_management_page
-from cretop_runner import run_cretop_worker
-from income_tax_return_parser import parse_income_tax_return
-from corporate_conversion_analyzer import analyze_corporate_conversion
-from cloud_admin import render_cloud_database_page
-from ai_usage import render_ai_usage_page
-from cloud_restore import restore_customer_db_if_needed
-from cloud_crm_restore import restore_crm_from_cloud
-from claim_correction_center import render_claim_correction_center
-from enterprise_center import render_enterprise_management_center
-from enterprise_customer_management import render_customer_trash_page
-from prospect_db_center import (
-    render_prospect_admin_settings,
-    render_prospect_db_center,
-)
 from address_tools import (
     enrich_address_fields,
     repair_user_customer_addresses,
@@ -49,28 +35,16 @@ from cloud_sync import (
     sync_customer_snapshot,
     sync_crm_record,
 )
-from registered_policy_match import (
-    load_registered_customers,
-    build_customer_labels,
-    customer_preview,
-    create_single_customer_workbook,
-)
 from matching_preferences import (
     INTEREST_OPTIONS,
     get_matching_preferences,
     save_matching_preferences,
     preference_summary,
 )
-from multi_source_policy import render_multi_source_match
-from consulting_copilot import render_copilot_page
-from stock_valuation import (
-    render_stock_valuation_page,
-    save_cretop_financial_snapshot,
-)
 from crm import (
     STATUS_OPTIONS, ACTION_OPTIONS, make_customer_key, get_customer_record,
     upsert_customer_record, append_timeline_event, get_crm_summary,
-    get_due_action_summary
+    get_due_action_summary, get_home_dashboard_summary
 )
 
 from auth import (
@@ -112,17 +86,10 @@ for _folder in [TEMPLATE_DIR, UPLOAD_DIR, RESULT_DIR, HISTORY_DIR]:
     _folder.mkdir(exist_ok=True)
 
 def get_customer_template_download():
-    candidates = [
-        TEMPLATE_DIR / "고객DB_양식.xlsx",
-        TEMPLATE_DIR / "고객DB(11).xlsx",
-        BASE_DIR / "고객DB_양식.xlsx",
-        BASE_DIR / "고객DB.xlsx",
-    ]
-
-    for path in candidates:
-        if path.exists():
-            with open(path, "rb") as f:
-                return f.read(), "고객DB_양식.xlsx"
+    path = find_customer_template()
+    if path is not None:
+        with open(path, "rb") as f:
+            return f.read(), "고객DB_양식.xlsx"
 
     columns = [
         "업체명", "대표자명", "사업자등록번호", "업종명", "사업장 소재지",
@@ -647,12 +614,22 @@ def _clean_customer_df(df: pd.DataFrame) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-@st.cache_data(show_spinner=False, ttl=60)
-def _read_customer_sheet_cached(path_str: str, mtime: float):
+@st.cache_data(
+    show_spinner=False,
+    ttl=60,
+    max_entries=128,
+    scope="session",
+)
+def _read_customer_sheet_cached(
+    path_str: str,
+    mtime_ns: int,
+    file_size: int,
+):
     """누적 고객DB 고객DB 시트를 캐시로 읽고 실제 고객 행만 반환한다.
 
     v3.2.2: 서식만 있는 빈 행을 고객으로 세지 않도록 정리한다.
     """
+    del mtime_ns, file_size
     df = pd.read_excel(path_str, sheet_name="고객DB", dtype=object)
     return _clean_customer_df(df)
 
@@ -666,18 +643,69 @@ def read_current_user_customer_df(user_id):
     try:
         # v3.2.1: 파일 구조 보정은 최초 진입 시에만 최소화하고, 실제 엑셀 로딩은 캐시 처리한다.
         path, _, _ = ensure_user_cumulative_db_format(user_id)
-        mtime = path.stat().st_mtime
-        df = _read_customer_sheet_cached(str(path), mtime)
+        stat = path.stat()
+        df = _read_customer_sheet_cached(
+            str(path),
+            int(stat.st_mtime_ns),
+            int(stat.st_size),
+        )
         return df.copy(), path
     except Exception:
         return pd.DataFrame(), path
 
 
+def _navigate_to_main_menu(target: str) -> None:
+    """Update both sidebar selectors before Streamlit's natural button rerun."""
+    group_by_target = {
+        "홈": "주요업무",
+        "DB발굴": "주요업무",
+        "기업등록": "주요업무",
+        "기업 컨설팅": "주요업무",
+        "경정청구": "주요업무",
+        "AI 코파일럿": "주요업무",
+        "내 누적 고객DB": "고객관리",
+        "실행이력": "고객관리",
+        "담당자 통계": "고객관리",
+        "휴지통": "고객관리",
+        "회원 승인 관리": "관리자",
+        "시스템 관리": "관리자",
+        "클라우드 DB 관리": "관리자",
+        "AI 사용량": "관리자",
+    }
+    st.session_state["active_main_menu_v1020"] = target
+    target_group = group_by_target.get(target)
+    if target_group:
+        st.session_state["sidebar_menu_group_v1020"] = target_group
+
+
+def _handle_pending_user_action(
+    action: str,
+    target_user_id: str,
+    admin_user_id: str,
+) -> None:
+    """Apply an approval action before Streamlit's natural button rerun.
+
+    Rendering the refreshed member lists on the same natural rerun avoids the
+    previous second full-app rerun while preserving immediate visual feedback.
+    """
+    if action == "approve":
+        ok, message = approve_user(target_user_id, admin_user_id)
+        level = "success"
+    elif action == "reject":
+        ok, message = reject_user(target_user_id, admin_user_id)
+        level = "warning"
+    else:
+        ok, message, level = False, "지원하지 않는 회원 처리입니다.", "error"
+    st.session_state["_member_action_flash_v1030"] = {
+        "level": level if ok else "error",
+        "message": message,
+    }
+
+
 def render_home_page(user_id, user_name=""):
     customer_df, _ = read_current_user_customer_df(user_id)
     customer_count = len(customer_df)
-    crm_summary = get_crm_summary(user_id)
-    due_summary = get_due_action_summary(user_id)
+    crm_summary, due_summary = get_home_dashboard_summary(user_id)
     today_count = len(due_summary.get("today", []))
     overdue_count = len(due_summary.get("overdue", []))
     week_count = len(due_summary.get("week", []))
@@ -700,28 +728,28 @@ def render_home_page(user_id, user_name=""):
 
     st.markdown("### 빠른 시작")
     quick_cols = st.columns(3)
-    if quick_cols[0].button(
+    quick_cols[0].button(
         "연락 가능한 기업 찾기",
         type="primary",
         use_container_width=True,
         key="home_open_prospect_v1020",
-    ):
-        st.session_state["_oasis_pending_main_menu"] = "DB발굴"
-        st.rerun()
-    if quick_cols[1].button(
+        on_click=_navigate_to_main_menu,
+        args=("DB발굴",),
+    )
+    quick_cols[1].button(
         "새 기업 등록",
         use_container_width=True,
         key="home_open_registration_v1020",
-    ):
-        st.session_state["_oasis_pending_main_menu"] = "기업등록"
-        st.rerun()
-    if quick_cols[2].button(
+        on_click=_navigate_to_main_menu,
+        args=("기업등록",),
+    )
+    quick_cols[2].button(
         "기업 컨설팅 열기",
         use_container_width=True,
         key="home_open_consulting_v1020",
-    ):
-        st.session_state["_oasis_pending_main_menu"] = "기업 컨설팅"
-        st.rerun()
+        on_click=_navigate_to_main_menu,
+        args=("기업 컨설팅",),
+    )
 
     st.markdown("### 오늘의 후속관리")
     due_items = [
@@ -1097,6 +1125,8 @@ def render_customer_management_page(user_id):
             )
             if ok:
                 st.success(msg)
+                # The workbook changed after its dependent cards were rendered;
+                # one explicit refresh is required to load the new file revision.
                 st.rerun()
             else:
                 st.error(msg)
@@ -1417,8 +1447,9 @@ def render_customer_management_page(user_id):
                 selected_biz,
                 updated_crm,
             )
+            crm_record = updated_crm
+            crm_profile = saved_profile
             st.success(msg)
-            st.rerun()
         else:
             st.error(msg)
 
@@ -1450,7 +1481,6 @@ def render_customer_management_page(user_id):
                         updated_crm,
                     )
                     st.success(msg)
-                    st.rerun()
                 else:
                     st.error(msg)
 
@@ -1491,6 +1521,9 @@ def render_cumulative_db_page(user_id):
 
 
 def render_personal_business_registration(user_id, user_name, upload_dir):
+    from corporate_conversion_analyzer import analyze_corporate_conversion
+    from income_tax_return_parser import parse_income_tax_return
+
     st.markdown("### 종합소득세 신고서로 개인사업자 등록")
     st.caption(
         "사업소득명세서를 사업자등록번호별로 분리합니다. "
@@ -1723,20 +1756,6 @@ USER_DIRS = get_user_dirs(CURRENT_USER_ID)
 USER_UPLOAD_DIR = USER_DIRS["uploads"]
 USER_RESULT_DIR = USER_DIRS["results"]
 
-# Streamlit Cloud는 재배포 시 로컬 파일이 초기화될 수 있다.
-# 기존 로컬 고객이 없을 때만 Supabase 고객자료를 자동 복원한다.
-restore_session_key = f"cloud_customer_restore_{CURRENT_USER_ID}"
-if not st.session_state.get(restore_session_key):
-    restore_result = restore_customer_db_if_needed(CURRENT_USER_ID)
-    st.session_state[restore_session_key] = True
-    st.session_state["cloud_customer_restore_result"] = restore_result
-
-crm_restore_session_key = f"cloud_crm_restore_{CURRENT_USER_ID}"
-if not st.session_state.get(crm_restore_session_key):
-    crm_restore_result = restore_crm_from_cloud(CURRENT_USER_ID)
-    st.session_state[crm_restore_session_key] = True
-    st.session_state["cloud_crm_restore_result"] = crm_restore_result
-
 # v3.0.0: 상단 탭/가로 메뉴 대신 사이드바 기반 메뉴로 전환
 with st.sidebar:
     st.markdown(
@@ -1863,6 +1882,49 @@ with st.sidebar:
     render_password_change(CURRENT_USER_ID)
     logout_button()
 
+# 로컬 파일이 필요한 화면을 선택했을 때만 복원 모듈과 네트워크를 사용한다.
+local_customer_routes = {
+    "홈",
+    "내 누적 고객DB",
+    "기업등록",
+    "통합 정책자금 매칭",
+}
+if active_tab in local_customer_routes:
+    restore_session_key = f"cloud_customer_restore_{CURRENT_USER_ID}"
+    restore_attempt_key = f"{restore_session_key}_attempted_at"
+    last_attempt = float(st.session_state.get(restore_attempt_key, 0) or 0)
+    if (
+        not st.session_state.get(restore_session_key)
+        and time.monotonic() - last_attempt >= 60
+    ):
+        from cloud_restore import restore_customer_db_if_needed
+
+        st.session_state[restore_attempt_key] = time.monotonic()
+        restore_result = restore_customer_db_if_needed(CURRENT_USER_ID)
+        st.session_state["cloud_customer_restore_result"] = restore_result
+        restore_message = str(restore_result.get("message", "") or "")
+        if "실패" not in restore_message:
+            st.session_state[restore_session_key] = True
+
+if active_tab == "홈":
+    crm_restore_session_key = f"cloud_crm_restore_{CURRENT_USER_ID}"
+    crm_restore_attempt_key = f"{crm_restore_session_key}_attempted_at"
+    last_attempt = float(
+        st.session_state.get(crm_restore_attempt_key, 0) or 0
+    )
+    if (
+        not st.session_state.get(crm_restore_session_key)
+        and time.monotonic() - last_attempt >= 60
+    ):
+        from cloud_crm_restore import restore_crm_from_cloud
+
+        st.session_state[crm_restore_attempt_key] = time.monotonic()
+        crm_restore_result = restore_crm_from_cloud(CURRENT_USER_ID)
+        st.session_state["cloud_crm_restore_result"] = crm_restore_result
+        restore_message = str(crm_restore_result.get("message", "") or "")
+        if "실패" not in restore_message:
+            st.session_state[crm_restore_session_key] = True
+
 st.markdown(f"""
 <div class="oasis-topbar oasis-topbar-compact">
     <div>
@@ -1892,24 +1954,32 @@ if active_tab == "홈":
     render_home_page(CURRENT_USER_ID, CURRENT_USER_NAME)
 
 elif active_tab == "기업관리센터":
+    from enterprise_center import render_enterprise_management_center
+
     render_enterprise_management_center(
         CURRENT_USER_ID,
         CURRENT_USER_NAME,
     )
 
 elif active_tab == "경정청구":
+    from claim_correction_center import render_claim_correction_center
+
     render_claim_correction_center(
         CURRENT_USER_ID,
         CURRENT_USER_NAME,
     )
 
 elif active_tab == "휴지통":
+    from enterprise_customer_management import render_customer_trash_page
+
     render_customer_trash_page(
         CURRENT_USER_ID,
         CURRENT_USER_NAME,
     )
 
 elif active_tab == "AI 코파일럿":
+    from consulting_copilot import render_copilot_page
+
     render_copilot_page(
         CURRENT_USER_ID,
         CURRENT_USER_NAME,
@@ -1919,6 +1989,8 @@ elif active_tab == "내 누적 고객DB":
     render_cumulative_db_page(CURRENT_USER_ID)
 
 elif active_tab == "DB발굴":
+    from prospect_db_center import render_prospect_db_center
+
     render_prospect_db_center(
         CURRENT_USER_ID,
         can_view_mobile=CURRENT_USER_CAN_VIEW_MOBILE,
@@ -1926,6 +1998,14 @@ elif active_tab == "DB발굴":
     )
 
 elif active_tab == "통합 정책자금 매칭":
+    from multi_source_policy import render_multi_source_match
+    from registered_policy_match import (
+        build_customer_labels,
+        create_single_customer_workbook,
+        customer_preview,
+        load_registered_customers,
+    )
+
     st.markdown("### 등록 고객 통합 정책자금 AI 매칭")
     st.caption(
         "기업등록으로 생성된 누적 고객DB에서 업체를 선택하면 "
@@ -2458,12 +2538,17 @@ elif active_tab == "통합 정책자금 매칭":
 
 
 elif active_tab == "주가평가":
+    from stock_valuation import render_stock_valuation_page
+
     render_stock_valuation_page(
         CURRENT_USER_ID,
         CURRENT_USER_NAME,
     )
 
 elif active_tab == "기업등록":
+    from cretop_runner import run_cretop_worker
+    from stock_valuation import save_cretop_financial_snapshot
+
     registration_type = st.radio(
         "등록할 사업자 유형",
         ["법인사업자 - 크레탑 PDF", "개인사업자 - 종합소득세 신고서"],
@@ -2998,6 +3083,18 @@ elif active_tab == "담당자 통계":
 elif CURRENT_USER_IS_ADMIN and active_tab == "회원 승인 관리":
     st.caption("회원가입 신청자는 관리자 승인 전까지 매칭 시스템에 로그인할 수 없습니다.")
 
+    member_action_flash = st.session_state.pop(
+        "_member_action_flash_v1030",
+        None,
+    )
+    if member_action_flash:
+        flash_renderer = getattr(
+            st,
+            str(member_action_flash.get("level") or "info"),
+            st.info,
+        )
+        flash_renderer(str(member_action_flash.get("message") or ""))
+
     pending_users = list_pending_users(CURRENT_USER_ID)
 
     st.markdown("#### 승인 대기 회원")
@@ -3011,21 +3108,29 @@ elif CURRENT_USER_IS_ADMIN and active_tab == "회원 승인 관리":
                     st.write(f"**{row.get('이름', '')}**")
                     st.caption(f"아이디: {row.get('아이디', '')} / 가입일시: {row.get('가입일시', '')}")
                 with c2:
-                    if st.button("승인", key=f"approve_{row.get('아이디', '')}", use_container_width=True):
-                        ok, msg = approve_user(row.get('아이디', ''), CURRENT_USER_ID)
-                        if ok:
-                            st.success(msg)
-                            st.rerun()
-                        else:
-                            st.error(msg)
+                    st.button(
+                        "승인",
+                        key=f"approve_{row.get('아이디', '')}",
+                        use_container_width=True,
+                        on_click=_handle_pending_user_action,
+                        args=(
+                            "approve",
+                            row.get("아이디", ""),
+                            CURRENT_USER_ID,
+                        ),
+                    )
                 with c3:
-                    if st.button("거절", key=f"reject_{row.get('아이디', '')}", use_container_width=True):
-                        ok, msg = reject_user(row.get('아이디', ''), CURRENT_USER_ID)
-                        if ok:
-                            st.warning(msg)
-                            st.rerun()
-                        else:
-                            st.error(msg)
+                    st.button(
+                        "거절",
+                        key=f"reject_{row.get('아이디', '')}",
+                        use_container_width=True,
+                        on_click=_handle_pending_user_action,
+                        args=(
+                            "reject",
+                            row.get("아이디", ""),
+                            CURRENT_USER_ID,
+                        ),
+                    )
 
     st.markdown("#### 전체 회원 현황")
     all_users = list_all_users_for_admin(CURRENT_USER_ID)
@@ -3035,24 +3140,36 @@ elif CURRENT_USER_IS_ADMIN and active_tab == "회원 승인 관리":
         st.info("등록된 회원이 없습니다.")
 
 elif CURRENT_USER_IS_ADMIN and active_tab == "시스템 관리":
-    system_status_tab, data_connection_tab = st.tabs(
-        ["운영 상태·백업", "데이터·API 연결"]
+    system_admin_section = st.segmented_control(
+        "시스템 관리 구분",
+        ["운영 상태·백업", "데이터·API 연결"],
+        default="운영 상태·백업",
+        key="system_admin_section_v1030",
+        label_visibility="collapsed",
     )
-    with system_status_tab:
+    if system_admin_section == "데이터·API 연결":
+        from prospect_db_center import render_prospect_admin_settings
+
+        render_prospect_admin_settings(CURRENT_USER_ID)
+    else:
+        from maintenance import render_system_management_page
+
         render_system_management_page(
             project_root=ROOT_DIR,
             current_user_id=CURRENT_USER_ID,
         )
-    with data_connection_tab:
-        render_prospect_admin_settings(CURRENT_USER_ID)
 
 elif CURRENT_USER_IS_ADMIN and active_tab == "AI 사용량":
+    from ai_usage import render_ai_usage_page
+
     render_ai_usage_page(
         CURRENT_USER_ID,
         CURRENT_USER_NAME,
     )
 
 elif CURRENT_USER_IS_ADMIN and active_tab == "클라우드 DB 관리":
+    from cloud_admin import render_cloud_database_page
+
     render_cloud_database_page(
         CURRENT_USER_ID,
         CURRENT_USER_NAME,

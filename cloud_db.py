@@ -9,6 +9,8 @@ from urllib.parse import quote
 
 import requests
 
+from performance_cache import invalidate_cache
+
 
 TABLE_CUSTOMERS = "oasis_customers"
 TABLE_CRM = "oasis_crm"
@@ -17,6 +19,23 @@ TABLE_REGISTRY = "oasis_registry"
 TABLE_STOCK = "oasis_stock_valuations"
 TABLE_MIGRATIONS = "oasis_migration_runs"
 TABLE_MATCHING_PREFERENCES = "oasis_matching_preferences"
+
+
+def _invalidate_written_rows(
+    table: str,
+    rows: list[dict[str, Any]],
+) -> None:
+    """Invalidate only read caches affected by a successful write."""
+    if table != TABLE_CUSTOMERS:
+        return
+    owner_ids = {
+        str(row.get("owner_user_id", "") or "").strip().lower()
+        for row in rows
+        if isinstance(row, dict)
+    }
+    for owner_id in owner_ids:
+        if owner_id:
+            invalidate_cache("registered_customers", owner_id)
 
 
 def normalize_business_no(value: Any) -> str:
@@ -122,7 +141,9 @@ class CloudDatabase:
                 f"{table} 저장 실패 HTTP {response.status_code}: "
                 f"{response.text[:800]}"
             )
-        return response.json() if response.text else []
+        result = response.json() if response.text else []
+        _invalidate_written_rows(table, rows)
+        return result
 
     def insert(self, table: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not rows:
@@ -138,7 +159,9 @@ class CloudDatabase:
                 f"{table} 저장 실패 HTTP {response.status_code}: "
                 f"{response.text[:800]}"
             )
-        return response.json() if response.text else []
+        result = response.json() if response.text else []
+        _invalidate_written_rows(table, rows)
+        return result
 
     def rpc(
         self,
@@ -264,6 +287,7 @@ class CloudDatabase:
         columns: str = "*",
         order: str | None = None,
         limit: int | None = None,
+        offset: int | None = None,
     ) -> list[dict[str, Any]]:
         params: dict[str, Any] = {"select": columns}
 
@@ -274,6 +298,8 @@ class CloudDatabase:
             params["order"] = order
         if limit is not None:
             params["limit"] = str(int(limit))
+        if offset is not None:
+            params["offset"] = str(max(0, int(offset)))
 
         response = requests.get(
             self._url(table),
@@ -289,6 +315,36 @@ class CloudDatabase:
 
         data = response.json() if response.text else []
         return data if isinstance(data, list) else []
+
+    def select_all(
+        self,
+        table: str,
+        filters: dict[str, Any] | None = None,
+        columns: str = "*",
+        order: str | None = None,
+        *,
+        page_size: int = 1000,
+        max_rows: int = 100000,
+    ) -> list[dict[str, Any]]:
+        """Read a bounded result set in stable server-side pages."""
+        safe_page_size = max(1, min(int(page_size), 1000))
+        safe_max_rows = max(1, int(max_rows))
+        rows: list[dict[str, Any]] = []
+        offset = 0
+        while offset < safe_max_rows:
+            batch = self.select(
+                table,
+                filters=filters,
+                columns=columns,
+                order=order,
+                limit=min(safe_page_size, safe_max_rows - offset),
+                offset=offset,
+            )
+            rows.extend(batch)
+            if len(batch) < safe_page_size:
+                break
+            offset += len(batch)
+        return rows
 
 
     def count(self, table: str, owner_user_id: str | None = None) -> int:

@@ -4,10 +4,13 @@ import inspect
 import unittest
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
+from unittest.mock import patch
+from zipfile import ZipFile
 
 from openpyxl import load_workbook
 
 from claim_correction_center import (
+    _build_claim_documents_zip,
     _build_claim_results_excel,
     _claim_download_cache_fingerprint,
     _claim_downloadable_documents,
@@ -21,6 +24,39 @@ from claim_correction_center import (
     _render_status_tab,
     render_claim_correction_center,
 )
+
+
+class _ZipResponse:
+    def __init__(self, content: bytes):
+        self.content = content
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def raise_for_status(self):
+        return None
+
+    def iter_content(self, chunk_size: int):
+        del chunk_size
+        yield self.content
+
+
+class _BatchZipRepository:
+    def __init__(self):
+        self.batch_calls = []
+
+    def document_download_urls(self, case_id, document_ids):
+        self.batch_calls.append((case_id, list(document_ids)))
+        return [
+            f"https://example.invalid/{document_id}"
+            for document_id in document_ids
+        ]
+
+    def document_download_url(self, *_args, **_kwargs):
+        raise AssertionError("ZIP creation must use the batch link method")
 
 
 class ClaimResultsViewTests(unittest.TestCase):
@@ -384,6 +420,47 @@ class ClaimResultsViewTests(unittest.TestCase):
             ],
             [12, 1],
         )
+
+    @patch("requests.get")
+    def test_zip_build_uses_one_batch_link_request(self, requests_get):
+        documents = [
+            self._document(
+                "first-document",
+                facts={"download_file_name": "first.pdf"},
+            ),
+            self._document(
+                "second-document",
+                facts={"download_file_name": "second.pdf"},
+            ),
+        ]
+        repository = _BatchZipRepository()
+        requests_get.side_effect = [
+            _ZipResponse(b"first"),
+            _ZipResponse(b"second"),
+        ]
+
+        archive = _build_claim_documents_zip(
+            repository,
+            "case-id",
+            documents,
+        )
+
+        self.assertEqual(
+            repository.batch_calls,
+            [
+                (
+                    "case-id",
+                    ["first-document", "second-document"],
+                )
+            ],
+        )
+        with ZipFile(BytesIO(archive)) as zip_file:
+            self.assertEqual(
+                set(zip_file.namelist()),
+                {"first.pdf", "second.pdf"},
+            )
+            self.assertEqual(zip_file.read("first.pdf"), b"first")
+            self.assertEqual(zip_file.read("second.pdf"), b"second")
 
     def test_collection_monitor_has_only_one_render_path(self) -> None:
         status_source = inspect.getsource(_render_status_tab)

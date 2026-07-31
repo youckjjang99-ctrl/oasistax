@@ -816,14 +816,62 @@ class ClaimRepository:
     ) -> str:
         safe_case_id = str(case_id or "").strip()
         safe_document_id = str(document_id or "").strip()
+        documents = self.list_documents(safe_case_id)
         target = next(
             (
                 document
-                for document in self.list_documents(safe_case_id)
+                for document in documents
                 if str(document.get("id", "")) == safe_document_id
             ),
             None,
         )
+        return self._document_download_url_from_target(
+            safe_case_id,
+            safe_document_id,
+            target,
+        )
+
+    def document_download_urls(
+        self,
+        case_id: str,
+        document_ids: list[str],
+    ) -> list[str]:
+        """Issue document links after one owner-scoped document-list read.
+
+        Every requested document still passes the same ownership, case,
+        status, retention, bucket, path, content-type and filename checks as
+        :meth:`document_download_url`.  A separate audit event is also kept
+        for every signed link, matching the single-document behavior.
+        """
+
+        safe_case_id = str(case_id or "").strip()
+        safe_document_ids = [
+            str(document_id or "").strip()
+            for document_id in document_ids
+        ]
+        if not safe_document_ids:
+            return []
+        documents = self.list_documents(safe_case_id)
+        documents_by_id = {
+            str(document.get("id", "")): document
+            for document in documents
+            if isinstance(document, dict)
+        }
+        return [
+            self._document_download_url_from_target(
+                safe_case_id,
+                safe_document_id,
+                documents_by_id.get(safe_document_id),
+            )
+            for safe_document_id in safe_document_ids
+        ]
+
+    def _document_download_url_from_target(
+        self,
+        safe_case_id: str,
+        safe_document_id: str,
+        target: dict[str, Any] | None,
+    ) -> str:
         if (
             target is None
             or str(target.get("owner_user_id", "")).strip().lower()

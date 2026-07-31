@@ -16,6 +16,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from artifact_cache import content_digest, file_revision
 from matching_preferences import get_matching_preferences
 from cloud_sync import (
     load_financial_snapshot,
@@ -46,6 +47,43 @@ from temporary_advance_calculator import (
     format_estimate_range,
     representative_burden_text,
 )
+
+
+REPORT_CACHE_TTL_SECONDS = 30 * 60
+
+
+@st.cache_data(
+    ttl=REPORT_CACHE_TTL_SECONDS,
+    max_entries=32,
+    show_spinner=False,
+)
+def _cached_representative_pdf(
+    owner_id: str,
+    report_digest: str,
+    consultant_name: str,
+    logo_path: str | None,
+    _analysis: dict[str, Any],
+) -> bytes:
+    del owner_id, report_digest
+    return build_representative_pdf(
+        _analysis,
+        consultant_name=consultant_name,
+        logo_path=logo_path,
+    )
+
+
+@st.cache_data(
+    ttl=REPORT_CACHE_TTL_SECONDS,
+    max_entries=32,
+    show_spinner=False,
+)
+def _cached_consulting_excel(
+    owner_id: str,
+    report_digest: str,
+    _analysis: dict[str, Any],
+) -> bytes:
+    del owner_id, report_digest
+    return build_consulting_excel_report(_analysis)
 
 
 
@@ -1859,11 +1897,20 @@ def render_ai_consulting_report_page(
     analysis["tax_diagnosis"] = tax_core if isinstance(tax_core, dict) else {}
 
     logo_path = Path(__file__).resolve().parent / "assets" / "oasis_logo.png"
+    logo_value = str(logo_path) if logo_path.exists() else None
+    pdf_digest = content_digest(
+        analysis,
+        user_name,
+        file_revision(logo_value),
+    )
+    excel_digest = content_digest(analysis)
     try:
-        pdf_bytes = build_representative_pdf(
-            analysis,
+        pdf_bytes = _cached_representative_pdf(
+            user_id,
+            pdf_digest,
             consultant_name=user_name,
-            logo_path=str(logo_path) if logo_path.exists() else None,
+            logo_path=logo_value,
+            _analysis=analysis,
         )
     except Exception as exc:
         pdf_bytes = b""
@@ -1874,7 +1921,11 @@ def render_ai_consulting_report_page(
         suffix = f" (오류로그: {log_path})" if log_path else ""
         st.warning(f"PDF 생성 중 오류가 발생했습니다: {exc}{suffix}")
 
-    excel_bytes = build_consulting_excel_report(analysis)
+    excel_bytes = _cached_consulting_excel(
+        user_id,
+        excel_digest,
+        _analysis=analysis,
+    )
     safe_company = re.sub(
         r'[\\/:*?"<>|]',
         "_",

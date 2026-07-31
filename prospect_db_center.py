@@ -117,6 +117,7 @@ DISCOVERY_TYPE_OPTIONS = {
 DISCOVERY_TYPE_LABELS = {
     value: label for label, value in DISCOVERY_TYPE_OPTIONS.items()
 }
+PROSPECT_RESULT_PAGE_SIZE_OPTIONS = (25, 50, 100)
 
 MOBILE_PHONE_PATTERN = re.compile(
     r"(?<!\d)(?:(?:\+?82)[\s.\-]?(?:\(0\)[\s.\-]?)?|0)"
@@ -217,6 +218,40 @@ def _sanitize_search_result(
     ]
     sanitized["found_count"] = len(accessible_items)
     return sanitized
+
+
+def _result_page_window(
+    total_count: int,
+    page_number: int,
+    page_size: int,
+) -> tuple[int, int, int, int]:
+    """Return a clamped page number/count and its zero-based slice."""
+    safe_total = max(0, int(total_count or 0))
+    safe_size = max(1, int(page_size or 1))
+    page_count = max(1, (safe_total + safe_size - 1) // safe_size)
+    safe_page = min(max(1, int(page_number or 1)), page_count)
+    start = (safe_page - 1) * safe_size
+    return safe_page, page_count, start, min(safe_total, start + safe_size)
+
+
+def _merge_result_page_selection(
+    selected_keys: set[str],
+    page_keys: set[str],
+    checked_keys: set[str],
+) -> set[str]:
+    """Replace only the visible page's selections, preserving other pages."""
+    normalized_selected = {
+        str(key) for key in selected_keys if str(key or "").strip()
+    }
+    normalized_page = {
+        str(key) for key in page_keys if str(key or "").strip()
+    }
+    normalized_checked = {
+        str(key) for key in checked_keys if str(key or "").strip()
+    }
+    normalized_selected.difference_update(normalized_page)
+    normalized_selected.update(normalized_checked & normalized_page)
+    return normalized_selected
 
 
 def _is_stock_company(value: object) -> bool:
@@ -597,6 +632,7 @@ def _saved_candidate_frame(
     return pd.DataFrame(display)
 
 
+@st.cache_data(ttl=300, max_entries=32, show_spinner=False)
 def _excel_bytes(frame: pd.DataFrame, sheet_name: str) -> bytes:
     output = BytesIO()
     safe_sheet_name = str(sheet_name or "DB발굴")[:31]
@@ -1602,7 +1638,6 @@ def _render_prospect_db_center_legacy(owner_user_id: str = "") -> None:
             saved_rows = st.session_state["prospect_saved_list_v960"]
         except Exception as exc:
             st.warning(f"분석 후 목록 새로고침 실패: {exc}")
-        st.rerun()
 
     if enrich_saved_clicked:
         enrichment_results: list[dict] = []
@@ -1642,6 +1677,8 @@ def _render_prospect_db_center_legacy(owner_user_id: str = "") -> None:
             enrichment_results
         )
         st.session_state.pop("prospect_contacts_v970", None)
+        # Contact tables were rendered before enrichment in this legacy view.
+        # Refresh once so every table uses the newly saved contact records.
         st.rerun()
 
     sales_results = st.session_state.get("sales_analysis_results_v971", [])
@@ -1867,6 +1904,7 @@ def _render_clean_saved_prospects(
             for prospect_id, memo in changed_memos:
                 save_prospect_memo(prospect_id, memo, owner_user_id)
             st.success(f"업체 메모 {len(changed_memos):,}건을 저장했습니다.")
+            # Reset the data editor's dirty baseline after persisted changes.
             st.rerun()
         except Exception as exc:
             st.error(
@@ -2072,6 +2110,13 @@ def render_prospect_db_center(
     )
     page_count = 1
     result_state_key = f"prospect_result_v1012_{discovery_type}"
+    selection_state_key = (
+        f"prospect_selected_keys_v1013_{discovery_type}"
+    )
+    result_revision_key = (
+        f"prospect_result_revision_v1013_{discovery_type}"
+    )
+    result_page_key = f"prospect_result_page_v1013_{discovery_type}"
     if search_clicked and int(maximum_employees) < int(minimum_employees):
         st.error("최대 고용인원은 최소 고용인원보다 크거나 같아야 합니다.")
         search_clicked = False
@@ -2280,13 +2325,26 @@ def render_prospect_db_center(
         except Exception as exc:
             result["history_warning"] = str(exc)
         st.session_state[result_state_key] = result
+        st.session_state[selection_state_key] = [
+            str(item.get("source_key") or "")
+            for item in list(result.get("items") or [])
+            if bool(item.get("선택", True))
+            and str(item.get("source_key") or "").strip()
+        ]
+        st.session_state[result_revision_key] = (
+            int(st.session_state.get(result_revision_key, 0) or 0) + 1
+        )
+        st.session_state[result_page_key] = 1
         st.session_state[page_state_key] = int(
             result.get("next_page") or int(end_page) + 1
         )
         st.session_state["_prospect_workflow_step_pending_v1020"] = (
             "② 검색 결과"
         )
-        st.rerun()
+        # Render the completed result immediately in this run. The pending
+        # value synchronizes the selector on the next natural interaction,
+        # avoiding a second full-app repaint at the end of a long search.
+        workflow_step = "② 검색 결과"
 
     if workflow_step != "② 검색 결과":
         st.info(
@@ -2481,6 +2539,75 @@ def render_prospect_db_center(
                     f"{discovery_type}_{region_name}_{district_name}"
                 ),
             )
+            if selection_state_key not in st.session_state:
+                st.session_state[selection_state_key] = [
+                    str(value)
+                    for value in display.loc[
+                        display["선택"] == True,
+                        "source_key",
+                    ].tolist()
+                    if str(value or "").strip()
+                ]
+            selected_keys = {
+                str(value)
+                for value in st.session_state.get(
+                    selection_state_key,
+                    [],
+                )
+                if str(value or "").strip()
+            }
+            visible_result_keys = {
+                str(value)
+                for value in display["source_key"].tolist()
+                if str(value or "").strip()
+            }
+            selected_keys.intersection_update(visible_result_keys)
+            st.session_state[selection_state_key] = sorted(selected_keys)
+            page_size_key = (
+                f"prospect_result_page_size_v1013_{discovery_type}"
+            )
+            page_control_cols = st.columns([1, 2])
+            with page_control_cols[0]:
+                page_size = st.selectbox(
+                    "페이지당 표시",
+                    list(PROSPECT_RESULT_PAGE_SIZE_OPTIONS),
+                    index=1,
+                    key=page_size_key,
+                )
+            current_page, page_total, _, _ = _result_page_window(
+                len(display),
+                int(st.session_state.get(result_page_key, 1) or 1),
+                int(page_size),
+            )
+            if int(st.session_state.get(result_page_key, 1) or 1) != (
+                current_page
+            ):
+                st.session_state[result_page_key] = current_page
+            with page_control_cols[1]:
+                page_number = st.selectbox(
+                    "결과 페이지",
+                    list(range(1, page_total + 1)),
+                    format_func=lambda value: (
+                        f"{value:,} / {page_total:,} 페이지"
+                    ),
+                    key=result_page_key,
+                )
+            page_number, page_total, page_start, page_end = (
+                _result_page_window(
+                    len(display),
+                    int(page_number),
+                    int(page_size),
+                )
+            )
+            page_display = display.iloc[page_start:page_end].copy()
+            page_display["선택"] = (
+                page_display["source_key"].astype(str).isin(selected_keys)
+            )
+            st.caption(
+                f"전체 {len(display):,}건 중 "
+                f"{page_start + 1:,}~{page_end:,}건을 표시합니다. "
+                "다른 페이지로 이동해도 선택은 유지됩니다."
+            )
             visible_columns = [
                 column
                 for column in [
@@ -2504,7 +2631,7 @@ def render_prospect_db_center(
                 if column in display.columns
             ]
             edited = st.data_editor(
-                display[visible_columns],
+                page_display[visible_columns],
                 use_container_width=True,
                 hide_index=True,
                 disabled=[
@@ -2535,17 +2662,40 @@ def render_prospect_db_center(
                 },
                 key=(
                     "prospect_editor_v1012_"
-                    f"{discovery_type}_{region_name}_{district_name}"
+                    f"{discovery_type}_{region_name}_{district_name}_"
+                    f"{int(st.session_state.get(result_revision_key, 0) or 0)}_"
+                    f"{int(page_size)}_{page_number}"
                 ),
             )
-            selected_keys = set(
-                edited.loc[edited["선택"] == True, "source_key"].tolist()
+            page_keys = {
+                str(value)
+                for value in page_display["source_key"].tolist()
+                if str(value or "").strip()
+            }
+            checked_page_keys = {
+                str(value)
+                for value in edited.loc[
+                    edited["선택"] == True,
+                    "source_key",
+                ].tolist()
+                if str(value or "").strip()
+            }
+            selected_keys = _merge_result_page_selection(
+                selected_keys,
+                page_keys,
+                checked_page_keys,
             )
+            st.session_state[selection_state_key] = sorted(selected_keys)
             if selected_keys:
-                with st.expander(
-                    f"선택 업체 {len(selected_keys):,}개의 상세정보",
-                    expanded=False,
-                ):
+                show_selected_detail = st.toggle(
+                    f"선택 업체 {len(selected_keys):,}개의 상세정보 보기",
+                    value=False,
+                    key=(
+                        "prospect_selected_detail_v1013_"
+                        f"{discovery_type}"
+                    ),
+                )
+                if show_selected_detail:
                     detail_columns = [
                         column
                         for column in [
@@ -2565,7 +2715,7 @@ def render_prospect_db_center(
                         if column in display.columns
                     ]
                     selected_detail = display[
-                        display["source_key"].isin(selected_keys)
+                        display["source_key"].astype(str).isin(selected_keys)
                     ]
                     detail_column_config = {}
                     if "인스타그램URL" in detail_columns:
@@ -2581,7 +2731,7 @@ def render_prospect_db_center(
             selected_items = [
                 item
                 for item in items
-                if item.get("source_key") in selected_keys
+                if str(item.get("source_key") or "") in selected_keys
                 and (
                     normalize_phone(item.get("대표전화"))
                     or str(item.get("이메일") or "").strip()
@@ -2602,6 +2752,7 @@ def render_prospect_db_center(
                     )
                     st.success(f"{saved_count:,}개 업체를 저장했습니다.")
                     st.session_state.pop("prospect_result_v1002", None)
+                    # Clear the saved search-result workspace immediately.
                     st.rerun()
                 except Exception as exc:
                     st.error(f"영업후보 저장 실패: {exc}")

@@ -9,6 +9,7 @@ from typing import Any
 
 import streamlit as st
 
+from artifact_cache import content_digest
 from articles_pdf import (
     build_comparison_pdf,
     build_revised_articles_pdf,
@@ -20,6 +21,75 @@ from utils import ROOT_DIR, get_user_dirs
 
 TEMPLATE_PATH = ROOT_DIR / "data" / "articles_amendment_templates.json"
 TABLE_ARTICLES_VERSIONS = "oasis_articles_versions"
+ARTICLES_PDF_CACHE_TTL_SECONDS = 30 * 60
+
+
+@st.cache_data(
+    ttl=ARTICLES_PDF_CACHE_TTL_SECONDS,
+    max_entries=48,
+    show_spinner=False,
+)
+def _cached_revised_articles_pdf(
+    owner_id: str,
+    document_digest: str,
+    company_name: str,
+    business_no: str,
+    final_text: str,
+    version_name: str,
+) -> bytes:
+    del owner_id, document_digest
+    return build_revised_articles_pdf(
+        company_name,
+        business_no,
+        final_text,
+        version_name,
+    )
+
+
+@st.cache_data(
+    ttl=ARTICLES_PDF_CACHE_TTL_SECONDS,
+    max_entries=48,
+    show_spinner=False,
+)
+def _cached_comparison_pdf(
+    owner_id: str,
+    document_digest: str,
+    company_name: str,
+    business_no: str,
+    _comparisons: list[dict[str, Any]],
+    version_name: str,
+) -> bytes:
+    del owner_id, document_digest
+    return build_comparison_pdf(
+        company_name,
+        business_no,
+        _comparisons,
+        version_name,
+    )
+
+
+@st.cache_data(
+    ttl=ARTICLES_PDF_CACHE_TTL_SECONDS,
+    max_entries=48,
+    show_spinner=False,
+)
+def _cached_review_report_pdf(
+    owner_id: str,
+    document_digest: str,
+    company_name: str,
+    business_no: str,
+    _review: dict[str, Any],
+    _comparisons: list[dict[str, Any]],
+    version_name: str,
+) -> bytes:
+    del owner_id, document_digest
+    return build_review_report_pdf(
+        company_name,
+        business_no,
+        _review,
+        _comparisons,
+        version_name,
+    )
 
 
 def _normalize_business_no(value: Any) -> str:
@@ -440,24 +510,49 @@ def render_articles_editor(
             "_",
             company_name or "기업",
         )
-        revised_pdf = build_revised_articles_pdf(
+        revised_digest = content_digest(
             company_name,
             business_no,
             final_text,
             version_name,
         )
-        comparison_pdf = build_comparison_pdf(
+        comparison_digest = content_digest(
             company_name,
             business_no,
             comparisons,
             version_name,
         )
-        report_pdf = build_review_report_pdf(
+        report_digest = content_digest(
             company_name,
             business_no,
             review,
             comparisons,
             version_name,
+        )
+        revised_pdf = _cached_revised_articles_pdf(
+            user_id,
+            revised_digest,
+            company_name,
+            business_no,
+            final_text,
+            version_name,
+        )
+        comparison_pdf = _cached_comparison_pdf(
+            user_id,
+            comparison_digest,
+            company_name,
+            business_no,
+            _comparisons=comparisons,
+            version_name=version_name,
+        )
+        report_pdf = _cached_review_report_pdf(
+            user_id,
+            report_digest,
+            company_name,
+            business_no,
+            _review=review,
+            _comparisons=comparisons,
+            version_name=version_name,
         )
 
         d1, d2, d3 = st.columns(3)

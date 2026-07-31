@@ -31,6 +31,7 @@ def _local_customer_count(path: Path) -> int:
     if not path.exists():
         return 0
 
+    workbook = None
     try:
         workbook = load_workbook(path, read_only=True, data_only=True)
         if "고객DB" not in workbook.sheetnames:
@@ -64,6 +65,9 @@ def _local_customer_count(path: Path) -> int:
         )
     except Exception:
         return 0
+    finally:
+        if workbook is not None:
+            workbook.close()
 
 
 def _make_blank_workbook(path: Path, columns: list[str]) -> None:
@@ -173,7 +177,7 @@ def restore_customer_db_if_needed(user_id: str) -> dict[str, Any]:
         return result
 
     try:
-        records = CloudDatabase().select(
+        records = CloudDatabase().select_all(
             TABLE_CUSTOMERS,
             filters={"owner_user_id": user_id},
             columns=(
@@ -181,7 +185,8 @@ def restore_customer_db_if_needed(user_id: str) -> dict[str, Any]:
                 "industry_name,address,manager_name,customer_data,"
                 "created_at,updated_at"
             ),
-            order="created_at.asc",
+            order="created_at.asc,id.asc",
+            max_rows=50000,
         )
     except Exception as exc:
         result["message"] = f"Supabase 고객조회 실패: {exc}"
