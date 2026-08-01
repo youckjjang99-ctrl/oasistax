@@ -39,6 +39,7 @@ from claim_correction_center import (
     _resolve_auth_progress,
     _retry_authenticated_claim_collection,
     _run_background_claim_job,
+    _safe_provider_error_code,
     _seal_claim_job_payload,
     _select_claim_management_number,
     _set_claim_expiry,
@@ -2835,6 +2836,87 @@ class ClaimCorrectionTests(unittest.TestCase):
             repository.stored_codes,
             ["hometax_tax_payment_certificate"],
         )
+
+    def test_safe_provider_error_code_prefers_explicit_provider_code(self):
+        error = ClaimProviderError(
+            "공급자 요청이 거절되었습니다.",
+            error_code="TILKO_RETURN_LOOKUP_FAILED",
+        )
+
+        self.assertEqual(
+            _safe_provider_error_code(error),
+            "HOMETAX_TILKO_RETURN_LOOKUP_FAILED",
+        )
+
+    def test_safe_provider_error_code_rejects_phone_shaped_code(self):
+        error = ClaimProviderError(
+            "공급자 요청이 거절되었습니다.",
+            error_code="010-1234-5678",
+        )
+
+        self.assertEqual(
+            _safe_provider_error_code(error),
+            "HOMETAX_DOCUMENT_COLLECTION_FAILED",
+        )
+
+    def test_income_tax_return_failure_persists_safe_query_evidence(self):
+        repository = MagicMock()
+        repository.list_documents.return_value = [
+            {
+                "source": "hometax",
+                "document_code": "hometax_income_tax_return",
+                "period_year": 2024,
+                "collection_key": "default",
+                "status": "auth_pending",
+            }
+        ]
+        client = MagicMock()
+        client.collect_hometax_income_tax_return.side_effect = (
+            ClaimProviderError(
+                "공급자 요청이 거절되었습니다.",
+                error_code="RETURN_QUERY_REJECTED",
+            )
+        )
+
+        summary = _collect_supported_hometax_documents(
+            repository,
+            client,
+            case_id="case-1",
+            birth_date="19901019",
+            representative="홍길동",
+            cellphone="01012345678",
+            identity_number="9010191234567",
+            business_number="",
+            session={
+                "Token": "token",
+                "CxId": "cx",
+                "TxId": "tx",
+                "ReqTxId": "req",
+            },
+        )
+
+        self.assertEqual(summary["target"], 1)
+        self.assertEqual(summary["failed"], 1)
+        failure = repository.fail_document.call_args.kwargs
+        self.assertEqual(failure["period_year"], 2024)
+        self.assertEqual(
+            failure["safe_error_code"],
+            "HOMETAX_RETURN_QUERY_REJECTED",
+        )
+        self.assertEqual(
+            failure["facts"],
+            {
+                "collection_scope": "taxpayer",
+                "query_strategy": (
+                    HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY
+                ),
+                "safe_error_code": "HOMETAX_RETURN_QUERY_REJECTED",
+                "period_year": 2024,
+            },
+        )
+        serialized = json.dumps(failure["facts"], ensure_ascii=False)
+        self.assertNotIn("9010191234567", serialized)
+        self.assertNotIn("01012345678", serialized)
 
     def test_comwel_without_business_number_collects_remuneration_only(self):
         repository = MagicMock()

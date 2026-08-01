@@ -1078,13 +1078,11 @@ def _safe_provider_error_code(
     prefix = re.sub(r"[^A-Z0-9_]", "", str(source or "").upper())
     if not prefix:
         prefix = "DOCUMENT"
-    match = re.search(
-        r"(?:오류코드|TargetCode|ErrorCode)\s*[:：]\s*([A-Za-z0-9_-]+)",
-        str(exc),
-        flags=re.IGNORECASE,
-    )
-    if match:
-        return f"{prefix}_{match.group(1).upper()}"[:80]
+    provider_code = _provider_error_code(exc)
+    if provider_code and re.fullmatch(r"(?:[A-Z][A-Z0-9_]{0,63}|[0-9]{1,10})", provider_code):
+        if provider_code.startswith(f"{prefix}_"):
+            return provider_code[:80]
+        return f"{prefix}_{provider_code}"[:80]
     return f"{prefix}_DOCUMENT_COLLECTION_FAILED"[:80]
 
 
@@ -2063,7 +2061,17 @@ def _collect_supported_hometax_documents(
                         fail_kwargs["period_year"] = period_year
                     if collection_key != CLAIM_DEFAULT_COLLECTION_KEY:
                         fail_kwargs["collection_key"] = collection_key
-                        fail_kwargs["facts"] = scope_facts
+                    failure_facts = dict(scope_facts)
+                    if document_code == "hometax_income_tax_return":
+                        failure_facts["safe_error_code"] = safe_error_code
+                        if period_year:
+                            failure_facts["period_year"] = period_year
+                        failure_facts.setdefault(
+                            "query_strategy",
+                            HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY,
+                        )
+                    if failure_facts:
+                        fail_kwargs["facts"] = failure_facts
                     repository.fail_document(case_id, **fail_kwargs)
                 except ClaimRepositoryError:
                     pass
@@ -6246,6 +6254,72 @@ _CLAIM_NO_DATA_REASON_LABELS = {
     "provider_no_records": "기관 조회 결과 해당 자료가 없습니다.",
 }
 
+_CLAIM_FAILED_REASON_LABELS = {
+    "AUTH_SESSION_EXPIRED": (
+        "인증 유효시간이 만료되어 기관 조회를 완료하지 못했습니다. "
+        "새 인증 후 다시 수집해 주세요."
+    ),
+    "BUSINESS_NUMBER_NOT_FOUND": (
+        "사업자등록번호를 확인하지 못해 해당 서류를 조회하지 못했습니다."
+    ),
+    "HOMETAX_DOCUMENT_COLLECTION_FAILED": (
+        "홈택스가 해당 서류를 정상 반환하지 않아 수집을 완료하지 못했습니다."
+    ),
+    "COMWEL_DOCUMENT_COLLECTION_FAILED": (
+        "근로복지공단이 해당 서류를 정상 반환하지 않아 수집을 완료하지 못했습니다."
+    ),
+    "DOCUMENT_COLLECTION_FAILED": (
+        "기관 응답을 정상 처리하지 못해 수집을 완료하지 못했습니다."
+    ),
+}
+
+
+def _claim_document_safe_error_code(document: dict[str, Any]) -> str:
+    """Return only the allow-listed shape of a stored, PII-free error code."""
+
+    facts = document.get("facts")
+    raw_code = (
+        str(facts.get("safe_error_code", "") or "").strip().upper()
+        if isinstance(facts, dict)
+        else ""
+    )
+    if re.fullmatch(r"(?:[A-Z][A-Z0-9_]{0,79}|[0-9]{1,10})", raw_code):
+        return raw_code
+    source = str(document.get("source", "") or "").strip().lower()
+    if source == "hometax":
+        return "HOMETAX_DOCUMENT_COLLECTION_FAILED"
+    if source == "comwel":
+        return "COMWEL_DOCUMENT_COLLECTION_FAILED"
+    return "DOCUMENT_COLLECTION_FAILED"
+
+
+def _claim_failed_reason_label(document: dict[str, Any]) -> str:
+    """Translate a safe provider code without exposing raw errors or PII."""
+
+    code = _claim_document_safe_error_code(document)
+    if code in _CLAIM_FAILED_REASON_LABELS:
+        return _CLAIM_FAILED_REASON_LABELS[code]
+    if code.endswith("_OACX_NO_USER"):
+        return (
+            "기관 간편인증 확인이 완료되지 않아 조회하지 못했습니다. "
+            "고객정보와 인증 완료 여부를 확인해 주세요."
+        )
+    if "AUTH" in code:
+        return "기관 인증 상태를 확인하지 못해 조회를 완료하지 못했습니다."
+    if str(document.get("source", "") or "").strip().lower() == "hometax":
+        return "홈택스 조회 중 오류가 발생해 해당 서류를 수집하지 못했습니다."
+    if str(document.get("source", "") or "").strip().lower() == "comwel":
+        return "근로복지공단 조회 중 오류가 발생해 해당 서류를 수집하지 못했습니다."
+    return _CLAIM_FAILED_REASON_LABELS["DOCUMENT_COLLECTION_FAILED"]
+
+
+def _claim_document_year_label(document: dict[str, Any]) -> str:
+    """Keep Streamlit/Arrow result-table year columns a single string type."""
+
+    value = document.get("period_year")
+    text = str(value or "").strip()
+    return text if text else "-"
+
 
 def _claim_no_data_reason_label(document: dict[str, Any]) -> str:
     if _claim_document_needs_recollection(document):
@@ -6327,12 +6401,13 @@ def _show_claim_documents_dialog(
 
     active_documents = _claim_active_collection_documents(documents)
     ready_documents = _claim_downloadable_documents(documents)
-    failed_count = sum(
-        1
+    failed_documents = [
+        document
         for document in active_documents
         if str(document.get("status", "") or "") == "failed"
         and not _claim_document_is_no_data(document)
-    )
+    ]
+    failed_count = len(failed_documents)
     planned_count = sum(
         1
         for document in documents
@@ -6410,7 +6485,7 @@ def _show_claim_documents_dialog(
                             "사업자": (
                                 _claim_document_scope_label(document) or "공통"
                             ),
-                            "연도": document.get("period_year") or "-",
+                            "연도": _claim_document_year_label(document),
                             "확인 결과": _claim_no_data_reason_label(document),
                         }
                         for document in detail_documents
@@ -6419,6 +6494,41 @@ def _show_claim_documents_dialog(
                 use_container_width=True,
                 hide_index=True,
                 height=min(520, 38 + len(detail_documents) * 35),
+            )
+
+    if failed_documents:
+        with st.expander(
+            f"수집 실패·재시도 필요 {len(failed_documents):,}건",
+            expanded=True,
+        ):
+            st.warning(
+                "아래 항목은 '조회 내역 없음'이 아니라 기관 조회 또는 "
+                "응답 처리에 실패한 자료입니다. 실패 자료 재수집 대상에 "
+                "포함됩니다."
+            )
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "자료명": (
+                                _clean(document.get("document_name"))
+                                or _clean(document.get("document_code"))
+                                or "수집자료"
+                            ),
+                            "기관": _claim_document_source_label(document),
+                            "사업자": (
+                                _claim_document_scope_label(document) or "공통"
+                            ),
+                            "연도": _claim_document_year_label(document),
+                            "실패 사유": _claim_failed_reason_label(document),
+                            "오류 코드": _claim_document_safe_error_code(document),
+                        }
+                        for document in failed_documents
+                    ]
+                ),
+                use_container_width=True,
+                hide_index=True,
+                height=min(520, 38 + len(failed_documents) * 35),
             )
 
     if pending_documents:
@@ -6436,7 +6546,7 @@ def _show_claim_documents_dialog(
                                 or "수집자료"
                             ),
                             "기관": _claim_document_source_label(document),
-                            "연도": document.get("period_year") or "-",
+                            "연도": _claim_document_year_label(document),
                             "상태": _claim_pending_reason_label(document),
                         }
                         for document in pending_documents
@@ -6473,7 +6583,7 @@ def _show_claim_documents_dialog(
                 ),
                 "기관": _claim_document_source_label(document),
                 "사업자": _claim_document_scope_label(document) or "공통",
-                "연도": document.get("period_year") or "-",
+                "연도": _claim_document_year_label(document),
                 "수집일": _format_claim_datetime(
                     document.get("collected_at"),
                     include_time=False,

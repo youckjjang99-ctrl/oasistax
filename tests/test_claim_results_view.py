@@ -15,7 +15,10 @@ from claim_correction_center import (
     _claim_download_cache_fingerprint,
     _claim_downloadable_documents,
     _claim_document_download_name,
+    _claim_document_safe_error_code,
     _claim_document_scope_label,
+    _claim_document_year_label,
+    _claim_failed_reason_label,
     _format_claim_datetime,
     _plan_claim_document_zip_parts,
     _claim_result_case_view,
@@ -160,6 +163,68 @@ class ClaimResultsViewTests(unittest.TestCase):
             [document["id"] for document in selected],
             ["ready-pdf", "ready-excel"],
         )
+
+    def test_failed_document_reason_uses_only_sanitized_error_code(self) -> None:
+        failed = self._document(
+            "failed-income-return",
+            status="failed",
+            source="hometax",
+            document_code="hometax_income_tax_return",
+            facts={
+                "safe_error_code": "HOMETAX_DOCUMENT_COLLECTION_FAILED",
+                "unsafe_message": "주민번호와 인증 토큰이 포함된 원문",
+            },
+        )
+
+        self.assertEqual(
+            _claim_document_safe_error_code(failed),
+            "HOMETAX_DOCUMENT_COLLECTION_FAILED",
+        )
+        label = _claim_failed_reason_label(failed)
+        self.assertIn("홈택스", label)
+        self.assertNotIn("주민번호", label)
+        self.assertNotIn("토큰", label)
+
+    def test_failed_document_invalid_code_falls_back_to_source_code(self) -> None:
+        failed = self._document(
+            "failed-invalid-code",
+            status="failed",
+            source="hometax",
+            facts={"safe_error_code": "bad code: 010-1234-5678"},
+        )
+
+        self.assertEqual(
+            _claim_document_safe_error_code(failed),
+            "HOMETAX_DOCUMENT_COLLECTION_FAILED",
+        )
+
+    def test_document_year_labels_never_mix_integer_and_string_types(self) -> None:
+        import pandas as pd
+        import pyarrow as pa
+
+        labels = [
+            _claim_document_year_label({"period_year": 2025}),
+            _claim_document_year_label({"period_year": None}),
+            _claim_document_year_label({"period_year": "2024"}),
+        ]
+
+        self.assertEqual(labels, ["2025", "-", "2024"])
+        self.assertTrue(all(isinstance(label, str) for label in labels))
+        table = pa.Table.from_pandas(
+            pd.DataFrame({"연도": labels}),
+            preserve_index=False,
+        )
+        self.assertEqual(table.column("연도").to_pylist(), labels)
+
+    def test_document_dialog_renders_failed_rows_separately_from_no_data(
+        self,
+    ) -> None:
+        from claim_correction_center import _show_claim_documents_dialog
+
+        source = inspect.getsource(_show_claim_documents_dialog)
+        self.assertIn("수집 실패·재시도 필요", source)
+        self.assertIn("_claim_failed_reason_label(document)", source)
+        self.assertIn("조회 내역 없음·재확인 상세", source)
 
     def test_result_case_view_is_one_compact_masked_customer_row(self) -> None:
         case = {

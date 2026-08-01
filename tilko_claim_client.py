@@ -48,7 +48,7 @@ HOMETAX_INCOME_TAX_RETURN = (
     "jonghabsodeugse/singo"
 )
 HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY = (
-    "filing_period_plain_dates_v6"
+    "tax_period_plain_dates_v7"
 )
 HOMETAX_AGENT_REFUND = (
     "/api/v1.0/HometaxAgent/UTERDAAA01/HwanGeubGeum"
@@ -1658,19 +1658,16 @@ def _collected_hometax_income_tax_return(
     binary_rows = raw_binary
     filtered_response = dict(response_data)
     discarded_mismatched_records = 0
-    if result_rows and len(identified_years) != len(result_rows):
-        raise ClaimProviderError(
-            "종합소득세 신고서 응답의 귀속연도를 안전하게 확인하지 못했습니다."
-        )
-    if binary_rows and not result_rows:
-        raise ClaimProviderError(
-            "종합소득세 신고서 파일의 귀속연도 정보가 없습니다."
-        )
-    tax_year_verified = True
+    unidentified_result_count = len(result_rows) - len(identified_years)
+    # The v1.0 contract exposes Result and BinaryResult as separate lists.
+    # txnrm* values are useful evidence, but are not declared as required
+    # fields. A valid PDF must therefore survive missing metadata rows.
+    tax_year_verified = bool(result_rows) and not unidentified_result_count
     if mismatched_indexes:
         if binary_rows and len(binary_rows) != len(result_rows):
             raise ClaimProviderError(
-                "종합소득세 신고서 파일과 귀속연도 내역이 일치하지 않습니다."
+                "종합소득세 신고서 파일과 귀속연도 내역이 일치하지 않습니다.",
+                error_code="HOMETAX_RETURN_YEAR_MAPPING_AMBIGUOUS",
             )
         discarded_mismatched_records = len(mismatched_indexes)
         result_rows = [result_rows[index] for index in matching_indexes]
@@ -1682,29 +1679,29 @@ def _collected_hometax_income_tax_return(
             filtered_response["BinaryResult"] = binary_rows
 
     pdf_files: list[tuple[str, bytes]] = []
+    discarded_binary_count = 0
     for index, row in enumerate(binary_rows, start=1):
         if not isinstance(row, dict):
+            discarded_binary_count += 1
             continue
         encoded = str(row.get("Result", "") or "").strip()
         if not encoded:
+            discarded_binary_count += 1
             continue
-        extension = str(row.get("FileExtension", "") or "").strip().lower()
-        extension = extension.lstrip(".")
-        if extension and extension != "pdf":
-            raise ClaimProviderError(
-                "종합소득세 신고서 응답에 허용되지 않은 파일 형식이 포함되어 있습니다."
-            )
         if encoded.casefold().startswith("data:application/pdf;base64,"):
             encoded = encoded.split(",", 1)[1]
         encoded = "".join(encoded.split())
-        content = _decode_provider_file(
-            encoded,
-            document_label="종합소득세 신고서",
-        )
-        if not content.startswith(b"%PDF-"):
-            raise ClaimProviderError(
-                "종합소득세 신고서 응답이 PDF 형식이 아닙니다."
+        try:
+            content = _decode_provider_file(
+                encoded,
+                document_label="종합소득세 신고서",
             )
+        except ClaimProviderError:
+            discarded_binary_count += 1
+            continue
+        if not content.startswith(b"%PDF-"):
+            discarded_binary_count += 1
+            continue
         raw_name = row.get("FileName") or f"income-tax-return-{year}-{index}"
         pdf_files.append(
             (
@@ -1758,6 +1755,8 @@ def _collected_hometax_income_tax_return(
                 "record_count": _structured_record_count(result),
                 "pdf_count": len(pdf_files),
                 "tax_year_verified": tax_year_verified,
+                "unidentified_result_count": unidentified_result_count,
+                "discarded_binary_count": discarded_binary_count,
                 "discarded_mismatched_records": (
                     discarded_mismatched_records
                 ),
@@ -1767,7 +1766,13 @@ def _collected_hometax_income_tax_return(
     result = filtered_response.get("Result")
     if isinstance(result, list) and result:
         raise ClaimProviderError(
-            "종합소득세 신고내역은 확인했지만 신고서 PDF를 받지 못했습니다."
+            "종합소득세 신고내역은 확인했지만 신고서 PDF를 받지 못했습니다.",
+            error_code="HOMETAX_RETURN_PDF_MISSING",
+        )
+    if binary_rows:
+        raise ClaimProviderError(
+            "종합소득세 신고서 파일 응답을 확인하지 못했습니다.",
+            error_code="HOMETAX_RETURN_PDF_INVALID",
         )
     return _collected_no_data_json(
         response_data,
@@ -1778,6 +1783,8 @@ def _collected_hometax_income_tax_return(
             "filing_year": filing_year,
             "query_strategy": query_strategy,
             "tax_year_verified": tax_year_verified,
+            "unidentified_result_count": unidentified_result_count,
+            "discarded_binary_count": discarded_binary_count,
             "discarded_mismatched_records": (
                 discarded_mismatched_records
             ),
@@ -2631,11 +2638,11 @@ class TilkoClaimClient:
         session: dict[str, str],
     ) -> CollectedClaimDocument:
         selected_year = _document_year(year)
-        # 카탈로그의 year는 귀속연도이지만 Tilko 신고서 목록의 검색기간은
-        # 신고일 기준입니다. 따라서 다음 연도(신고연도)를 딱 한 번 조회하고,
-        # 응답의 txnrm* 귀속연도가 요청 연도와 일치하는지 별도로 검증합니다.
-        # 공식 간편인증 명세상 StartDate/EndDate는 평문 yyyyMMdd 필드입니다.
-        filing_year = str(int(selected_year) + 1)
+        # 벤치마킹 서비스의 정상 수집 로그는 귀속연도와 같은 기간을 조회합니다.
+        # 예: 2019년 자료 -> StartDate=20190101, EndDate=20191231.
+        # 공식 간편인증 명세상 StartDate/EndDate는 평문 yyyyMMdd 필드이고,
+        # 납세자 식별번호(BusinessNumber)만 암호화 대상입니다.
+        filing_year = selected_year
         selected_business_number = _valid_hometax_taxpayer_number(
             business_number
         )
@@ -2644,15 +2651,15 @@ class TilkoClaimClient:
                 "종합소득세 신고서 조회에는 유효한 납세자 식별번호가 필요합니다."
             )
         today = date.today()
-        start_date = date(int(filing_year), 1, 1)
+        start_date = date(int(selected_year), 1, 1)
         if start_date > today:
             raise ClaimProviderError(
                 "종합소득세 신고서 조회연도가 아직 시작되지 않았습니다."
             )
-        end_date = min(date(int(filing_year), 12, 31), today)
+        end_date = min(date(int(selected_year), 12, 31), today)
         query_windows = [
             {
-                "label": "filing_period",
+                "label": "tax_period",
                 "start_date": start_date.strftime("%Y%m%d"),
                 "end_date": end_date.strftime("%Y%m%d"),
             }
