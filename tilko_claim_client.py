@@ -48,7 +48,7 @@ HOMETAX_INCOME_TAX_RETURN = (
     "jonghabsodeugse/singo"
 )
 HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY = (
-    "tax_period_encrypted_dates_v5"
+    "filing_period_plain_dates_v6"
 )
 HOMETAX_AGENT_REFUND = (
     "/api/v1.0/HometaxAgent/UTERDAAA01/HwanGeubGeum"
@@ -2631,10 +2631,10 @@ class TilkoClaimClient:
         session: dict[str, str],
     ) -> CollectedClaimDocument:
         selected_year = _document_year(year)
-        # Tilko 신고서 API의 조회기간은 귀속연도를 기준으로 전달합니다.
-        # 같은 연도를 신고연도로 바꿔 재호출하면 건별 비용만 중복될 수
-        # 있으므로 한 귀속연도당 정확히 한 번만 조회합니다. StartDate와
-        # EndDate도 공식 명세상 암호화 필드입니다.
+        # 카탈로그의 year는 귀속연도이지만 Tilko 신고서 목록의 검색기간은
+        # 신고일 기준입니다. 따라서 다음 연도(신고연도)를 딱 한 번 조회하고,
+        # 응답의 txnrm* 귀속연도가 요청 연도와 일치하는지 별도로 검증합니다.
+        # 공식 간편인증 명세상 StartDate/EndDate는 평문 yyyyMMdd 필드입니다.
         filing_year = str(int(selected_year) + 1)
         selected_business_number = _valid_hometax_taxpayer_number(
             business_number
@@ -2644,15 +2644,15 @@ class TilkoClaimClient:
                 "종합소득세 신고서 조회에는 유효한 납세자 식별번호가 필요합니다."
             )
         today = date.today()
-        start_date = date(int(selected_year), 1, 1)
+        start_date = date(int(filing_year), 1, 1)
         if start_date > today:
             raise ClaimProviderError(
                 "종합소득세 신고서 조회연도가 아직 시작되지 않았습니다."
             )
-        end_date = min(date(int(selected_year), 12, 31), today)
+        end_date = min(date(int(filing_year), 12, 31), today)
         query_windows = [
             {
-                "label": "tax_period",
+                "label": "filing_period",
                 "start_date": start_date.strftime("%Y%m%d"),
                 "end_date": end_date.strftime("%Y%m%d"),
             }
@@ -2684,8 +2684,6 @@ class TilkoClaimClient:
                         "BirthDate",
                         "UserCellphoneNumber",
                         "BusinessNumber",
-                        "StartDate",
-                        "EndDate",
                     ),
                 )
                 attempted_windows.append(dict(window))

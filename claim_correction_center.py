@@ -99,9 +99,6 @@ _REMOTE_INVITE_NOTICE_KEY = "claim_remote_invite_notice_v1"
 _REMOTE_INVITE_NAME_PATTERN = re.compile(r"^[가-힣]+(?:[ ·][가-힣]+)*$")
 _REMOTE_INVITE_PHONE_PATTERN = re.compile(r"^010\d{8}$")
 _KOREA_TIMEZONE = timezone(timedelta(hours=9))
-_LEGACY_INCOME_TAX_RETURN_QUERY_STRATEGY = (
-    "tax_period_then_filing_period_v4"
-)
 _REMOTE_INVITE_ERROR_MESSAGES = {
     "PUBLIC_BASE_URL_REQUIRED": (
         "고객 인증 주소 설정이 완료되지 않았습니다. 관리자에게 문의해주세요."
@@ -212,13 +209,12 @@ def _claim_document_needs_recollection(document: dict[str, Any]) -> bool:
         and facts.get("no_data_verified") is True
         and query_attempt_count >= 1
     )
-    legacy_verified = bool(
-        query_strategy == _LEGACY_INCOME_TAX_RETURN_QUERY_STRATEGY
-        and facts.get("provider_query_attempted") is True
-        and facts.get("no_data_verified_across_windows") is True
-        and query_attempt_count >= 2
-    )
-    return not (current_verified or legacy_verified)
+    # Empty results created by every older strategy must be rechecked.  The
+    # v4/v5 strategies queried the wrong calendar window (and v5 also
+    # encrypted plain date fields), so they cannot be treated as verified
+    # evidence that no return exists.  Existing non-empty/PDF documents are
+    # preserved by the early return above.
+    return not current_verified
 
 
 def _claim_document_is_downloadable(

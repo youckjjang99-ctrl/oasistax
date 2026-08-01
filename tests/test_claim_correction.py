@@ -945,7 +945,7 @@ class ClaimCorrectionTests(unittest.TestCase):
         self.assertEqual(ready_count, 0)
         self.assertEqual(percentage, 0)
 
-    def test_verified_legacy_dual_window_empty_remains_terminal(self):
+    def test_verified_legacy_dual_window_empty_requires_recollection(self):
         document = {
             "source": "hometax",
             "document_code": "hometax_income_tax_return",
@@ -967,8 +967,8 @@ class ClaimCorrectionTests(unittest.TestCase):
         )
 
         self.assertEqual(target_count, 1)
-        self.assertEqual(ready_count, 1)
-        self.assertEqual(percentage, 100)
+        self.assertEqual(ready_count, 0)
+        self.assertEqual(percentage, 0)
 
     def test_verified_legacy_income_tax_pdf_remains_downloadable(self):
         document = {
