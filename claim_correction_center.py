@@ -138,6 +138,27 @@ def _clean(value: Any) -> str:
     return text
 
 
+def _format_claim_datetime(
+    value: Any,
+    *,
+    include_time: bool = True,
+) -> str:
+    """Render stored UTC/ISO timestamps consistently in Korea time."""
+    text = _clean(value)
+    if not text:
+        return "-"
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        localized = parsed.astimezone(_KOREA_TIMEZONE)
+    except (TypeError, ValueError, OverflowError):
+        return text[:16].replace("T", " ") if include_time else text[:10]
+    return localized.strftime(
+        "%Y-%m-%d %H:%M" if include_time else "%Y-%m-%d"
+    )
+
+
 def _claim_document_is_no_data(document: dict[str, Any]) -> bool:
     facts = document.get("facts")
     return bool(isinstance(facts, dict) and facts.get("no_data") is True)
@@ -181,13 +202,19 @@ def _claim_document_needs_recollection(document: dict[str, Any]) -> bool:
         query_attempt_count = int(facts.get("query_attempt_count") or 0)
     except (TypeError, ValueError):
         query_attempt_count = 0
-    return not (
-        str(facts.get("query_strategy", "")).strip()
-        == HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY
+    query_strategy = str(facts.get("query_strategy", "")).strip()
+    current_verified = bool(
+        query_strategy == HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY
         and facts.get("provider_query_attempted") is True
-        and facts.get("no_data_verified_across_windows") is True
-        and query_attempt_count >= 2
+        and facts.get("no_data_verified") is True
+        and query_attempt_count >= 1
     )
+    # Empty results created by every older strategy must be rechecked.  The
+    # v4/v5 strategies queried the wrong calendar window (and v5 also
+    # encrypted plain date fields), so they cannot be treated as verified
+    # evidence that no return exists.  Existing non-empty/PDF documents are
+    # preserved by the early return above.
+    return not current_verified
 
 
 def _claim_document_is_downloadable(
@@ -2215,10 +2242,16 @@ def _collect_supported_comwel_documents(
         scope_refresh = bool(
             preexisting_ready and scoped_job and not scope_matches
         )
+        terminal_no_data = bool(
+            preexisting_ready
+            and _claim_document_is_no_data(current)
+            and not _claim_document_is_provider_blocked(current)
+            and not _claim_document_needs_recollection(current)
+        )
         if (
             preexisting_ready
             and (not scoped_job or scope_matches)
-            and not refresh_ready
+            and (not refresh_ready or terminal_no_data)
         ):
             completed_count += 1
             report(document_code)
@@ -4909,8 +4942,7 @@ def _select_claim_management_number(
 
 def _case_label(row: dict[str, Any]) -> str:
     company = _clean(row.get("company_name")) or "업체명 없음"
-    requested = _clean(row.get("requested_at"))
-    date_text = requested[:10] if requested else "-"
+    date_text = _format_claim_datetime(row.get("requested_at"))
     return f"{company} · {date_text} · {str(row.get('id', ''))[:8]}"
 
 
@@ -5543,7 +5575,7 @@ def _cases_dataframe(cases: list[dict[str, Any]]) -> pd.DataFrame:
     for case in cases:
         rows.append(
             {
-                "요청일": _clean(case.get("requested_at"))[:16].replace("T", " "),
+                "요청일": _format_claim_datetime(case.get("requested_at")),
                 "상호명": _clean(case.get("company_name")),
                 "사업자번호": _clean(case.get("business_no_masked")),
                 "구분": (
@@ -5727,10 +5759,16 @@ def _render_status_tab(
         hide_index=True,
     )
     labels = [_case_label(case) for case in cases]
+    selector_key = "claim_status_case_selector_v1"
+    latest_case_id = str(cases[0].get("id", ""))
+    latest_marker_key = "_claim_status_latest_case_id_v1"
+    if st.session_state.get(latest_marker_key) != latest_case_id:
+        st.session_state[selector_key] = labels[0]
+        st.session_state[latest_marker_key] = latest_case_id
     selected_label = st.selectbox(
         "완료 여부를 확인할 요청",
         labels,
-        key="claim_status_case_selector_v1",
+        key=selector_key,
     )
     selected_case = cases[labels.index(selected_label)]
     case_id = str(selected_case.get("id", ""))
@@ -5844,9 +5882,7 @@ def _claim_result_case_view(
         "hometax_status": _source_status(case.get("hometax_status")),
         "comwel_status": _source_status(case.get("comwel_status")),
         "overall_status": _claim_result_status_group(case),
-        "requested_at": (
-            _clean(case.get("requested_at"))[:16].replace("T", " ") or "-"
-        ),
+        "requested_at": _format_claim_datetime(case.get("requested_at")),
         "requested_by": _clean(case.get("requested_by")) or "-",
         "downloadable_document_count": len(
             _claim_downloadable_documents(documents or [], now=now)
@@ -6438,7 +6474,10 @@ def _show_claim_documents_dialog(
                 "기관": _claim_document_source_label(document),
                 "사업자": _claim_document_scope_label(document) or "공통",
                 "연도": document.get("period_year") or "-",
-                "수집일": _clean(document.get("collected_at"))[:10] or "-",
+                "수집일": _format_claim_datetime(
+                    document.get("collected_at"),
+                    include_time=False,
+                ),
                 "파일": size_label,
             }
         )
