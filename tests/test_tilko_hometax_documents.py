@@ -22,6 +22,7 @@ from tilko_claim_client import (
     HOMETAX_HOST,
     HOMETAX_INCOME_TAX_HELP,
     HOMETAX_INCOME_TAX_RETURN,
+    HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY,
     ClaimProviderError,
     CollectedClaimDocument,
     TilkoClaimClient,
@@ -112,8 +113,10 @@ class TilkoHometaxDocumentClientTests(unittest.TestCase):
         self.assertNotIn(identity_number, json.dumps(document.facts))
         self.assertEqual(
             document.facts["query_strategy"],
-            "filing_year_taxpayer_v3",
+            HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY,
         )
+        self.assertEqual(post.call_count, 2)
+        self.assertNotIn(identity_number, document.content.decode("utf-8"))
 
     @patch("tilko_claim_client.requests.post")
     def test_income_tax_return_uses_hometax_v1_and_encrypts_payload(
@@ -142,8 +145,12 @@ class TilkoHometaxDocumentClientTests(unittest.TestCase):
             post.call_args.args[0],
             f"{HOMETAX_HOST}{HOMETAX_INCOME_TAX_RETURN}",
         )
-        payload = post.call_args.kwargs["json"]
+        self.assertEqual(post.call_count, 2)
+        first_payload = post.call_args_list[0].kwargs["json"]
+        payload = post.call_args_list[1].kwargs["json"]
         self.assertNotIn("Auth", payload)
+        self.assertEqual(first_payload["StartDate"], "20240101")
+        self.assertEqual(first_payload["EndDate"], "20241231")
         self.assertEqual(payload["StartDate"], "20250101")
         self.assertEqual(payload["EndDate"], "20251231")
         self.assertEqual(payload["PrivateAuthType"], "0")
@@ -162,7 +169,13 @@ class TilkoHometaxDocumentClientTests(unittest.TestCase):
         self.assertTrue(document.facts["no_data"])
         self.assertEqual(document.facts["year"], "2024")
         self.assertEqual(document.facts["filing_year"], "2025")
-        self.assertEqual(document.facts["query_strategy"], "filing_year_v2")
+        self.assertEqual(
+            document.facts["query_strategy"],
+            HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY,
+        )
+        self.assertTrue(document.facts["provider_query_attempted"])
+        self.assertTrue(document.facts["no_data_verified_across_windows"])
+        self.assertEqual(document.facts["query_attempt_count"], 2)
 
     @patch("tilko_claim_client.requests.post")
     def test_income_tax_return_collects_downloadable_pdf(self, post):
@@ -201,8 +214,195 @@ class TilkoHometaxDocumentClientTests(unittest.TestCase):
         self.assertEqual(document.file_name, "income-return.pdf")
         self.assertEqual(document.facts["year"], "2024")
         self.assertEqual(document.facts["filing_year"], "2025")
-        self.assertEqual(document.facts["query_strategy"], "filing_year_v2")
+        self.assertEqual(
+            document.facts["query_strategy"],
+            HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY,
+        )
         self.assertEqual(document.facts["pdf_count"], 1)
+        self.assertEqual(document.facts["selected_query_window"], "tax_period")
+        self.assertEqual(post.call_count, 1)
+
+    @patch("tilko_claim_client.requests.post")
+    def test_income_tax_return_falls_back_to_filing_period(self, post):
+        pdf = b"%PDF-1.7\nfallback-income-tax-return"
+        post.side_effect = [
+            _JsonResponse(
+                {
+                    "ErrorCode": 0,
+                    "ApiTxKey": "empty-tax-period",
+                    "Result": [],
+                    "BinaryResult": [],
+                }
+            ),
+            _JsonResponse(
+                {
+                    "ErrorCode": 0,
+                    "ApiTxKey": "filing-period-pdf",
+                    "Result": [
+                        {
+                            "txnrmStrtDt": "20240101",
+                            "txnrmEndDt": "20241231",
+                        }
+                    ],
+                    "BinaryResult": [
+                        {
+                            "FileName": "income-return-2024.pdf",
+                            "FileExtension": "pdf",
+                            "Result": base64.b64encode(pdf).decode("ascii"),
+                        }
+                    ],
+                }
+            ),
+        ]
+
+        document = _client().collect_hometax_income_tax_return(
+            year=2024,
+            birth_date="19901019",
+            user_name="홍길동",
+            cellphone="01012345678",
+            business_number="2208162517",
+            session=_session(),
+        )
+
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(
+            [
+                call.kwargs["json"]["StartDate"]
+                for call in post.call_args_list
+            ],
+            ["20240101", "20250101"],
+        )
+        self.assertEqual(document.content, pdf)
+        self.assertEqual(document.content_type, "application/pdf")
+        self.assertEqual(
+            document.facts["selected_query_window"],
+            "filing_period",
+        )
+        self.assertEqual(document.facts["query_attempt_count"], 2)
+
+    @patch("tilko_claim_client.requests.post")
+    def test_income_tax_return_both_windows_empty_is_verified(self, post):
+        post.side_effect = [
+            _JsonResponse(
+                {
+                    "ErrorCode": 0,
+                    "ApiTxKey": f"empty-{index}",
+                    "Result": [],
+                    "BinaryResult": [],
+                }
+            )
+            for index in range(2)
+        ]
+
+        document = _client().collect_hometax_income_tax_return(
+            year=2024,
+            birth_date="19901019",
+            user_name="홍길동",
+            cellphone="01012345678",
+            business_number="2208162517",
+            session=_session(),
+        )
+
+        self.assertEqual(post.call_count, 2)
+        self.assertTrue(document.facts["no_data"])
+        self.assertTrue(document.facts["no_data_verified_across_windows"])
+        self.assertEqual(document.facts["query_attempt_count"], 2)
+        self.assertEqual(
+            json.loads(document.content.decode("utf-8")),
+            document.facts,
+        )
+
+    def test_income_tax_return_keeps_valid_primary_result_when_fallback_fails(
+        self,
+    ):
+        client = _client()
+        client._post = MagicMock(
+            side_effect=[
+                {
+                    "ErrorCode": 0,
+                    "ApiTxKey": "valid-tax-period",
+                    "Result": [
+                        {
+                            "txnrmStrtDt": "20240101",
+                            "txnrmEndDt": "20241231",
+                            "rtnDt": "20240531",
+                        }
+                    ],
+                    "BinaryResult": [],
+                },
+                ClaimProviderError("temporary fallback failure"),
+            ]
+        )
+
+        document = client.collect_hometax_income_tax_return(
+            year=2024,
+            birth_date="19901019",
+            user_name="홍길동",
+            cellphone="01012345678",
+            business_number="2208162517",
+            session=_session(),
+        )
+
+        self.assertEqual(client._post.call_count, 2)
+        self.assertIsNot(document.facts.get("no_data"), True)
+        self.assertTrue(document.facts["tax_year_verified"])
+        self.assertEqual(
+            document.facts["selected_query_window"],
+            "tax_period",
+        )
+
+    def test_income_tax_return_keeps_valid_primary_on_fallback_parse_error(
+        self,
+    ):
+        client = _client()
+        client._post = MagicMock(
+            side_effect=[
+                {
+                    "ErrorCode": 0,
+                    "ApiTxKey": "valid-tax-period",
+                    "Result": [
+                        {
+                            "txnrmStrtDt": "20240101",
+                            "txnrmEndDt": "20241231",
+                            "rtnDt": "20240531",
+                        }
+                    ],
+                    "BinaryResult": [],
+                },
+                {
+                    "ErrorCode": 0,
+                    "ApiTxKey": "invalid-filing-period",
+                    "Result": [],
+                    "BinaryResult": [
+                        {
+                            "FileName": "unmatched.pdf",
+                            "FileExtension": "pdf",
+                            "Result": base64.b64encode(
+                                b"%PDF-1.7\nunmatched"
+                            ).decode("ascii"),
+                        }
+                    ],
+                },
+            ]
+        )
+
+        document = client.collect_hometax_income_tax_return(
+            year=2024,
+            birth_date="19901019",
+            user_name="홍길동",
+            cellphone="01012345678",
+            business_number="2208162517",
+            session=_session(),
+        )
+
+        self.assertEqual(client._post.call_count, 2)
+        self.assertIsNot(document.facts.get("no_data"), True)
+        self.assertTrue(document.facts["tax_year_verified"])
+        self.assertEqual(document.facts["query_attempt_count"], 2)
+        self.assertEqual(
+            document.facts["selected_query_window"],
+            "tax_period",
+        )
 
     @patch("tilko_claim_client.requests.post")
     def test_income_tax_return_filters_other_tax_years(self, post):
@@ -495,6 +695,81 @@ class TilkoHometaxDocumentClientTests(unittest.TestCase):
     },
 )
 class TilkoHometaxAnnualCollectionTests(unittest.TestCase):
+    def test_legacy_empty_income_return_is_recollected(self):
+        repository = MagicMock()
+        repository.list_documents.return_value = [
+            {
+                "source": "hometax",
+                "document_code": "hometax_income_tax_return",
+                "period_year": 2024,
+                "collection_key": "default",
+                "status": "ready",
+                "facts": {
+                    "no_data": True,
+                    "query_strategy": "filing_year_taxpayer_v3",
+                    "tax_year_verified": True,
+                },
+            }
+        ]
+        repository.store_collected_document.return_value = {
+            "status": "ready"
+        }
+        client = MagicMock()
+        client.collect_hometax_income_tax_return.return_value = _document(2024)
+
+        _collect_supported_hometax_documents(
+            repository,
+            client,
+            case_id="legacy-empty-return",
+            birth_date="901019",
+            representative="홍길동",
+            cellphone="01012345678",
+            identity_number="9010191234567",
+            business_number="",
+            session=_session(),
+        )
+
+        client.collect_hometax_income_tax_return.assert_called_once()
+
+    def test_verified_dual_window_empty_income_return_is_skipped(self):
+        repository = MagicMock()
+        repository.list_documents.return_value = [
+            {
+                "source": "hometax",
+                "document_code": "hometax_income_tax_return",
+                "period_year": 2024,
+                "collection_key": "default",
+                "status": "ready",
+                "facts": {
+                    "no_data": True,
+                    "collection_scope": "taxpayer",
+                    "query_strategy": (
+                        HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY
+                    ),
+                    "tax_year_verified": True,
+                    "provider_query_attempted": True,
+                    "no_data_verified_across_windows": True,
+                    "query_attempt_count": 2,
+                },
+            }
+        ]
+        client = MagicMock()
+
+        _collect_supported_hometax_documents(
+            repository,
+            client,
+            case_id="verified-empty-return",
+            birth_date="901019",
+            representative="홍길동",
+            cellphone="01012345678",
+            identity_number="9010191234567",
+            business_number="",
+            session=_session(),
+        )
+
+        client.collect_hometax_income_tax_return.assert_not_called()
+        repository.store_collected_document.assert_not_called()
+
     def test_seven_year_rows_are_stored_by_year_and_ready_years_are_skipped(
         self,
     ):

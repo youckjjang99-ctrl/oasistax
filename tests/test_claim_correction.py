@@ -56,6 +56,7 @@ from claim_correction_repository import (
 from tilko_claim_client import (
     ClaimProviderError,
     CollectedClaimDocument,
+    HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY,
     TilkoClaimClient,
     TilkoClaimConfig,
     is_transient_provider_error,
@@ -893,6 +894,82 @@ class ClaimCorrectionTests(unittest.TestCase):
         self.assertEqual(ready_count, 1)
         self.assertEqual(percentage, 50)
 
+    def test_verified_dual_window_empty_income_return_is_terminal(self):
+        document = {
+            "source": "hometax",
+            "document_code": "hometax_income_tax_return",
+            "period_year": 2024,
+            "status": "ready",
+            "facts": {
+                "no_data": True,
+                "record_count": 0,
+                "query_strategy": HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY,
+                "tax_year_verified": True,
+                "provider_query_attempted": True,
+                "no_data_verified_across_windows": True,
+                "query_attempt_count": 2,
+            },
+        }
+
+        percentage, _, ready_count, target_count = (
+            _claim_collection_progress([document])
+        )
+
+        self.assertEqual(target_count, 1)
+        self.assertEqual(ready_count, 1)
+        self.assertEqual(percentage, 100)
+
+    def test_invalid_dual_window_evidence_requires_recollection(self):
+        document = {
+            "source": "hometax",
+            "document_code": "hometax_income_tax_return",
+            "period_year": 2024,
+            "status": "ready",
+            "facts": {
+                "no_data": True,
+                "record_count": 0,
+                "query_strategy": HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY,
+                "tax_year_verified": True,
+                "provider_query_attempted": True,
+                "no_data_verified_across_windows": True,
+                "query_attempt_count": "invalid",
+            },
+        }
+
+        percentage, _, ready_count, target_count = (
+            _claim_collection_progress([document])
+        )
+
+        self.assertEqual(target_count, 1)
+        self.assertEqual(ready_count, 0)
+        self.assertEqual(percentage, 0)
+
+    def test_verified_legacy_income_tax_pdf_remains_downloadable(self):
+        document = {
+            "source": "hometax",
+            "document_code": "hometax_income_tax_return",
+            "period_year": 2024,
+            "status": "ready",
+            "storage_bucket": "oasis-claim-documents",
+            "storage_path": "case/verified-return.pdf",
+            "content_type": "application/pdf",
+            "retention_until": "2099-12-31T00:00:00+00:00",
+            "facts": {
+                "record_count": 1,
+                "query_strategy": "filing_year_v2",
+                "tax_year_verified": True,
+            },
+        }
+
+        percentage, _, ready_count, target_count = (
+            _claim_collection_progress([document])
+        )
+
+        self.assertEqual(target_count, 1)
+        self.assertEqual(ready_count, 1)
+        self.assertEqual(percentage, 100)
+        self.assertTrue(_claim_document_is_downloadable(document))
+
     def test_collection_progress_includes_configured_optional_providers(self):
         documents = [
             {
@@ -1077,8 +1154,8 @@ class ClaimCorrectionTests(unittest.TestCase):
         )
 
         self.assertEqual(target_count, 2)
-        self.assertEqual(ready_count, 1)
-        self.assertEqual(percentage, 50)
+        self.assertEqual(ready_count, 0)
+        self.assertEqual(percentage, 0)
 
     def test_old_downloadable_income_tax_return_requires_recollection(self):
         old_document = {
@@ -1112,8 +1189,13 @@ class ClaimCorrectionTests(unittest.TestCase):
                 "status": "ready",
                 "facts": {
                     "no_data": True,
-                    "query_strategy": "filing_year_taxpayer_v3",
+                    "query_strategy": (
+                        HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY
+                    ),
                     "tax_year_verified": True,
+                    "provider_query_attempted": True,
+                    "no_data_verified_across_windows": True,
+                    "query_attempt_count": 2,
                 },
             },
             *[
@@ -2270,14 +2352,14 @@ class ClaimCorrectionTests(unittest.TestCase):
                 "hidden",
             ),
             (
-                "complete",
+                "completed-job-with-stale-documents",
                 {
                     **authenticated_case,
                     "overall_status": "ready",
                 },
                 {"status": "complete", "expires_at": future},
                 True,
-                "complete",
+                "reauth_required",
             ),
         ]
         for (
@@ -2296,6 +2378,16 @@ class ClaimCorrectionTests(unittest.TestCase):
                     ),
                     expected,
                 )
+
+        self.assertEqual(
+            _claim_collection_retry_state(
+                authenticated_case,
+                {"status": "complete", "expires_at": future},
+                provider_ready=True,
+                collection_complete=True,
+            ),
+            "complete",
+        )
 
     def test_background_job_completes_sequential_auth_and_collection(self):
         case_id = "case-1"

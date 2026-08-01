@@ -35,6 +35,7 @@ from registered_policy_match import (
     load_registered_customers,
 )
 from tilko_claim_client import (
+    HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY,
     ClaimProviderError,
     CollectedClaimDocument,
     TilkoClaimClient,
@@ -167,11 +168,25 @@ def _claim_document_needs_recollection(document: dict[str, Any]) -> bool:
     ):
         return False
     facts = document.get("facts")
+    if (
+        not isinstance(facts, dict)
+        or facts.get("tax_year_verified") is not True
+    ):
+        return True
+    # 이미 실제 파일/내역이 저장된 과거 결과는 비용을 들여 다시 받지 않습니다.
+    # 빈 결과만 새 이중 조회 전략으로 재검증합니다.
+    if facts.get("no_data") is not True:
+        return False
+    try:
+        query_attempt_count = int(facts.get("query_attempt_count") or 0)
+    except (TypeError, ValueError):
+        query_attempt_count = 0
     return not (
-        isinstance(facts, dict)
-        and str(facts.get("query_strategy", "")).strip()
-        in {"filing_year_v2", "filing_year_taxpayer_v3"}
-        and facts.get("tax_year_verified") is True
+        str(facts.get("query_strategy", "")).strip()
+        == HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY
+        and facts.get("provider_query_attempted") is True
+        and facts.get("no_data_verified_across_windows") is True
+        and query_attempt_count >= 2
     )
 
 
@@ -458,6 +473,8 @@ def _claim_result_document_status(
 
     if _claim_document_is_provider_blocked(document):
         return "API 미호출 · 재수집 필요"
+    if _claim_document_needs_recollection(document):
+        return "이전 조회 결과 · 재검증 필요"
     if _claim_document_is_no_data(document):
         return "조회된 신고내역 없음"
     if (
@@ -636,8 +653,15 @@ def _claim_active_collection_documents(
         == CLAIM_DEFAULT_COLLECTION_KEY
         and str(document.get("status", "")).strip().lower() == "ready"
         and isinstance(document.get("facts"), dict)
-        and str(document["facts"].get("query_strategy", "")).strip()
-        == "filing_year_taxpayer_v3"
+        and (
+            str(document["facts"].get("collection_scope", "")).strip()
+            == "taxpayer"
+            or str(document["facts"].get("query_strategy", "")).strip()
+            in {
+                "filing_year_taxpayer_v3",
+                HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY,
+            }
+        )
     }
     variant_groups = {
         (
@@ -671,8 +695,15 @@ def _claim_active_collection_documents(
             str(document.get("document_code", "")).strip()
             == "hometax_income_tax_return"
             and isinstance(facts, dict)
-            and str(facts.get("query_strategy", "")).strip()
-            == "filing_year_taxpayer_v3"
+            and (
+                str(facts.get("collection_scope", "")).strip()
+                == "taxpayer"
+                or str(facts.get("query_strategy", "")).strip()
+                in {
+                    "filing_year_taxpayer_v3",
+                    HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY,
+                }
+            )
         ):
             return False
         group = (
@@ -1803,7 +1834,9 @@ def _collect_supported_hometax_documents(
                         CLAIM_DEFAULT_COLLECTION_KEY,
                         {
                             "collection_scope": "taxpayer",
-                            "query_strategy": "filing_year_taxpayer_v3",
+                            "query_strategy": (
+                                HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY
+                            ),
                         },
                         lambda year=period_year, taxpayer_number=taxpayer_number: client.collect_hometax_income_tax_return(
                             year=year,
@@ -4653,7 +4686,10 @@ def _claim_collection_retry_state(
     if job_status in {"running", "queued"}:
         return "running"
     if job_status == "complete":
-        return "complete"
+        # 완료 작업은 임시 인증정보를 즉시 폐기합니다. 배포 후 새 조회
+        # 전략으로 미완료 문서가 발견되면 같은 작업을 재사용할 수 없으므로
+        # 완료로 숨기지 않고 새 인증을 안내해야 합니다.
+        return "reauth_required"
     if (
         job_status == "expired"
         or float(job_snapshot.get("expires_at", 0) or 0) <= time.time()
@@ -5592,12 +5628,6 @@ def _render_auto_claim_monitor(
                 st.rerun(scope="app")
             st.success(
                 f"{completion_message} ‘수집결과’에서 확인해 주세요."
-            )
-            return
-        if job_status == "complete" and not verified_complete:
-            st.warning(
-                "작업 종료 신호는 받았지만 Supabase의 실제 수집 자료가 "
-                "모두 확인되지 않아 완료로 표시하지 않았습니다."
             )
             return
         if job_status == "expired":

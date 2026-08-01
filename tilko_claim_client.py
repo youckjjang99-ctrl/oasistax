@@ -47,6 +47,9 @@ HOMETAX_INCOME_TAX_RETURN = (
     "/api/v1.0/hometaxsimpleauth/uternaaz110/"
     "jonghabsodeugse/singo"
 )
+HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY = (
+    "tax_period_then_filing_period_v4"
+)
 HOMETAX_AGENT_REFUND = (
     "/api/v1.0/HometaxAgent/UTERDAAA01/HwanGeubGeum"
 )
@@ -1613,7 +1616,7 @@ def _collected_hometax_income_tax_return(
     *,
     year: str,
     filing_year: str,
-    query_strategy: str = "filing_year_v2",
+    query_strategy: str = HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY,
 ) -> CollectedClaimDocument:
     raw_result = response_data.get("Result")
     result_rows = (
@@ -1794,6 +1797,47 @@ def _collected_hometax_income_tax_return(
                 discarded_mismatched_records
             ),
         },
+    )
+
+
+def _with_income_tax_return_query_metadata(
+    document: CollectedClaimDocument,
+    *,
+    filing_year: str,
+    attempted_windows: list[dict[str, str]],
+    selected_window: str,
+) -> CollectedClaimDocument:
+    """Attach PII-free evidence about the provider queries that were made."""
+    facts = dict(document.facts or {})
+    facts.update(
+        {
+            "filing_year": filing_year,
+            "query_strategy": HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY,
+            "provider_query_attempted": True,
+            "query_attempt_count": len(attempted_windows),
+            "query_windows": [dict(window) for window in attempted_windows],
+            "selected_query_window": selected_window,
+        }
+    )
+    if facts.get("no_data") is True:
+        facts["no_data_verified_across_windows"] = bool(
+            len(attempted_windows) >= 2
+        )
+        content = json.dumps(
+            facts,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    else:
+        content = document.content
+    return CollectedClaimDocument(
+        content=content,
+        file_name=document.file_name,
+        content_type=document.content_type,
+        provider_reference=document.provider_reference,
+        facts=facts,
+        transient_facts=dict(document.transient_facts or {}),
     )
 
 
@@ -2601,15 +2645,11 @@ class TilkoClaimClient:
         session: dict[str, str],
     ) -> CollectedClaimDocument:
         selected_year = _document_year(year)
-        # 종합소득세 신고서는 귀속연도의 다음 해에 제출됩니다.
-        # Tilko의 StartDate/EndDate는 귀속기간이 아니라 신고일 검색기간이고,
-        # 응답은 txnrmStrtDt/txnrmEndDt(귀속기간)와 rtnDt(신고일)를 별도로
-        # 제공합니다. 예: 2025년 귀속 신고서는 2026년 신고기간에서 조회합니다.
+        # Tilko 전용 신고서 API와 기존 전자신고결과 연동은 조회기간을
+        # 다르게 해석하는 사례가 있습니다. 귀속연도 기간을 먼저 조회하고,
+        # 파일이 없으면 실제 신고가 이뤄지는 다음 연도 기간을 한 번 더
+        # 조회한 뒤 응답의 txnrm* 값으로 귀속연도를 최종 검증합니다.
         filing_year = str(int(selected_year) + 1)
-        filing_end = min(
-            date(int(filing_year), 12, 31),
-            date.today(),
-        ).strftime("%Y%m%d")
         selected_business_number = _valid_hometax_taxpayer_number(
             business_number
         )
@@ -2617,40 +2657,100 @@ class TilkoClaimClient:
             raise ClaimProviderError(
                 "종합소득세 신고서 조회에는 유효한 납세자 식별번호가 필요합니다."
             )
-        query_strategy = (
-            "filing_year_taxpayer_v3"
-            if len(selected_business_number) == 13
-            else "filing_year_v2"
-        )
-        payload = {
-            "CxId": str(session.get("CxId", "") or ""),
-            "PrivateAuthType": "0",
-            "ReqTxId": str(session.get("ReqTxId", "") or ""),
-            "Token": str(session.get("Token", "") or ""),
-            "TxId": str(session.get("TxId", "") or ""),
-            "UserName": user_name,
-            "BirthDate": birth_date,
-            "UserCellphoneNumber": cellphone,
-            "BusinessNumber": selected_business_number,
-            "StartDate": f"{filing_year}0101",
-            "EndDate": filing_end,
-        }
-        response = self._post(
-            self.config.hometax_host,
-            HOMETAX_INCOME_TAX_RETURN,
-            payload,
+        today = date.today()
+        query_windows: list[dict[str, str]] = []
+        for label, query_year in (
+            ("tax_period", selected_year),
+            ("filing_period", filing_year),
+        ):
+            start_date = date(int(query_year), 1, 1)
+            if start_date > today:
+                continue
+            end_date = min(date(int(query_year), 12, 31), today)
+            query_windows.append(
+                {
+                    "label": label,
+                    "start_date": start_date.strftime("%Y%m%d"),
+                    "end_date": end_date.strftime("%Y%m%d"),
+                }
+            )
+
+        attempted_windows: list[dict[str, str]] = []
+        candidates: list[tuple[str, CollectedClaimDocument]] = []
+        for window in query_windows:
+            payload = {
+                "CxId": str(session.get("CxId", "") or ""),
+                "PrivateAuthType": "0",
+                "ReqTxId": str(session.get("ReqTxId", "") or ""),
+                "Token": str(session.get("Token", "") or ""),
+                "TxId": str(session.get("TxId", "") or ""),
+                "UserName": user_name,
+                "BirthDate": birth_date,
+                "UserCellphoneNumber": cellphone,
+                "BusinessNumber": selected_business_number,
+                "StartDate": window["start_date"],
+                "EndDate": window["end_date"],
+            }
+            try:
+                response = self._post(
+                    self.config.hometax_host,
+                    HOMETAX_INCOME_TAX_RETURN,
+                    payload,
+                    (
+                        "UserName",
+                        "BirthDate",
+                        "UserCellphoneNumber",
+                        "BusinessNumber",
+                    ),
+                )
+                attempted_windows.append(dict(window))
+                document = _collected_hometax_income_tax_return(
+                    response,
+                    year=selected_year,
+                    filing_year=filing_year,
+                    query_strategy=(
+                        HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY
+                    ),
+                )
+            except ClaimProviderError:
+                # 첫 조회에서 이미 유효한 신고내역을 확보했다면 보조 조회의
+                # 일시 오류 때문에 그 결과까지 버리지 않습니다. 빈 결과만
+                # 있는 상태에서는 '자료 없음'으로 오인하지 않도록 실패를
+                # 그대로 전달합니다.
+                if any(
+                    candidate.facts.get("no_data") is not True
+                    for _, candidate in candidates
+                ):
+                    break
+                raise
+            candidates.append((window["label"], document))
+            if document.content_type == "application/pdf":
+                break
+
+        if not candidates:
+            raise ClaimProviderError(
+                "종합소득세 신고서 조회기간을 구성하지 못했습니다."
+            )
+        selected_label, selected_document = next(
             (
-                "UserName",
-                "BirthDate",
-                "UserCellphoneNumber",
-                "BusinessNumber",
+                candidate
+                for candidate in candidates
+                if candidate[1].content_type == "application/pdf"
+            ),
+            next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate[1].facts.get("no_data") is not True
+                ),
+                candidates[-1],
             ),
         )
-        return _collected_hometax_income_tax_return(
-            response,
-            year=selected_year,
+        return _with_income_tax_return_query_metadata(
+            selected_document,
             filing_year=filing_year,
-            query_strategy=query_strategy,
+            attempted_windows=attempted_windows,
+            selected_window=selected_label,
         )
 
     def collect_hometax_closure_certificate(
