@@ -538,7 +538,13 @@ def _enrich_one(
                     f"{type(exc).__name__}: {exc}"[:1000]
                 ),
                 **(
-                    {PHONE_PROVIDER_FIELD: phone_provider}
+                    {
+                        PHONE_PROVIDER_FIELD: (
+                            "complete"
+                            if phone_provider == "naver"
+                            else phone_provider
+                        )
+                    }
                     if stage == "phone"
                     else {}
                 ),
