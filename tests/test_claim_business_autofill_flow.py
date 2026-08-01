@@ -693,6 +693,137 @@ class ClaimBusinessAutofillFlowTests(unittest.TestCase):
             "no_workplace_rate",
         )
 
+    def test_verified_empty_management_numbers_are_not_queried_again(self):
+        case_id = "cached-empty-management-case"
+        scope = _business_collection_scopes(
+            case_id,
+            [
+                {
+                    "business_number": VALID_BUSINESS_NUMBER,
+                    "business_name": "오아시스",
+                }
+            ],
+        )[0]
+        repository = MagicMock()
+        repository.list_documents.return_value = [
+            {
+                "source": "comwel",
+                "document_code": "comwel_management_number_list",
+                "period_year": None,
+                "collection_key": "default",
+                "status": "auth_pending",
+            },
+            {
+                "source": "comwel",
+                "document_code": "comwel_management_number_list",
+                "period_year": None,
+                "collection_key": scope["collection_key"],
+                "status": "ready",
+                "facts": {
+                    "no_data": True,
+                    "no_data_reason": "no_management_number",
+                    "management_numbers": [],
+                    "collection_scope_fingerprint": scope[
+                        "collection_scope_fingerprint"
+                    ],
+                },
+            },
+        ]
+        client = MagicMock()
+
+        summary = _collect_supported_comwel_documents(
+            repository,
+            client,
+            case_id=case_id,
+            identity_number="9010191234567",
+            representative="홍길동",
+            cellphone="01012345678",
+            business_number=VALID_BUSINESS_NUMBER,
+            businesses=[
+                {
+                    "business_number": VALID_BUSINESS_NUMBER,
+                    "business_name": "오아시스",
+                }
+            ],
+            management_cache={scope["collection_key"]: []},
+            session=_transient()["comwel"],
+        )
+
+        self.assertEqual(summary["ready"], 1)
+        self.assertEqual(summary["failed"], 0)
+        client.collect_comwel_management_numbers.assert_not_called()
+        repository.store_collected_document.assert_not_called()
+
+    def test_provider_blocked_empty_management_numbers_are_retried(self):
+        case_id = "blocked-empty-management-case"
+        scope = _business_collection_scopes(
+            case_id,
+            [
+                {
+                    "business_number": VALID_BUSINESS_NUMBER,
+                    "business_name": "오아시스",
+                }
+            ],
+        )[0]
+        repository = MagicMock()
+        repository.list_documents.return_value = [
+            {
+                "source": "comwel",
+                "document_code": "comwel_management_number_list",
+                "period_year": None,
+                "collection_key": "default",
+                "status": "auth_pending",
+            },
+            {
+                "source": "comwel",
+                "document_code": "comwel_management_number_list",
+                "period_year": None,
+                "collection_key": scope["collection_key"],
+                "status": "ready",
+                "facts": {
+                    "no_data": True,
+                    "provider_query_attempted": False,
+                    "management_numbers": [],
+                    "collection_scope_fingerprint": scope[
+                        "collection_scope_fingerprint"
+                    ],
+                },
+            },
+        ]
+        repository.store_collected_document.return_value = {
+            "status": "ready"
+        }
+        client = MagicMock()
+        client.collect_comwel_management_numbers.return_value = _document(
+            "management-numbers.json",
+            facts={
+                "no_data": True,
+                "no_data_reason": "no_management_number",
+                "management_numbers": [],
+            },
+        )
+
+        _collect_supported_comwel_documents(
+            repository,
+            client,
+            case_id=case_id,
+            identity_number="9010191234567",
+            representative="홍길동",
+            cellphone="01012345678",
+            business_number=VALID_BUSINESS_NUMBER,
+            businesses=[
+                {
+                    "business_number": VALID_BUSINESS_NUMBER,
+                    "business_name": "오아시스",
+                }
+            ],
+            management_cache={scope["collection_key"]: []},
+            session=_transient()["comwel"],
+        )
+
+        client.collect_comwel_management_numbers.assert_called_once()
+        repository.store_collected_document.assert_called_once()
+
     def test_management_lookup_failure_does_not_become_no_data(self):
         repository = MagicMock()
         repository.list_documents.return_value = [

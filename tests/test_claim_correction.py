@@ -894,7 +894,7 @@ class ClaimCorrectionTests(unittest.TestCase):
         self.assertEqual(ready_count, 1)
         self.assertEqual(percentage, 50)
 
-    def test_verified_dual_window_empty_income_return_is_terminal(self):
+    def test_verified_single_window_empty_income_return_is_terminal(self):
         document = {
             "source": "hometax",
             "document_code": "hometax_income_tax_return",
@@ -904,6 +904,57 @@ class ClaimCorrectionTests(unittest.TestCase):
                 "no_data": True,
                 "record_count": 0,
                 "query_strategy": HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY,
+                "tax_year_verified": True,
+                "provider_query_attempted": True,
+                "no_data_verified": True,
+                "no_data_verified_across_windows": False,
+                "query_attempt_count": 1,
+            },
+        }
+
+        percentage, _, ready_count, target_count = (
+            _claim_collection_progress([document])
+        )
+
+        self.assertEqual(target_count, 1)
+        self.assertEqual(ready_count, 1)
+        self.assertEqual(percentage, 100)
+
+    def test_invalid_single_window_evidence_requires_recollection(self):
+        document = {
+            "source": "hometax",
+            "document_code": "hometax_income_tax_return",
+            "period_year": 2024,
+            "status": "ready",
+            "facts": {
+                "no_data": True,
+                "record_count": 0,
+                "query_strategy": HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY,
+                "tax_year_verified": True,
+                "provider_query_attempted": True,
+                "no_data_verified": True,
+                "query_attempt_count": "invalid",
+            },
+        }
+
+        percentage, _, ready_count, target_count = (
+            _claim_collection_progress([document])
+        )
+
+        self.assertEqual(target_count, 1)
+        self.assertEqual(ready_count, 0)
+        self.assertEqual(percentage, 0)
+
+    def test_verified_legacy_dual_window_empty_remains_terminal(self):
+        document = {
+            "source": "hometax",
+            "document_code": "hometax_income_tax_return",
+            "period_year": 2024,
+            "status": "ready",
+            "facts": {
+                "no_data": True,
+                "record_count": 0,
+                "query_strategy": "tax_period_then_filing_period_v4",
                 "tax_year_verified": True,
                 "provider_query_attempted": True,
                 "no_data_verified_across_windows": True,
@@ -918,31 +969,6 @@ class ClaimCorrectionTests(unittest.TestCase):
         self.assertEqual(target_count, 1)
         self.assertEqual(ready_count, 1)
         self.assertEqual(percentage, 100)
-
-    def test_invalid_dual_window_evidence_requires_recollection(self):
-        document = {
-            "source": "hometax",
-            "document_code": "hometax_income_tax_return",
-            "period_year": 2024,
-            "status": "ready",
-            "facts": {
-                "no_data": True,
-                "record_count": 0,
-                "query_strategy": HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY,
-                "tax_year_verified": True,
-                "provider_query_attempted": True,
-                "no_data_verified_across_windows": True,
-                "query_attempt_count": "invalid",
-            },
-        }
-
-        percentage, _, ready_count, target_count = (
-            _claim_collection_progress([document])
-        )
-
-        self.assertEqual(target_count, 1)
-        self.assertEqual(ready_count, 0)
-        self.assertEqual(percentage, 0)
 
     def test_verified_legacy_income_tax_pdf_remains_downloadable(self):
         document = {
@@ -1194,8 +1220,9 @@ class ClaimCorrectionTests(unittest.TestCase):
                     ),
                     "tax_year_verified": True,
                     "provider_query_attempted": True,
-                    "no_data_verified_across_windows": True,
-                    "query_attempt_count": 2,
+                    "no_data_verified": True,
+                    "no_data_verified_across_windows": False,
+                    "query_attempt_count": 1,
                 },
             },
             *[

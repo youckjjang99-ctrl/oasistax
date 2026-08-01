@@ -48,7 +48,7 @@ HOMETAX_INCOME_TAX_RETURN = (
     "jonghabsodeugse/singo"
 )
 HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY = (
-    "tax_period_then_filing_period_v4"
+    "tax_period_encrypted_dates_v5"
 )
 HOMETAX_AGENT_REFUND = (
     "/api/v1.0/HometaxAgent/UTERDAAA01/HwanGeubGeum"
@@ -1619,13 +1619,11 @@ def _collected_hometax_income_tax_return(
     query_strategy: str = HOMETAX_INCOME_TAX_RETURN_QUERY_STRATEGY,
 ) -> CollectedClaimDocument:
     raw_result = response_data.get("Result")
-    result_rows = (
-        raw_result
-        if isinstance(raw_result, list)
-        else [raw_result]
-        if isinstance(raw_result, dict)
-        else []
-    )
+    if not isinstance(raw_result, list):
+        raise ClaimProviderError(
+            "종합소득세 신고서 응답의 신고내역 형식이 변경되었습니다."
+        )
+    result_rows = raw_result
 
     def result_tax_year(row: Any) -> str:
         if not isinstance(row, dict):
@@ -1653,13 +1651,11 @@ def _collected_hometax_income_tax_return(
         if value == year
     ]
     raw_binary = response_data.get("BinaryResult")
-    binary_rows = (
-        raw_binary
-        if isinstance(raw_binary, list)
-        else [raw_binary]
-        if isinstance(raw_binary, dict)
-        else []
-    )
+    if not isinstance(raw_binary, list):
+        raise ClaimProviderError(
+            "종합소득세 신고서 응답의 파일목록 형식이 변경되었습니다."
+        )
+    binary_rows = raw_binary
     filtered_response = dict(response_data)
     discarded_mismatched_records = 0
     if result_rows and len(identified_years) != len(result_rows):
@@ -1769,20 +1765,9 @@ def _collected_hometax_income_tax_return(
         )
 
     result = filtered_response.get("Result")
-    if isinstance(result, (dict, list)) and bool(result):
-        return _collected_private_json(
-            filtered_response,
-            fallback_name=f"hometax-income-tax-return-{year}",
-            facts={
-                "year": year,
-                "filing_year": filing_year,
-                "query_strategy": query_strategy,
-                "tax_year_verified": tax_year_verified,
-                "discarded_mismatched_records": (
-                    discarded_mismatched_records
-                ),
-            },
-            document_label="종합소득세 신고서",
+    if isinstance(result, list) and result:
+        raise ClaimProviderError(
+            "종합소득세 신고내역은 확인했지만 신고서 PDF를 받지 못했습니다."
         )
     return _collected_no_data_json(
         response_data,
@@ -1820,6 +1805,7 @@ def _with_income_tax_return_query_metadata(
         }
     )
     if facts.get("no_data") is True:
+        facts["no_data_verified"] = bool(attempted_windows)
         facts["no_data_verified_across_windows"] = bool(
             len(attempted_windows) >= 2
         )
@@ -2645,10 +2631,10 @@ class TilkoClaimClient:
         session: dict[str, str],
     ) -> CollectedClaimDocument:
         selected_year = _document_year(year)
-        # Tilko 전용 신고서 API와 기존 전자신고결과 연동은 조회기간을
-        # 다르게 해석하는 사례가 있습니다. 귀속연도 기간을 먼저 조회하고,
-        # 파일이 없으면 실제 신고가 이뤄지는 다음 연도 기간을 한 번 더
-        # 조회한 뒤 응답의 txnrm* 값으로 귀속연도를 최종 검증합니다.
+        # Tilko 신고서 API의 조회기간은 귀속연도를 기준으로 전달합니다.
+        # 같은 연도를 신고연도로 바꿔 재호출하면 건별 비용만 중복될 수
+        # 있으므로 한 귀속연도당 정확히 한 번만 조회합니다. StartDate와
+        # EndDate도 공식 명세상 암호화 필드입니다.
         filing_year = str(int(selected_year) + 1)
         selected_business_number = _valid_hometax_taxpayer_number(
             business_number
@@ -2658,22 +2644,19 @@ class TilkoClaimClient:
                 "종합소득세 신고서 조회에는 유효한 납세자 식별번호가 필요합니다."
             )
         today = date.today()
-        query_windows: list[dict[str, str]] = []
-        for label, query_year in (
-            ("tax_period", selected_year),
-            ("filing_period", filing_year),
-        ):
-            start_date = date(int(query_year), 1, 1)
-            if start_date > today:
-                continue
-            end_date = min(date(int(query_year), 12, 31), today)
-            query_windows.append(
-                {
-                    "label": label,
-                    "start_date": start_date.strftime("%Y%m%d"),
-                    "end_date": end_date.strftime("%Y%m%d"),
-                }
+        start_date = date(int(selected_year), 1, 1)
+        if start_date > today:
+            raise ClaimProviderError(
+                "종합소득세 신고서 조회연도가 아직 시작되지 않았습니다."
             )
+        end_date = min(date(int(selected_year), 12, 31), today)
+        query_windows = [
+            {
+                "label": "tax_period",
+                "start_date": start_date.strftime("%Y%m%d"),
+                "end_date": end_date.strftime("%Y%m%d"),
+            }
+        ]
 
         attempted_windows: list[dict[str, str]] = []
         candidates: list[tuple[str, CollectedClaimDocument]] = []
@@ -2701,6 +2684,8 @@ class TilkoClaimClient:
                         "BirthDate",
                         "UserCellphoneNumber",
                         "BusinessNumber",
+                        "StartDate",
+                        "EndDate",
                     ),
                 )
                 attempted_windows.append(dict(window))
@@ -2713,10 +2698,8 @@ class TilkoClaimClient:
                     ),
                 )
             except ClaimProviderError:
-                # 첫 조회에서 이미 유효한 신고내역을 확보했다면 보조 조회의
-                # 일시 오류 때문에 그 결과까지 버리지 않습니다. 빈 결과만
-                # 있는 상태에서는 '자료 없음'으로 오인하지 않도록 실패를
-                # 그대로 전달합니다.
+                # 빈 결과를 성공으로 조작하거나 다른 기간으로 유료 재조회하지
+                # 않습니다. 공급자 오류는 그대로 실패 상태로 전달합니다.
                 if any(
                     candidate.facts.get("no_data") is not True
                     for _, candidate in candidates
@@ -2724,8 +2707,6 @@ class TilkoClaimClient:
                     break
                 raise
             candidates.append((window["label"], document))
-            if document.content_type == "application/pdf":
-                break
 
         if not candidates:
             raise ClaimProviderError(

@@ -16,6 +16,7 @@ from claim_correction_center import (
     _claim_downloadable_documents,
     _claim_document_download_name,
     _claim_document_scope_label,
+    _format_claim_datetime,
     _plan_claim_document_zip_parts,
     _claim_result_case_view,
     _render_auto_claim_monitor,
@@ -78,6 +79,31 @@ class ClaimResultsViewTests(unittest.TestCase):
         }
         document.update(overrides)
         return document
+
+    def test_claim_datetime_is_rendered_in_korea_time(self) -> None:
+        self.assertEqual(
+            _format_claim_datetime("2026-08-01T00:17:53+00:00"),
+            "2026-08-01 09:17",
+        )
+        self.assertEqual(
+            _format_claim_datetime(
+                "2026-07-31T15:30:00Z",
+                include_time=False,
+            ),
+            "2026-08-01",
+        )
+
+    def test_result_case_view_converts_utc_request_time(self) -> None:
+        view = _claim_result_case_view(
+            {
+                "company_name": "오아시스 세무",
+                "business_type": "individual",
+                "overall_status": "ready",
+                "requested_at": "2026-08-01T00:17:53+00:00",
+            }
+        )
+
+        self.assertEqual(view["requested_at"], "2026-08-01 09:17")
 
     def test_downloadable_documents_keeps_only_valid_private_ready_files(
         self,
