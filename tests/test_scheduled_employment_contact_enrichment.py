@@ -353,6 +353,7 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
         self.assertTrue(result["halt"])
         saved = patch_row.call_args_list[-1].args[1]
         self.assertEqual(saved["phone_status"], "error")
+        self.assertEqual(saved["phone_provider_stage"], "complete")
         self.assertIn("UpstreamLimitError", saved["phone_last_error"])
 
 
