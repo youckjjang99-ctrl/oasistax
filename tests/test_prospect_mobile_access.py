@@ -2,6 +2,10 @@ import unittest
 
 from prospect_db_center import (
     _display_frame,
+    _effective_contact_filter_labels,
+    _effective_prospect_mobile_visibility,
+    _effective_prospect_target_count,
+    _limit_prospect_result_for_role,
     _redact_mobile_candidate,
     _sanitize_search_result,
     _saved_candidate_frame,
@@ -9,6 +13,79 @@ from prospect_db_center import (
 
 
 class ProspectMobileAccessTests(unittest.TestCase):
+    def test_member_mobile_visibility_is_enabled_in_prospect_center(self):
+        self.assertTrue(
+            _effective_prospect_mobile_visibility(
+                False,
+                is_admin_user=False,
+            )
+        )
+        self.assertFalse(
+            _effective_prospect_mobile_visibility(
+                False,
+                is_admin_user=True,
+            )
+        )
+        self.assertTrue(
+            _effective_prospect_mobile_visibility(
+                True,
+                is_admin_user=True,
+            )
+        )
+
+    def test_member_search_count_is_always_capped_at_thirty(self):
+        self.assertEqual(
+            _effective_prospect_target_count(500, is_admin_user=False),
+            30,
+        )
+        self.assertEqual(
+            _effective_prospect_target_count(1, is_admin_user=False),
+            30,
+        )
+        self.assertEqual(
+            _effective_prospect_target_count(300, is_admin_user=True),
+            300,
+        )
+        oversized = {
+            "items": [{"source_key": str(index)} for index in range(50)],
+            "found_count": 50,
+        }
+        member_result = _limit_prospect_result_for_role(
+            oversized,
+            is_admin_user=False,
+        )
+        admin_result = _limit_prospect_result_for_role(
+            oversized,
+            is_admin_user=True,
+        )
+        self.assertEqual(member_result["found_count"], 30)
+        self.assertEqual(len(member_result["items"]), 30)
+        self.assertEqual(admin_result["found_count"], 50)
+        self.assertEqual(len(admin_result["items"]), 50)
+
+    def test_member_phone_filters_are_mandatory_together(self):
+        self.assertEqual(
+            _effective_contact_filter_labels(
+                ["휴대전화"],
+                is_admin_user=False,
+            ),
+            ["휴대전화", "일반전화"],
+        )
+        self.assertEqual(
+            _effective_contact_filter_labels(
+                ["이메일"],
+                is_admin_user=False,
+            ),
+            ["휴대전화", "일반전화", "이메일"],
+        )
+        self.assertEqual(
+            _effective_contact_filter_labels(
+                ["일반전화", "이메일"],
+                is_admin_user=True,
+            ),
+            ["일반전화", "이메일"],
+        )
+
     def test_member_receives_landline_but_not_mobile(self):
         item = {
             "사업장명": "테스트 업체",

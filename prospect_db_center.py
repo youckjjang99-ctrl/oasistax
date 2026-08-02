@@ -124,6 +124,10 @@ DISCOVERY_TYPE_LABELS = {
     value: label for label, value in DISCOVERY_TYPE_OPTIONS.items()
 }
 PROSPECT_RESULT_PAGE_SIZE_OPTIONS = (25, 50, 100)
+_PROSPECT_SAVE_FLASH_KEY = "_prospect_save_flash_v989"
+MEMBER_PROSPECT_TARGET_COUNT = 30
+MEMBER_REQUIRED_CONTACT_LABELS = ("휴대전화", "일반전화")
+MEMBER_OPTIONAL_CONTACT_LABELS = ("이메일", "인스타그램")
 
 CONTACT_METHOD_OPTIONS = (
     "전화",
@@ -149,6 +153,92 @@ MOBILE_PHONE_PATTERN = re.compile(
     r"(?<!\d)(?:(?:\+?82)[\s.\-]?(?:\(0\)[\s.\-]?)?|0)"
     r"(?:10|11|16|17|18|19)[\s.\-]?\d{3,4}[\s.\-]?\d{4}(?!\d)"
 )
+
+
+def _show_pending_prospect_save_notices() -> None:
+    """Render save feedback once after the result table refreshes."""
+    pending_notices = st.session_state.pop(_PROSPECT_SAVE_FLASH_KEY, [])
+    if not isinstance(pending_notices, list):
+        return
+    for notice in pending_notices:
+        if not isinstance(notice, dict):
+            continue
+        message = str(notice.get("message") or "").strip()
+        if not message:
+            continue
+        level = str(notice.get("level") or "info").strip().lower()
+        renderer = getattr(st, level, st.info)
+        renderer(message)
+
+
+def _effective_prospect_target_count(
+    requested_count: object,
+    *,
+    is_admin_user: bool,
+) -> int:
+    """Enforce the ordinary-user result cap on the server-rendered path."""
+    if not is_admin_user:
+        return MEMBER_PROSPECT_TARGET_COUNT
+    try:
+        parsed_count = int(requested_count)
+    except (TypeError, ValueError):
+        parsed_count = 100
+    return min(500, max(1, parsed_count))
+
+
+def _effective_prospect_mobile_visibility(
+    can_view_mobile: bool,
+    *,
+    is_admin_user: bool,
+) -> bool:
+    """Show mobile numbers to members without changing admin policy."""
+    return bool(can_view_mobile or not is_admin_user)
+
+
+def _limit_prospect_result_for_role(
+    result: dict,
+    *,
+    is_admin_user: bool,
+) -> dict:
+    """Keep cached or unexpectedly oversized member results within 30 rows."""
+    copied = dict(result or {})
+    if is_admin_user:
+        return copied
+    visible_items = list(copied.get("items") or [])[
+        :MEMBER_PROSPECT_TARGET_COUNT
+    ]
+    copied["items"] = visible_items
+    copied["found_count"] = len(visible_items)
+    return copied
+
+
+def _effective_contact_filter_labels(
+    selected_labels: object,
+    *,
+    is_admin_user: bool,
+) -> list[str]:
+    """Keep both phone channels mandatory for ordinary users."""
+    if isinstance(selected_labels, (list, tuple, set)):
+        requested = [str(label) for label in selected_labels]
+    elif selected_labels:
+        requested = [str(selected_labels)]
+    else:
+        requested = []
+    valid_requested = [
+        label
+        for label in CONTACT_CHANNEL_OPTIONS
+        if label in requested
+    ]
+    if is_admin_user:
+        return valid_requested
+    return [
+        *MEMBER_REQUIRED_CONTACT_LABELS,
+        *(
+            label
+            for label in MEMBER_OPTIONAL_CONTACT_LABELS
+            if label in valid_requested
+        ),
+    ]
 
 
 def _assignment_session_id() -> str:
@@ -2329,11 +2419,16 @@ def render_prospect_db_center(
     can_view_mobile: bool = False,
     is_admin_user: bool = False,
 ) -> None:
+    can_view_mobile = _effective_prospect_mobile_visibility(
+        can_view_mobile,
+        is_admin_user=is_admin_user,
+    )
     st.caption(
         "행안부 자료는 사용하지 않습니다. 국민연금 월별 자료와 "
         "근로복지공단 연간 자료에서 고용증가기업 또는 신규개업 "
         "추정기업을 골라 조회합니다."
     )
+    _show_pending_prospect_save_notices()
     pending_workflow_step = st.session_state.pop(
         "_prospect_workflow_step_pending_v1020",
         None,
@@ -2393,34 +2488,70 @@ def render_prospect_db_center(
         )
         target_count = col4.selectbox(
             "조회 단위",
-            [50, 100, 300, 500],
-            index=1,
-            key="prospect_target_v1002",
+            [50, 100, 300, 500] if is_admin_user else [30],
+            index=1 if is_admin_user else 0,
+            disabled=not is_admin_user,
+            key=(
+                "prospect_target_v1002"
+                if is_admin_user
+                else "prospect_target_v1033_member"
+            ),
+        )
+        target_count = _effective_prospect_target_count(
+            target_count,
+            is_admin_user=is_admin_user,
         )
         with st.expander("검색 범위 조정", expanded=True):
-            contact_channel_options = {
-                label: value
-                for label, value in CONTACT_CHANNEL_OPTIONS.items()
-                if can_view_mobile or value != "mobile_phone"
-            }
-            default_contact_labels = (
-                ["휴대전화", "일반전화"]
-                if can_view_mobile
-                else ["일반전화", "이메일", "인스타그램"]
-            )
-            selected_contact_labels = st.pills(
-                "연락처 필터",
-                list(contact_channel_options.keys()),
-                default=default_contact_labels,
-                selection_mode="multi",
-                key=(
-                    "prospect_contact_channels_v1021_"
-                    + ("owner" if can_view_mobile else "member")
-                ),
-                help=(
-                    "선택한 연락수단 중 하나라도 저장된 업체만 "
-                    "조회합니다. 여러 항목을 함께 선택할 수 있습니다."
-                ),
+            if is_admin_user:
+                contact_channel_options = {
+                    label: value
+                    for label, value in CONTACT_CHANNEL_OPTIONS.items()
+                    if can_view_mobile or value != "mobile_phone"
+                }
+                default_contact_labels = (
+                    ["휴대전화", "일반전화"]
+                    if can_view_mobile
+                    else ["일반전화", "이메일", "인스타그램"]
+                )
+                selected_contact_labels = st.pills(
+                    "연락처 필터",
+                    list(contact_channel_options.keys()),
+                    default=default_contact_labels,
+                    selection_mode="multi",
+                    key=(
+                        "prospect_contact_channels_v1021_"
+                        + ("owner" if can_view_mobile else "member_admin")
+                    ),
+                    help=(
+                        "선택한 연락수단 중 하나라도 저장된 업체만 "
+                        "조회합니다. 여러 항목을 함께 선택할 수 있습니다."
+                    ),
+                )
+            else:
+                contact_channel_options = dict(CONTACT_CHANNEL_OPTIONS)
+                st.pills(
+                    "연락처 필터",
+                    list(MEMBER_REQUIRED_CONTACT_LABELS),
+                    default=list(MEMBER_REQUIRED_CONTACT_LABELS),
+                    selection_mode="multi",
+                    disabled=True,
+                    key="prospect_required_phone_channels_v1033_member",
+                    help=(
+                        "일반 계정은 휴대전화와 일반전화를 항상 함께 "
+                        "조회하고 표시합니다."
+                    ),
+                )
+                optional_contact_labels = st.pills(
+                    "추가 연락처 필터 (선택)",
+                    list(MEMBER_OPTIONAL_CONTACT_LABELS),
+                    default=[],
+                    selection_mode="multi",
+                    key="prospect_optional_contact_channels_v1033_member",
+                )
+                selected_contact_labels = optional_contact_labels
+            selected_contact_labels = _effective_contact_filter_labels(
+                selected_contact_labels,
+                is_admin_user=is_admin_user,
             )
             if discovery_type == "recent_opening":
                 recent_col1, recent_col2 = st.columns(2)
@@ -2696,6 +2827,10 @@ def render_prospect_db_center(
                 owner_user_id,
                 is_admin_user=is_admin_user,
             )
+        result = _limit_prospect_result_for_role(
+            result,
+            is_admin_user=is_admin_user,
+        )
         if result.get("ok"):
             progress_bar.progress(1.0, text="검색을 완료했습니다.")
         else:
@@ -2774,6 +2909,10 @@ def render_prospect_db_center(
     result = _sanitize_search_result(
         st.session_state.get(result_state_key) or {},
         can_view_mobile,
+    )
+    result = _limit_prospect_result_for_role(
+        result,
+        is_admin_user=is_admin_user,
     )
     st.session_state[result_state_key] = result
     if not result:
@@ -3198,23 +3337,39 @@ def render_prospect_db_center(
                     already_owned_count = int(
                         save_result.get("already_owned_count") or 0
                     )
+                    newly_saved_count = max(
+                        0,
+                        saved_count - already_owned_count,
+                    )
                     failures = [
                         row
                         for row in (save_result.get("results") or [])
                         if not row.get("ok")
                     ]
-                    if saved_count:
-                        st.success(
-                            f"{saved_count:,}개 업체를 내 영업DB에 "
-                            "임시 배정했습니다. 24시간 안에 연락결과를 "
-                            "기록해 주세요."
+                    save_notices: list[dict[str, str]] = []
+                    if newly_saved_count:
+                        save_notices.append(
+                            {
+                                "level": "success",
+                                "message": (
+                                    "저장 완료: "
+                                    f"{newly_saved_count:,}개 업체를 내 "
+                                    "영업DB에 담았습니다. 24시간 안에 "
+                                    "연락결과를 기록해 주세요."
+                                ),
+                            }
                         )
                     if already_owned_count:
-                        st.info(
-                            f"{already_owned_count:,}개 업체는 이미 내 "
-                            "영업DB에 있어 중복 저장하지 않았습니다. "
-                            "③ 저장된 영업후보에서 기존 상세정보를 "
-                            "확인할 수 있습니다."
+                        save_notices.append(
+                            {
+                                "level": "info",
+                                "message": (
+                                    f"{already_owned_count:,}개 업체는 이미 "
+                                    "내 영업DB에 있어 중복 저장하지 "
+                                    "않았습니다. ③ 저장된 영업후보에서 "
+                                    "기존 상세정보를 확인할 수 있습니다."
+                                ),
+                            }
                         )
                     failure_codes = {
                         str(row.get("code") or "") for row in failures
@@ -3223,19 +3378,31 @@ def render_prospect_db_center(
                         "ASSIGNMENT_CONFLICT",
                         "ALREADY_ASSIGNED",
                     }:
-                        st.warning(
-                            "다른 담당자가 먼저 배정받은 업체입니다. "
-                            "검색 결과를 새로고침합니다."
+                        save_notices.append(
+                            {
+                                "level": "warning",
+                                "message": (
+                                    "다른 담당자가 먼저 배정받은 "
+                                    "업체입니다. 검색 결과를 "
+                                    "새로고침합니다."
+                                ),
+                            }
                         )
                     if failure_codes & {
                         "MAX_UNCONTACTED_REACHED",
                         "LIMIT_REACHED",
                         "UNCONTACTED_LIMIT_REACHED",
                     }:
-                        st.warning(
-                            "미접촉 배정 DB는 최대 30개까지 보유할 수 "
-                            "있습니다. 기존 DB의 연락결과를 기록하거나 "
-                            "배정을 해제한 후 다시 시도해 주세요."
+                        save_notices.append(
+                            {
+                                "level": "warning",
+                                "message": (
+                                    "미접촉 배정 DB는 최대 30개까지 "
+                                    "보유할 수 있습니다. 기존 DB의 "
+                                    "연락결과를 기록하거나 배정을 "
+                                    "해제한 후 다시 시도해 주세요."
+                                ),
+                            }
                         )
                     for row in failures:
                         if str(row.get("code") or "") not in {
@@ -3245,7 +3412,14 @@ def render_prospect_db_center(
                             "LIMIT_REACHED",
                             "UNCONTACTED_LIMIT_REACHED",
                         }:
-                            st.warning(str(row.get("message") or "저장 실패"))
+                            save_notices.append(
+                                {
+                                    "level": "warning",
+                                    "message": str(
+                                        row.get("message") or "저장 실패"
+                                    ),
+                                }
+                            )
 
                     saved_uids = {
                         str((row.get("assignment") or {}).get("company_uid") or "")
@@ -3263,6 +3437,10 @@ def render_prospect_db_center(
                     st.session_state[result_revision_key] = int(
                         st.session_state.get(result_revision_key, 0) or 0
                     ) + 1
+                    if save_notices:
+                        st.session_state[_PROSPECT_SAVE_FLASH_KEY] = (
+                            save_notices
+                        )
                     st.rerun()
                 except Exception as exc:
                     st.error(f"영업후보 저장 실패: {exc}")

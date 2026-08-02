@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from company_sales_assignment import (
     CompanyIdentityError,
@@ -904,6 +905,31 @@ class AssignmentRpcTests(unittest.TestCase):
                 )
             ],
         )
+
+
+class ProspectSaveNoticeTests(unittest.TestCase):
+    def test_save_confirmation_survives_result_rerun_once(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "prospect_db_center.py"
+        ).read_text(encoding="utf-8")
+        helper_start = source.index(
+            "def _show_pending_prospect_save_notices()"
+        )
+        helper_end = source.index("\ndef ", helper_start + 5)
+        helper_source = source[helper_start:helper_end]
+        self.assertIn(
+            "st.session_state.pop(_PROSPECT_SAVE_FLASH_KEY, [])",
+            helper_source,
+        )
+        self.assertIn("renderer(message)", helper_source)
+
+        queue_marker = (
+            "st.session_state[_PROSPECT_SAVE_FLASH_KEY] = ("
+        )
+        queue_index = source.index(queue_marker)
+        rerun_index = source.index("st.rerun()", queue_index)
+        self.assertLess(queue_index, rerun_index)
+        self.assertIn("저장 완료: ", source)
 
 
 if __name__ == "__main__":
