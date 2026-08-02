@@ -206,6 +206,7 @@ def _patch(
     *,
     expected_status: str | None = None,
     status_field: str = "status",
+    expected_phone_provider_stage: str | None = None,
 ) -> bool:
     db = CloudDatabase()
     headers = dict(db.headers)
@@ -216,6 +217,10 @@ def _patch(
     }
     if expected_status:
         params[status_field] = f"eq.{expected_status}"
+    if expected_phone_provider_stage:
+        params[PHONE_PROVIDER_FIELD] = (
+            f"eq.{expected_phone_provider_stage}"
+        )
 
     last_error = ""
     for attempt in range(DB_PATCH_RETRY_ATTEMPTS):
@@ -254,7 +259,11 @@ def _patch(
     )
 
 
-def _claim(row: dict[str, Any], stage: str) -> bool:
+def _claim(
+    row: dict[str, Any],
+    stage: str,
+    phone_provider: str | None = None,
+) -> bool:
     fields = STAGE_FIELDS[stage]
     status_field = fields["status"]
     status = str(row.get(status_field) or "pending")
@@ -267,6 +276,9 @@ def _claim(row: dict[str, Any], stage: str) -> bool:
         },
         expected_status=status,
         status_field=status_field,
+        expected_phone_provider_stage=(
+            phone_provider if stage == "phone" else None
+        ),
     )
 
 
@@ -349,7 +361,7 @@ def _enrich_one(
     fields = STAGE_FIELDS[stage]
     status_field = fields["status"]
     contact_key = str(row.get("contact_key") or "")
-    if not _claim(row, stage):
+    if not _claim(row, stage, phone_provider):
         return {"status": "skipped", "contact_key": contact_key}
 
     checked_at = _now()
@@ -493,6 +505,9 @@ def _enrich_one(
             values,
             expected_status="processing",
             status_field=status_field,
+            expected_phone_provider_stage=(
+                phone_provider if stage == "phone" else None
+            ),
         )
         return {
             "status": (
@@ -540,9 +555,7 @@ def _enrich_one(
                 **(
                     {
                         PHONE_PROVIDER_FIELD: (
-                            "complete"
-                            if phone_provider == "naver"
-                            else phone_provider
+                            phone_provider
                         )
                     }
                     if stage == "phone"
@@ -551,6 +564,9 @@ def _enrich_one(
             },
             expected_status="processing",
             status_field=status_field,
+            expected_phone_provider_stage=(
+                phone_provider if stage == "phone" else None
+            ),
         )
         return {
             "status": "error",

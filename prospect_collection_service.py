@@ -191,6 +191,7 @@ def collect_recent_opening_companies(
     contact_channels: list[str] | None = None,
     district_name: str = "",
     progress: ProgressCallback | None = None,
+    exclude_saved_prospects: bool = True,
 ) -> dict[str, Any]:
     """사전 저장된 국민연금·근로복지공단 신규 추정 기업을 조회."""
     target_count = min(500, max(1, int(target_count)))
@@ -223,15 +224,19 @@ def collect_recent_opening_companies(
         }
     )
     started_at = time.monotonic()
-    try:
-        saved_source_keys, saved_business_nos, saved_company_address_keys = (
-            existing_prospect_identities()
-        )
-        duplicate_warning = ""
-    except Exception as exc:
-        saved_source_keys, saved_business_nos = set(), set()
-        saved_company_address_keys = set()
-        duplicate_warning = str(exc)
+    saved_source_keys: set[str] = set()
+    saved_business_nos: set[str] = set()
+    saved_company_address_keys: set[str] = set()
+    duplicate_warning = ""
+    if exclude_saved_prospects:
+        try:
+            (
+                saved_source_keys,
+                saved_business_nos,
+                saved_company_address_keys,
+            ) = existing_prospect_identities()
+        except Exception as exc:
+            duplicate_warning = str(exc)
 
     stats = {
         "basic_received": 0,
@@ -281,12 +286,14 @@ def collect_recent_opening_companies(
         stats["recent_candidates"] = len(candidates)
         candidates, customer_count = remove_existing_customers(candidates)
         stats["existing_customer_excluded"] = customer_count
-        candidates, prospect_count = remove_existing_prospects(
-            candidates,
-            source_keys=saved_source_keys,
-            business_nos=saved_business_nos,
-            company_address_keys=saved_company_address_keys,
-        )
+        prospect_count = 0
+        if exclude_saved_prospects:
+            candidates, prospect_count = remove_existing_prospects(
+                candidates,
+                source_keys=saved_source_keys,
+                business_nos=saved_business_nos,
+                company_address_keys=saved_company_address_keys,
+            )
         stats["saved_prospect_excluded"] = prospect_count
         selected = candidates[:target_count]
         stats["contact_checked"] = len(selected)
@@ -385,6 +392,7 @@ def collect_contactable_growth_companies(
     sigungu_code: str = "",
     emd_code: str = "",
     progress: ProgressCallback | None = None,
+    exclude_saved_prospects: bool = True,
 ) -> dict[str, Any]:
     target_count = min(500, max(1, int(target_count)))
     max_pages = min(100, max(1, int(max_pages)))
@@ -421,15 +429,19 @@ def collect_contactable_growth_companies(
         in {"mobile_phone", "landline_phone", "email", "instagram"}
     }
 
-    try:
-        saved_source_keys, saved_business_nos, saved_company_address_keys = (
-            existing_prospect_identities()
-        )
-        duplicate_warning = ""
-    except Exception as exc:
-        saved_source_keys, saved_business_nos = set(), set()
-        saved_company_address_keys = set()
-        duplicate_warning = str(exc)
+    saved_source_keys: set[str] = set()
+    saved_business_nos: set[str] = set()
+    saved_company_address_keys: set[str] = set()
+    duplicate_warning = ""
+    if exclude_saved_prospects:
+        try:
+            (
+                saved_source_keys,
+                saved_business_nos,
+                saved_company_address_keys,
+            ) = existing_prospect_identities()
+        except Exception as exc:
+            duplicate_warning = str(exc)
     snapshot_warning = ""
 
     seen_source_keys = set(saved_source_keys)
@@ -509,12 +521,14 @@ def collect_contactable_growth_companies(
                 cached_items
             )
             stats["existing_customer_excluded"] += customer_count
-            cached_items, prospect_count = remove_existing_prospects(
-                cached_items,
-                source_keys=saved_source_keys,
-                business_nos=saved_business_nos,
-                company_address_keys=saved_company_address_keys,
-            )
+            prospect_count = 0
+            if exclude_saved_prospects:
+                cached_items, prospect_count = remove_existing_prospects(
+                    cached_items,
+                    source_keys=saved_source_keys,
+                    business_nos=saved_business_nos,
+                    company_address_keys=saved_company_address_keys,
+                )
             stats["saved_prospect_excluded"] += prospect_count
             selected = cached_items[:target_count]
             stats["contact_checked"] = len(selected)
@@ -671,12 +685,14 @@ def collect_contactable_growth_companies(
         except Exception as exc:
             duplicate_warning = duplicate_warning or str(exc)
 
-        minimum_filtered, prospect_count = remove_existing_prospects(
-            minimum_filtered,
-            source_keys=saved_source_keys,
-            business_nos=saved_business_nos,
-            company_address_keys=saved_company_address_keys,
-        )
+        prospect_count = 0
+        if exclude_saved_prospects:
+            minimum_filtered, prospect_count = remove_existing_prospects(
+                minimum_filtered,
+                source_keys=saved_source_keys,
+                business_nos=saved_business_nos,
+                company_address_keys=saved_company_address_keys,
+            )
         stats["saved_prospect_excluded"] += prospect_count
 
         try:

@@ -770,6 +770,8 @@ def remove_existing_prospects(
 def _database_row(
     prospect: dict[str, Any],
     owner_user_id: str,
+    *,
+    include_assignment_fields: bool = False,
 ) -> dict[str, Any]:
     now = datetime.now(timezone.utc).isoformat()
     source_data = dict(prospect.get("원본데이터") or {})
@@ -801,7 +803,18 @@ def _database_row(
     sales_analysis = prospect.get("영업분석")
     if isinstance(sales_analysis, dict):
         source_data["sales_intelligence_v971"] = sales_analysis
-    return {
+    corporate_registration_no = str(
+        prospect.get("corporate_registration_no")
+        or prospect.get("법인등록번호")
+        or ""
+    ).strip()
+    nps_workplace_management_no = str(
+        prospect.get("nps_workplace_management_no")
+        or prospect.get("국민연금사업장관리번호")
+        or prospect.get("사업장관리번호")
+        or ""
+    ).strip()
+    row = {
         "source": str(prospect.get("source") or "nps_workplace_v2"),
         "source_key": str(prospect.get("source_key") or ""),
         "business_no": _business_no(prospect.get("사업자등록번호")),
@@ -823,6 +836,17 @@ def _database_row(
         "collected_at": now,
         "updated_at": now,
     }
+    if include_assignment_fields:
+        from company_sales_assignment import build_company_uid
+
+        row.update(
+            {
+                "company_uid": build_company_uid(prospect),
+                "corporate_registration_no": corporate_registration_no,
+                "nps_workplace_management_no": nps_workplace_management_no,
+            }
+        )
+    return row
 
 
 def save_prospects(
@@ -863,6 +887,110 @@ def save_prospects(
         )
     saved = response.json() if response.text else []
     return len(saved) if isinstance(saved, list) else len(rows)
+
+
+def save_assigned_prospects(
+    prospects: list[dict[str, Any]],
+    owner_user_id: str,
+    *,
+    session_id: str = "",
+) -> dict[str, Any]:
+    """Atomically claim companies and mirror them to the existing sales DB.
+
+    Both writes are performed inside one PostgreSQL RPC transaction.  This
+    prevents a lost HTTP response or a second REST failure from leaving the
+    company-wide assignment and the legacy owner row out of sync.
+    """
+    from company_sales_assignment import (
+        build_company_uid,
+        claim_and_save_companies,
+    )
+
+    owner_user_id = str(owner_user_id or "").strip().lower()
+    if not owner_user_id:
+        raise ValueError("로그인 사용자 정보가 없습니다.")
+
+    prepared_by_uid: dict[str, dict[str, Any]] = {}
+    invalid_results: list[dict[str, Any]] = []
+    for item in prospects:
+        candidate = dict(item)
+        try:
+            uid = build_company_uid(candidate)
+        except ValueError as exc:
+            invalid_results.append(
+                {
+                    "ok": False,
+                    "code": "INVALID_INPUT",
+                    "message": str(exc),
+                    "assignment": {},
+                }
+            )
+            continue
+        candidate["company_uid"] = uid
+        # A batch can contain the same company from two public sources.  Keep
+        # the first/highest-ranked row and make only one assignment request.
+        prepared_by_uid.setdefault(uid, candidate)
+
+    prepared = list(prepared_by_uid.values())
+    if not prepared:
+        return {
+            "ok": False,
+            "code": "INVALID_INPUT",
+            "message": "저장할 수 있는 업체 식별정보가 없습니다.",
+            "saved_count": 0,
+            "success_count": 0,
+            "failure_count": len(invalid_results),
+            "results": invalid_results,
+        }
+
+    payloads = [
+        _database_row(
+            item,
+            owner_user_id,
+            include_assignment_fields=True,
+        )
+        for item in prepared
+    ]
+    database = CloudDatabase()
+    claim_result = claim_and_save_companies(
+        owner_user_id,
+        payloads,
+        session_id=session_id,
+        db=database,
+    )
+    claim_rows = list(claim_result.get("results") or [])
+    success_count = 0
+    newly_claimed_count = 0
+    already_owned_count = 0
+    for result in claim_rows:
+        if not result.get("ok"):
+            continue
+        success_count += 1
+        result_code = str(result.get("code") or "").upper()
+        if result_code in {"ALREADY_OWNED", "OWNED", "ALREADY_MINE"}:
+            already_owned_count += 1
+        elif result_code in {
+            "OK",
+            "CLAIMED",
+            "ASSIGNED",
+            "CREATED",
+        }:
+            newly_claimed_count += 1
+
+    results = [*claim_rows, *invalid_results]
+    failure_count = sum(1 for result in results if not result.get("ok"))
+    return {
+        **claim_result,
+        "ok": not invalid_results and bool(claim_result.get("ok")),
+        # ALREADY_OWNED also repairs/refreshes the mirrored legacy row inside
+        # the same RPC, so it counts as a successfully saved selection.
+        "saved_count": success_count,
+        "claimed_count": newly_claimed_count,
+        "already_owned_count": already_owned_count,
+        "success_count": success_count,
+        "failure_count": failure_count,
+        "results": results,
+    }
 
 
 def list_prospects(
@@ -1058,6 +1186,9 @@ def list_search_history(
 
 def list_contacts_for_prospects(
     prospect_ids: list[str],
+    owner_user_id: str = "",
+    *,
+    is_admin_user: bool = False,
 ) -> list[dict[str, Any]]:
     normalized = sorted(
         {
@@ -1068,7 +1199,38 @@ def list_contacts_for_prospects(
     )
     if not normalized:
         return []
+    owner_user_id = str(owner_user_id or "").strip()
     config = get_cloud_config()
+    if not is_admin_user:
+        if not owner_user_id:
+            return []
+        ownership_response = requests.get(
+            f"{config.url}/rest/v1/{TABLE_PROSPECTS}",
+            headers=_rest_headers(),
+            params={
+                "select": "id",
+                "id": f"in.({','.join(normalized)})",
+                "owner_user_id": f"eq.{owner_user_id}",
+            },
+            timeout=max(config.timeout, 30),
+        )
+        if not ownership_response.ok:
+            raise RuntimeError(
+                "영업후보 소유권 확인 실패 "
+                f"HTTP {ownership_response.status_code}: "
+                f"{ownership_response.text[:300]}"
+            )
+        owned_rows = ownership_response.json() if ownership_response.text else []
+        if not isinstance(owned_rows, list):
+            owned_rows = []
+        owned_ids = {
+            str(row.get("id") or "").strip()
+            for row in owned_rows
+            if str(row.get("id") or "").strip()
+        }
+        normalized = [value for value in normalized if value in owned_ids]
+        if not normalized:
+            return []
     response = requests.get(
         f"{config.url}/rest/v1/{TABLE_CONTACTS}",
         headers=_rest_headers(),
@@ -1164,7 +1326,10 @@ def save_prospect_contacts(
     if not valid_contacts:
         return 0
 
-    existing = list_contacts_for_prospects([prospect_id])
+    existing = list_contacts_for_prospects(
+        [prospect_id],
+        owner_user_id,
+    )
     existing_map = {
         (
             str(row.get("contact_type") or ""),

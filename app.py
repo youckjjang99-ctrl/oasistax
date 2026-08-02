@@ -3204,12 +3204,16 @@ elif CURRENT_USER_IS_ADMIN and active_tab == "회원 승인 관리":
 elif CURRENT_USER_IS_ADMIN and active_tab == "시스템 관리":
     system_admin_section = st.segmented_control(
         "시스템 관리 구분",
-        ["운영 상태·백업", "데이터·API 연결"],
+        ["운영 상태·백업", "데이터·API 연결", "영업배정 관리"],
         default="운영 상태·백업",
         key="system_admin_section_v1030",
         label_visibility="collapsed",
     )
-    if system_admin_section == "데이터·API 연결":
+    if system_admin_section == "영업배정 관리":
+        from prospect_db_center import render_company_assignment_admin
+
+        render_company_assignment_admin(CURRENT_USER_ID)
+    elif system_admin_section == "데이터·API 연결":
         from prospect_db_center import render_prospect_admin_settings
 
         render_prospect_admin_settings(CURRENT_USER_ID)

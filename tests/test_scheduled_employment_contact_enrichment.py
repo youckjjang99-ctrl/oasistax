@@ -39,6 +39,7 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
             {"phone_status": "processing"},
             expected_status="pending",
             status_field="phone_status",
+            expected_phone_provider_stage="naver",
         )
 
         self.assertTrue(claimed)
@@ -46,6 +47,39 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
         self.assertEqual(
             request_patch.call_args.kwargs["params"]["select"],
             "contact_key",
+        )
+        self.assertEqual(
+            request_patch.call_args.kwargs["params"][
+                "phone_provider_stage"
+            ],
+            "eq.naver",
+        )
+
+    @patch.object(job, "_patch", return_value=True)
+    def test_phone_claim_compares_provider_stage_atomically(
+        self,
+        patch_row,
+    ) -> None:
+        claimed = job._claim(
+            {
+                "contact_key": "place:test",
+                "phone_status": "pending",
+                "phone_provider_stage": "naver",
+            },
+            "phone",
+            "naver",
+        )
+
+        self.assertTrue(claimed)
+        self.assertEqual(
+            patch_row.call_args.kwargs[
+                "expected_phone_provider_stage"
+            ],
+            "naver",
+        )
+        self.assertEqual(
+            patch_row.call_args.kwargs["expected_status"],
+            "pending",
         )
 
     @patch.object(
@@ -353,8 +387,44 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
         self.assertTrue(result["halt"])
         saved = patch_row.call_args_list[-1].args[1]
         self.assertEqual(saved["phone_status"], "error")
-        self.assertEqual(saved["phone_provider_stage"], "complete")
+        self.assertEqual(saved["phone_provider_stage"], "naver")
         self.assertIn("UpstreamLimitError", saved["phone_last_error"])
+
+    @patch.object(job, "_patch", return_value=True)
+    @patch.object(
+        job,
+        "enrich_company",
+        side_effect=RuntimeError("temporary upstream failure"),
+    )
+    def test_naver_error_remains_retryable_in_naver_queue(
+        self,
+        _enrich,
+        patch_row,
+    ) -> None:
+        result = job._enrich_one(
+            {
+                "contact_key": "place:retry",
+                "phone_status": "pending",
+                "phone_provider_stage": "naver",
+                "company_name": "테스트기업",
+                "address": "서울특별시 강남구",
+            },
+            "phone",
+            "naver",
+        )
+
+        self.assertEqual(result["status"], "error")
+        self.assertFalse(result["halt"])
+        saved = patch_row.call_args_list[-1].args[1]
+        self.assertEqual(saved["phone_status"], "error")
+        self.assertEqual(saved["phone_provider_stage"], "naver")
+        self.assertIn("phone_next_check_at", saved)
+        self.assertEqual(
+            patch_row.call_args_list[-1].kwargs[
+                "expected_phone_provider_stage"
+            ],
+            "naver",
+        )
 
 
 if __name__ == "__main__":

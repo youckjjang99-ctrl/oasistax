@@ -1,0 +1,6 @@
+git status
+git add VERSION.txt app.py company_sales_assignment.py prospect_collection_service.py prospect_db_center.py prospect_db_repository.py scheduled_employment_contact_enrichment.py supabase_v1032_company_sales_assignments.sql supabase_v1032_company_sales_assignments_rls.sql tests/test_company_sales_assignments.py tests/test_company_sales_assignment_integration.py tests/test_company_sales_assignment_migration.py tests/test_scheduled_employment_contact_enrichment.py APPLY_UPDATE_v9.8.9.py GITHUB_UPLOAD_COMMANDS_v9.8.9.txt IMPLEMENTATION_REPORT_v9.8.9.md PATCH_MANIFEST_v9.8.9.txt README_UPDATE_v9.8.9.md RUN_v9.8.9.bat
+git add -f CHANGELOG_v9.8.9.md
+git status
+git commit -m "feat: prevent duplicate sales contact assignments"
+git push origin main

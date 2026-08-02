@@ -2,13 +2,17 @@ from __future__ import annotations
 
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 import re
+import secrets
+import time
 
 import pandas as pd
 import streamlit as st
 
+import company_sales_assignment as sales_assignments
 import localdata_contact_client
 from korea_regions import (
     ALL_DISTRICTS,
@@ -39,10 +43,12 @@ from prospect_db_repository import (
     list_search_history,
     prospect_table_status,
     remove_existing_customers,
+    remove_existing_prospects,
     save_prospect_memo,
     save_search_history,
     save_sales_analysis,
     save_prospect_contacts,
+    save_assigned_prospects,
     save_prospects,
     search_history_table_status,
 )
@@ -119,10 +125,192 @@ DISCOVERY_TYPE_LABELS = {
 }
 PROSPECT_RESULT_PAGE_SIZE_OPTIONS = (25, 50, 100)
 
+CONTACT_METHOD_OPTIONS = (
+    "전화",
+    "문자",
+    "카카오톡",
+    "상담",
+)
+CONTACT_RESULT_OPTIONS = (
+    "부재중",
+    "연결됨",
+    "문자발송",
+    "카카오톡 발송",
+    "상담예약",
+    "관심없음",
+    "재연락 요청",
+    "번호오류",
+    "기존거래처",
+    "계약진행",
+    "계약완료",
+)
+
 MOBILE_PHONE_PATTERN = re.compile(
     r"(?<!\d)(?:(?:\+?82)[\s.\-]?(?:\(0\)[\s.\-]?)?|0)"
     r"(?:10|11|16|17|18|19)[\s.\-]?\d{3,4}[\s.\-]?\d{4}(?!\d)"
 )
+
+
+def _assignment_session_id() -> str:
+    """Return an opaque per-login-session identifier without PII."""
+    key = "company_sales_assignment_session_v989"
+    if key not in st.session_state:
+        st.session_state[key] = secrets.token_urlsafe(24)
+    return str(st.session_state[key])
+
+
+@st.cache_data(ttl=60, max_entries=2, show_spinner=False)
+def _assignment_feature_status() -> tuple[bool, str]:
+    return sales_assignments.assignment_feature_ready()
+
+
+def _release_expired_assignments_if_due(owner_user_id: str) -> None:
+    key = "company_sales_assignment_expiry_checked_v989"
+    last_checked = float(st.session_state.get(key, 0.0) or 0.0)
+    if time.monotonic() - last_checked < 60:
+        return
+    st.session_state[key] = time.monotonic()
+    sales_assignments.release_expired_assignments(
+        owner_user_id,
+        session_id=_assignment_session_id(),
+    )
+
+
+def _filter_assignment_search_result(
+    result: dict,
+    owner_user_id: str,
+    *,
+    is_admin_user: bool,
+) -> dict:
+    """Apply company-wide assignment visibility without claiming on browse."""
+    copied = dict(result or {})
+    items = list(copied.get("items") or [])
+    stats = dict(copied.get("stats") or {})
+    prior_assignment_excluded = int(
+        stats.pop("assignment_blocked_excluded", 0) or 0
+    )
+    prior_own_excluded = int(stats.pop("already_my_db_excluded", 0) or 0)
+    stats["saved_prospect_excluded"] = max(
+        0,
+        int(stats.get("saved_prospect_excluded") or 0)
+        - prior_assignment_excluded
+        - prior_own_excluded,
+    )
+    if not items:
+        return copied
+
+    ready, ready_message = _assignment_feature_status()
+    if not ready:
+        filtered, excluded = remove_existing_prospects(items)
+        copied["items"] = filtered
+        copied["found_count"] = len(filtered)
+        stats["saved_prospect_excluded"] = int(
+            stats.get("saved_prospect_excluded") or 0
+        ) + excluded
+        copied["stats"] = stats
+        copied["assignment_warning"] = ready_message
+        copied["assignment_feature_ready"] = False
+        return copied
+
+    _release_expired_assignments_if_due(owner_user_id)
+    availability = sales_assignments.filter_company_availability(
+        items,
+        owner_user_id,
+        is_admin_user=is_admin_user,
+    )
+    if not availability.get("ready"):
+        # Fail closed for new claims, while preserving the legacy global
+        # exclusion on the read-only result screen.
+        filtered, excluded = remove_existing_prospects(items)
+        copied["items"] = filtered
+        copied["found_count"] = len(filtered)
+        stats["saved_prospect_excluded"] = int(
+            stats.get("saved_prospect_excluded") or 0
+        ) + excluded
+        copied["stats"] = stats
+        copied["assignment_warning"] = availability.get("warning", "")
+        copied["assignment_feature_ready"] = False
+        return copied
+
+    visible = list(availability.get("items") or [])
+    excluded_count = int(availability.get("excluded_count") or 0)
+    own_count = int(availability.get("own_count") or 0)
+    copied["items"] = visible
+    copied["found_count"] = len(visible)
+    stats["saved_prospect_excluded"] = int(
+        stats.get("saved_prospect_excluded") or 0
+    ) + excluded_count + (0 if is_admin_user else own_count)
+    stats["assignment_blocked_excluded"] = excluded_count
+    stats["already_my_db_excluded"] = own_count
+    copied["stats"] = stats
+    copied["assignment_warning"] = availability.get("warning", "")
+    copied["assignment_feature_ready"] = True
+
+    if is_admin_user and visible:
+        admin_result = sales_assignments.list_admin_assignments(
+            owner_user_id,
+            limit=1000,
+        )
+        if admin_result.get("ok"):
+            assignment_by_uid = {
+                str(row.get("company_uid") or ""): row
+                for row in admin_result.get("assignments") or []
+                if str(row.get("company_uid") or "")
+            }
+            for item in visible:
+                assignment = assignment_by_uid.get(
+                    str(item.get("company_uid") or "")
+                )
+                if not assignment:
+                    item["담당자"] = "미배정"
+                    item["배정상태"] = "미배정"
+                    item["최근연락일"] = ""
+                    continue
+                item["담당자"] = (
+                    assignment.get("assigned_user_name")
+                    or assignment.get("assigned_user_id")
+                    or "미배정"
+                )
+                item["배정상태"] = sales_assignments.assignment_status_label(
+                    assignment.get("status")
+                )
+                item["최근연락일"] = str(
+                    assignment.get("last_contacted_at") or ""
+                ).replace("T", " ")[:16]
+
+    record_views = getattr(sales_assignments, "record_company_views", None)
+    if callable(record_views) and visible:
+        view_result = record_views(
+            owner_user_id,
+            visible,
+            session_id=_assignment_session_id(),
+        )
+        if not view_result.get("ok"):
+            copied["assignment_view_warning"] = view_result.get(
+                "message", ""
+            )
+    return copied
+
+
+def _assignment_expiry_text(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "담당 확정"
+    try:
+        expires_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        remaining = int(
+            (expires_at.astimezone(timezone.utc) - datetime.now(timezone.utc))
+            .total_seconds()
+        )
+    except (TypeError, ValueError):
+        return raw[:19].replace("T", " ")
+    if remaining <= 0:
+        return "만료 정리 대기"
+    hours, remainder = divmod(remaining, 3600)
+    minutes = remainder // 60
+    return f"{hours}시간 {minutes}분"
 
 
 def _redact_mobile_candidate(
@@ -388,6 +576,9 @@ def _display_frame(
             "고용자료상태": item.get("고용자료상태", ""),
             "영업주제": item.get("영업주제", "분석 전"),
             "추천등급": item.get("추천등급", ""),
+            "담당자": item.get("담당자", ""),
+            "배정상태": item.get("배정상태", ""),
+            "최근연락일": item.get("최근연락일", ""),
             "우선순위점수": int(item.get("우선순위점수") or 0),
             "추천사유": " · ".join(item.get("추천사유") or []),
             "초회전화스크립트": item.get("초회전화스크립트", ""),
@@ -432,6 +623,9 @@ def _display_frame(
         "고용자료상태",
         "영업주제",
         "추천등급",
+        "담당자",
+        "배정상태",
+        "최근연락일",
         "우선순위점수",
         "추천사유",
         "초회전화스크립트",
@@ -626,7 +820,25 @@ def _saved_candidate_frame(
                     "",
                 ),
                 "메모": str(row.get("memo") or ""),
+                "배정상태": sales_assignments.assignment_status_label(
+                    row.get("status")
+                ),
+                "배정만료": _assignment_expiry_text(
+                    row.get("assignment_expires_at")
+                ),
+                "연락횟수": int(row.get("contact_count") or 0),
+                "최근연락일": str(
+                    row.get("last_contacted_at") or ""
+                ).replace("T", " ")[:16],
+                "다음연락일": str(
+                    row.get("next_contact_at") or ""
+                ).replace("T", " ")[:16],
                 "_prospect_id": prospect_id,
+                "_company_uid": str(row.get("company_uid") or ""),
+                "_assignment_status": str(row.get("status") or ""),
+                "_assignment_expires_at": str(
+                    row.get("assignment_expires_at") or ""
+                ),
             }
         )
     return pd.DataFrame(display)
@@ -1442,7 +1654,8 @@ def _render_prospect_db_center_legacy(owner_user_id: str = "") -> None:
     if stock_company_rows and saved_contact_status[0]:
         try:
             contact_rows = list_contacts_for_prospects(
-                [str(row.get("id")) for row in stock_company_rows]
+                [str(row.get("id")) for row in stock_company_rows],
+                owner_user_id,
             )
             st.session_state["prospect_contacts_v970"] = contact_rows
         except Exception as exc:
@@ -1511,7 +1724,8 @@ def _render_prospect_db_center_legacy(owner_user_id: str = "") -> None:
             ):
                 try:
                     contact_rows = list_contacts_for_prospects(
-                        [str(row.get("id")) for row in saved_rows]
+                        [str(row.get("id")) for row in saved_rows],
+                        owner_user_id,
                     )
                     st.session_state["prospect_contacts_v970"] = contact_rows
                 except Exception as exc:
@@ -1759,15 +1973,30 @@ def _render_clean_saved_prospects(
     st.caption(
         "내가 저장한 영업후보만 표시합니다. 다른 사용자가 저장한 업체는 "
         "보이지 않지만, 전사 중복 제외 기준에는 계속 반영됩니다. "
-        + (
-            "휴대전화·일반전화·이메일·인스타그램이 확인된 업체를 "
-            if can_view_mobile
-            else "일반전화·이메일·인스타그램이 확인된 업체를 "
-        )
-        + "고용 증가 기준 순으로 표시합니다."
+        "전사 배정 기능 적용 후에는 공개 연락처가 아직 없는 업체도 "
+        "배정 해제·연락결과 관리를 위해 함께 표시합니다."
     )
+    assignment_mode = False
     try:
-        rows = list_prospects(owner_user_id, limit=1000)
+        ready, _ready_message = _assignment_feature_status()
+        if ready:
+            _release_expired_assignments_if_due(owner_user_id)
+            assignment_result = sales_assignments.list_user_assignments(
+                owner_user_id,
+                limit=1000,
+            )
+        else:
+            assignment_result = {"ok": False}
+        if assignment_result.get("ok"):
+            rows = []
+            for assignment in assignment_result.get("assignments") or []:
+                row = dict(assignment)
+                row["id"] = row.get("company_id") or row.get("id")
+                row["memo"] = row.get("own_memo") or row.get("memo") or ""
+                rows.append(row)
+            assignment_mode = True
+        else:
+            rows = list_prospects(owner_user_id, limit=1000)
     except Exception as exc:
         st.warning(f"저장목록을 불러오지 못했습니다: {exc}")
         return
@@ -1779,7 +2008,8 @@ def _render_clean_saved_prospects(
     try:
         if contact_table_status()[0]:
             contacts = list_contacts_for_prospects(
-                [str(row.get("id") or "") for row in rows]
+                [str(row.get("id") or "") for row in rows],
+                owner_user_id,
             )
     except Exception:
         contacts = []
@@ -1807,6 +2037,10 @@ def _render_clean_saved_prospects(
         )
         if can_view_mobile:
             accessible = accessible | (frame["휴대전화"] != "")
+        if assignment_mode:
+            # Central assignments must remain manageable even when a public
+            # phone/email/Instagram address has not been enriched yet.
+            accessible = pd.Series(True, index=frame.index)
         frame = frame[accessible].reset_index(drop=True)
         frame = frame.sort_values(
             by=["_고용정렬", "가입자"],
@@ -1818,7 +2052,13 @@ def _render_clean_saved_prospects(
         return
 
     export_frame = frame.drop(
-        columns=["_prospect_id", "_고용정렬"],
+        columns=[
+            "_prospect_id",
+            "_company_uid",
+            "_assignment_status",
+            "_assignment_expires_at",
+            "_고용정렬",
+        ],
         errors="ignore",
     )
     if not can_view_mobile:
@@ -1855,9 +2095,17 @@ def _render_clean_saved_prospects(
         "고용판정",
         "영업주제",
         "추천등급",
+        "배정상태",
+        "배정만료",
+        "연락횟수",
+        "최근연락일",
+        "다음연락일",
         "초회전화스크립트",
         "메모",
         "_prospect_id",
+        "_company_uid",
+        "_assignment_status",
+        "_assignment_expires_at",
     ]
     original_memos = {
         str(row["_prospect_id"]): str(row.get("메모") or "")
@@ -1881,12 +2129,16 @@ def _render_clean_saved_prospects(
                 help="담당자·통화 결과·다음 연락일 등을 기록합니다.",
             ),
             "_prospect_id": None,
+            "_company_uid": None,
+            "_assignment_status": None,
+            "_assignment_expires_at": None,
         },
         key="saved_prospect_memo_editor_v984",
     )
     changed_memos = [
         (
             str(row.get("_prospect_id") or ""),
+            str(row.get("_company_uid") or ""),
             str(row.get("메모") or ""),
         )
         for row in edited.to_dict("records")
@@ -1901,16 +2153,174 @@ def _render_clean_saved_prospects(
         key="save_prospect_memos_v984",
     ):
         try:
-            for prospect_id, memo in changed_memos:
-                save_prospect_memo(prospect_id, memo, owner_user_id)
+            for prospect_id, company_uid, memo in changed_memos:
+                if assignment_mode and company_uid:
+                    memo_result = sales_assignments.save_user_note(
+                        owner_user_id,
+                        company_uid,
+                        memo,
+                        company_id=prospect_id,
+                    )
+                    if not memo_result.get("ok"):
+                        raise RuntimeError(memo_result.get("message"))
+                else:
+                    save_prospect_memo(prospect_id, memo, owner_user_id)
             st.success(f"업체 메모 {len(changed_memos):,}건을 저장했습니다.")
             # Reset the data editor's dirty baseline after persisted changes.
             st.rerun()
         except Exception as exc:
             st.error(
-                "메모를 저장하지 못했습니다. 관리자 설정에서 v9.8.4 "
+                "메모를 저장하지 못했습니다. 관리자 설정에서 v9.8.9 "
                 f"SQL 실행 여부를 확인해 주세요: {exc}"
             )
+
+    if assignment_mode:
+        st.markdown("#### 연락결과 기록")
+        st.caption(
+            "통화·문자·카카오톡·상담 결과를 저장하면 담당자가 "
+            "확정되고 전사 중복연락 방지 상태가 함께 갱신됩니다."
+        )
+        assignment_rows = {
+            (
+                f"{row.get('업체명', '')} · "
+                f"{row.get('배정상태', '')} · "
+                f"{str(row.get('_company_uid') or '')[-10:]}"
+            ): row
+            for row in frame.to_dict("records")
+            if str(row.get("_company_uid") or "")
+        }
+        selected_label = st.selectbox(
+            "연락결과를 기록할 업체",
+            list(assignment_rows),
+            key="sales_contact_company_v989",
+        )
+        selected_assignment = assignment_rows.get(selected_label, {})
+        with st.form("sales_contact_record_form_v989"):
+            contact_col1, contact_col2 = st.columns(2)
+            contact_method = contact_col1.selectbox(
+                "연락방식",
+                CONTACT_METHOD_OPTIONS,
+            )
+            contact_result = contact_col2.selectbox(
+                "연락결과",
+                CONTACT_RESULT_OPTIONS,
+            )
+            schedule_next_contact = st.checkbox(
+                "다음 연락예정일 지정",
+                value=False,
+            )
+            next_contact_date = st.date_input(
+                "다음 연락예정일",
+                disabled=not schedule_next_contact,
+                help="‘재연락 요청’ 선택 시 반드시 지정합니다.",
+            )
+            contact_notes = st.text_area(
+                "상담내용",
+                max_chars=10_000,
+                placeholder="고객 반응과 후속조치 내용을 기록해 주세요.",
+            )
+            contact_submitted = st.form_submit_button(
+                "연락결과 저장",
+                type="primary",
+                use_container_width=True,
+            )
+        if contact_submitted:
+            if contact_result == "재연락 요청" and not schedule_next_contact:
+                st.error("재연락 요청은 다음 연락예정일을 입력해 주세요.")
+            else:
+                contact_save_result = sales_assignments.record_contact(
+                    owner_user_id,
+                    selected_assignment.get("_prospect_id"),
+                    selected_assignment.get("_company_uid"),
+                    contact_method,
+                    contact_result,
+                    notes=contact_notes,
+                    next_contact_at=(
+                        next_contact_date.isoformat()
+                        if schedule_next_contact
+                        else None
+                    ),
+                    session_id=_assignment_session_id(),
+                )
+                if contact_save_result.get("ok"):
+                    st.success(contact_save_result.get("message"))
+                else:
+                    st.error(contact_save_result.get("message"))
+
+        with st.expander("내 연락이력", expanded=False):
+            contact_history_result = sales_assignments.list_company_contacts(
+                owner_user_id,
+                selected_assignment.get("_company_uid"),
+                limit=200,
+            )
+            if contact_history_result.get("ok") and contact_history_result.get(
+                "contacts"
+            ):
+                contact_history_frame = pd.DataFrame(
+                    contact_history_result["contacts"]
+                ).rename(
+                    columns={
+                        "contact_method": "연락방식",
+                        "contact_result": "연락결과",
+                        "notes": "상담내용",
+                        "contacted_at": "연락일시",
+                        "next_contact_at": "다음 연락예정일",
+                    }
+                )
+                st.dataframe(
+                    contact_history_frame[
+                        [
+                            column
+                            for column in [
+                                "연락방식",
+                                "연락결과",
+                                "상담내용",
+                                "연락일시",
+                                "다음 연락예정일",
+                            ]
+                            if column in contact_history_frame.columns
+                        ]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            elif contact_history_result.get("ok"):
+                st.info("기록된 연락이력이 없습니다.")
+            else:
+                st.error(contact_history_result.get("message"))
+
+        selected_contact_count = int(
+            selected_assignment.get("연락횟수") or 0
+        )
+        selected_status = str(
+            selected_assignment.get("_assignment_status") or ""
+        )
+        if selected_contact_count == 0 and selected_status == "assigned":
+            with st.expander("미접촉 임시 배정 해제", expanded=False):
+                with st.form("sales_assignment_release_form_v989"):
+                    release_reason = st.text_input(
+                        "해제 사유",
+                        max_chars=500,
+                    )
+                    release_submitted = st.form_submit_button(
+                        "이 업체 배정 해제",
+                        use_container_width=True,
+                    )
+                if release_submitted:
+                    if not release_reason.strip():
+                        st.error("배정 해제 사유를 입력해 주세요.")
+                    else:
+                        release_result = sales_assignments.release_assignment(
+                            owner_user_id,
+                            selected_assignment.get("_prospect_id"),
+                            selected_assignment.get("_company_uid"),
+                            reason=release_reason,
+                            session_id=_assignment_session_id(),
+                        )
+                        if release_result.get("ok"):
+                            st.success(release_result.get("message"))
+                        else:
+                            st.error(release_result.get("message"))
 
 
 def render_prospect_db_center(
@@ -2254,6 +2664,7 @@ def render_prospect_db_center(
                         else district_name
                     ),
                     progress=_progress,
+                    exclude_saved_prospects=False,
                 )
             else:
                 result = collect_contactable_growth_companies(
@@ -2276,8 +2687,15 @@ def render_prospect_db_center(
                     ),
                     data_source=data_source,
                     progress=_progress,
+                    exclude_saved_prospects=False,
                 )
         result = _sanitize_search_result(result, can_view_mobile)
+        if result.get("ok"):
+            result = _filter_assignment_search_result(
+                result,
+                owner_user_id,
+                is_admin_user=is_admin_user,
+            )
         if result.get("ok"):
             progress_bar.progress(1.0, text="검색을 완료했습니다.")
         else:
@@ -2456,8 +2874,8 @@ def render_prospect_db_center(
                     if discovery_type == "recent_opening"
                     else (
                         "Supabase 사전 계산 목록과 지역·고용·업종 전용 "
-                        "인덱스를 사용했습니다. 모든 사용자가 저장한 "
-                        "기존 영업후보는 자동 제외됩니다."
+                        "인덱스를 사용했습니다. 다른 담당자가 배정·"
+                        "연락 중인 업체는 전사 상태 기준으로 제외됩니다."
                     )
                 )
             )
@@ -2465,12 +2883,30 @@ def render_prospect_db_center(
             st.info(
                 f"다음 검색 권장 시작 페이지는 "
                 f"{result.get('next_page', int(end_page) + 1):,}입니다. "
-                "모든 사용자가 저장한 기존 영업후보는 자동 제외됩니다."
+                "다른 담당자가 배정·연락 중인 업체는 전사 상태 "
+                "기준으로 제외됩니다."
             )
         if result.get("duplicate_warning"):
             st.warning(
                 "기존 DB 중복확인 일부를 완료하지 못했습니다: "
                 f"{result['duplicate_warning']}"
+            )
+        if result.get("assignment_warning"):
+            st.warning(
+                "전사 중복연락 방지 상태를 완전히 확인하지 못했습니다. "
+                f"{result['assignment_warning']}"
+            )
+        own_excluded = int(stats.get("already_my_db_excluded") or 0)
+        if own_excluded:
+            st.info(
+                f"이미 내 영업DB에 저장된 업체 {own_excluded:,}건은 "
+                "신규 결과에서 제외했습니다. ③ 저장된 영업후보에서 "
+                "기존 담당 상태와 연락이력을 확인할 수 있습니다."
+            )
+        if result.get("assignment_view_warning") and is_admin_user:
+            st.caption(
+                "업체 조회이력 기록 안내: "
+                f"{result['assignment_view_warning']}"
             )
         if result.get("snapshot_warning"):
             st.warning(
@@ -2626,6 +3062,8 @@ def render_prospect_db_center(
                     ),
                     "업종분류",
                     "추천등급",
+                    *((["담당자", "배정상태", "최근연락일"])
+                      if is_admin_user else []),
                     "source_key",
                 ]
                 if column in display.columns
@@ -2738,24 +3176,214 @@ def render_prospect_db_center(
                     or str(item.get("인스타그램") or "").strip()
                 )
             ]
+            assignment_ready = bool(
+                result.get("assignment_feature_ready")
+            )
+            if "assignment_feature_ready" not in result:
+                assignment_ready = _assignment_feature_status()[0]
             if st.button(
-                f"선택한 {len(selected_items):,}개 업체 영업DB에 저장",
+                f"선택한 {len(selected_items):,}개 업체 내 영업DB에 담기",
                 type="primary",
                 use_container_width=True,
-                disabled=not selected_items,
+                disabled=not selected_items or not assignment_ready,
                 key=f"save_prospects_v1012_{discovery_type}",
             ):
                 try:
-                    saved_count = save_prospects(
+                    save_result = save_assigned_prospects(
                         selected_items,
                         owner_user_id,
+                        session_id=_assignment_session_id(),
                     )
-                    st.success(f"{saved_count:,}개 업체를 저장했습니다.")
-                    st.session_state.pop("prospect_result_v1002", None)
-                    # Clear the saved search-result workspace immediately.
+                    saved_count = int(save_result.get("saved_count") or 0)
+                    already_owned_count = int(
+                        save_result.get("already_owned_count") or 0
+                    )
+                    failures = [
+                        row
+                        for row in (save_result.get("results") or [])
+                        if not row.get("ok")
+                    ]
+                    if saved_count:
+                        st.success(
+                            f"{saved_count:,}개 업체를 내 영업DB에 "
+                            "임시 배정했습니다. 24시간 안에 연락결과를 "
+                            "기록해 주세요."
+                        )
+                    if already_owned_count:
+                        st.info(
+                            f"{already_owned_count:,}개 업체는 이미 내 "
+                            "영업DB에 있어 중복 저장하지 않았습니다. "
+                            "③ 저장된 영업후보에서 기존 상세정보를 "
+                            "확인할 수 있습니다."
+                        )
+                    failure_codes = {
+                        str(row.get("code") or "") for row in failures
+                    }
+                    if failure_codes & {
+                        "ASSIGNMENT_CONFLICT",
+                        "ALREADY_ASSIGNED",
+                    }:
+                        st.warning(
+                            "다른 담당자가 먼저 배정받은 업체입니다. "
+                            "검색 결과를 새로고침합니다."
+                        )
+                    if failure_codes & {
+                        "MAX_UNCONTACTED_REACHED",
+                        "LIMIT_REACHED",
+                        "UNCONTACTED_LIMIT_REACHED",
+                    }:
+                        st.warning(
+                            "미접촉 배정 DB는 최대 30개까지 보유할 수 "
+                            "있습니다. 기존 DB의 연락결과를 기록하거나 "
+                            "배정을 해제한 후 다시 시도해 주세요."
+                        )
+                    for row in failures:
+                        if str(row.get("code") or "") not in {
+                            "ASSIGNMENT_CONFLICT",
+                            "ALREADY_ASSIGNED",
+                            "MAX_UNCONTACTED_REACHED",
+                            "LIMIT_REACHED",
+                            "UNCONTACTED_LIMIT_REACHED",
+                        }:
+                            st.warning(str(row.get("message") or "저장 실패"))
+
+                    saved_uids = {
+                        str((row.get("assignment") or {}).get("company_uid") or "")
+                        for row in (save_result.get("results") or [])
+                        if row.get("ok")
+                    }
+                    result["items"] = [
+                        item
+                        for item in items
+                        if str(item.get("company_uid") or "") not in saved_uids
+                    ]
+                    result["found_count"] = len(result["items"])
+                    st.session_state[result_state_key] = result
+                    st.session_state[selection_state_key] = []
+                    st.session_state[result_revision_key] = int(
+                        st.session_state.get(result_revision_key, 0) or 0
+                    ) + 1
                     st.rerun()
                 except Exception as exc:
                     st.error(f"영업후보 저장 실패: {exc}")
+
+            if assignment_ready and len(selected_items) == 1:
+                with st.expander(
+                    "선택 업체 연락결과 바로 기록",
+                    expanded=False,
+                ):
+                    st.caption(
+                        "저장과 동시에 임시 배정한 뒤 연락결과를 기록합니다. "
+                        "다른 담당자가 먼저 배정받았다면 저장되지 않습니다."
+                    )
+                    with st.form(
+                        f"search_contact_record_v989_{discovery_type}"
+                    ):
+                        quick_col1, quick_col2 = st.columns(2)
+                        quick_method = quick_col1.selectbox(
+                            "연락방식",
+                            CONTACT_METHOD_OPTIONS,
+                            key=f"quick_method_v989_{discovery_type}",
+                        )
+                        quick_result = quick_col2.selectbox(
+                            "연락결과",
+                            CONTACT_RESULT_OPTIONS,
+                            key=f"quick_result_v989_{discovery_type}",
+                        )
+                        quick_schedule = st.checkbox(
+                            "다음 연락예정일 지정",
+                            value=False,
+                            key=f"quick_schedule_v989_{discovery_type}",
+                        )
+                        quick_next_date = st.date_input(
+                            "다음 연락예정일",
+                            disabled=not quick_schedule,
+                            help="‘재연락 요청’ 선택 시 반드시 지정합니다.",
+                            key=f"quick_date_v989_{discovery_type}",
+                        )
+                        quick_notes = st.text_area(
+                            "상담내용",
+                            max_chars=10_000,
+                            key=f"quick_notes_v989_{discovery_type}",
+                        )
+                        quick_submitted = st.form_submit_button(
+                            "내 영업DB에 담고 연락결과 기록",
+                            type="primary",
+                            use_container_width=True,
+                        )
+                    if quick_submitted:
+                        if (
+                            quick_result == "재연락 요청"
+                            and not quick_schedule
+                        ):
+                            st.error(
+                                "재연락 요청은 다음 연락예정일을 입력해 주세요."
+                            )
+                        else:
+                            quick_item = selected_items[0]
+                            quick_claim = save_assigned_prospects(
+                                [quick_item],
+                                owner_user_id,
+                                session_id=_assignment_session_id(),
+                            )
+                            quick_rows = list(
+                                quick_claim.get("results") or []
+                            )
+                            quick_row = quick_rows[0] if quick_rows else {}
+                            if not quick_row.get("ok"):
+                                st.warning(
+                                    quick_row.get("message")
+                                    or quick_claim.get("message")
+                                    or "업체를 배정하지 못했습니다."
+                                )
+                            else:
+                                quick_assignment = dict(
+                                    quick_row.get("assignment") or {}
+                                )
+                                quick_uid = str(
+                                    quick_assignment.get("company_uid")
+                                    or quick_item.get("company_uid")
+                                    or sales_assignments.build_company_uid(
+                                        quick_item
+                                    )
+                                )
+                                quick_contact = (
+                                    sales_assignments.record_contact(
+                                        owner_user_id,
+                                        quick_assignment.get("company_id"),
+                                        quick_uid,
+                                        quick_method,
+                                        quick_result,
+                                        notes=quick_notes,
+                                        next_contact_at=(
+                                            quick_next_date.isoformat()
+                                            if quick_schedule
+                                            else None
+                                        ),
+                                        session_id=_assignment_session_id(),
+                                    )
+                                )
+                                if quick_contact.get("ok"):
+                                    st.success(quick_contact.get("message"))
+                                    result["items"] = [
+                                        item
+                                        for item in items
+                                        if str(item.get("company_uid") or "")
+                                        != quick_uid
+                                    ]
+                                    result["found_count"] = len(
+                                        result["items"]
+                                    )
+                                    st.session_state[result_state_key] = result
+                                    st.session_state[selection_state_key] = []
+                                    st.session_state[result_revision_key] = int(
+                                        st.session_state.get(
+                                            result_revision_key, 0
+                                        )
+                                        or 0
+                                    ) + 1
+                                else:
+                                    st.error(quick_contact.get("message"))
 
         failures = result.get("failures") or []
         if failures:
@@ -2765,6 +3393,413 @@ def render_prospect_db_center(
                     use_container_width=True,
                     hide_index=True,
                 )
+
+def render_company_assignment_admin(current_user_id: str = "") -> None:
+    """Admin-only company assignment, limit and audit management screen."""
+    from auth import is_admin, list_all_users_for_admin
+
+    if not is_admin(current_user_id):
+        st.error("관리자 권한이 필요합니다.")
+        return
+
+    st.markdown("## 전사 영업배정 관리")
+    st.caption(
+        "DB발굴 업체의 현재 담당자·연락상태를 확인하고, 담당자 변경·"
+        "강제 회수·재활성화·영구 제외를 처리합니다. 모든 변경은 "
+        "감사로그에 남습니다."
+    )
+    ready, ready_message = _assignment_feature_status()
+    if not ready:
+        st.warning(ready_message)
+        st.info(
+            "supabase_v1032_company_sales_assignments.sql을 적용한 뒤 "
+            "이 화면을 다시 열어 주세요. 적용 전에는 기존 DB발굴 "
+            "중복 제외 기능이 그대로 유지됩니다."
+        )
+        return
+
+    _release_expired_assignments_if_due(current_user_id)
+    metrics_result = sales_assignments.list_admin_assignment_metrics(
+        current_user_id
+    )
+    metric_rows = (
+        list(metrics_result.get("metrics") or [])
+        if metrics_result.get("ok")
+        else []
+    )
+    global_total = max(
+        (int(row.get("total_assignment_count") or 0) for row in metric_rows),
+        default=0,
+    )
+    page_control_col1, page_control_col2 = st.columns([1, 2])
+    page_size = page_control_col1.selectbox(
+        "페이지당 업체",
+        [100, 200, 500],
+        index=1,
+        key="assignment_admin_page_size_v989",
+    )
+    page_count = max(1, (global_total + int(page_size) - 1) // int(page_size))
+    page_state_key = "assignment_admin_page_v989"
+    if page_state_key not in st.session_state:
+        st.session_state[page_state_key] = 1
+    if int(st.session_state.get(page_state_key, 1) or 1) > page_count:
+        st.session_state[page_state_key] = page_count
+    page_number = page_control_col2.number_input(
+        "페이지",
+        min_value=1,
+        max_value=page_count,
+        step=1,
+        key=page_state_key,
+    )
+    assignment_result = sales_assignments.list_admin_assignments(
+        current_user_id,
+        limit=int(page_size),
+        offset=(int(page_number) - 1) * int(page_size),
+    )
+    if not assignment_result.get("ok"):
+        st.error(assignment_result.get("message") or "배정현황 조회 실패")
+        return
+    rows = list(assignment_result.get("assignments") or [])
+
+    total_count = int(
+        assignment_result.get("total_count") or global_total or len(rows)
+    )
+    uncontacted_count = sum(
+        int(row.get("uncontacted_count") or 0) for row in metric_rows
+    )
+    contacted_count = sum(
+        int(row.get("contacted_count") or 0) for row in metric_rows
+    )
+    long_unprocessed_count = sum(
+        int(row.get("long_unprocessed_count") or 0) for row in metric_rows
+    )
+    duplicate_attempt_count = max(
+        (
+            int(row.get("global_duplicate_assignment_attempt_count") or 0)
+            for row in metric_rows
+        ),
+        default=sum(
+            int(row.get("duplicate_attempt_count") or 0)
+            for row in metric_rows
+        ),
+    )
+    migration_conflict_count = max(
+        (
+            int(row.get("global_migration_conflict_count") or 0)
+            for row in metric_rows
+        ),
+        default=sum(1 for row in rows if row.get("migration_conflict")),
+    )
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("전체 배정상태", f"{total_count:,}건")
+    metric_cols[1].metric("미접촉 임시배정", f"{uncontacted_count:,}건")
+    metric_cols[2].metric("연락기록 보유", f"{contacted_count:,}건")
+    metric_cols[3].metric(
+        "장기 미처리 / 중복시도",
+        f"{long_unprocessed_count:,}건 / {duplicate_attempt_count:,}회",
+    )
+    st.caption(
+        f"전체 {total_count:,}건 중 {int(page_number):,}/{page_count:,}페이지 · "
+        f"기존 이관 충돌 {migration_conflict_count:,}건"
+    )
+
+    salesperson_metrics = [
+        {
+            "영업사원": row.get("assigned_user_name")
+            or row.get("assigned_user_id"),
+            "미접촉 배정 DB": int(row.get("uncontacted_count") or 0),
+            "연락완료 DB": int(row.get("contacted_count") or 0),
+            "장기 미처리 DB": int(
+                row.get("long_unprocessed_count") or 0
+            ),
+            "중복 배정 시도": int(
+                row.get("duplicate_attempt_count") or 0
+            ),
+        }
+        for row in metric_rows
+        if row.get("assigned_user_id")
+    ]
+    if salesperson_metrics:
+        st.dataframe(
+            pd.DataFrame(salesperson_metrics),
+            use_container_width=True,
+            hide_index=True,
+        )
+    elif not metrics_result.get("ok"):
+        st.warning(
+            metrics_result.get("message")
+            or "전사 전체 통계를 불러오지 못했습니다."
+        )
+
+    if rows:
+        admin_frame = pd.DataFrame(
+            [
+                {
+                    "업체": row.get("company_name") or row.get("company_uid"),
+                    "담당자": row.get("assigned_user_name")
+                    or row.get("assigned_user_id")
+                    or "미배정",
+                    "상태": sales_assignments.assignment_status_label(
+                        row.get("status")
+                    ),
+                    "최초 조회자": row.get("first_viewer_user_name")
+                    or row.get("first_viewer_user_id")
+                    or "-",
+                    "최초 배정자": row.get("first_assigned_user_name")
+                    or row.get("first_assigned_user_id")
+                    or "-",
+                    "최초 연락자": row.get("first_contacted_user_name")
+                    or row.get("first_contacted_user_id")
+                    or "-",
+                    "최초 연락일": str(row.get("first_contacted_at") or "")
+                    .replace("T", " ")[:16],
+                    "최근 연락일": str(row.get("last_contacted_at") or "")
+                    .replace("T", " ")[:16],
+                    "연락횟수": int(row.get("contact_count") or 0),
+                    "다음 연락일": str(row.get("next_contact_at") or "")
+                    .replace("T", " ")[:16],
+                    "임시배정 만료": str(
+                        row.get("assignment_expires_at") or ""
+                    ).replace("T", " ")[:16],
+                    "중복배정 시도": int(
+                        row.get("duplicate_attempt_count") or 0
+                    ),
+                    "이관충돌": (
+                        "담당자 확인 필요"
+                        if row.get("migration_conflict")
+                        else ""
+                    ),
+                    "기존 저장 사용자": ", ".join(
+                        str(value)
+                        for value in (row.get("conflicting_user_ids") or [])
+                    ),
+                }
+                for row in rows
+            ]
+        )
+        st.dataframe(
+            admin_frame,
+            use_container_width=True,
+            hide_index=True,
+            height=min(620, 72 + len(admin_frame) * 36),
+        )
+        conflict_rows = [
+            row for row in rows if bool(row.get("migration_conflict"))
+        ]
+        if conflict_rows:
+            with st.expander(
+                f"현재 페이지 이관 충돌 {len(conflict_rows):,}건",
+                expanded=False,
+            ):
+                st.caption(
+                    "기존에 여러 사용자에게 저장된 업체입니다. 아래 담당 "
+                    "상태 변경에서 최종 담당자를 선택하면 원본 자료는 "
+                    "삭제하지 않고 충돌만 해결됩니다."
+                )
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "업체": row.get("company_name")
+                                or row.get("company_uid"),
+                                "기존 저장 사용자": ", ".join(
+                                    str(value)
+                                    for value in (
+                                        row.get("conflicting_user_ids") or []
+                                    )
+                                ),
+                                "상태": row.get(
+                                    "conflict_resolution_status"
+                                )
+                                or "pending",
+                            }
+                            for row in conflict_rows
+                        ]
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+    else:
+        st.info("현재 전사 영업배정 상태가 등록된 업체가 없습니다.")
+
+    users = [
+        row
+        for row in list_all_users_for_admin(current_user_id)
+        if str(row.get("상태") or "approved") == "approved"
+    ]
+    user_labels = {
+        f"{row.get('이름') or row.get('아이디')} · {row.get('아이디')}": str(
+            row.get("아이디") or ""
+        )
+        for row in users
+        if str(row.get("아이디") or "")
+    }
+
+    if rows:
+        st.markdown("### 담당 상태 변경")
+        company_labels: dict[str, dict] = {}
+        for index, row in enumerate(rows, start=1):
+            company_uid = str(row.get("company_uid") or "")
+            label = (
+                f"{row.get('company_name') or '업체명 미확인'} · "
+                f"{sales_assignments.assignment_status_label(row.get('status'))} · "
+                f"{company_uid[-10:]} · {index}"
+            )
+            company_labels[label] = row
+        selected_company_label = st.selectbox(
+            "대상 업체",
+            list(company_labels),
+            key="assignment_admin_company_v989",
+        )
+        selected_company = company_labels[selected_company_label]
+        with st.form("assignment_admin_action_form_v989"):
+            action = st.selectbox(
+                "관리 작업",
+                [
+                    "담당자 변경",
+                    "임시 배정 강제 해제",
+                    "담당자 강제 회수",
+                    "재활성화",
+                    "영구 제외",
+                ],
+            )
+            selected_target_label = st.selectbox(
+                "변경할 담당자",
+                list(user_labels) or ["승인된 사용자가 없습니다"],
+                disabled=action != "담당자 변경" or not user_labels,
+            )
+            reason = st.text_input(
+                "변경 사유",
+                max_chars=500,
+                placeholder="감사로그에 기록할 사유를 입력하세요.",
+            )
+            action_submitted = st.form_submit_button(
+                "변경 적용",
+                type="primary",
+                use_container_width=True,
+            )
+        if action_submitted:
+            if not reason.strip():
+                st.error("변경 사유를 입력해 주세요.")
+            elif action == "담당자 변경" and not user_labels:
+                st.error("변경할 승인 사용자가 없습니다.")
+            else:
+                company_id = selected_company.get("company_id") or ""
+                company_uid = selected_company.get("company_uid") or ""
+                session_id = _assignment_session_id()
+                if action == "담당자 변경":
+                    action_result = sales_assignments.admin_change_assignee(
+                        current_user_id,
+                        company_id,
+                        company_uid,
+                        user_labels[selected_target_label],
+                        reason=reason,
+                        session_id=session_id,
+                    )
+                elif action in {"임시 배정 강제 해제", "담당자 강제 회수"}:
+                    action_result = sales_assignments.admin_release_assignment(
+                        current_user_id,
+                        company_id,
+                        company_uid,
+                        reason=f"{action}: {reason}",
+                        session_id=session_id,
+                    )
+                elif action == "재활성화":
+                    action_result = sales_assignments.admin_reactivate(
+                        current_user_id,
+                        company_id,
+                        company_uid,
+                        reason=reason,
+                        session_id=session_id,
+                    )
+                else:
+                    action_result = sales_assignments.admin_permanent_exclude(
+                        current_user_id,
+                        company_id,
+                        company_uid,
+                        reason=reason,
+                        session_id=session_id,
+                    )
+                if action_result.get("ok"):
+                    st.success(action_result.get("message"))
+                else:
+                    st.error(action_result.get("message"))
+
+    st.markdown("### 영업사원별 미접촉 배정 한도")
+    if user_labels:
+        with st.form("assignment_user_limit_form_v989"):
+            limit_user_label = st.selectbox(
+                "영업사원",
+                list(user_labels),
+            )
+            max_uncontacted = st.number_input(
+                "미접촉 임시배정 최대 건수",
+                min_value=1,
+                max_value=1000,
+                value=30,
+                step=1,
+            )
+            limit_reason = st.text_input(
+                "한도 변경 사유",
+                max_chars=500,
+            )
+            limit_submitted = st.form_submit_button(
+                "한도 저장",
+                use_container_width=True,
+            )
+        if limit_submitted:
+            if not limit_reason.strip():
+                st.error("한도 변경 사유를 입력해 주세요.")
+            else:
+                limit_result = sales_assignments.admin_set_user_limit(
+                    current_user_id,
+                    user_labels[limit_user_label],
+                    int(max_uncontacted),
+                    limit_reason,
+                    _assignment_session_id(),
+                )
+                if limit_result.get("ok"):
+                    st.success(limit_result.get("message"))
+                else:
+                    st.error(limit_result.get("message"))
+    else:
+        st.info("한도를 설정할 승인 사용자가 없습니다.")
+
+    with st.expander("배정·연락 감사로그", expanded=False):
+        audit_result = sales_assignments.list_admin_assignment_audit(
+            current_user_id,
+            limit=500,
+        )
+        if audit_result.get("ok") and audit_result.get("audit"):
+            audit_frame = pd.DataFrame(audit_result["audit"])
+            st.dataframe(
+                audit_frame,
+                use_container_width=True,
+                hide_index=True,
+            )
+        elif audit_result.get("ok"):
+            st.info("기록된 감사로그가 없습니다.")
+        else:
+            st.error(audit_result.get("message") or "감사로그 조회 실패")
+
+    with st.expander("전체 연락이력", expanded=False):
+        admin_contact_result = sales_assignments.list_company_contacts(
+            current_user_id,
+            limit=1000,
+        )
+        if admin_contact_result.get("ok") and admin_contact_result.get(
+            "contacts"
+        ):
+            st.dataframe(
+                pd.DataFrame(admin_contact_result["contacts"]),
+                use_container_width=True,
+                hide_index=True,
+            )
+        elif admin_contact_result.get("ok"):
+            st.info("기록된 연락이력이 없습니다.")
+        else:
+            st.error(admin_contact_result.get("message"))
+
 
 def render_prospect_admin_settings(current_user_id: str = "") -> None:
     from auth import is_admin
