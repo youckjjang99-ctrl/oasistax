@@ -654,6 +654,22 @@ button[data-baseweb="tab"][aria-selected="true"] {
     box-shadow: inset 3px 0 0 rgba(255, 255, 255, 0.34) !important;
 }
 
+/* Keep every detail-menu item aligned to the navigation card edge. */
+[data-testid="stSidebar"] .st-key-sidebar_detail_navigation [data-testid="stRadio"],
+[data-testid="stSidebar"] .st-key-sidebar_detail_navigation [data-testid="stRadio"] > div,
+[data-testid="stSidebar"] .st-key-sidebar_detail_navigation [data-testid="stRadio"] div[role="radiogroup"],
+[data-testid="stSidebar"] .st-key-sidebar_detail_navigation [data-testid="stRadioOption"],
+[data-testid="stSidebar"] .st-key-sidebar_detail_navigation [data-testid="stRadioOption"] > label {
+    width: 100% !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+}
+
+[data-testid="stSidebar"] .st-key-sidebar_detail_navigation [data-testid="stRadioOption"] {
+    display: block !important;
+}
+
 [data-testid="stSidebar"] .st-key-sidebar_group_switcher
 [data-testid="stVerticalBlock"],
 [data-testid="stSidebar"] .st-key-sidebar_detail_navigation
@@ -713,6 +729,13 @@ button[data-baseweb="tab"][aria-selected="true"] {
     background: rgba(255, 255, 255, 0.055) !important;
     box-shadow: none !important;
     transition: background 0.14s ease, border-color 0.14s ease !important;
+}
+
+[data-testid="stSidebar"] .st-key-sidebar_detail_navigation
+[data-testid="stRadio"] div[role="radiogroup"] label {
+    width: 100% !important;
+    max-width: 100% !important;
+    box-sizing: border-box !important;
 }
 
 [data-testid="stSidebar"] [data-testid="stRadio"] div[role="radiogroup"] label:hover {
@@ -1116,6 +1139,22 @@ button[data-baseweb="tab"][aria-selected="true"] {
         min-height: 44px !important;
         padding: 0.55rem 0.65rem !important;
         border-radius: 9px !important;
+    }
+
+    /* The detail-menu card uses full-width rows even on narrow screens. */
+    [data-testid="stSidebar"] .st-key-sidebar_detail_navigation
+    [data-testid="stRadio"] [data-testid="stRadioOption"] {
+        display: block !important;
+        width: 100% !important;
+        max-width: 100% !important;
+    }
+
+    [data-testid="stSidebar"] .st-key-sidebar_detail_navigation
+    [data-testid="stRadio"] div[role="radiogroup"] label {
+        display: flex !important;
+        width: 100% !important;
+        max-width: 100% !important;
+        box-sizing: border-box !important;
     }
 
     [data-testid="stSidebar"] [data-testid="stRadioOption"]
