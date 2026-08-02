@@ -31,6 +31,9 @@ _DEFAULT_ADMIN_LOCK = threading.Lock()
 AUTH_RECHECK_SECONDS = 10.0
 PERSISTENT_LOGIN_COOKIE = "oasis_login_v1"
 PERSISTENT_LOGIN_SECONDS = 30 * 24 * 60 * 60
+SIGNED_OUT_QUERY_PARAM = "_oasis_signed_out"
+SIGNED_OUT_SESSION_GUARD = "_persistent_login_restore_blocked_v1"
+SIGNED_OUT_COOKIE_CLEANUP = "_persistent_login_cookie_cleanup_queued_v1"
 
 
 # ================================
@@ -358,6 +361,10 @@ def create_user(user_id, password, name):
         return False, password_error
     if not name:
         return False, "이름을 입력해주세요."
+
+    configured_admin_id = _safe_user_id(get_secret("APP_LOGIN_ID", ""))
+    if configured_admin_id and user_id == configured_admin_id:
+        return False, "사용할 수 없는 아이디입니다. 다른 아이디를 입력해주세요."
 
     users = load_users()
     if user_id in users:
@@ -738,6 +745,51 @@ def _clear_persistent_login_cookie() -> None:
     _render_persistent_login_cookie("", max_age=0)
 
 
+def _signed_out_query_guard_active() -> bool:
+    try:
+        value = st.query_params.get(SIGNED_OUT_QUERY_PARAM, "")
+    except Exception:
+        value = ""
+    if isinstance(value, list):
+        value = value[-1] if value else ""
+    return str(value or "").strip() == "1"
+
+
+def _set_signed_out_query_guard(active: bool) -> None:
+    try:
+        if active:
+            st.query_params[SIGNED_OUT_QUERY_PARAM] = "1"
+        else:
+            st.query_params.pop(SIGNED_OUT_QUERY_PARAM, None)
+    except Exception:
+        pass
+
+
+def _activate_signed_out_guard(*, clear_all_state: bool) -> None:
+    """Keep a stale browser cookie from restoring the previous account."""
+    _set_signed_out_query_guard(True)
+    _clear_persistent_login_cookie()
+    if clear_all_state:
+        _clear_local_login_state()
+    else:
+        st.session_state.logged_in = False
+        st.session_state.current_user_id = ""
+        st.session_state.current_user_name = ""
+        st.session_state.current_user_role = ""
+        st.session_state.login_session_token = ""
+        st.session_state.pop("_persistent_login_cookie_fingerprint", None)
+        st.session_state.pop("_auth_last_verified_key", None)
+        st.session_state.pop("_auth_last_verified_at", None)
+    st.session_state[SIGNED_OUT_SESSION_GUARD] = True
+    st.session_state[SIGNED_OUT_COOKIE_CLEANUP] = True
+
+
+def _deactivate_signed_out_guard() -> None:
+    _set_signed_out_query_guard(False)
+    st.session_state.pop(SIGNED_OUT_SESSION_GUARD, None)
+    st.session_state.pop(SIGNED_OUT_COOKIE_CLEANUP, None)
+
+
 def _sync_persistent_login_cookie(user_id: str, session_token: str) -> None:
     fingerprint = hashlib.sha256(
         f"{_safe_user_id(user_id)}\0{session_token}".encode("utf-8")
@@ -884,8 +936,21 @@ def render_password_change(user_id: str) -> None:
 
 def check_login():
     if st.session_state.pop("_logout_requested_v1", False):
-        _clear_persistent_login_cookie()
-        _clear_local_login_state()
+        _activate_signed_out_guard(clear_all_state=True)
+        return False
+
+    signed_out_guard_active = bool(
+        st.session_state.get(SIGNED_OUT_SESSION_GUARD, False)
+    ) or _signed_out_query_guard_active()
+    if signed_out_guard_active:
+        if not st.session_state.get(SIGNED_OUT_COOKIE_CLEANUP, False):
+            _clear_persistent_login_cookie()
+            st.session_state[SIGNED_OUT_COOKIE_CLEANUP] = True
+        st.session_state.logged_in = False
+        st.session_state.current_user_id = ""
+        st.session_state.current_user_name = ""
+        st.session_state.current_user_role = ""
+        st.session_state.login_session_token = ""
         return False
 
     claim_bucket = st.session_state.get("_claim_auth_sessions_v1")
@@ -1009,6 +1074,7 @@ def login_form(logo_html_func):
         if login_submitted:
             ok, user, msg = authenticate_user_with_message(user_id, user_pw)
             if ok and user:
+                _deactivate_signed_out_guard()
                 st.session_state.logged_in = True
                 st.session_state.current_user_id = user.get("user_id", "")
                 st.session_state.current_user_name = user.get("name", "")
@@ -1057,7 +1123,10 @@ def login_form(logo_html_func):
             else:
                 ok, msg = create_user(new_id, new_pw, new_name)
                 if ok:
-                    st.success(msg)
+                    _activate_signed_out_guard(clear_all_state=False)
+                    st.success(
+                        f"{msg} 기존에 남아 있던 로그인 정보도 해제했습니다."
+                    )
                 else:
                     st.error(msg)
 

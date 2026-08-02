@@ -4,6 +4,17 @@ from unittest.mock import patch
 import auth
 
 
+class _SessionState(dict):
+    def __getattr__(self, key):
+        try:
+            return self[key]
+        except KeyError as exc:
+            raise AttributeError(key) from exc
+
+    def __setattr__(self, key, value):
+        self[key] = value
+
+
 class AuthSecurityTests(unittest.TestCase):
     def test_password_policy_requires_length_letters_and_numbers(self):
         self.assertTrue(auth._password_policy_error("short1"))
@@ -77,6 +88,61 @@ class AuthSecurityTests(unittest.TestCase):
         self.assertIn('st.session_state["_logout_requested_v1"] = True', source)
         self.assertIn("_clear_persistent_login_cookie()", source)
         self.assertIn("_restore_persistent_login()", source)
+
+    @patch("auth.get_secret")
+    def test_signup_cannot_reuse_configured_admin_id(self, get_secret):
+        get_secret.side_effect = lambda key, default="": {
+            "APP_LOGIN_ID": "oasis-admin",
+        }.get(key, default)
+
+        ok, message = auth.create_user(
+            "OASIS-ADMIN",
+            "SecurePass123",
+            "신규 사용자",
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("사용할 수 없는 아이디", message)
+
+    @patch("auth._restore_persistent_login")
+    @patch("auth._clear_persistent_login_cookie")
+    @patch("auth._signed_out_query_guard_active", return_value=True)
+    def test_signed_out_guard_blocks_stale_admin_cookie_restore(
+        self,
+        _query_guard,
+        clear_cookie,
+        restore_login,
+    ):
+        state = _SessionState(
+            {
+                "logged_in": True,
+                "current_user_id": "old-admin",
+                "current_user_name": "관리자",
+                "current_user_role": "admin",
+                "login_session_token": "old-token",
+            }
+        )
+
+        with patch.object(auth.st, "session_state", state):
+            self.assertFalse(auth.check_login())
+
+        restore_login.assert_not_called()
+        clear_cookie.assert_called_once()
+        self.assertFalse(state["logged_in"])
+        self.assertEqual(state["current_user_id"], "")
+        self.assertEqual(state["current_user_role"], "")
+
+    def test_signup_success_activates_signed_out_guard(self):
+        source = (auth.ROOT_DIR / "auth.py").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "_activate_signed_out_guard(clear_all_state=False)",
+            source,
+        )
+        self.assertIn(
+            "_deactivate_signed_out_guard()",
+            source,
+        )
 
 
 if __name__ == "__main__":
