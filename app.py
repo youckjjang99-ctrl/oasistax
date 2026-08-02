@@ -702,6 +702,52 @@ def _handle_pending_user_action(
     }
 
 
+def _queue_sidebar_collapse() -> None:
+    """Collapse the open sidebar once after a user selects a detail menu."""
+    st.session_state["_oasis_collapse_sidebar_once"] = True
+
+
+def _render_queued_sidebar_collapse() -> None:
+    """Apply the queued client-side collapse without another app rerun."""
+    if not st.session_state.pop("_oasis_collapse_sidebar_once", False):
+        return
+
+    import streamlit.components.v1 as components
+
+    components.html(
+        """
+        <script>
+        (() => {
+          let attempts = 0;
+          const collapseSidebar = () => {
+            const collapseButton = window.parent.document.querySelector(
+              '[data-testid="stSidebarCollapseButton"] button'
+            );
+            if (!collapseButton) {
+              return false;
+            }
+            collapseButton.click();
+            return true;
+          };
+
+          if (collapseSidebar()) {
+            return;
+          }
+
+          const retryTimer = window.setInterval(() => {
+            attempts += 1;
+            if (collapseSidebar() || attempts >= 20) {
+              window.clearInterval(retryTimer);
+            }
+          }, 50);
+        })();
+        </script>
+        """,
+        height=0,
+        scrolling=False,
+    )
+
+
 def render_home_page(user_id, user_name=""):
     customer_df, _ = read_current_user_customer_df(user_id)
     customer_count = len(customer_df)
@@ -1867,6 +1913,7 @@ with st.sidebar:
             key="active_main_menu_v1020",
             format_func=lambda value: menu_labels.get(value, value),
             label_visibility="visible",
+            on_change=_queue_sidebar_collapse,
         )
     active_tab = menu_groups[selected_group][selected_menu_label]
 
@@ -1881,6 +1928,8 @@ with st.sidebar:
     st.divider()
     render_password_change(CURRENT_USER_ID)
     logout_button()
+
+_render_queued_sidebar_collapse()
 
 # 로컬 파일이 필요한 화면을 선택했을 때만 복원 모듈과 네트워크를 사용한다.
 local_customer_routes = {

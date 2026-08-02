@@ -19,6 +19,19 @@ class NavigationVisibilityTests(unittest.TestCase):
         self.assertNotIn("<small>{html.escape(selected_group)}</small>", source)
         self.assertIn('"경정청구": "경정청구"', source)
 
+    def test_detail_menu_change_collapses_sidebar_once(self):
+        source = (ROOT / "app.py").read_text(encoding="utf-8")
+
+        self.assertIn("def _queue_sidebar_collapse()", source)
+        self.assertIn("def _render_queued_sidebar_collapse()", source)
+        self.assertIn("on_change=_queue_sidebar_collapse", source)
+        self.assertIn(
+            "st.session_state.pop(\"_oasis_collapse_sidebar_once\", False)",
+            source,
+        )
+        self.assertIn('[data-testid="stSidebarCollapseButton"] button', source)
+        self.assertEqual(source.count("_render_queued_sidebar_collapse()"), 2)
+
     def test_enterprise_tools_are_visible_in_one_tab_row(self):
         source = (ROOT / "enterprise_center.py").read_text(encoding="utf-8")
         expected_labels = [
