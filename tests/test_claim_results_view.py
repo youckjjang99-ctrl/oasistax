@@ -363,6 +363,9 @@ class ClaimResultsViewTests(unittest.TestCase):
 
         self.assertIn('"서류조회"', source)
         self.assertIn('"Excel 다운로드"', source)
+        self.assertIn('"삭제"', source)
+        self.assertIn("_show_claim_case_delete_dialog", source)
+        self.assertIn("white-space: nowrap", source)
         self.assertIn("_build_claim_results_excel(filtered_cases)", source)
         self.assertNotIn("결정세액", source)
         self.assertNotIn("환급액", source)

@@ -478,6 +478,31 @@ class ClaimRepository:
         except Exception as exc:
             raise _safe_storage_error(exc) from exc
 
+    def delete_case(self, case_id: str) -> None:
+        """Hide one owner-scoped case while preserving its audit trail."""
+
+        safe_case_id = str(case_id or "").strip()
+        if not safe_case_id:
+            raise ClaimRepositoryError("삭제할 경정청구 건을 확인하지 못했습니다.")
+        current = self.get_case(safe_case_id)
+        if current is None:
+            raise ClaimRepositoryError("해당 경정청구 건을 찾을 수 없습니다.")
+        current_owner = str(current.get("owner_user_id", "")).strip().lower()
+        if current_owner != self.owner_user_id:
+            raise ClaimRepositoryError("해당 경정청구 건에 접근할 수 없습니다.")
+        try:
+            deleted = self.database.rpc(
+                "oasis_claim_soft_delete_case",
+                {
+                    "p_owner_user_id": self.owner_user_id,
+                    "p_case_id": safe_case_id,
+                },
+            )
+        except Exception as exc:
+            raise _safe_storage_error(exc) from exc
+        if deleted is not True:
+            raise ClaimRepositoryError("고객을 목록에서 삭제하지 못했습니다.")
+
     def list_documents(self, case_id: str) -> list[dict[str, Any]]:
         safe_case_id = str(case_id)
         collected: list[dict[str, Any]] = []

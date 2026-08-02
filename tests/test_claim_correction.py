@@ -454,6 +454,7 @@ class _FakeDatabase:
                 for row in self.rows
                 if str(row.get("owner_user_id"))
                 == str(parameters["p_owner_user_id"])
+                and not row.get("deleted_at")
             ][: int(parameters["p_limit"])]
         if function_name == "oasis_claim_get_case":
             return [
@@ -462,7 +463,19 @@ class _FakeDatabase:
                 if str(row.get("owner_user_id"))
                 == str(parameters["p_owner_user_id"])
                 and str(row.get("id")) == str(parameters["p_case_id"])
+                and not row.get("deleted_at")
             ][:1]
+        if function_name == "oasis_claim_soft_delete_case":
+            for row in self.rows:
+                if (
+                    str(row.get("owner_user_id"))
+                    == str(parameters["p_owner_user_id"])
+                    and str(row.get("id")) == str(parameters["p_case_id"])
+                    and not row.get("deleted_at")
+                ):
+                    row["deleted_at"] = "2026-08-02T00:00:00+00:00"
+                    return True
+            return False
         if function_name == "oasis_claim_list_documents":
             matches = [
                 row
@@ -622,6 +635,33 @@ def _public_key_b64() -> str:
     {"CLAIM_DOCUMENT_VARIANT_KEY": TEST_VARIANT_SECRET},
 )
 class ClaimCorrectionTests(unittest.TestCase):
+    def test_repository_soft_deletes_only_the_owned_case(self):
+        case_id = "00000000-0000-0000-0000-000000000901"
+        other_case_id = "00000000-0000-0000-0000-000000000902"
+        fake = _FakeDatabase(
+            rows=[
+                {"id": case_id, "owner_user_id": "owner-user"},
+                {"id": other_case_id, "owner_user_id": "other-user"},
+            ]
+        )
+        repository = ClaimRepository("owner-user", database=fake)
+
+        repository.delete_case(case_id)
+
+        self.assertIsNone(repository.get_case(case_id))
+        self.assertEqual(repository.list_cases(), [])
+        self.assertIsNone(fake.rows[1].get("deleted_at"))
+        self.assertIn(
+            (
+                "oasis_claim_soft_delete_case",
+                {
+                    "p_owner_user_id": "owner-user",
+                    "p_case_id": case_id,
+                },
+            ),
+            fake.rpc_calls,
+        )
+
     def test_seven_year_plan_uses_previous_seven_tax_years(self):
         self.assertEqual(
             seven_years(2026),

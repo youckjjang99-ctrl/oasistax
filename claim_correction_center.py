@@ -6794,11 +6794,69 @@ def _show_claim_documents_dialog(
                     )
 
 
+@st.dialog("고객 삭제")
+def _show_claim_case_delete_dialog(
+    user_id: str,
+    repository: ClaimRepository,
+    selected_case: dict[str, Any],
+) -> None:
+    case_id = str(selected_case.get("id", "") or "").strip()
+    customer_name = _claim_result_customer_name(selected_case)
+    st.write(f"**{html.escape(customer_name)}** 고객을 목록에서 삭제합니다.")
+    st.caption(
+        "고객 목록에서는 즉시 사라지며 진행 중인 인증·수집 작업은 중단됩니다. "
+        "감사 이력과 수집 서류는 기존 보관기한 정책에 따라 안전하게 유지됩니다."
+    )
+
+    cancel_col, delete_col = st.columns(2)
+    with cancel_col:
+        if st.button(
+            "취소",
+            use_container_width=True,
+            key=f"claim_case_delete_cancel_{case_id}",
+        ):
+            st.rerun()
+    with delete_col:
+        if st.button(
+            "삭제",
+            type="primary",
+            use_container_width=True,
+            key=f"claim_case_delete_confirm_{case_id}",
+        ):
+            try:
+                repository.delete_case(case_id)
+                _expire_claim_job(
+                    case_id,
+                    _claim_job_owner_ref(user_id),
+                    user_id,
+                )
+            except ClaimRepositoryError as exc:
+                st.error(str(exc))
+                return
+            if st.session_state.get("_claim_active_case_v1") == case_id:
+                st.session_state.pop("_claim_active_case_v1", None)
+            st.session_state["_claim_flash_v1"] = (
+                f"{customer_name} 고객을 목록에서 삭제했습니다."
+            )
+            st.rerun()
+
+
 def _render_results_tab(
     user_id: str,
     repository: ClaimRepository | None,
     provider_ready: bool,
 ) -> None:
+    st.markdown(
+        """
+        <style>
+        div[class*="st-key-claim_result_documents_"] button p {
+            white-space: nowrap !important;
+            word-break: keep-all !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     if repository is None:
         st.info("전용 저장소 설치 후 수집결과가 표시됩니다.")
         return
@@ -6905,7 +6963,7 @@ def _render_results_tab(
     widths = [
         0.4,
         1.45,
-        0.75,
+        1.05,
         0.65,
         1.0,
         1.05,
@@ -6914,6 +6972,7 @@ def _render_results_tab(
         1.0,
         1.15,
         0.9,
+        0.7,
     ]
     headers = [
         "번호",
@@ -6927,6 +6986,7 @@ def _render_results_tab(
         "수집 상태",
         "등록일",
         "담당자",
+        "삭제",
     ]
     header_cols = st.columns(widths)
     for column, label in zip(header_cols, headers):
@@ -6961,6 +7021,16 @@ def _render_results_tab(
             row_cols[8].write(str(case_view["overall_status"]))
             row_cols[9].write(str(case_view["requested_at"]))
             row_cols[10].write(str(case_view["requested_by"]))
+            if row_cols[11].button(
+                "삭제",
+                key=f"claim_result_delete_{case_id}",
+                use_container_width=True,
+            ):
+                _show_claim_case_delete_dialog(
+                    user_id,
+                    repository,
+                    case,
+                )
 
 
 def _render_catalog_tab() -> None:
