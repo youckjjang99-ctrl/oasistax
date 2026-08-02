@@ -704,43 +704,52 @@ def _handle_pending_user_action(
 
 def _queue_sidebar_collapse() -> None:
     """Collapse the open sidebar once after a user selects a detail menu."""
-    st.session_state["_oasis_collapse_sidebar_once"] = True
+    request_number = int(
+        st.session_state.get("_oasis_sidebar_collapse_request", 0) or 0
+    ) + 1
+    st.session_state["_oasis_sidebar_collapse_request"] = request_number
+    st.session_state["_oasis_collapse_sidebar_once"] = request_number
 
 
 def _render_queued_sidebar_collapse() -> None:
     """Apply the queued client-side collapse without another app rerun."""
-    if not st.session_state.pop("_oasis_collapse_sidebar_once", False):
+    request_number = st.session_state.pop(
+        "_oasis_collapse_sidebar_once",
+        0,
+    )
+    if not request_number:
         return
 
     import streamlit.components.v1 as components
 
     components.html(
-        """
+        f"""
         <script>
-        (() => {
+        (() => {{
+          const requestNumber = {int(request_number)};
           let attempts = 0;
-          const collapseSidebar = () => {
+          const collapseSidebar = () => {{
             const collapseButton = window.parent.document.querySelector(
               '[data-testid="stSidebarCollapseButton"] button'
             );
-            if (!collapseButton) {
+            if (!collapseButton) {{
               return false;
-            }
+            }}
             collapseButton.click();
             return true;
-          };
+          }};
 
-          if (collapseSidebar()) {
+          if (collapseSidebar()) {{
             return;
-          }
+          }}
 
-          const retryTimer = window.setInterval(() => {
+          const retryTimer = window.setInterval(() => {{
             attempts += 1;
-            if (collapseSidebar() || attempts >= 20) {
+            if (collapseSidebar() || attempts >= 20) {{
               window.clearInterval(retryTimer);
-            }
-          }, 50);
-        })();
+            }}
+          }}, 50);
+        }})();
         </script>
         """,
         height=0,

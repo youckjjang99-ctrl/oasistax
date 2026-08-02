@@ -1,4 +1,5 @@
 import os
+import base64
 import json
 import hashlib
 import secrets
@@ -10,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
+from cryptography.fernet import Fernet, InvalidToken
 
 from cloud_db import CloudDatabase, cloud_is_configured
 from performance_cache import cache_generation, invalidate_cache
@@ -27,6 +29,8 @@ _LOGIN_ATTEMPTS_LOCK = threading.Lock()
 _DEFAULT_ADMIN_ENSURED = False
 _DEFAULT_ADMIN_LOCK = threading.Lock()
 AUTH_RECHECK_SECONDS = 10.0
+PERSISTENT_LOGIN_COOKIE = "oasis_login_v1"
+PERSISTENT_LOGIN_SECONDS = 30 * 24 * 60 * 60
 
 
 # ================================
@@ -635,6 +639,148 @@ def _session_is_current(user_id: str, token: str) -> bool:
         return False
 
 
+def _persistent_login_cipher() -> Fernet | None:
+    """Build a stable cipher without exposing application secrets to the client."""
+    secret = ""
+    for key in (
+        "APP_SESSION_SECRET",
+        "SUPABASE_SECRET_KEY",
+        "SUPABASE_SERVICE_ROLE_KEY",
+        "APP_LOGIN_PW",
+    ):
+        secret = str(get_secret(key, "") or "").strip()
+        if secret:
+            break
+    if len(secret) < 16:
+        return None
+    digest = hashlib.sha256(
+        f"oasis-persistent-login-v1\0{secret}".encode("utf-8")
+    ).digest()
+    return Fernet(base64.urlsafe_b64encode(digest))
+
+
+def _encode_persistent_login(user_id: str, session_token: str) -> str:
+    cipher = _persistent_login_cipher()
+    safe_user_id = _safe_user_id(user_id)
+    token = str(session_token or "")
+    if cipher is None or not safe_user_id or not token:
+        return ""
+    payload = json.dumps(
+        {
+            "version": 1,
+            "user_id": safe_user_id,
+            "session_token": token,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return cipher.encrypt(payload).decode("ascii")
+
+
+def _decode_persistent_login(cookie_value: str) -> tuple[str, str] | None:
+    cipher = _persistent_login_cipher()
+    if cipher is None or not cookie_value:
+        return None
+    try:
+        raw = cipher.decrypt(
+            str(cookie_value).encode("ascii"),
+            ttl=PERSISTENT_LOGIN_SECONDS,
+        )
+        payload = json.loads(raw.decode("utf-8"))
+    except (InvalidToken, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    if int(payload.get("version", 0) or 0) != 1:
+        return None
+    user_id = _safe_user_id(payload.get("user_id", ""))
+    session_token = str(payload.get("session_token", "") or "")
+    if not user_id or not session_token:
+        return None
+    return user_id, session_token
+
+
+def _read_persistent_login_cookie() -> str:
+    try:
+        return str(st.context.cookies.get(PERSISTENT_LOGIN_COOKIE, "") or "")
+    except Exception:
+        return ""
+
+
+def _render_persistent_login_cookie(
+    value: str,
+    *,
+    max_age: int,
+) -> None:
+    """Write only the encrypted resume token to a secure browser cookie."""
+    import streamlit.components.v1 as components
+
+    cookie_name_json = json.dumps(PERSISTENT_LOGIN_COOKIE)
+    cookie_value_json = json.dumps(str(value or ""))
+    request_id_json = json.dumps(uuid.uuid4().hex)
+    components.html(
+        f"""
+        <script>
+        (() => {{
+          const requestId = {request_id_json};
+          const cookieName = {cookie_name_json};
+          const cookieValue = {cookie_value_json};
+          const maxAge = {max(0, int(max_age))};
+          window.parent.document.cookie =
+            `${{cookieName}}=${{encodeURIComponent(cookieValue)}}; ` +
+            `Path=/; Max-Age=${{maxAge}}; SameSite=Strict; Secure`;
+        }})();
+        </script>
+        """,
+        height=0,
+        scrolling=False,
+    )
+
+
+def _clear_persistent_login_cookie() -> None:
+    _render_persistent_login_cookie("", max_age=0)
+
+
+def _sync_persistent_login_cookie(user_id: str, session_token: str) -> None:
+    fingerprint = hashlib.sha256(
+        f"{_safe_user_id(user_id)}\0{session_token}".encode("utf-8")
+    ).hexdigest()
+    if st.session_state.get("_persistent_login_cookie_fingerprint") == fingerprint:
+        return
+    cookie_value = _encode_persistent_login(user_id, session_token)
+    if not cookie_value:
+        return
+    _render_persistent_login_cookie(
+        cookie_value,
+        max_age=PERSISTENT_LOGIN_SECONDS,
+    )
+    st.session_state["_persistent_login_cookie_fingerprint"] = fingerprint
+
+
+def _restore_persistent_login() -> bool:
+    restored = _decode_persistent_login(_read_persistent_login_cookie())
+    if not restored:
+        return False
+    user_id, session_token = restored
+    if not _session_is_current(user_id, session_token):
+        _clear_persistent_login_cookie()
+        return False
+    current_user = _load_current_user_access(user_id)
+    if str(current_user.get("status", "")).strip() != "approved":
+        _clear_persistent_login_cookie()
+        return False
+
+    st.session_state.logged_in = True
+    st.session_state.current_user_id = user_id
+    st.session_state.current_user_name = str(current_user.get("name", "") or "")
+    st.session_state.current_user_role = str(
+        current_user.get("role", "member") or "member"
+    )
+    st.session_state.login_session_token = session_token
+    fingerprint = hashlib.sha256(
+        f"{user_id}\0{session_token}".encode("utf-8")
+    ).hexdigest()
+    st.session_state["_persistent_login_cookie_fingerprint"] = fingerprint
+    return True
+
+
 def _clear_local_login_state() -> None:
     # A browser session may be reused by another account. Remove all user data,
     # uploaded document handles and generated download bytes on logout.
@@ -733,11 +879,15 @@ def render_password_change(user_id: str) -> None:
                 st.error(message)
                 return
 
-            _clear_local_login_state()
-            st.success(message)
+            st.session_state["_logout_requested_v1"] = True
             st.rerun()
 
 def check_login():
+    if st.session_state.pop("_logout_requested_v1", False):
+        _clear_persistent_login_cookie()
+        _clear_local_login_state()
+        return False
+
     claim_bucket = st.session_state.get("_claim_auth_sessions_v1")
     if isinstance(claim_bucket, dict):
         now = time.time()
@@ -773,6 +923,9 @@ def check_login():
 
     ensure_default_admin()
 
+    if not st.session_state.logged_in:
+        _restore_persistent_login()
+
     if st.session_state.logged_in:
         current_user_id = _safe_user_id(st.session_state.current_user_id)
         session_token = str(st.session_state.login_session_token or "")
@@ -790,9 +943,11 @@ def check_login():
         )
 
         if verification_is_fresh:
+            _sync_persistent_login_cookie(current_user_id, session_token)
             return True
 
         if not _session_is_current(current_user_id, session_token):
+            _clear_persistent_login_cookie()
             _clear_local_login_state()
             st.warning(
                 "동일 계정으로 새 로그인이 확인되어 현재 기기에서 자동 로그아웃되었습니다."
@@ -800,6 +955,7 @@ def check_login():
             return False
         current_user = _load_current_user_access(current_user_id)
         if str(current_user.get("status", "")).strip() != "approved":
+            _clear_persistent_login_cookie()
             _clear_local_login_state()
             st.warning("승인된 계정만 이용할 수 있습니다.")
             return False
@@ -811,6 +967,7 @@ def check_login():
         )
         st.session_state["_auth_last_verified_key"] = verification_key
         st.session_state["_auth_last_verified_at"] = now
+        _sync_persistent_login_cookie(current_user_id, session_token)
 
     return st.session_state.logged_in
 
@@ -910,5 +1067,5 @@ def login_form(logo_html_func):
 
 def logout_button():
     if st.button("로그아웃", use_container_width=True):
-        _clear_local_login_state()
+        st.session_state["_logout_requested_v1"] = True
         st.rerun()

@@ -40,6 +40,44 @@ class AuthSecurityTests(unittest.TestCase):
 
         self.assertFalse(auth._session_is_current("owner", "token"))
 
+    @patch("auth.get_secret")
+    def test_persistent_login_cookie_is_encrypted_and_round_trips(
+        self,
+        get_secret,
+    ):
+        get_secret.side_effect = lambda key, default="": {
+            "APP_SESSION_SECRET": "test-session-secret-value-1234567890",
+        }.get(key, default)
+
+        encoded = auth._encode_persistent_login("owner", "session-token")
+
+        self.assertTrue(encoded)
+        self.assertNotIn("owner", encoded)
+        self.assertNotIn("session-token", encoded)
+        self.assertEqual(
+            auth._decode_persistent_login(encoded),
+            ("owner", "session-token"),
+        )
+
+    @patch("auth.get_secret")
+    def test_persistent_login_cookie_rejects_tampering(self, get_secret):
+        get_secret.side_effect = lambda key, default="": {
+            "APP_SESSION_SECRET": "test-session-secret-value-1234567890",
+        }.get(key, default)
+        encoded = auth._encode_persistent_login("owner", "session-token")
+        replacement = "A" if encoded[-1] != "A" else "B"
+
+        self.assertIsNone(
+            auth._decode_persistent_login(encoded[:-1] + replacement)
+        )
+
+    def test_logout_queues_cookie_cleanup_before_clearing_session(self):
+        source = (auth.ROOT_DIR / "auth.py").read_text(encoding="utf-8")
+
+        self.assertIn('st.session_state["_logout_requested_v1"] = True', source)
+        self.assertIn("_clear_persistent_login_cookie()", source)
+        self.assertIn("_restore_persistent_login()", source)
+
 
 if __name__ == "__main__":
     unittest.main()

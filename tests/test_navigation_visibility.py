@@ -26,9 +26,10 @@ class NavigationVisibilityTests(unittest.TestCase):
         self.assertIn("def _render_queued_sidebar_collapse()", source)
         self.assertIn("on_change=_queue_sidebar_collapse", source)
         self.assertIn(
-            "st.session_state.pop(\"_oasis_collapse_sidebar_once\", False)",
+            'st.session_state.get("_oasis_sidebar_collapse_request", 0)',
             source,
         )
+        self.assertIn("const requestNumber = {int(request_number)}", source)
         self.assertIn('[data-testid="stSidebarCollapseButton"] button', source)
         self.assertEqual(source.count("_render_queued_sidebar_collapse()"), 2)
 
