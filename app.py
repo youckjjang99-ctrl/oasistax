@@ -727,6 +727,10 @@ def _render_queued_sidebar_collapse() -> None:
         <script>
         (() => {{
           const requestNumber = {int(request_number)};
+          const mobileViewport = window.parent.matchMedia('(max-width: 768px)');
+          if (!mobileViewport.matches) {{
+            return;
+          }}
           let attempts = 0;
           const collapseSidebar = () => {{
             const collapseButton = window.parent.document.querySelector(

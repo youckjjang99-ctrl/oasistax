@@ -30,6 +30,11 @@ class NavigationVisibilityTests(unittest.TestCase):
             source,
         )
         self.assertIn("const requestNumber = {int(request_number)}", source)
+        self.assertIn(
+            "window.parent.matchMedia('(max-width: 768px)')",
+            source,
+        )
+        self.assertIn("if (!mobileViewport.matches)", source)
         self.assertIn('[data-testid="stSidebarCollapseButton"] button', source)
         self.assertEqual(source.count("_render_queued_sidebar_collapse()"), 2)
 
