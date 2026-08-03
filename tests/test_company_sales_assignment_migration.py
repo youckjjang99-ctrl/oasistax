@@ -119,7 +119,12 @@ class CompanySalesAssignmentMigrationStaticTests(unittest.TestCase):
         self.assertIn("'oasis-company:' || v_uid", claim_sql)
         self.assertIn("'oasis-user:' || p_current_user_id", claim_sql)
         self.assertIn("for update", claim_sql)
-        self.assertIn("on conflict (company_uid) do nothing", claim_sql)
+        self.assertIn(
+            "on conflict on constraint "
+            "oasis_company_sales_assignments_company_uid_key",
+            claim_sql,
+        )
+        self.assertNotIn("on conflict (company_uid) do nothing", claim_sql)
         self.assertIn("'duplicate_assignment_attempt'", claim_sql)
         self.assertIn("'already_assigned'", claim_sql)
         self.assertIn("status = 'assigned'", claim_sql)
