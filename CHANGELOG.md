@@ -9,7 +9,7 @@
 - 고객 이관의 식별 불가·대기·실패 건을 완료로 오인하지 않고 오류 원문을 이력에 저장하지 않는다.
 - 기존 기능, 고객 원본, 고객 ID, `company_uid`, 전화수집·원천DB 상태, 경정청구/Tilko 경로는 삭제하거나 축소하지 않았다.
 - 격리 Supabase 동일 SQL 2회 적용, 논리 백업·복원, 운영 전후 건수·지문 비교, 전체 회귀 `652 passed, 1 skipped, 22 subtests passed`, Privacy Guard를 통과했다.
-- 운영 Supabase 마이그레이션 적용 완료. GitHub `main`과 Railway 배포 검증 후 2단계를 최종 완료 처리한다.
+- 운영 Supabase 마이그레이션, GitHub `main`, Railway 연관 서비스 4개 배포를 모두 확인해 2단계를 완료 처리했다.
 
 ---
 
