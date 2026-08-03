@@ -13,6 +13,7 @@ from typing import Any
 
 import requests
 import streamlit as st
+from runtime_error_log import safe_public_error, write_runtime_error
 
 from cloud_sync import sync_crm_record
 from cloud_db import CloudDatabase, cloud_is_configured
@@ -69,6 +70,12 @@ DEFAULT_SUMMARY_MODEL = "gpt-5-mini"
 CACHE_VERSION = "v1"
 CONSULTATION_JOURNAL_TABLE = "oasis_consultation_journals"
 CONSULTATION_AI_CACHE_TABLE = "oasis_consultation_ai_cache"
+
+
+def _safe_logged_error(context: str, exc: BaseException, fallback: str) -> str:
+    """Record a redacted diagnostic and return a non-sensitive UI message."""
+    write_runtime_error(context, exc)
+    return safe_public_error(exc, fallback)
 
 CONSULTING_TOPIC_TAXONOMY = [
     "정책자금",
@@ -1993,7 +2000,11 @@ def save_consultation_journal(
     try:
         _save_cloud_journal(user_id, record)
     except Exception as exc:
-        cloud_save_warning = f" 클라우드 상담일지 저장 확인 필요: {exc}"
+        cloud_save_warning = " " + _safe_logged_error(
+            "consultation_journal.cloud_save",
+            exc,
+            "클라우드 상담일지 저장을 확인해 주세요.",
+        )
 
     audio_storage = record.get("_audio_storage", {})
     if isinstance(audio_storage, dict):
@@ -2007,6 +2018,7 @@ def save_consultation_journal(
                     or "녹음 상담일지"
                 ),
                 summary=str(record.get("summary", "") or ""),
+                owner_user_id=user_id,
             )
 
     title = record.get("consultation_title") or "녹음 상담일지"
@@ -2070,12 +2082,14 @@ def save_consultation_journal(
             record,
         )
     except Exception as exc:
+        public_error = _safe_logged_error(
+            "consultation_journal.policy_matching",
+            exc,
+            "정책자금 키워드 자동반영 중 오류가 발생했습니다.",
+        )
         policy_result = {
             "updated": False,
-            "message": (
-                "상담일지는 저장했지만 정책자금 키워드 자동반영 중 "
-                f"오류가 발생했습니다: {exc}"
-            ),
+            "message": "상담일지는 저장했지만 " + public_error,
         }
 
     message = "상담일지·CRM·기업히스토리를 저장했습니다."
@@ -2157,7 +2171,13 @@ def relink_saved_consultation_journals(
             keyword_added.extend(result.get("added_keywords", []) or [])
             interest_added.extend(result.get("added_interests", []) or [])
         except Exception as exc:
-            errors.append(f"키워드 반영 실패({journal_id}): {exc}")
+            errors.append(
+                _safe_logged_error(
+                    "consultation_journal.relink_policy",
+                    exc,
+                    "키워드 반영 중 오류가 발생했습니다.",
+                )
+            )
 
         if journal_id not in processed:
             try:
@@ -2179,7 +2199,13 @@ def relink_saved_consultation_journals(
                 processed.add(journal_id)
                 history_added += 1
             except Exception as exc:
-                errors.append(f"히스토리 반영 실패({journal_id}): {exc}")
+                errors.append(
+                    _safe_logged_error(
+                        "consultation_journal.relink_history",
+                        exc,
+                        "기업 히스토리 반영 중 오류가 발생했습니다.",
+                    )
+                )
 
     _save_journal_relink_state(user_id, processed)
 
@@ -2524,8 +2550,10 @@ def render_audio_consultation_journal(
                 )
         except Exception as upload_exc:
             upload_ready = False
-            upload_status_message = (
-                f"업로드 파일 확인 중 오류: {upload_exc}"
+            upload_status_message = _safe_logged_error(
+                "consultation_journal.upload_read",
+                upload_exc,
+                "업로드 파일을 확인하는 중 오류가 발생했습니다.",
             )
 
     status_col, reset_col = st.columns([4, 1])
@@ -2792,13 +2820,18 @@ def render_audio_consultation_journal(
                         "stored_size_bytes"
                     ] = len(storage_bytes)
                 except Exception as storage_exc:
+                    public_storage_error = _safe_logged_error(
+                        "consultation_journal.audio_storage",
+                        storage_exc,
+                        "클라우드 보관 중 오류가 발생했습니다.",
+                    )
                     audio_storage_result = {
                         "stored": False,
                         "message": (
                             "클라우드 보관은 실패했지만 녹취와 상담일지 생성은 완료했습니다. "
-                            f"원인: {storage_exc}"
+                            + public_storage_error
                         ),
-                        "error": str(storage_exc),
+                        "error": type(storage_exc).__name__,
                     }
                     stage_message.warning(
                         audio_storage_result["message"]
@@ -2850,7 +2883,27 @@ def render_audio_consultation_journal(
                 st.session_state.pop(error_key, None)
 
             except Exception as exc:
-                error_message = str(exc)
+                raw_error_message = str(exc)
+                write_runtime_error("consultation_journal.generate", exc)
+                if (
+                    "insufficient_quota" in raw_error_message
+                    or "exceeded your current quota" in raw_error_message
+                ):
+                    error_message = (
+                        "OpenAI API 잔액 또는 월 사용한도가 부족합니다. "
+                        "OpenAI Platform의 Billing과 Usage limit을 "
+                        "확인한 뒤 다시 실행해주세요."
+                    )
+                elif "429" in raw_error_message:
+                    error_message = (
+                        "OpenAI 요청 한도에 도달했습니다. "
+                        "잠시 후 다시 실행해주세요."
+                    )
+                else:
+                    error_message = safe_public_error(
+                        exc,
+                        "상담일지 생성 중 오류가 발생했습니다.",
+                    )
                 st.session_state[error_key] = error_message
                 st.session_state.pop(job_key, None)
                 st.session_state[running_key] = False
@@ -2865,26 +2918,7 @@ def render_audio_consultation_journal(
                     expanded=True,
                 )
 
-                if (
-                    "insufficient_quota" in error_message
-                    or "exceeded your current quota"
-                    in error_message
-                ):
-                    st.error(
-                        "OpenAI API 잔액 또는 월 사용한도가 부족합니다. "
-                        "OpenAI Platform의 Billing과 Usage limit을 "
-                        "확인한 뒤 다시 실행해주세요."
-                    )
-                elif "429" in error_message:
-                    st.error(
-                        "OpenAI 요청 한도에 도달했습니다. "
-                        "잠시 후 다시 실행해주세요."
-                    )
-                else:
-                    st.error(
-                        f"상담일지 생성 중 오류가 발생했습니다: "
-                        f"{error_message}"
-                    )
+                st.error(error_message)
 
         # 성공한 경우에만 초안 화면을 다시 그린다.
         # 실패 시에는 현재 화면의 상세 오류를 유지한다.
@@ -2897,33 +2931,7 @@ def render_audio_consultation_journal(
     previous_error = st.session_state.get(error_key)
     if previous_error and not st.session_state.get(running_key):
         error_text = str(previous_error)
-
-        if (
-            "insufficient_quota" in error_text
-            or "exceeded your current quota" in error_text
-        ):
-            st.error(
-                "OpenAI API 잔액 또는 월 사용한도가 부족합니다. "
-                "OpenAI Platform의 Billing과 Usage limit을 확인해주세요."
-            )
-        elif "429" in error_text:
-            st.error(
-                "OpenAI 요청 한도에 도달했습니다. 잠시 후 다시 실행해주세요."
-            )
-        elif (
-            "Supabase" in error_text
-            or "Storage" in error_text
-            or "storage" in error_text
-        ):
-            st.error(
-                "원본 녹음파일의 Supabase 저장 과정에서 오류가 발생했습니다."
-            )
-            st.code(error_text)
-        else:
-            st.error(
-                "상담일지 생성이 중단되었습니다."
-            )
-            st.code(error_text)
+        st.error(error_text)
 
         if st.button(
             "오류 메시지 닫기",
@@ -3216,7 +3224,13 @@ def render_audio_consultation_journal(
             )
             st.rerun()
         except Exception as exc:
-            st.error(f"상담일지 재생성 중 오류가 발생했습니다: {exc}")
+            st.error(
+                _safe_logged_error(
+                    "consultation_journal.regenerate",
+                    exc,
+                    "상담일지 재생성 중 오류가 발생했습니다.",
+                )
+            )
 
     if st.button(
         "상담일지 및 CRM 저장",
@@ -3294,6 +3308,8 @@ def render_audio_consultation_journal(
                 signed_url = create_signed_audio_url(
                     str(audio_item.get("storage_path", "")),
                     expires_in=3600,
+                    owner_user_id=user_id,
+                    audio_id=str(audio_item.get("audio_id", "")),
                 )
                 if signed_url:
                     st.audio(signed_url)
@@ -3309,6 +3325,7 @@ def render_audio_consultation_journal(
                     ok, message = delete_audio(
                         str(audio_item.get("audio_id", "")),
                         str(audio_item.get("storage_path", "")),
+                        owner_user_id=user_id,
                     )
                     if ok:
                         st.success(message)

@@ -11,6 +11,7 @@ from typing import Any
 
 import streamlit as st
 from pypdf import PdfReader
+from runtime_error_log import safe_public_error
 
 from document_preprocessor import (
     document_quality,
@@ -454,7 +455,7 @@ def render_articles_review(
             )
             st.rerun()
         except Exception as exc:
-            st.error(f"정관 분석 실패: {exc}")
+            st.error(safe_public_error(exc, "정관 분석에 실패했습니다."))
 
     review = get_latest_articles_review(
         user_id,

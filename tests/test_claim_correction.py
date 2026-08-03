@@ -3896,7 +3896,7 @@ class ClaimCorrectionTests(unittest.TestCase):
         self.assertEqual(len(fake.uploads), 1)
         replacement_path = fake.uploads[0][1]
         self.assertNotEqual(replacement_path, old_storage_path)
-        self.assertIn(
+        self.assertNotIn(
             ("oasis-claim-documents", replacement_path),
             fake.deleted_objects,
         )

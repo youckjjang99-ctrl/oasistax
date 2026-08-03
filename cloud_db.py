@@ -19,6 +19,13 @@ TABLE_REGISTRY = "oasis_registry"
 TABLE_STOCK = "oasis_stock_valuations"
 TABLE_MIGRATIONS = "oasis_migration_runs"
 TABLE_MATCHING_PREFERENCES = "oasis_matching_preferences"
+TABLE_SYNC_OUTBOX = "oasis_sync_outbox"
+TABLE_CUSTOMER_ASSETS = "oasis_customer_assets"
+TABLE_COPILOT_ASSETS = "oasis_copilot_assets"
+TABLE_BACKUP_RUNS = "oasis_backup_runs"
+TABLE_RESTORE_DRILLS = "oasis_restore_drills"
+TABLE_CUSTOMER_ARCHIVE_EVENTS = "oasis_customer_archive_events"
+PRIVATE_CUSTOMER_ASSET_BUCKET = "oasis-customer-assets"
 
 
 def _invalidate_written_rows(

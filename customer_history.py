@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -9,6 +11,12 @@ from typing import Any
 import pandas as pd
 
 from cloud_db import CloudDatabase, cloud_is_configured
+from data_safety_storage import (
+    StorageWriteStatus,
+    local_only_status,
+    require_owner_context,
+    safe_error_code,
+)
 from utils import get_user_dirs
 
 
@@ -23,6 +31,10 @@ TRACKED_FIELDS = [
     "종업원수",
     "사업장 소재지",
 ]
+
+
+class CustomerHistoryCorruptionError(RuntimeError):
+    """Raised without replacing a malformed customer-history source file."""
 
 
 def _normalize_business_no(value: Any) -> str:
@@ -42,25 +54,100 @@ def _load_all(user_id: str) -> dict[str, Any]:
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    except Exception as exc:
+        raise CustomerHistoryCorruptionError(
+            "고객 변경이력 파일을 읽지 못했습니다. 원본 파일은 덮어쓰지 않았습니다."
+        ) from exc
+    if not isinstance(data, dict):
+        raise CustomerHistoryCorruptionError(
+            "고객 변경이력 파일 형식이 올바르지 않습니다. 원본 파일은 덮어쓰지 않았습니다."
+        )
+    return data
+
+
+def _history_identity(item: Any) -> str:
+    if not isinstance(item, dict):
+        return json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+    return json.dumps(
+        {
+            "captured_at": item.get("captured_at", ""),
+            "source": item.get("source", ""),
+            "business_no": item.get("business_no", ""),
+            "data": item.get("data", {}),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+
+
+def _merge_history_lists(
+    incoming: list[Any],
+    existing: list[Any],
+) -> list[Any]:
+    merged: list[Any] = []
+    seen: set[str] = set()
+    for item in list(incoming) + list(existing):
+        identity = _history_identity(item)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        merged.append(item)
+    merged.sort(
+        key=lambda item: str(item.get("captured_at", ""))
+        if isinstance(item, dict)
+        else "",
+        reverse=True,
+    )
+    return merged
 
 
 def _save_all(user_id: str, data: dict[str, Any]) -> None:
+    """Atomically merge local history without deleting or truncating old rows."""
     path = _path(user_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
-    )
+    current = _load_all(user_id)
+    merged = dict(current)
+    for business_no, incoming in dict(data or {}).items():
+        existing = current.get(business_no, [])
+        if isinstance(incoming, list) and isinstance(existing, list):
+            merged[business_no] = _merge_history_lists(incoming, existing)
+        elif business_no not in merged:
+            merged[business_no] = incoming
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(merged, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _result_with_status(
+    record: dict[str, Any],
+    status: StorageWriteStatus,
+    *,
+    return_status: bool,
+) -> dict[str, Any]:
+    if return_status:
+        return {
+            "record": record,
+            "storage_status": status.as_dict(),
+        }
+    return record
 
 
 def save_customer_snapshot(
     user_id: str,
     extracted_data: dict[str, Any],
     source: str = "cretop",
+    *,
+    return_status: bool = False,
 ) -> dict[str, Any]:
+    user_id = require_owner_context(user_id)
     data = dict(extracted_data or {})
     business_no = _normalize_business_no(
         data.get("사업자등록번호", "")
@@ -87,12 +174,17 @@ def save_customer_snapshot(
 
     # 같은 값이 연속으로 들어오면 중복 스냅샷을 만들지 않는다.
     if items and items[0].get("data") == snapshot_data:
-        return items[0]
+        return _result_with_status(
+            items[0],
+            local_only_status(),
+            return_status=return_status,
+        )
 
     items.insert(0, snapshot)
-    all_history[business_no] = items[:50]
+    all_history[business_no] = items
     _save_all(user_id, all_history)
 
+    status = local_only_status()
     if cloud_is_configured():
         try:
             CloudDatabase().insert(
@@ -106,10 +198,28 @@ def save_customer_snapshot(
                     "captured_at": snapshot["captured_at"],
                 }],
             )
-        except Exception:
-            pass
+            status = StorageWriteStatus(
+                local_saved=True,
+                cloud_enabled=True,
+                cloud_attempted=True,
+                cloud_saved=True,
+            )
+        except Exception as exc:
+            status = StorageWriteStatus(
+                local_saved=True,
+                cloud_enabled=True,
+                cloud_attempted=True,
+                cloud_saved=False,
+                degraded=True,
+                error_code=safe_error_code(exc),
+                error_summary="클라우드 변경이력 저장에 실패해 로컬 원본을 유지했습니다.",
+            )
 
-    return snapshot
+    return _result_with_status(
+        snapshot,
+        status,
+        return_status=return_status,
+    )
 
 
 
@@ -122,7 +232,10 @@ def save_customer_event(
     event_detail: str,
     occurred_at: str = "",
     source: str = "consultation",
+    *,
+    return_status: bool = False,
 ) -> dict[str, Any]:
+    user_id = require_owner_context(user_id)
     normalized = _normalize_business_no(business_no)
     if not normalized:
         return {}
@@ -134,7 +247,11 @@ def save_customer_event(
     for item in items:
         data = item.get("data", {}) if isinstance(item, dict) else {}
         if isinstance(data, dict) and str(data.get("이벤트ID", "")) == event_id:
-            return item
+            return _result_with_status(
+                item,
+                local_only_status(),
+                return_status=return_status,
+            )
     captured_at = occurred_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     event_data = {
         "히스토리유형": "상담",
@@ -150,8 +267,9 @@ def save_customer_event(
         "data": event_data,
     }
     items.insert(0, snapshot)
-    all_history[normalized] = items[:200]
+    all_history[normalized] = items
     _save_all(user_id, all_history)
+    status = local_only_status()
     if cloud_is_configured():
         try:
             CloudDatabase().insert(
@@ -165,14 +283,33 @@ def save_customer_event(
                     "captured_at": captured_at,
                 }],
             )
-        except Exception:
-            pass
-    return snapshot
+            status = StorageWriteStatus(
+                local_saved=True,
+                cloud_enabled=True,
+                cloud_attempted=True,
+                cloud_saved=True,
+            )
+        except Exception as exc:
+            status = StorageWriteStatus(
+                local_saved=True,
+                cloud_enabled=True,
+                cloud_attempted=True,
+                cloud_saved=False,
+                degraded=True,
+                error_code=safe_error_code(exc),
+                error_summary="클라우드 변경이력 저장에 실패해 로컬 원본을 유지했습니다.",
+            )
+    return _result_with_status(
+        snapshot,
+        status,
+        return_status=return_status,
+    )
 
 def get_customer_history(
     user_id: str,
     business_no: str,
 ) -> list[dict[str, Any]]:
+    user_id = require_owner_context(user_id, allow_admin=True)
     normalized = _normalize_business_no(business_no)
     all_history = _load_all(user_id)
     local_items = all_history.get(normalized, []) or []
@@ -218,7 +355,8 @@ def get_customer_history(
         merged.append(item)
     merged.sort(key=lambda item: str(item.get("captured_at", "")), reverse=True)
     if merged:
-        all_history[normalized] = merged[:200]
+        # The 200-row return cap is a UI/cache limit, never a retention limit.
+        all_history[normalized] = merged
         _save_all(user_id, all_history)
     return merged[:200]
 

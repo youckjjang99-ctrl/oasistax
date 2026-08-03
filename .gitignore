@@ -27,6 +27,7 @@ RUN_V*_UPDATE.cmd
 RUN_V*_UPDATE.bat
 README_v*_적용방법.md
 CHANGELOG_v*.md
+!CHANGELOG_v9.9.0.md
 
 # Keep the common v8 updater files
 !update_engine.py
@@ -36,3 +37,67 @@ _update_backups/
 
 # Local service connection tools
 .tools/
+
+# Local test/cache state
+.pytest_cache/
+
+# Customer/runtime artifacts must never be newly added to Git.
+# Existing tracked legacy files are intentionally not removed by this rule.
+.codex-remote-attachments/
+logs/
+downloads/
+*.log
+*.jsonl
+*.pem
+*.key
+*.p8
+*.p12
+*.pfx
+*.jks
+*.keystore
+.env
+.env.*
+!.env.example
+*.zip
+*.7z
+*.rar
+*.pdf
+*.cer
+*.crt
+*.der
+*.db
+*.sqlite
+*.sqlite3
+*.bak
+*.xls
+*.xlsx
+*.mp3
+*.m4a
+*.wav
+*.aac
+*.ogg
+*.flac
+*.duckdb
+*.parquet
+*.feather
+*.pickle
+*.pkl
+
+# Explicit public policy datasets and blank workbook templates.
+!data/기업마당_공고DB.xlsx
+!지원사업DB_20260710.xlsx
+!#Uc9c0#Uc6d0#Uc0ac#Uc5c5DB_20260708.xlsx
+!templates/#Uace0#Uac1dDB_#Uc591#Uc2ddv2.xlsx
+
+# Known per-user/customer JSON stores. These are migrated separately and
+# remain local backups until cloud migration has been verified.
+**/cloud_sync_queue.json
+**/crm_data.json
+**/customer_crm_profiles.json
+**/customer_history.json
+**/consulting_copilot_memory.json
+**/consulting_success_cases.json
+**/consulting_checklists.json
+**/consultation_ai_cache.json
+**/consultation_journals.json
+**/consultation_relink_state.json

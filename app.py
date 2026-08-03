@@ -1,14 +1,15 @@
 import streamlit as st
-import subprocess
-import sys
 import os
-import glob
 import html
 import shutil
 import time
 import pandas as pd
 from pathlib import Path
-from runtime_error_log import write_runtime_error
+from runtime_error_log import (
+    safe_public_error,
+    sanitize_public_text,
+    write_runtime_error,
+)
 
 from ui import apply_oasis_ui
 from address_tools import (
@@ -58,7 +59,8 @@ from utils import (
     ROOT_DIR, TEMPLATE_DIR, UPLOAD_DIR, RESULT_DIR,
     logo_html, make_upload_filename, find_customer_template,
     make_basic_customer_template_bytes, run_cleanup,
-    move_result_files_to_results, extract_company_previews,
+    run_matching_engine_isolated,
+    extract_company_previews,
     get_user_dirs, get_user_cumulative_db_path, append_user_customer_db,
     append_cretop_to_user_customer_db,
     append_income_tax_business_to_user_customer_db,
@@ -111,8 +113,9 @@ def validate_customer_workbook(file_path):
     errors, warnings = [], []
     try:
         xls = pd.ExcelFile(file_path)
-    except Exception as e:
-        return False, [f"엑셀 파일을 읽을 수 없습니다: {e}"], warnings
+    except Exception as exc:
+        write_runtime_error("customer_workbook_open", exc)
+        return False, [safe_public_error(exc, "엑셀 파일을 읽을 수 없습니다.")], warnings
 
     if "고객DB" not in xls.sheet_names:
         errors.append("필수 시트가 없습니다: 고객DB")
@@ -124,8 +127,11 @@ def validate_customer_workbook(file_path):
             for col in ["업체명", "업종명"]:
                 if col not in cols:
                     warnings.append(f"권장 컬럼이 없습니다: {col}")
-        except Exception as e:
-            errors.append(f"고객DB 시트를 읽을 수 없습니다: {e}")
+        except Exception as exc:
+            write_runtime_error("customer_workbook_sheet_read", exc)
+            errors.append(
+                safe_public_error(exc, "고객DB 시트를 읽을 수 없습니다.")
+            )
 
     return len(errors) == 0, errors, warnings
 
@@ -1791,7 +1797,8 @@ def render_personal_business_registration(user_id, user_name, upload_dir):
                     {"business_no": business.get("사업자등록번호", "")},
                 )
                 messages.append(
-                    f"{business.get('업체명', '사업장')}: 등록 중 오류가 발생했습니다 - {exc}"
+                    f"{business.get('업체명', '사업장')}: "
+                    + safe_public_error(exc, "등록 중 오류가 발생했습니다.")
                 )
         st.success(
             f"선택 사업장 처리가 완료되었습니다. 신규 {added_count}건, "
@@ -2238,7 +2245,8 @@ elif active_tab == "통합 정책자금 매칭":
                 )
                 st.success("고객별 정책자금 매칭설정을 저장했습니다.")
             except Exception as exc:
-                st.error(f"매칭설정 저장 중 오류가 발생했습니다: {exc}")
+                write_runtime_error("matching_preferences_save", exc)
+                st.error(safe_public_error(exc, "매칭설정 저장 중 오류가 발생했습니다."))
 
         current_multi_source_preferences = {
             "매칭키워드": [
@@ -2309,24 +2317,10 @@ elif active_tab == "통합 정책자금 매칭":
                             matching_preferences=current_preferences,
                         )
 
-                        # 기존 main.py 매칭 엔진 호환용 임시파일.
-                        # 원본 누적 고객DB는 수정하지 않는다.
-                        shutil.copy2(
+                        result, moved_files = run_matching_engine_isolated(
                             single_customer_path,
-                            ROOT_DIR / "고객DB.xlsx",
-                        )
-
-                        before_files = set(glob.glob("매칭결과_*.xlsx"))
-                        result = subprocess.run(
-                            [sys.executable, str(ROOT_DIR / "main.py")],
-                            capture_output=True,
-                            text=True,
-                            encoding="utf-8",
-                            errors="ignore",
-                        )
-
-                        moved_files = move_result_files_to_results(
-                            before_files
+                            CURRENT_USER_ID,
+                            result_dir=USER_RESULT_DIR,
                         )
 
                     if moved_files:
@@ -2334,19 +2328,18 @@ elif active_tab == "통합 정책자금 매칭":
                             moved_files,
                             key=os.path.getmtime,
                         )
-                        user_result_path = (
-                            USER_RESULT_DIR
-                            / os.path.basename(latest_file)
-                        )
-                        try:
-                            shutil.copy2(
-                                latest_file,
-                                user_result_path,
-                            )
-                            latest_file = str(user_result_path)
-                        except Exception:
-                            pass
+                        from customer_asset_storage import store_private_customer_asset
 
+                        result_asset_status = store_private_customer_asset(
+                            latest_file,
+                            owner_user_id=CURRENT_USER_ID,
+                            asset_type="matching_result",
+                            source_type="policy_matching",
+                        )
+                        if result_asset_status.degraded:
+                            st.warning(
+                                "결과 파일은 로컬에 보존했으며 비공개 클라우드 보관은 재확인이 필요합니다."
+                            )
                         st.session_state.latest_result_file = latest_file
                         company_name = str(
                             selected_customer_row.get("업체명", "")
@@ -2382,17 +2375,21 @@ elif active_tab == "통합 정책자금 매칭":
 
                     with st.expander("실행 로그 보기"):
                         if result.stdout:
-                            st.code(result.stdout)
+                            st.code(sanitize_public_text(result.stdout))
                         if result.stderr:
-                            st.code(result.stderr)
+                            st.code(sanitize_public_text(result.stderr))
 
                 except PermissionError:
                     st.error(
                         "고객DB 파일이 열려 있습니다. 엑셀 파일을 닫고 다시 실행해주세요."
                     )
                 except Exception as exc:
+                    write_runtime_error("registered_customer_matching", exc)
                     st.error(
-                        f"등록 고객 정책자금 매칭 중 오류가 발생했습니다: {exc}"
+                        safe_public_error(
+                            exc,
+                            "등록 고객 정책자금 매칭 중 오류가 발생했습니다.",
+                        )
                     )
 
     st.divider()
@@ -2494,11 +2491,9 @@ elif active_tab == "통합 정책자금 매칭":
             with open(uploaded_save_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
 
-            # 기존 main.py 호환용: 루트의 고객DB.xlsx로 임시 저장
-            with open(ROOT_DIR / "고객DB.xlsx", "wb") as f:
-                f.write(uploaded_file.getbuffer())
-
-            is_valid, validation_errors, validation_warnings = validate_customer_workbook("고객DB.xlsx")
+            is_valid, validation_errors, validation_warnings = validate_customer_workbook(
+                uploaded_save_path
+            )
 
             if validation_errors:
                 st.error("업로드한 고객DB 양식에 문제가 있습니다.")
@@ -2517,6 +2512,18 @@ elif active_tab == "통합 정책자금 매칭":
                 CURRENT_USER_ID,
                 manager_name=manager_name.strip() or CURRENT_USER_NAME
             )
+            from customer_asset_storage import store_private_customer_asset
+
+            upload_asset_status = store_private_customer_asset(
+                uploaded_save_path,
+                owner_user_id=CURRENT_USER_ID,
+                asset_type="customer_upload",
+                source_type="customer_registration",
+            )
+            if upload_asset_status.degraded:
+                st.warning(
+                    "업로드 원본은 로컬에 보존했으며 비공개 클라우드 보관은 재확인이 필요합니다."
+                )
             cumulative_path, _, _ = ensure_user_cumulative_db_format(CURRENT_USER_ID)
 
             st.session_state.latest_upload_file = str(uploaded_save_path)
@@ -2527,26 +2534,24 @@ elif active_tab == "통합 정책자금 매칭":
 
             if st.button("정책자금 매칭 실행", width='stretch'):
                 with st.spinner("정책자금과 고용지원금을 분석 중입니다..."):
-                    before_files = set(glob.glob("매칭결과_*.xlsx"))
-
-                    result = subprocess.run(
-                        [sys.executable, str(ROOT_DIR / "main.py")],
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="ignore"
+                    result, moved_files = run_matching_engine_isolated(
+                        uploaded_save_path,
+                        CURRENT_USER_ID,
+                        result_dir=USER_RESULT_DIR,
                     )
-
-                    moved_files = move_result_files_to_results(before_files)
 
                     if moved_files:
                         latest_file = max(moved_files, key=os.path.getmtime)
-                        user_result_path = USER_RESULT_DIR / os.path.basename(latest_file)
-                        try:
-                            shutil.copy2(latest_file, user_result_path)
-                            latest_file = str(user_result_path)
-                        except Exception:
-                            pass
+                        result_asset_status = store_private_customer_asset(
+                            latest_file,
+                            owner_user_id=CURRENT_USER_ID,
+                            asset_type="matching_result",
+                            source_type="policy_matching",
+                        )
+                        if result_asset_status.degraded:
+                            st.warning(
+                                "결과 파일은 로컬에 보존했으며 비공개 클라우드 보관은 재확인이 필요합니다."
+                            )
                         st.session_state.latest_result_file = latest_file
 
                         st.success("매칭이 완료되었습니다.")
@@ -2573,9 +2578,9 @@ elif active_tab == "통합 정책자금 매칭":
 
                     with st.expander("실행 로그 보기"):
                         if result.stdout:
-                            st.code(result.stdout)
+                            st.code(sanitize_public_text(result.stdout))
                         if result.stderr:
-                            st.code(result.stderr)
+                            st.code(sanitize_public_text(result.stderr))
 
         except PermissionError:
             append_run_history(
@@ -3042,8 +3047,8 @@ elif active_tab == "기업등록":
                     )
                     st.error(
                         "고객 기본정보 저장 중 오류가 발생했습니다. "
-                        "입력한 정책자금 키워드와는 별개로 처리됩니다: "
-                        f"{exc}"
+                        "입력한 정책자금 키워드와는 별개로 처리됩니다. "
+                        + safe_public_error(exc, "잠시 후 다시 시도해 주세요.")
                     )
 
                 if registration_error is None:
@@ -3070,7 +3075,10 @@ elif active_tab == "기업등록":
                         )
                         st.warning(
                             "고객 기본정보는 처리됐지만 정책자금 매칭설정 저장에 "
-                            f"실패했습니다: {preference_error}"
+                            + safe_public_error(
+                                preference_error,
+                                "실패했습니다. 잠시 후 다시 시도해 주세요.",
+                            )
                         )
 
                     if saved_count > 0:
@@ -3087,8 +3095,11 @@ elif active_tab == "기업등록":
                                 {"business_no": cretop_business_no},
                             )
                             st.warning(
-                                "고객은 등록됐지만 클라우드 동기화가 지연됐습니다: "
-                                f"{sync_error}"
+                                "고객은 등록됐지만 클라우드 동기화가 지연됐습니다. "
+                                + safe_public_error(
+                                    sync_error,
+                                    "자동 재처리 상태를 확인해 주세요.",
+                                )
                             )
 
                         try:

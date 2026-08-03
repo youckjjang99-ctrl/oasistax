@@ -9,6 +9,7 @@ from typing import Any
 
 import pandas as pd
 import streamlit as st
+from runtime_error_log import safe_public_error
 
 from cloud_sync import (
     sync_financial_snapshot,
@@ -1386,7 +1387,7 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
                 state="error",
                 expanded=True,
             )
-            st.error(f"주가평가 오류: {exc}")
+            st.error(safe_public_error(exc, "주가평가 중 오류가 발생했습니다."))
 
     if result is None:
         result = st.session_state.get("stock_last_result")

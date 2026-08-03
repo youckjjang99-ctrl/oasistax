@@ -5,6 +5,7 @@ from typing import Any
 
 import pandas as pd
 import streamlit as st
+from runtime_error_log import safe_public_error
 
 from artifact_cache import content_digest
 from matching_preferences import save_temporary_advance_calculation
@@ -617,7 +618,9 @@ def render_temporary_advance_calculator(
         )
     except Exception as exc:
         pdf_bytes = b""
-        st.warning(f"1페이지 리포트 생성 중 오류가 발생했습니다: {exc}")
+        st.warning(
+            safe_public_error(exc, "1페이지 리포트 생성 중 오류가 발생했습니다.")
+        )
 
     safe_company = re.sub(r'[\\/:*?"<>|]', "_", company_name or "기업")
     business_digits = re.sub(r"[^0-9]", "", business_no or "")
@@ -648,7 +651,7 @@ def render_temporary_advance_calculator(
                         "같은 범위·미확인 상태가 반영됩니다."
                     )
             except Exception as exc:
-                st.error(f"계산결과 저장에 실패했습니다: {exc}")
+                st.error(safe_public_error(exc, "계산결과 저장에 실패했습니다."))
     with download_col:
         st.download_button(
             "1페이지 리포트 다운로드",

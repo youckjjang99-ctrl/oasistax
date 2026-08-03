@@ -799,7 +799,6 @@ class ClaimRepository:
         if provider_reference_hash:
             facts["provider_reference_sha256"] = provider_reference_hash
 
-        uploaded_new_object = False
         try:
             if not reusable_previous_object:
                 self.database.upload_private_object(
@@ -808,7 +807,6 @@ class ClaimRepository:
                     document.content,
                     document.content_type,
                 )
-                uploaded_new_object = True
             rows = self.database.rpc(
                 "oasis_claim_finalize_document",
                 {
@@ -827,27 +825,13 @@ class ClaimRepository:
                 },
             )
         except Exception as exc:
-            if uploaded_new_object:
-                try:
-                    self.database.delete_private_object(
-                        CLAIM_STORAGE_BUCKET,
-                        storage_path,
-                    )
-                except Exception:
-                    pass
+            # Preserve the uploaded object when metadata finalization fails.
+            # The content-addressed path can be reconciled or reused on retry;
+            # deleting it here could destroy the only durable customer copy.
             raise _safe_storage_error(exc) from exc
-        if (
-            previous_storage_bucket == CLAIM_STORAGE_BUCKET
-            and previous_storage_path
-            and previous_storage_path != storage_path
-        ):
-            try:
-                self.database.delete_private_object(
-                    CLAIM_STORAGE_BUCKET,
-                    previous_storage_path,
-                )
-            except Exception:
-                pass
+        # Previous versions are intentionally retained as customer records.
+        # They may be reconciled by a future version index, but are never
+        # physically deleted during collection or replacement.
         if isinstance(rows, list) and rows:
             return rows[0]
         target.update(

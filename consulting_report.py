@@ -7,7 +7,7 @@ import re
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from runtime_error_log import write_runtime_error
+from runtime_error_log import safe_public_error, write_runtime_error
 from typing import Any
 
 import pandas as pd
@@ -1919,7 +1919,9 @@ def render_ai_consulting_report_page(
             {"company_name": analysis.get("company_name", "")},
         )
         suffix = f" (오류로그: {log_path})" if log_path else ""
-        st.warning(f"PDF 생성 중 오류가 발생했습니다: {exc}{suffix}")
+        st.warning(
+            safe_public_error(exc, "PDF 생성 중 오류가 발생했습니다.") + suffix
+        )
 
     excel_bytes = _cached_consulting_excel(
         user_id,

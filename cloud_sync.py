@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +15,16 @@ from cloud_db import (
     normalize_business_no,
 )
 from utils import get_user_dirs
+from sync_outbox import (
+    cloud_outbox_status,
+    durable_outbox_enabled,
+    enqueue_outbox,
+    load_local_outbox,
+    local_outbox_status,
+    retry_cloud_outbox,
+    retry_local_outbox,
+    save_local_outbox,
+)
 
 
 def _queue_path(user_id: str) -> Path:
@@ -24,23 +32,11 @@ def _queue_path(user_id: str) -> Path:
 
 
 def _load_queue(user_id: str) -> list[dict[str, Any]]:
-    path = _queue_path(user_id)
-    if not path.exists():
-        return []
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+    return load_local_outbox(_queue_path(user_id))
 
 
 def _save_queue(user_id: str, items: list[dict[str, Any]]) -> None:
-    path = _queue_path(user_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(items[-500:], ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
-    )
+    save_local_outbox(_queue_path(user_id), items)
 
 
 def _enqueue(
@@ -51,44 +47,49 @@ def _enqueue(
     on_conflict: str,
     error: str,
 ) -> None:
-    queue = _load_queue(user_id)
-    queue.append({
-        "operation": operation,
-        "table": table,
-        "rows": rows,
-        "on_conflict": on_conflict,
-        "error": error,
-        "queued_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    })
-    _save_queue(user_id, queue)
+    enqueue_outbox(
+        _queue_path(user_id),
+        user_id,
+        operation,
+        table,
+        rows,
+        on_conflict,
+        error=error,
+    )
 
 
 def retry_cloud_sync_queue(user_id: str) -> dict[str, int]:
-    queue = _load_queue(user_id)
-    if not queue or not cloud_is_configured():
-        return {"success": 0, "failed": len(queue)}
+    local_status = local_outbox_status(_queue_path(user_id))
+    if not cloud_is_configured():
+        return {
+            "success": 0,
+            "failed": int(local_status.get("queued", 0)),
+            "dead_letter": int(local_status.get("dead_letter", 0)),
+        }
 
     db = CloudDatabase()
-    remaining = []
     success = 0
+    failed = 0
+    dead_letter = 0
 
-    for item in queue:
+    if durable_outbox_enabled():
         try:
-            db.upsert(
-                item["table"],
-                item["rows"],
-                item["on_conflict"],
+            durable_result = retry_cloud_outbox(
+                db,
+                owner_user_id=user_id,
+                worker_id=f"app-{user_id}",
             )
-            success += 1
-        except Exception as exc:
-            item["error"] = str(exc)
-            item["last_retry_at"] = datetime.now().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-            remaining.append(item)
+            success += int(durable_result.get("success", 0))
+            failed += int(durable_result.get("failed", 0))
+        except Exception:
+            # Migration/RPC availability must never destroy the local fallback.
+            failed += 1
 
-    _save_queue(user_id, remaining)
-    return {"success": success, "failed": len(remaining)}
+    local_result = retry_local_outbox(_queue_path(user_id), db.upsert)
+    success += int(local_result.get("success", 0))
+    failed += int(local_result.get("failed", 0))
+    dead_letter += int(local_result.get("dead_letter", 0))
+    return {"success": success, "failed": failed, "dead_letter": dead_letter}
 
 
 def _safe_upsert(
@@ -116,7 +117,7 @@ def _safe_upsert(
         _enqueue(
             user_id, operation, table, rows, on_conflict, str(exc)
         )
-        return False, f"Supabase 저장 실패로 대기열에 보관: {exc}"
+        return False, "클라우드 저장에 실패하여 안전한 재시도 대기열에 보관했습니다."
 
 
 def sync_customer_snapshot(
@@ -345,9 +346,25 @@ def sync_matching_preferences(
 
 
 def get_cloud_sync_status(user_id: str) -> dict[str, Any]:
-    queue = _load_queue(user_id)
+    local_status = local_outbox_status(_queue_path(user_id))
+    try:
+        durable_status = cloud_outbox_status(user_id)
+    except Exception:
+        durable_status = {
+            "enabled": durable_outbox_enabled(),
+            "queued": 0,
+            "dead_letter": 0,
+            "total": 0,
+            "unavailable": True,
+        }
     return {
         "configured": cloud_is_configured(),
-        "queued": len(queue),
+        "durable_enabled": durable_outbox_enabled(),
+        "queued": int(local_status.get("queued", 0))
+        + int(durable_status.get("queued", 0)),
+        "dead_letter": int(local_status.get("dead_letter", 0))
+        + int(durable_status.get("dead_letter", 0)),
+        "local": local_status,
+        "cloud": durable_status,
         "queue_path": str(_queue_path(user_id)),
     }

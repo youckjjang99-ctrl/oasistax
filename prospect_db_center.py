@@ -11,6 +11,7 @@ import time
 
 import pandas as pd
 import streamlit as st
+from runtime_error_log import safe_public_error
 
 import company_sales_assignment as sales_assignments
 import localdata_contact_client
@@ -959,7 +960,7 @@ def _render_search_history(owner_user_id: str) -> int:
         try:
             rows = list_search_history(owner_user_id, limit=50)
         except Exception as exc:
-            st.warning(f"검색 이력을 불러오지 못했습니다: {exc}")
+            st.warning(safe_public_error(exc, "검색 이력을 불러오지 못했습니다."))
             return 1
         if not rows:
             st.caption(
@@ -1749,7 +1750,7 @@ def _render_prospect_db_center_legacy(owner_user_id: str = "") -> None:
             )
             st.session_state["prospect_contacts_v970"] = contact_rows
         except Exception as exc:
-            st.warning(f"연락처 목록 확인 실패: {exc}")
+            st.warning(safe_public_error(exc, "연락처 목록 확인에 실패했습니다."))
             contact_rows = st.session_state.get("prospect_contacts_v970", [])
 
     phone_prospect_ids = {
@@ -1941,7 +1942,9 @@ def _render_prospect_db_center_legacy(owner_user_id: str = "") -> None:
             )
             saved_rows = st.session_state["prospect_saved_list_v960"]
         except Exception as exc:
-            st.warning(f"분석 후 목록 새로고침 실패: {exc}")
+            st.warning(
+                safe_public_error(exc, "분석 후 목록을 새로고치지 못했습니다.")
+            )
 
     if enrich_saved_clicked:
         enrichment_results: list[dict] = []
@@ -2088,7 +2091,7 @@ def _render_clean_saved_prospects(
         else:
             rows = list_prospects(owner_user_id, limit=1000)
     except Exception as exc:
-        st.warning(f"저장목록을 불러오지 못했습니다: {exc}")
+        st.warning(safe_public_error(exc, "저장목록을 불러오지 못했습니다."))
         return
     if not rows:
         st.info("내가 저장한 영업후보가 없습니다.")
@@ -3443,7 +3446,7 @@ def render_prospect_db_center(
                         )
                     st.rerun()
                 except Exception as exc:
-                    st.error(f"영업후보 저장 실패: {exc}")
+                    st.error(safe_public_error(exc, "영업후보 저장에 실패했습니다."))
 
             if assignment_ready and len(selected_items) == 1:
                 with st.expander(

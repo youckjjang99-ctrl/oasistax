@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Iterable
 
 import streamlit as st
+from runtime_error_log import safe_public_error
 
 from bizinfo_cache import get_bizinfo_cache_status
 from collector import sync_bizinfo_cache
@@ -284,7 +285,7 @@ def render_system_management_page(
                 )
                 st.rerun()
             except Exception as exc:
-                st.error(f"동기화 실패: {type(exc).__name__}: {exc}")
+                st.error(safe_public_error(exc, "동기화에 실패했습니다."))
 
     st.markdown("#### 수동 백업")
     col1, col2 = st.columns([1.4, 1])
@@ -315,7 +316,7 @@ def render_system_management_page(
             st.success(f"백업 완료: {backup_dir.name}")
             st.rerun()
         except Exception as exc:
-            st.error(f"백업 실패: {type(exc).__name__}: {exc}")
+            st.error(safe_public_error(exc, "백업에 실패했습니다."))
 
     st.markdown("#### 백업 및 복원")
     if not backups:
@@ -345,7 +346,7 @@ def render_system_management_page(
                 else:
                     st.error(message)
             except Exception as exc:
-                st.error(f"복원 실패: {type(exc).__name__}: {exc}")
+                st.error(safe_public_error(exc, "복원에 실패했습니다."))
 
     st.markdown("#### 업데이트 기록")
     history = read_update_history(project_root)

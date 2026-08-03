@@ -7,6 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from io import BytesIO
 import shutil
+import subprocess
+import sys
 from copy import copy
 from functools import lru_cache
 import uuid
@@ -165,22 +167,50 @@ def make_basic_customer_template_bytes():
 
 
 def cleanup_old_files(folder, pattern, keep_count=30):
+    """Move older generated files into a local archive without deleting them.
+
+    These folders can contain customer uploads and matching results.  The old
+    implementation unlinked files once the display limit was exceeded, which
+    made a routine UI action a physical-delete operation.  Archived files stay
+    on the same volume and can be restored by an administrator.
+    """
     files = list(Path(folder).glob(pattern))
     if len(files) <= keep_count:
-        return
+        return []
 
     files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-
+    archive_dir = Path(folder) / ".archive"
+    archived_files = []
     for old_file in files[keep_count:]:
         try:
-            old_file.unlink()
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            destination = archive_dir / old_file.name
+            if destination.exists():
+                destination = archive_dir / (
+                    f"{old_file.stem}_{uuid.uuid4().hex[:8]}{old_file.suffix}"
+                )
+            old_file.replace(destination)
+            archived_files.append(str(destination))
         except Exception:
+            # Failure to archive must never turn into a delete or block the
+            # customer's current operation.  The source remains in place.
             pass
+    return archived_files
 
 
 def run_cleanup():
-    cleanup_old_files(RESULT_DIR, "매칭결과_*.xlsx", keep_count=30)
-    cleanup_old_files(UPLOAD_DIR, "업로드고객DB_*.xlsx", keep_count=30)
+    return {
+        "results": cleanup_old_files(
+            RESULT_DIR,
+            "매칭결과_*.xlsx",
+            keep_count=30,
+        ),
+        "uploads": cleanup_old_files(
+            UPLOAD_DIR,
+            "업로드고객DB_*.xlsx",
+            keep_count=30,
+        ),
+    }
 
 
 def move_result_files_to_results(before_files):
@@ -200,7 +230,9 @@ def move_result_files_to_results(before_files):
         try:
             if src.exists():
                 if dst.exists():
-                    dst.unlink()
+                    dst = dst.with_name(
+                        f"{dst.stem}_{uuid.uuid4().hex[:8]}{dst.suffix}"
+                    )
                 src.replace(dst)
                 moved_files.append(str(dst))
             elif dst.exists():
@@ -210,6 +242,95 @@ def move_result_files_to_results(before_files):
                 moved_files.append(str(src))
 
     return moved_files
+
+
+def run_matching_engine_isolated(
+    customer_file,
+    user_id,
+    *,
+    engine_script=None,
+    runtime_root=None,
+    result_dir=None,
+):
+    """Run the legacy matching engine in a private, per-request workspace.
+
+    The legacy engine expects a file named ``고객DB.xlsx`` in its working
+    directory.  Using an isolated directory prevents one user's upload from
+    overwriting another user's workbook or the repository-level source file.
+    """
+    source = Path(customer_file).resolve()
+    if not source.is_file():
+        raise FileNotFoundError(str(source))
+
+    script = Path(engine_script or (ROOT_DIR / "main.py")).resolve()
+    if not script.is_file():
+        raise FileNotFoundError(str(script))
+
+    user_dirs = get_user_dirs(str(user_id))
+    runtime_parent = Path(
+        runtime_root or (user_dirs["base"] / "matching_runtime")
+    ).resolve()
+    destination_root = Path(result_dir or user_dirs["results"]).resolve()
+    runtime_parent.mkdir(parents=True, exist_ok=True)
+    destination_root.mkdir(parents=True, exist_ok=True)
+
+    run_dir = (runtime_parent / uuid.uuid4().hex).resolve()
+    if not run_dir.is_relative_to(runtime_parent):
+        raise RuntimeError("안전한 매칭 작업 경로를 만들지 못했습니다.")
+    run_dir.mkdir(parents=False, exist_ok=False)
+
+    process = None
+    copied_results = []
+    copy_completed = False
+    try:
+        shutil.copy2(source, run_dir / "고객DB.xlsx")
+        # main.py intentionally resolves the BizInfo cache relative to its
+        # working directory.  Copy only repository-owned reference files into
+        # the isolated workspace so matching keeps using the existing cache
+        # without granting the subprocess write access to the repository copy.
+        reference_source = ROOT_DIR / "data"
+        reference_destination = run_dir / "data"
+        if reference_source.is_dir():
+            reference_destination.mkdir(parents=True, exist_ok=True)
+            for reference_file in reference_source.iterdir():
+                if reference_file.is_file():
+                    shutil.copy2(
+                        reference_file,
+                        reference_destination / reference_file.name,
+                    )
+        process = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(run_dir),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+        )
+        for generated in sorted(run_dir.glob("매칭결과_*.xlsx")):
+            destination = destination_root / generated.name
+            if destination.exists():
+                destination = destination.with_name(
+                    f"{destination.stem}_{uuid.uuid4().hex[:8]}{destination.suffix}"
+                )
+            shutil.copy2(generated, destination)
+            copied_results.append(str(destination))
+        copy_completed = True
+    finally:
+        resolved_run_dir = run_dir.resolve()
+        generated_results_remain = bool(
+            list(resolved_run_dir.glob("매칭결과_*.xlsx"))
+        )
+        should_preserve_runtime = generated_results_remain and not copy_completed
+        if (
+            not should_preserve_runtime
+            and resolved_run_dir.is_relative_to(runtime_parent)
+            and resolved_run_dir != runtime_parent
+        ):
+            # Runtime cleanup is best effort.  A file lock must not replace a
+            # successful matching result with a cleanup exception.
+            shutil.rmtree(resolved_run_dir, ignore_errors=True)
+
+    return process, copied_results
 
 
 def extract_company_previews(result_file):

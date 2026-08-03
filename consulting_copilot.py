@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import json
 import math
 import re
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,12 @@ from consultation_journal import load_company_consultation_context
 from cloud_sync import load_financial_snapshot, load_stock_valuations
 from matching_preferences import get_matching_preferences
 from consulting_priority_engine import build_priority_recommendations
+from data_safety_storage import (
+    feature_enabled,
+    load_copilot_assets,
+    migrate_local_copilot_assets,
+    write_copilot_asset,
+)
 from consultation_scenario_engine import (
     analyze_representative_answer,
     build_scenario_brief,
@@ -202,27 +210,370 @@ def _checklist_path(user_id: str) -> Path:
     return _base_path(user_id) / "consulting_checklists.json"
 
 
+def _sync_meta_path(user_id: str) -> Path:
+    return _base_path(user_id) / "consulting_copilot_sync_meta.json"
+
+
+def _conflict_path(user_id: str) -> Path:
+    return _base_path(user_id) / "consulting_copilot_conflicts.json"
+
+
+class CopilotLocalDataCorruptionError(RuntimeError):
+    """Raised without replacing a malformed local Copilot asset."""
+
+
 def _load_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data
-    except Exception:
-        return default
+    except Exception as exc:
+        raise CopilotLocalDataCorruptionError(
+            "AI 코파일럿 로컬 자산을 읽지 못했습니다. 원본 파일은 덮어쓰지 않았습니다."
+        ) from exc
+    if isinstance(default, dict) and not isinstance(data, dict):
+        raise CopilotLocalDataCorruptionError(
+            "AI 코파일럿 로컬 자산 형식이 올바르지 않습니다. 원본 파일은 덮어쓰지 않았습니다."
+        )
+    if isinstance(default, list) and not isinstance(data, list):
+        raise CopilotLocalDataCorruptionError(
+            "AI 코파일럿 로컬 자산 형식이 올바르지 않습니다. 원본 파일은 덮어쓰지 않았습니다."
+        )
+    return data
 
 
 def _save_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            value,
-            ensure_ascii=False,
-            indent=2,
-            default=str,
-        ),
-        encoding="utf-8",
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            ),
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+_CLOUD_SOURCE_TIMES: dict[tuple[str, str, str], str] = {}
+_MIGRATED_LOCAL_USERS: set[str] = set()
+
+
+def _timestamp_rank(value: Any) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _file_timestamp(path: Path) -> str:
+    try:
+        return datetime.fromtimestamp(
+            path.stat().st_mtime,
+            tz=timezone.utc,
+        ).isoformat()
+    except Exception:
+        return ""
+
+
+def _record_sync_conflict(
+    user_id: str,
+    asset_type: str,
+    asset_key: str,
+    local_payload: dict[str, Any],
+    cloud_payload: dict[str, Any],
+    local_updated_at: str,
+    cloud_updated_at: str,
+    chosen_source: str,
+) -> None:
+    differing = sorted(
+        key
+        for key in set(local_payload).intersection(cloud_payload)
+        if local_payload.get(key) != cloud_payload.get(key)
     )
+    if not differing:
+        return
+    material = json.dumps(
+        {
+            "asset_type": asset_type,
+            "asset_key": asset_key,
+            "local_updated_at": local_updated_at,
+            "cloud_updated_at": cloud_updated_at,
+            "local": local_payload,
+            "cloud": cloud_payload,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    conflict_id = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    path = _conflict_path(user_id)
+    try:
+        conflicts = _load_json(path, [])
+        if any(
+            isinstance(item, dict)
+            and item.get("conflict_id") == conflict_id
+            for item in conflicts
+        ):
+            return
+        conflicts.append(
+            {
+                "conflict_id": conflict_id,
+                "asset_type": asset_type,
+                "asset_key": asset_key,
+                "local_updated_at": local_updated_at,
+                "cloud_updated_at": cloud_updated_at,
+                "chosen_source": chosen_source,
+                "differing_fields": differing,
+                "local_payload": dict(local_payload),
+                "cloud_payload": dict(cloud_payload),
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        _save_json(path, conflicts)
+    except CopilotLocalDataCorruptionError:
+        # Preserve the malformed conflict file.  Failure to append an audit
+        # copy must not make customer memory unreadable.
+        return
+
+
+def _merge_local_cloud_payload(
+    *,
+    user_id: str,
+    asset_type: str,
+    asset_key: str,
+    local_payload: dict[str, Any],
+    cloud_payload: dict[str, Any],
+    local_updated_at: str,
+    cloud_updated_at: str,
+) -> tuple[dict[str, Any], str]:
+    if not cloud_payload:
+        return dict(local_payload), local_updated_at
+    if not local_payload:
+        return dict(cloud_payload), cloud_updated_at
+    cloud_is_newer = (
+        _timestamp_rank(cloud_updated_at)
+        > _timestamp_rank(local_updated_at)
+    )
+    if cloud_is_newer:
+        merged = dict(local_payload)
+        merged.update(cloud_payload)
+        chosen_source = "cloud"
+        chosen_timestamp = cloud_updated_at
+    else:
+        # Local wins ties and unknown timestamps so a stale cloud fallback can
+        # never silently roll back a recent local edit.
+        merged = dict(cloud_payload)
+        merged.update(local_payload)
+        chosen_source = "local"
+        chosen_timestamp = local_updated_at
+    _record_sync_conflict(
+        user_id,
+        asset_type,
+        asset_key,
+        local_payload,
+        cloud_payload,
+        local_updated_at,
+        cloud_updated_at,
+        chosen_source,
+    )
+    return merged, chosen_timestamp
+
+
+def _cloud_asset_payloads(
+    user_id: str,
+    asset_type: str,
+) -> dict[str, dict[str, Any]]:
+    for identity in [
+        identity
+        for identity in _CLOUD_SOURCE_TIMES
+        if identity[0] == user_id and identity[1] == asset_type
+    ]:
+        _CLOUD_SOURCE_TIMES.pop(identity, None)
+    payloads: dict[str, dict[str, Any]] = {}
+    for row in load_copilot_assets(
+        owner_user_id=user_id,
+        asset_type=asset_type,
+    ):
+        if not isinstance(row, dict):
+            continue
+        key = str(row.get("asset_key", "") or "").strip()
+        payload = row.get("payload", {})
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {}
+        if key and isinstance(payload, dict):
+            if key not in payloads:
+                payloads[key] = payload
+                _CLOUD_SOURCE_TIMES[(user_id, asset_type, key)] = str(
+                    row.get("source_updated_at", "") or ""
+                )
+    return payloads
+
+
+def _load_sync_meta(user_id: str) -> dict[str, str]:
+    try:
+        value = _load_json(_sync_meta_path(user_id), {})
+    except CopilotLocalDataCorruptionError:
+        return {}
+    return {
+        str(key): str(item or "")
+        for key, item in value.items()
+        if isinstance(key, str)
+    }
+
+
+def _sync_meta_key(asset_type: str, asset_key: str) -> str:
+    return f"{asset_type}:{asset_key}"
+
+
+def _local_asset_timestamp(
+    user_id: str,
+    asset_type: str,
+    asset_key: str,
+    payload: dict[str, Any],
+    path: Path,
+) -> str:
+    for field in ("updated_at", "saved_at", "source_updated_at"):
+        value = str(payload.get(field, "") or "").strip()
+        if value:
+            return value
+    return _load_sync_meta(user_id).get(
+        _sync_meta_key(asset_type, asset_key),
+        "",
+    ) or _file_timestamp(path)
+
+
+def _set_local_asset_timestamp(
+    user_id: str,
+    asset_type: str,
+    asset_key: str,
+    source_updated_at: str,
+) -> None:
+    path = _sync_meta_path(user_id)
+    try:
+        meta = _load_json(path, {})
+    except CopilotLocalDataCorruptionError:
+        # Never replace malformed metadata. The primary customer asset remains
+        # usable and the corrupt source remains available for recovery.
+        return
+    meta[_sync_meta_key(asset_type, asset_key)] = str(
+        source_updated_at or datetime.now(timezone.utc).isoformat()
+    )
+    _save_json(path, meta)
+
+
+def _collect_local_copilot_assets(user_id: str) -> list[dict[str, Any]]:
+    assets: list[dict[str, Any]] = []
+    memory_path = _memory_path(user_id)
+    memory = _load_json(memory_path, {})
+    for key, payload in memory.items():
+        if not isinstance(payload, dict):
+            continue
+        assets.append(
+            {
+                "asset_type": "memory",
+                "asset_key": str(key),
+                "payload": dict(payload),
+                "source_updated_at": _local_asset_timestamp(
+                    user_id, "memory", str(key), payload, memory_path
+                ),
+            }
+        )
+
+    success_path = _success_path(user_id)
+    cases = _load_json(success_path, [])
+    for case in cases:
+        if not isinstance(case, dict):
+            continue
+        key = str(case.get("case_id", "") or "").strip() or hashlib.sha256(
+            json.dumps(case, ensure_ascii=False, sort_keys=True, default=str).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        assets.append(
+            {
+                "asset_type": "success_case",
+                "asset_key": key,
+                "payload": dict(case),
+                "source_updated_at": _local_asset_timestamp(
+                    user_id, "success_case", key, case, success_path
+                ),
+            }
+        )
+
+    checklist_path = _checklist_path(user_id)
+    checklists = _load_json(checklist_path, {})
+    for key, payload in checklists.items():
+        if not isinstance(payload, dict):
+            continue
+        assets.append(
+            {
+                "asset_type": "checklist",
+                "asset_key": str(key),
+                "payload": dict(payload),
+                "source_updated_at": _local_asset_timestamp(
+                    user_id, "checklist", str(key), payload, checklist_path
+                ),
+            }
+        )
+    return assets
+
+
+def _ensure_local_copilot_migrated(user_id: str) -> None:
+    if user_id in _MIGRATED_LOCAL_USERS:
+        return
+    if not feature_enabled("OASIS_CLOUD_COPILOT_V1", default=False):
+        return
+    try:
+        result = migrate_local_copilot_assets(
+            owner_user_id=user_id,
+            assets=_collect_local_copilot_assets(user_id),
+        )
+    except CopilotLocalDataCorruptionError:
+        return
+    if result.get("enabled") and not result.get("degraded"):
+        _MIGRATED_LOCAL_USERS.add(user_id)
+
+
+def _write_result(
+    record: dict[str, Any],
+    status: Any,
+    *,
+    return_status: bool,
+) -> dict[str, Any] | None:
+    if not return_status:
+        return None
+    return {
+        "record": record,
+        "storage_status": status.as_dict(),
+    }
+
+
+def _show_storage_result(result: dict[str, Any] | None) -> bool:
+    status = (result or {}).get("storage_status", {})
+    if isinstance(status, dict) and status.get("degraded"):
+        message = str(
+            status.get("error_summary") or "클라우드 저장 상태를 확인해 주세요."
+        )
+        st.session_state["_oasis_copilot_storage_warning"] = message
+        st.warning(message)
+        return True
+    return False
 
 
 def _business_key(company_name: str, business_no: str) -> str:
@@ -235,13 +586,49 @@ def get_company_memory(
     company_name: str,
     business_no: str,
 ) -> dict[str, Any]:
-    data = _load_json(_memory_path(user_id), {})
+    _ensure_local_copilot_migrated(user_id)
+    memory_path = _memory_path(user_id)
+    data = _load_json(memory_path, {})
     if not isinstance(data, dict):
-        return {}
-    return data.get(
-        _business_key(company_name, business_no),
+        data = {}
+    business_key = _business_key(company_name, business_no)
+    local_value = data.get(business_key, {})
+    if not isinstance(local_value, dict):
+        local_value = {}
+    cloud_value = _cloud_asset_payloads(user_id, "memory").get(
+        business_key,
         {},
-    ) or {}
+    )
+    local_updated_at = _local_asset_timestamp(
+        user_id,
+        "memory",
+        business_key,
+        local_value,
+        memory_path,
+    )
+    cloud_updated_at = _CLOUD_SOURCE_TIMES.get(
+        (user_id, "memory", business_key),
+        str(cloud_value.get("updated_at", "") or "")
+        if isinstance(cloud_value, dict)
+        else "",
+    )
+    merged, chosen_updated_at = _merge_local_cloud_payload(
+        user_id=user_id,
+        asset_type="memory",
+        asset_key=business_key,
+        local_payload=local_value,
+        cloud_payload=cloud_value if isinstance(cloud_value, dict) else {},
+        local_updated_at=local_updated_at,
+        cloud_updated_at=cloud_updated_at,
+    )
+    if merged and merged != local_value:
+        data[business_key] = merged
+        _save_json(memory_path, data)
+    if merged and chosen_updated_at:
+        _set_local_asset_timestamp(
+            user_id, "memory", business_key, chosen_updated_at
+        )
+    return merged
 
 
 def save_company_memory(
@@ -249,7 +636,9 @@ def save_company_memory(
     company_name: str,
     business_no: str,
     memory: dict[str, Any],
-) -> None:
+    *,
+    return_status: bool = False,
+) -> dict[str, Any] | None:
     data = _load_json(_memory_path(user_id), {})
     if not isinstance(data, dict):
         data = {}
@@ -264,21 +653,90 @@ def save_company_memory(
             ),
         }
     )
-    data[
-        _business_key(company_name, business_no)
-    ] = record
+    business_key = _business_key(company_name, business_no)
+    data[business_key] = record
     _save_json(_memory_path(user_id), data)
+    _set_local_asset_timestamp(
+        user_id,
+        "memory",
+        business_key,
+        str(record["updated_at"]),
+    )
+    status = write_copilot_asset(
+        owner_user_id=user_id,
+        asset_type="memory",
+        asset_key=business_key,
+        payload=record,
+        source_updated_at=str(record["updated_at"]),
+    )
+    if status.degraded:
+        _MIGRATED_LOCAL_USERS.discard(user_id)
+    return _write_result(
+        record,
+        status,
+        return_status=return_status,
+    )
 
 
 def load_success_cases(user_id: str) -> list[dict[str, Any]]:
-    value = _load_json(_success_path(user_id), [])
-    return value if isinstance(value, list) else []
+    _ensure_local_copilot_migrated(user_id)
+    success_path = _success_path(user_id)
+    value = _load_json(success_path, [])
+    local_cases = value if isinstance(value, list) else []
+    cloud_map = _cloud_asset_payloads(user_id, "success_case")
+    merged_by_id: dict[str, dict[str, Any]] = {}
+    for case in local_cases:
+        if not isinstance(case, dict):
+            continue
+        identity = str(case.get("case_id", "") or "").strip() or hashlib.sha256(
+            json.dumps(case, ensure_ascii=False, sort_keys=True, default=str).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        merged_by_id[identity] = dict(case)
+    for identity, cloud_case in cloud_map.items():
+        local_case = merged_by_id.get(identity, {})
+        local_updated_at = _local_asset_timestamp(
+            user_id,
+            "success_case",
+            identity,
+            local_case,
+            success_path,
+        )
+        cloud_updated_at = _CLOUD_SOURCE_TIMES.get(
+            (user_id, "success_case", identity),
+            str(cloud_case.get("saved_at", "") or ""),
+        )
+        chosen, chosen_updated_at = _merge_local_cloud_payload(
+            user_id=user_id,
+            asset_type="success_case",
+            asset_key=identity,
+            local_payload=local_case,
+            cloud_payload=cloud_case,
+            local_updated_at=local_updated_at,
+            cloud_updated_at=cloud_updated_at,
+        )
+        merged_by_id[identity] = chosen
+        if chosen_updated_at:
+            _set_local_asset_timestamp(
+                user_id, "success_case", identity, chosen_updated_at
+            )
+    merged = list(merged_by_id.values())
+    merged.sort(
+        key=lambda item: str(item.get("saved_at", "")),
+        reverse=True,
+    )
+    if cloud_map and merged != local_cases:
+        _save_json(success_path, merged)
+    return merged
 
 
 def save_success_case(
     user_id: str,
     case: dict[str, Any],
-) -> None:
+    *,
+    return_status: bool = False,
+) -> dict[str, Any] | None:
     cases = load_success_cases(user_id)
     record = dict(case)
     record["case_id"] = datetime.now().strftime(
@@ -288,7 +746,28 @@ def save_success_case(
         timespec="seconds"
     )
     cases.insert(0, record)
-    _save_json(_success_path(user_id), cases[:1000])
+    # Local storage is a durable fallback/cache; never truncate existing cases.
+    _save_json(_success_path(user_id), cases)
+    _set_local_asset_timestamp(
+        user_id,
+        "success_case",
+        str(record["case_id"]),
+        str(record["saved_at"]),
+    )
+    status = write_copilot_asset(
+        owner_user_id=user_id,
+        asset_type="success_case",
+        asset_key=str(record["case_id"]),
+        payload=record,
+        source_updated_at=str(record["saved_at"]),
+    )
+    if status.degraded:
+        _MIGRATED_LOCAL_USERS.discard(user_id)
+    return _write_result(
+        record,
+        status,
+        return_status=return_status,
+    )
 
 
 def _normalize_business_no(value: Any) -> str:
@@ -527,29 +1006,99 @@ def _load_checklist(
     user_id: str,
     business_key: str,
 ) -> dict[str, bool]:
-    data = _load_json(_checklist_path(user_id), {})
+    _ensure_local_copilot_migrated(user_id)
+    checklist_path = _checklist_path(user_id)
+    data = _load_json(checklist_path, {})
     if not isinstance(data, dict):
-        return {}
+        data = {}
     value = data.get(business_key, {})
-    return value if isinstance(value, dict) else {}
+    local_value = value if isinstance(value, dict) else {}
+    cloud_value = _cloud_asset_payloads(user_id, "checklist").get(
+        business_key,
+        {},
+    )
+    local_updated_at = _local_asset_timestamp(
+        user_id,
+        "checklist",
+        business_key,
+        local_value,
+        checklist_path,
+    )
+    cloud_updated_at = _CLOUD_SOURCE_TIMES.get(
+        (user_id, "checklist", business_key),
+        "",
+    )
+    merged, chosen_updated_at = _merge_local_cloud_payload(
+        user_id=user_id,
+        asset_type="checklist",
+        asset_key=business_key,
+        local_payload=local_value,
+        cloud_payload=cloud_value if isinstance(cloud_value, dict) else {},
+        local_updated_at=local_updated_at,
+        cloud_updated_at=cloud_updated_at,
+    )
+    if merged and merged != local_value:
+        data[business_key] = merged
+        _save_json(checklist_path, data)
+    if merged and chosen_updated_at:
+        _set_local_asset_timestamp(
+            user_id, "checklist", business_key, chosen_updated_at
+        )
+    return {
+        str(key): bool(item)
+        for key, item in merged.items()
+    }
 
 
 def _save_checklist(
     user_id: str,
     business_key: str,
     checklist: dict[str, bool],
-) -> None:
+    *,
+    return_status: bool = False,
+) -> dict[str, Any] | None:
     data = _load_json(_checklist_path(user_id), {})
     if not isinstance(data, dict):
         data = {}
-    data[business_key] = checklist
+    record = {
+        str(key): bool(value)
+        for key, value in dict(checklist or {}).items()
+    }
+    data[business_key] = record
     _save_json(_checklist_path(user_id), data)
+    updated_at = datetime.now().isoformat(timespec="seconds")
+    _set_local_asset_timestamp(
+        user_id,
+        "checklist",
+        business_key,
+        updated_at,
+    )
+    status = write_copilot_asset(
+        owner_user_id=user_id,
+        asset_type="checklist",
+        asset_key=business_key,
+        payload=record,
+        source_updated_at=updated_at,
+    )
+    if status.degraded:
+        _MIGRATED_LOCAL_USERS.discard(user_id)
+    return _write_result(
+        record,
+        status,
+        return_status=return_status,
+    )
 
 
 def render_copilot_page(
     user_id: str,
     user_name: str,
 ) -> None:
+    pending_storage_warning = st.session_state.pop(
+        "_oasis_copilot_storage_warning",
+        "",
+    )
+    if pending_storage_warning:
+        st.warning(str(pending_storage_warning))
     st.markdown("## AI 컨설팅 코파일럿")
     st.caption(
         "오아시스 내부 직원이 고객별 상담목표·필수질문·필요서류·"
@@ -1149,11 +1698,13 @@ def render_copilot_page(
             use_container_width=True,
             key=f"save_copilot_checklist_{business_key}",
         ):
-            _save_checklist(
+            storage_result = _save_checklist(
                 user_id,
                 business_key,
                 updated,
+                return_status=True,
             )
+            _show_storage_result(storage_result)
             st.success("상담 체크리스트를 저장했습니다.")
 
     with tab_memory:
@@ -1241,7 +1792,7 @@ def render_copilot_page(
             use_container_width=True,
             key=f"save_memory_{business_key}",
         ):
-            save_company_memory(
+            storage_result = save_company_memory(
                 user_id,
                 company_name,
                 business_no,
@@ -1253,7 +1804,9 @@ def render_copilot_page(
                     "next_focus": next_focus,
                     "consultant_notes": consultant_notes,
                 },
+                return_status=True,
             )
+            _show_storage_result(storage_result)
             st.success(
                 "기업 메모리를 저장했습니다. 다음 상담 추천에 반영됩니다."
             )
@@ -1332,7 +1885,7 @@ def render_copilot_page(
             use_container_width=True,
             key=f"save_success_case_{business_key}",
         ):
-            save_success_case(
+            storage_result = save_success_case(
                 user_id,
                 {
                     "source_company_name": company_name,
@@ -1344,7 +1897,9 @@ def render_copilot_page(
                     "result_summary": result_summary,
                     "best_questions": best_questions,
                 },
+                return_status=True,
             )
+            _show_storage_result(storage_result)
             st.success(
                 "내부 성공사례를 저장했습니다. 이후 유사 기업 추천에 사용됩니다."
             )

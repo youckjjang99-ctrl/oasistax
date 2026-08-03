@@ -14,6 +14,7 @@ from cloud_db import (
     get_cloud_config,
 )
 from cloud_migration import collect_migration_preview, migrate_user_data
+from runtime_error_log import safe_public_error, sanitize_public_text
 
 
 def render_cloud_database_page(
@@ -44,25 +45,19 @@ def render_cloud_database_page(
         )
         return
 
-    masked_key = (
-        config.secret_key[:10] + "..." + config.secret_key[-4:]
-        if len(config.secret_key) > 18
-        else "설정됨"
-    )
-
     c1, c2 = st.columns(2)
     c1.metric("Supabase URL", config.url.replace("https://", ""))
-    c2.metric("Secret Key", masked_key)
+    c2.metric("Secret Key", "설정됨")
 
     if st.button("Supabase 연결 테스트", type="primary", use_container_width=True):
         try:
             ok, message = CloudDatabase(config).health_check()
             if ok:
-                st.success(message)
+                st.success("Supabase 연결이 정상입니다.")
             else:
-                st.error(message)
+                st.error(sanitize_public_text(message or "Supabase 연결을 확인해 주세요."))
         except Exception as exc:
-            st.error(str(exc))
+            st.error(safe_public_error(exc, "Supabase 연결 테스트에 실패했습니다."))
 
     st.markdown("### 기존 자료 이관 미리보기")
     preview = collect_migration_preview(current_user_id)
@@ -99,17 +94,27 @@ def render_cloud_database_page(
                     manager_name=current_user_name,
                 )
             except Exception as exc:
-                st.error(f"이관 실행 실패: {exc}")
+                st.error(safe_public_error(exc, "이관 실행에 실패했습니다."))
                 return
 
-        if result.get("errors"):
-            st.warning("일부 자료는 복사되지 않았습니다.")
-            for error in result["errors"]:
-                st.write(f"- {error}")
+        error_count = len(result.get("errors") or [])
+        if error_count:
+            st.warning(f"일부 자료는 복사되지 않았습니다. 실패 항목: {error_count}건")
         else:
             st.success("기존 자료 복사가 완료되었습니다.")
 
-        st.json(result)
+        safe_result = {
+            key: int(result.get(key, 0) or 0)
+            for key in (
+                "customers",
+                "crm",
+                "financials",
+                "registry",
+                "stock_valuations",
+            )
+        }
+        safe_result["error_count"] = error_count
+        st.json(safe_result)
 
     st.markdown("### 클라우드 저장 건수")
     if st.button("클라우드 건수 새로고침", use_container_width=True):
@@ -128,7 +133,7 @@ def render_cloud_database_page(
                 use_container_width=True,
             )
         except Exception as exc:
-            st.error(str(exc))
+            st.error(safe_public_error(exc, "클라우드 저장 건수를 불러오지 못했습니다."))
 
     with st.expander("v4.0 전환 상태"):
         st.markdown(
@@ -137,3 +142,7 @@ def render_cloud_database_page(
             "- 아직 하지 않는 것: 클라우드 자료를 기본 저장소로 강제 전환\n"
             "- 다음 단계: 복사 결과 검증 후 신규 입력을 파일+클라우드에 동시 저장"
         )
+
+    from data_safety_admin import render_data_safety_status
+
+    render_data_safety_status(current_user_id)
