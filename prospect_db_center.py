@@ -3168,11 +3168,6 @@ def render_prospect_db_center(
         can_view_mobile,
         is_admin_user=is_admin_user,
     )
-    st.caption(
-        "행안부 자료는 사용하지 않습니다. 국민연금 월별 자료와 "
-        "근로복지공단 연간 자료에서 고용증가기업 또는 신규개업 "
-        "추정기업을 골라 조회합니다."
-    )
     _show_pending_prospect_save_notices()
     pending_workflow_step = st.session_state.pop(
         "_prospect_workflow_step_pending_v1020",
@@ -4178,6 +4173,10 @@ def render_prospect_db_center(
                         if str(item.get("company_uid") or "") not in saved_uids
                     ]
                     result["found_count"] = len(result["items"])
+                    # A fresh save result is already shown once through the
+                    # flash notice.  Do not repeat a stale assignment warning
+                    # from the cached search result below it after rerun.
+                    result.pop("assignment_warning", None)
                     st.session_state[result_state_key] = result
                     st.session_state[selection_state_key] = []
                     st.session_state[result_revision_key] = int(

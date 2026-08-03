@@ -2411,7 +2411,8 @@ begin
             false,
             now()
         )
-        on conflict (company_uid) do nothing
+        on conflict on constraint oasis_company_sales_assignments_company_uid_key
+        do nothing
         returning * into v_saved;
 
         if v_saved.id is null then

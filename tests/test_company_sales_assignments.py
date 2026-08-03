@@ -931,6 +931,25 @@ class ProspectSaveNoticeTests(unittest.TestCase):
         self.assertLess(queue_index, rerun_index)
         self.assertIn("저장 완료: ", source)
 
+    def test_save_rerun_does_not_repeat_stale_assignment_warning(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "prospect_db_center.py"
+        ).read_text(encoding="utf-8")
+        clear_index = source.index(
+            'result.pop("assignment_warning", None)'
+        )
+        save_index = source.index(
+            "st.session_state[result_state_key] = result",
+            clear_index,
+        )
+        self.assertLess(clear_index, save_index)
+
+    def test_obsolete_prospect_source_caption_is_removed(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "prospect_db_center.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("행안부 자료는 사용하지 않습니다.", source)
+
 
 if __name__ == "__main__":
     unittest.main()
