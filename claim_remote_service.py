@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -22,6 +23,7 @@ from solapi_alimtalk_client import (
     SolapiAlimtalkConfig,
     SolapiAlimtalkError,
     environment_readiness as solapi_environment_readiness,
+    guidance_send_readiness,
 )
 from tilko_claim_client import (
     ClaimProviderError,
@@ -35,6 +37,10 @@ REMOTE_RETENTION_POLICY_VERSION = "claim-document-retention-v1-2026-07"
 REMOTE_JOB_TTL_SECONDS = 45 * 60
 REMOTE_AUTH_TTL_SECONDS = 10 * 60
 REMOTE_SUBMISSION_RESERVATION_SECONDS = 5 * 60
+PROSPECT_INVITE_TTL_SECONDS = 7 * 24 * 60 * 60
+
+STAFF_TARGETED_FLOW = "staff_targeted"
+PROSPECT_SELF_INPUT_FLOW = "prospect_self_input"
 
 TEMPLATE_AUTH_START = "auth_start"
 TEMPLATE_AUTH_RESUME = "auth_resume"
@@ -48,11 +54,136 @@ TEMPLATE_ENV_BY_CODE = {
     TEMPLATE_NEXT_AUTH: "SOLAPI_TEMPLATE_NEXT_AUTH_ID",
     TEMPLATE_COMPLETE: "SOLAPI_TEMPLATE_COMPLETE_ID",
     TEMPLATE_FAILED: "SOLAPI_TEMPLATE_FAILED_ID",
+    "GUIDANCE_EMPLOYMENT_SUPPORT": (
+        "SOLAPI_TEMPLATE_GUIDANCE_EMPLOYMENT_SUPPORT_ID"
+    ),
+    "GUIDANCE_POLICY_FUNDING": "SOLAPI_TEMPLATE_GUIDANCE_POLICY_FUNDING_ID",
+    "GUIDANCE_TAX_CREDIT": "SOLAPI_TEMPLATE_GUIDANCE_TAX_CREDIT_ID",
 }
 
 _PHONE_PATTERN = re.compile(r"^01(?:0|1|6|7|8|9)\d{7,8}$")
 _SAFE_ERROR_CODE_PATTERN = re.compile(r"^[A-Z0-9_-]{1,80}$")
-_DEFAULT_WORKER_OWNER = "claim-remote-worker@system.local"
+_DEFAULT_WORKER_OWNER = "claim-remote-worker-system"
+
+
+def _explicitly_enabled(value: Any) -> bool:
+    """Return true only for an explicit opt-in value."""
+
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _notify_guidance_outbox_status(
+    *,
+    guidance_message_id: str,
+    status: str,
+    provider_message_id: str = "",
+    error_code: str = "",
+) -> None:
+    """Best-effort bridge to the DB-discovery guidance status store.
+
+    The import is deliberately lazy so the existing claim worker does not
+    acquire a hard dependency on the optional DB-discovery feature.  Callback
+    failures never change the outbox result and never weaken the send gate.
+    """
+
+    if not str(guidance_message_id or "").strip():
+        return
+    try:
+        from company_kakao_guidance import (  # noqa: PLC0415
+            notify_guidance_outbox_status,
+        )
+
+        notify_guidance_outbox_status(
+            guidance_message_id=str(guidance_message_id).strip(),
+            status=str(status or "").strip().lower()[:40],
+            provider_message_id=str(provider_message_id or "").strip()[:200],
+            error_code=_safe_error_code(error_code, "") if error_code else "",
+        )
+    except Exception:
+        # Never log callback arguments: they can be correlated with a customer
+        # communication.  The guidance service can reconcile from outbox state.
+        return
+
+
+def _check_guidance_send_ready(
+    guidance_message_id: str,
+    canonical_contact_id: str,
+    recipient_phone_hash: str,
+) -> dict[str, Any]:
+    """Fail closed unless the guidance row is still sendable.
+
+    Cancellation, customer opt-out and administrator contact controls can be
+    changed after an outbox row is leased.  The provider worker therefore
+    performs this server-side check immediately before making the external
+    request.  No recipient or customer data is returned by this bridge.
+    """
+
+    message_id = str(guidance_message_id or "").strip()
+    contact_id = str(canonical_contact_id or "").strip()
+    phone_hash = str(recipient_phone_hash or "").strip().lower()
+    if not message_id or not contact_id or not re.fullmatch(
+        r"[0-9a-f]{64}", phone_hash
+    ):
+        return {
+            "allowed": False,
+            "code": "GUIDANCE_DELIVERY_BINDING_INVALID",
+        }
+    try:
+        from company_kakao_guidance import (  # noqa: PLC0415
+            check_guidance_send_ready,
+        )
+
+        result = check_guidance_send_ready(
+            message_id,
+            canonical_contact_id=contact_id,
+            recipient_phone_hash=phone_hash,
+        )
+        if (
+            not isinstance(result, Mapping)
+            or not isinstance(result.get("allowed"), bool)
+        ):
+            return {
+                "allowed": False,
+                "code": "GUIDANCE_SEND_STATE_UNAVAILABLE",
+            }
+        return {
+            "allowed": result["allowed"],
+            "code": _safe_error_code(
+                result.get("code", ""),
+                "GUIDANCE_SEND_STATE_BLOCKED",
+            ),
+        }
+    except Exception:
+        # Fail closed and do not log connector details.  RPC/provider errors
+        # can contain identifiers that must not be exposed in application logs.
+        return {
+            "allowed": False,
+            "code": "GUIDANCE_SEND_STATE_UNAVAILABLE",
+        }
+
+
+def _cancel_guidance_for_invite(
+    *,
+    invite_id: str,
+    owner_user_id: str,
+) -> None:
+    """Best-effort opt-out propagation for the optional guidance feature."""
+
+    if not str(invite_id or "").strip() or not str(owner_user_id or "").strip():
+        return
+    try:
+        from company_kakao_guidance import (  # noqa: PLC0415
+            cancel_guidance_for_invite,
+        )
+
+        cancel_guidance_for_invite(
+            invite_id=str(invite_id).strip(),
+            owner_user_id=str(owner_user_id).strip().lower(),
+            opt_out=True,
+            reason="customer_opt_out",
+        )
+    except Exception:
+        return
 
 
 class ClaimRemoteServiceError(RuntimeError):
@@ -101,6 +232,52 @@ def _clean_phone(value: Any) -> str:
             error_code="INVALID_CUSTOMER_PHONE",
         )
     return phone
+
+
+def _clean_optional_company_name(value: Any) -> str:
+    selected = re.sub(
+        r"[\x00-\x1f\x7f]+",
+        " ",
+        str(value or ""),
+    ).strip()
+    selected = re.sub(r"\s+", " ", selected)
+    if len(selected) > 120:
+        raise ClaimRemoteServiceError(
+            "상호명은 120자 이내로 입력해 주세요.",
+            error_code="INVALID_COMPANY_NAME",
+        )
+    return selected
+
+
+def _clean_optional_business_no(value: Any) -> str:
+    selected = _digits(value)
+    if selected and len(selected) != 10:
+        raise ClaimRemoteServiceError(
+            "사업자등록번호는 숫자 10자리로 입력해 주세요.",
+            error_code="INVALID_BUSINESS_NUMBER",
+        )
+    return selected
+
+
+def _clean_required_reference(
+    value: Any,
+    *,
+    label: str,
+    error_code: str,
+    maximum: int = 200,
+) -> str:
+    selected = re.sub(
+        r"[\x00-\x1f\x7f]+",
+        " ",
+        str(value or ""),
+    ).strip()
+    selected = re.sub(r"\s+", " ", selected)
+    if not selected or len(selected) > maximum:
+        raise ClaimRemoteServiceError(
+            f"{label} 정보를 확인해 주세요.",
+            error_code=error_code,
+        )
+    return selected
 
 
 def _clean_identity(value: Any) -> str:
@@ -259,6 +436,37 @@ def _load_claim_workflow() -> tuple[Callable[..., Any], Callable[..., Any]]:
     )
 
 
+_JOB_ACTIVE_GUARD_ERROR_CODES = frozenset(
+    {
+        "REMOTE_JOB_NO_LONGER_ACTIVE",
+        "REMOTE_JOB_ACTIVE_CHECK_UNAVAILABLE",
+    }
+)
+
+
+class _JobActiveProviderProxy:
+    """Revalidate durable job state at the instant a provider method runs."""
+
+    def __init__(
+        self,
+        delegate: Any,
+        assert_active: Callable[[], bool],
+    ) -> None:
+        self._delegate = delegate
+        self._assert_active = assert_active
+
+    def __getattr__(self, name: str) -> Any:
+        selected = getattr(self._delegate, name)
+        if not callable(selected):
+            return selected
+
+        def guarded(*args: Any, **kwargs: Any) -> Any:
+            self._assert_active()
+            return selected(*args, **kwargs)
+
+        return guarded
+
+
 class ClaimRemoteService:
     """Durable public claim orchestration plus restart-safe lease workers."""
 
@@ -393,6 +601,93 @@ class ClaimRemoteService:
             "message_queued": True,
         }
 
+    def create_prospect_self_input_invite(
+        self,
+        *,
+        owner_user_id: str,
+        requested_by: str,
+        company_uid: str,
+        guidance_type: str,
+        guidance_message_id: str,
+    ) -> dict[str, Any]:
+        """Create a seven-day customer self-input link without sending it.
+
+        Notification delivery is owned by the DB-discovery guidance service.
+        This method therefore persists no recipient PII and does not enqueue a
+        claim AlimTalk.  The returned opaque URL may be placed in an approved
+        guidance template by the caller.
+        """
+
+        readiness = dict(self.invite_readiness_checker() or {})
+        missing = {
+            str(item or "").strip().lower()
+            for item in (readiness.get("missing_components") or [])
+            if str(item or "").strip()
+        }
+        storage_ready = bool(readiness.get("ready")) or (
+            bool(missing) and missing <= {"solapi"}
+        )
+        if not storage_ready:
+            raise ClaimRemoteServiceError(
+                "고객 검토신청 링크 생성 설정이 완료되지 않았습니다. 관리자에게 문의해 주세요.",
+                error_code="REMOTE_INVITE_NOT_READY",
+            )
+
+        owner = _clean_required_reference(
+            str(owner_user_id or "").strip().lower(),
+            label="담당자",
+            error_code="REMOTE_OWNER_REQUIRED",
+        ).lower()
+        requester = _clean_required_reference(
+            requested_by or owner,
+            label="요청자",
+            error_code="REMOTE_REQUESTER_REQUIRED",
+            maximum=120,
+        )
+        selected_company_uid = _clean_required_reference(
+            company_uid,
+            label="업체 식별자",
+            error_code="REMOTE_COMPANY_UID_REQUIRED",
+            maximum=200,
+        )
+        selected_guidance_type = _clean_required_reference(
+            guidance_type,
+            label="안내 유형",
+            error_code="REMOTE_GUIDANCE_TYPE_REQUIRED",
+            maximum=80,
+        )
+        # The guidance service owns this identifier and persists invite_id on
+        # its reserved row.  Validate the hand-off contract, but deliberately
+        # keep the identifier out of the encrypted claim payload.
+        _clean_required_reference(
+            guidance_message_id,
+            label="안내 메시지",
+            error_code="REMOTE_GUIDANCE_MESSAGE_REQUIRED",
+            maximum=100,
+        )
+        expires_at = self.clock() + timedelta(
+            seconds=PROSPECT_INVITE_TTL_SECONDS
+        )
+        repository = self.remote_repository_factory(owner)
+        invite = repository.create_invite(
+            secure_payload={
+                "requested_by": requester,
+                "company_uid": selected_company_uid,
+                "guidance_type": selected_guidance_type,
+                "flow_type": PROSPECT_SELF_INPUT_FLOW,
+                "customer_self_input": True,
+                "enforce_recipient_match": False,
+            },
+            expires_at=expires_at,
+        )
+        invite_id = str(invite.record.get("id") or "")
+        return {
+            "invite_id": invite_id,
+            "invite_url": f"{self.base_url}/c/{invite.token}",
+            "status": str(invite.record.get("status") or "created"),
+            "expires_at": invite.record.get("expires_at") or expires_at,
+        }
+
     def open_invite(self, invite_token: str) -> Mapping[str, Any]:
         record = dict(
             ClaimRemoteRepository.mark_invite_opened_global(
@@ -419,13 +714,27 @@ class ClaimRemoteService:
         secure_payload = (
             repository.decrypt_payload(ciphertext) if ciphertext else {}
         )
+        flow_type = str(
+            secure_payload.get("flow_type") or STAFF_TARGETED_FLOW
+        ).strip().lower()
+        self_input = flow_type == PROSPECT_SELF_INPUT_FLOW
         return {
             "invite_id": str(record.get("id") or ""),
             "owner_ref": owner,
             "status": str(record.get("status") or "opened"),
             "expires_at": record.get("expires_at"),
-            "name": str(secure_payload.get("recipient_name") or ""),
-            "phone": str(secure_payload.get("recipient_phone") or ""),
+            "name": (
+                ""
+                if self_input
+                else str(secure_payload.get("recipient_name") or "")
+            ),
+            "phone": (
+                ""
+                if self_input
+                else str(secure_payload.get("recipient_phone") or "")
+            ),
+            "flow_type": flow_type,
+            "customer_self_input": self_input,
         }
 
     def submit_customer(
@@ -439,11 +748,15 @@ class ClaimRemoteService:
         resident_number: str,
         consent_version: str,
         consents: Mapping[str, bool],
+        company_name: str = "",
+        business_no: str = "",
     ) -> Mapping[str, Any]:
         owner = str(owner_ref or "").strip().lower()
         customer_name = _clean_name(name)
         customer_phone = _clean_phone(phone)
         identity_number = _clean_identity(resident_number)
+        selected_company_name = _clean_optional_company_name(company_name)
+        selected_business_no = _clean_optional_business_no(business_no)
         if not (
             bool(consents.get("privacy_and_unique_identifier"))
             and bool(consents.get("third_party_processing"))
@@ -470,28 +783,42 @@ class ClaimRemoteService:
         invite_payload = remote_repository.decrypt_payload(
             invite.get("secure_payload_ciphertext")
         )
-        try:
-            expected_name = _clean_name(
-                invite_payload.get("recipient_name")
-            )
-            expected_phone = _clean_phone(
-                invite_payload.get("recipient_phone")
-            )
-        except ClaimRemoteServiceError as exc:
-            raise ClaimRemoteServiceError(
-                "인증 요청의 고객정보를 확인하지 못했습니다. "
-                "담당자에게 새 인증 요청을 받아 주세요.",
-                error_code="INVITE_TARGET_INVALID",
-            ) from exc
-        if (
-            customer_name != expected_name
-            or customer_phone != expected_phone
-        ):
-            raise ClaimRemoteServiceError(
-                "인증 요청 대상자 정보와 입력한 정보가 일치하지 않습니다. "
-                "담당자에게 확인해 주세요.",
-                error_code="INVITE_TARGET_MISMATCH",
-            )
+        flow_type = str(
+            invite_payload.get("flow_type") or STAFF_TARGETED_FLOW
+        ).strip().lower()
+        # DB-discovery guidance may be delivered to a public business phone,
+        # while Tilko simple authentication must use the representative's
+        # own certificate phone entered on the customer page.  Prospect
+        # self-input links therefore never compare those two identities,
+        # even if a legacy/malformed payload contains recipient fields or an
+        # old recipient-match flag.
+        enforce_target_match = (
+            flow_type != PROSPECT_SELF_INPUT_FLOW
+            and bool(invite_payload.get("enforce_recipient_match", True))
+        )
+        if enforce_target_match:
+            try:
+                expected_name = _clean_name(
+                    invite_payload.get("recipient_name")
+                )
+                expected_phone = _clean_phone(
+                    invite_payload.get("recipient_phone")
+                )
+            except ClaimRemoteServiceError as exc:
+                raise ClaimRemoteServiceError(
+                    "인증 요청의 고객정보를 확인하지 못했습니다. "
+                    "담당자에게 새 인증 요청을 받아 주세요.",
+                    error_code="INVITE_TARGET_INVALID",
+                ) from exc
+            if (
+                customer_name != expected_name
+                or customer_phone != expected_phone
+            ):
+                raise ClaimRemoteServiceError(
+                    "인증 요청 대상자 정보와 입력한 정보가 일치하지 않습니다. "
+                    "담당자에게 확인해 주세요.",
+                    error_code="INVITE_TARGET_MISMATCH",
+                )
 
         now = self.clock()
         monotonic_now = self.monotonic()
@@ -501,6 +828,9 @@ class ClaimRemoteService:
             "absolute_expires_at": monotonic_now
             + REMOTE_JOB_TTL_SECONDS,
             "expires_at": monotonic_now + REMOTE_AUTH_TTL_SECONDS,
+            # This flag is non-PII and lets the worker enforce the shorter
+            # retention rules for a number entered solely for simple auth.
+            "flow_type": flow_type,
             "stage_started_at": monotonic_now,
             "expected_sources": ["hometax", "comwel"],
             "business_number": "",
@@ -519,6 +849,11 @@ class ClaimRemoteService:
                 secure_job_payload=transient,
                 hard_expires_at=now
                 + timedelta(seconds=REMOTE_JOB_TTL_SECONDS),
+                # Representative-entered authentication data is encrypted in
+                # the job only for the active auth/collection stage.  The
+                # database expires it independently if the worker stops.
+                sensitive_expires_at=now
+                + timedelta(seconds=REMOTE_AUTH_TTL_SECONDS),
                 stage="submission_reserved",
                 max_attempts=100,
                 initial_status="waiting",
@@ -553,11 +888,18 @@ class ClaimRemoteService:
         try:
             case = claim_repository.create_case(
                 case_id=case_id,
-                company_name="상호명 미입력",
-                business_no="",
+                company_name=selected_company_name or "상호명 미입력",
+                business_no=selected_business_no,
                 business_type="individual",
                 representative_name=customer_name,
-                cellphone=customer_phone,
+                # In the DB-discovery self-input flow this number exists only
+                # inside the encrypted, expiring auth job.  It must not be
+                # copied into the durable case fingerprint or masked columns.
+                cellphone=(
+                    ""
+                    if flow_type == PROSPECT_SELF_INPUT_FLOW
+                    else customer_phone
+                ),
                 requested_by=str(
                     invite_payload.get("requested_by") or owner
                 )[:120],
@@ -587,7 +929,17 @@ class ClaimRemoteService:
                 error_code="REMOTE_CASE_CREATE_FAILED",
             ) from exc
 
-        client = self.tilko_client_factory()
+        def assert_submission_active() -> bool:
+            return self._assert_job_active(
+                remote_repository,
+                job_id,
+                mode="submission_reserved",
+            )
+
+        client = _JobActiveProviderProxy(
+            self.tilko_client_factory(),
+            assert_submission_active,
+        )
         birth_date = str(
             transient["auth_context"].get("birth_date") or ""
         )
@@ -598,6 +950,14 @@ class ClaimRemoteService:
                 cellphone=customer_phone,
             )
         except Exception as exc:
+            if _safe_error_code(
+                getattr(exc, "error_code", ""),
+                "HOMETAX_AUTH_REQUEST_FAILED",
+            ) in _JOB_ACTIVE_GUARD_ERROR_CODES:
+                # Cancellation/expiry has already terminalized and scrubbed
+                # the reservation. An unavailable guard must also fail closed
+                # without rewriting or re-encrypting that durable state.
+                raise
             self._fail_submission_reservation(
                 remote_repository,
                 job_id,
@@ -670,6 +1030,47 @@ class ClaimRemoteService:
             "submitted": True,
         }
 
+    def cancel_customer(
+        self,
+        *,
+        owner_ref: str,
+        invite_id: str,
+        invite_token: str,
+        reason: str = "customer_opt_out",
+    ) -> Mapping[str, Any]:
+        """Cancel the public invite and any pending auth/collection work."""
+
+        owner = str(owner_ref or "").strip().lower()
+        repository = self.remote_repository_factory(owner)
+        invite = repository.get_invite(invite_token)
+        if not invite or str(invite.get("id") or "") != str(invite_id):
+            raise ClaimRemoteServiceError(
+                "인증 요청을 확인하지 못했습니다.",
+                error_code="INVITE_NOT_FOUND",
+            )
+        selected_reason = str(reason or "customer_opt_out").strip()[:120]
+        cancelled = dict(
+            repository.cancel_invite(
+                invite_token,
+                reason=selected_reason or "customer_opt_out",
+            )
+            or {}
+        )
+        _cancel_guidance_for_invite(
+            invite_id=str(invite_id),
+            owner_user_id=owner,
+        )
+        return {
+            "invite_id": str(cancelled.get("id") or invite_id),
+            "case_id": str(cancelled.get("case_id") or ""),
+            "status": "cancelled",
+            "stage": "customer_opt_out",
+            "progress": int(cancelled.get("progress") or 0),
+            "safe_message": "검토신청 안내가 취소되었습니다.",
+            "submitted": True,
+            "complete": True,
+        }
+
     def get_status(
         self,
         *,
@@ -691,8 +1092,10 @@ class ClaimRemoteService:
             "stage": str(row.get("job_stage") or ""),
             "progress": int(row.get("progress") or 0),
             "safe_message": str(row.get("safe_message") or ""),
-            "submitted": bool(job_status) or invite_status == "submitted",
-            "complete": job_status in {"complete", "partial"},
+            "submitted": bool(job_status)
+            or invite_status in {"submitted", "cancelled"},
+            "complete": job_status in {"complete", "partial", "cancelled"}
+            or invite_status == "cancelled",
         }
 
     def start(self) -> None:
@@ -755,6 +1158,58 @@ class ClaimRemoteService:
             bool(verified),
         )
 
+    def _sensitive_payload_expires_at(
+        self,
+        transient: Mapping[str, Any],
+    ) -> datetime:
+        """Convert the active monotonic workflow TTL to a database deadline."""
+
+        remaining = float(transient.get("expires_at") or 0) - self.monotonic()
+        remaining = max(1.0, min(remaining, float(REMOTE_JOB_TTL_SECONDS)))
+        return self.clock() + timedelta(seconds=remaining)
+
+    def _assert_job_active(
+        self,
+        repository: Any,
+        job_id: str,
+        *,
+        mode: str,
+    ) -> bool:
+        """Fail closed unless the same durable job may call a provider now."""
+
+        try:
+            state = repository.check_job_active(
+                job_id,
+                mode=mode,
+                worker_id=(self.worker_id if mode == "leased" else None),
+            )
+        except Exception as exc:
+            raise ClaimRemoteServiceError(
+                "작업 상태를 확인하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                error_code="REMOTE_JOB_ACTIVE_CHECK_UNAVAILABLE",
+            ) from exc
+        if not isinstance(state, Mapping) or state.get("allowed") is not True:
+            raise ClaimRemoteServiceError(
+                "작업이 취소되었거나 인증 유효시간이 지났습니다.",
+                error_code="REMOTE_JOB_NO_LONGER_ACTIVE",
+            )
+        try:
+            expected_job_id = str(uuid.UUID(str(job_id or "").strip()))
+            returned_job_id = str(
+                uuid.UUID(str(state.get("job_id") or "").strip())
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ClaimRemoteServiceError(
+                "작업 상태를 확인하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                error_code="REMOTE_JOB_ACTIVE_CHECK_UNAVAILABLE",
+            ) from exc
+        if returned_job_id != expected_job_id:
+            raise ClaimRemoteServiceError(
+                "작업 상태를 확인하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                error_code="REMOTE_JOB_ACTIVE_CHECK_UNAVAILABLE",
+            )
+        return True
+
     def _process_job(self, row: dict[str, Any]) -> None:
         owner = str(row.get("owner_user_id") or "").strip().lower()
         job_id = str(row.get("id") or "")
@@ -765,6 +1220,11 @@ class ClaimRemoteService:
         try:
             transient = repository.decrypt_payload(
                 row.get("secure_payload_ciphertext")
+            )
+            self._assert_job_active(
+                repository,
+                job_id,
+                mode="leased",
             )
             if str(row.get("stage") or "") == "submission_reserved":
                 repository.release_job(
@@ -799,7 +1259,17 @@ class ClaimRemoteService:
             case = claim_repository.get_case(case_id)
             if not case:
                 raise ClaimRepositoryError("경정청구 요청을 찾지 못했습니다.")
-            client = self.tilko_client_factory()
+            def assert_job_active() -> bool:
+                return self._assert_job_active(
+                    repository,
+                    job_id,
+                    mode="leased",
+                )
+
+            client = _JobActiveProviderProxy(
+                self.tilko_client_factory(),
+                assert_job_active,
+            )
             last_heartbeat = [self.monotonic()]
 
             def on_progress(
@@ -807,14 +1277,39 @@ class ClaimRemoteService:
                 _total: int,
                 _document_code: str,
             ) -> None:
-                if self.monotonic() - last_heartbeat[0] >= 10:
+                assert_job_active()
+                entering_collection = (
+                    transient.get("retention_stage") != "collection"
+                )
+                if entering_collection:
+                    # This callback begins only after both simple-auth steps
+                    # have succeeded.  Mark the encrypted context as an
+                    # active collection payload before the first potentially
+                    # long Tilko document call, so the database can apply the
+                    # collection deadline instead of the ten-minute auth cap.
+                    transient["retention_stage"] = "collection"
+                if (
+                    entering_collection
+                    or self.monotonic() - last_heartbeat[0] >= 10
+                ):
                     repository.heartbeat_job(
                         job_id,
                         self.worker_id,
                         lease_seconds=self.lease_seconds,
+                        sensitive_expires_at=(
+                            self._sensitive_payload_expires_at(transient)
+                        ),
+                        stage="collecting",
                     )
                     last_heartbeat[0] = self.monotonic()
 
+            def should_continue() -> bool:
+                assert_job_active()
+                return float(
+                    transient.get("absolute_expires_at") or 0
+                ) > self.monotonic()
+
+            assert_job_active()
             result = dict(
                 self.advance_case(
                     claim_repository,
@@ -830,10 +1325,7 @@ class ClaimRemoteService:
                         context.get("identity_number")
                     ),
                     on_progress=on_progress,
-                    should_continue=lambda: float(
-                        transient.get("absolute_expires_at") or 0
-                    )
-                    > self.monotonic(),
+                    should_continue=should_continue,
                 )
                 or {}
             )
@@ -853,6 +1345,9 @@ class ClaimRemoteService:
                     next_run_at=self.clock()
                     + timedelta(seconds=self._auth_poll_delay(row)),
                     safe_message=self._auth_wait_message(event),
+                    sensitive_expires_at=(
+                        self._sensitive_payload_expires_at(transient)
+                    ),
                 )
                 return
             if event == "comwel_requested":
@@ -871,6 +1366,9 @@ class ClaimRemoteService:
                     secure_payload=transient,
                     progress=progress,
                     next_run_at=self.clock() + timedelta(seconds=3),
+                    sensitive_expires_at=(
+                        self._sensitive_payload_expires_at(transient)
+                    ),
                     safe_message=(
                         "홈택스 인증이 완료되어 근로복지공단 인증을 발송했습니다."
                     ),
@@ -989,6 +1487,11 @@ class ClaimRemoteService:
             getattr(error, "error_code", ""),
             "REMOTE_WORKER_FAILED",
         )
+        if provider_code in _JOB_ACTIVE_GUARD_ERROR_CODES:
+            # A cancellation/expiry already made the durable row terminal, or
+            # the point-in-time check was unavailable. Do not overwrite that
+            # state, requeue sensitive data, or emit a failure notification.
+            return
         attempt_count = int(row.get("attempt_count") or 0)
         max_attempts = int(row.get("max_attempts") or 1)
         retryable = bool(
@@ -1019,12 +1522,20 @@ class ClaimRemoteService:
                 job_id,
                 self.worker_id,
                 next_status="retry",
-                stage="retry",
+                stage=(
+                    "collection_retry"
+                    if isinstance(transient, Mapping)
+                    and transient.get("retention_stage") == "collection"
+                    else "retry"
+                ),
                 secure_payload=(
                     transient if isinstance(transient, dict) else {}
                 ),
                 progress=progress,
                 next_run_at=self.clock() + timedelta(seconds=5),
+                sensitive_expires_at=(
+                    self._sensitive_payload_expires_at(transient)
+                ),
                 safe_message="인증 상태를 다시 확인하고 있습니다.",
                 safe_error_code=provider_code,
             )
@@ -1119,6 +1630,18 @@ class ClaimRemoteService:
         context = transient.get("auth_context")
         if not isinstance(context, Mapping):
             return
+        flow_type = str(
+            transient.get("flow_type") or STAFF_TARGETED_FLOW
+        ).strip().lower()
+        if (
+            flow_type == PROSPECT_SELF_INPUT_FLOW
+            and event_type != "NEXT_AUTH"
+        ):
+            # The representative-entered number is an authentication channel,
+            # not a durable CRM notification destination.  Only the immediate
+            # second-auth prompt may use it; completion/failure notices remain
+            # available on the secure status page and staff CRM.
+            return
         name = str(context.get("representative") or "").strip()
         phone = _digits(context.get("cellphone"))
         if not name or not _PHONE_PATTERN.fullmatch(phone):
@@ -1140,6 +1663,11 @@ class ClaimRemoteService:
             },
             invite_id=str(row.get("invite_id") or "") or None,
             case_id=str(row.get("case_id") or "") or None,
+            expires_at=(
+                self.clock() + timedelta(seconds=REMOTE_AUTH_TTL_SECONDS)
+                if flow_type == PROSPECT_SELF_INPUT_FLOW
+                else None
+            ),
         )
 
     @staticmethod
@@ -1161,8 +1689,152 @@ class ClaimRemoteService:
         owner = str(row.get("owner_user_id") or "").strip().lower()
         repository = self.remote_repository_factory(owner)
         message_id = str(row.get("id") or "")
+        event_type = str(row.get("event_type") or "").strip().upper()
+        is_guidance = event_type.startswith("GUIDANCE_")
+        payload: dict[str, Any] | None = None
+        guidance_message_id = ""
+        canonical_contact_id = ""
+        guidance_recipient_phone = ""
+        recipient_phone_hash = ""
+        provider_call_started = False
         try:
-            if str(row.get("template_code") or "") == TEMPLATE_AUTH_RESUME:
+            if is_guidance:
+                raw_guidance_message_id = str(
+                    row.get("guidance_message_id") or ""
+                ).strip()
+                try:
+                    guidance_message_id = str(
+                        uuid.UUID(raw_guidance_message_id)
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    guidance_message_id = ""
+                decrypted_payload = repository.decrypt_payload(
+                    row.get("secure_payload_ciphertext")
+                )
+                if not isinstance(decrypted_payload, Mapping):
+                    error_code = "GUIDANCE_DELIVERY_BINDING_INVALID"
+                    repository.release_message(
+                        message_id,
+                        self.worker_id,
+                        next_status="cancelled",
+                        safe_error_code=error_code,
+                    )
+                    _notify_guidance_outbox_status(
+                        guidance_message_id=guidance_message_id,
+                        status="cancelled",
+                        error_code=error_code,
+                    )
+                    return
+                payload = dict(decrypted_payload)
+                raw_payload_message_id = str(
+                    payload.get("guidance_message_id") or ""
+                ).strip()
+                raw_contact_id = str(
+                    payload.get("canonical_contact_id") or ""
+                ).strip()
+                try:
+                    payload_message_id = str(
+                        uuid.UUID(raw_payload_message_id)
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    payload_message_id = ""
+                try:
+                    canonical_contact_id = str(uuid.UUID(raw_contact_id))
+                except (AttributeError, TypeError, ValueError):
+                    canonical_contact_id = ""
+
+                guidance_recipient_phone = _digits(payload.get("to"))
+                if guidance_recipient_phone.startswith("82"):
+                    guidance_recipient_phone = (
+                        "0" + guidance_recipient_phone[2:]
+                    )
+                if (
+                    not guidance_message_id
+                    or payload_message_id != guidance_message_id
+                    or not canonical_contact_id
+                    or not _PHONE_PATTERN.fullmatch(
+                        guidance_recipient_phone
+                    )
+                ):
+                    error_code = "GUIDANCE_DELIVERY_BINDING_INVALID"
+                    repository.release_message(
+                        message_id,
+                        self.worker_id,
+                        next_status="cancelled",
+                        safe_error_code=error_code,
+                    )
+                    _notify_guidance_outbox_status(
+                        guidance_message_id=guidance_message_id,
+                        status="cancelled",
+                        error_code=error_code,
+                    )
+                    return
+
+                phone_hash_key = str(
+                    os.environ.get(
+                        "OASIS_KAKAO_GUIDANCE_PHONE_HASH_KEY", ""
+                    )
+                    or ""
+                ).strip()
+                if len(phone_hash_key) < 32:
+                    error_code = "GUIDANCE_PHONE_HASH_KEY_INVALID"
+                    repository.release_message(
+                        message_id,
+                        self.worker_id,
+                        next_status="cancelled",
+                        safe_error_code=error_code,
+                    )
+                    _notify_guidance_outbox_status(
+                        guidance_message_id=guidance_message_id,
+                        status="cancelled",
+                        error_code=error_code,
+                    )
+                    return
+                recipient_phone_hash = hmac.new(
+                    phone_hash_key.encode("utf-8"),
+                    guidance_recipient_phone.encode("ascii"),
+                    hashlib.sha256,
+                ).hexdigest()
+                provider_mode = str(
+                    os.environ.get(
+                        "OASIS_KAKAO_GUIDANCE_PROVIDER_MODE",
+                        "",
+                    )
+                    or ""
+                ).strip().lower()
+                template_code = str(row.get("template_code") or "")
+                template_env = TEMPLATE_ENV_BY_CODE.get(template_code, "")
+                guidance_readiness = guidance_send_readiness(
+                    os.environ,
+                    required_template_env_names=(template_env,),
+                )
+                if (
+                    provider_mode != "live"
+                    or not guidance_readiness.get(
+                        "external_send_allowed"
+                    )
+                ):
+                    error_code = (
+                        "GUIDANCE_SEND_DISABLED"
+                        if provider_mode == "live"
+                        else "GUIDANCE_PROVIDER_MODE_INVALID"
+                    )
+                    repository.release_message(
+                        message_id,
+                        self.worker_id,
+                        next_status="cancelled",
+                        safe_error_code=error_code,
+                    )
+                    _notify_guidance_outbox_status(
+                        guidance_message_id=guidance_message_id,
+                        status="blocked",
+                        error_code=error_code,
+                    )
+                    return
+            if str(row.get("template_code") or "") in {
+                TEMPLATE_AUTH_RESUME,
+                TEMPLATE_NEXT_AUTH,
+            }:
                 status = repository.get_session_status(
                     str(row.get("invite_id") or "")
                 )
@@ -1193,9 +1865,10 @@ class ClaimRemoteService:
                         next_status="cancelled",
                     )
                     return
-            payload = repository.decrypt_payload(
-                row.get("secure_payload_ciphertext")
-            )
+            if payload is None:
+                payload = repository.decrypt_payload(
+                    row.get("secure_payload_ciphertext")
+                )
             template_code = str(row.get("template_code") or "")
             template_env = TEMPLATE_ENV_BY_CODE.get(template_code, "")
             template_id = str(os.environ.get(template_env, "") or "").strip()
@@ -1204,8 +1877,70 @@ class ClaimRemoteService:
                     "CONFIGURATION_MISSING",
                     "알림톡 템플릿 설정이 필요합니다.",
                 )
+            if is_guidance:
+                # Re-check after decryption/config validation and immediately
+                # before the provider call.  This closes the queue -> cancel or
+                # opt-out race without trusting stale client/outbox state.
+                send_state = _check_guidance_send_ready(
+                    guidance_message_id,
+                    canonical_contact_id,
+                    recipient_phone_hash,
+                )
+                if not bool(send_state.get("allowed", False)):
+                    error_code = _safe_error_code(
+                        send_state.get("code", ""),
+                        "GUIDANCE_SEND_STATE_BLOCKED",
+                    )
+                    repository.release_message(
+                        message_id,
+                        self.worker_id,
+                        next_status="cancelled",
+                        safe_error_code=error_code,
+                    )
+                    _notify_guidance_outbox_status(
+                        guidance_message_id=guidance_message_id,
+                        status="cancelled",
+                        error_code=error_code,
+                    )
+                    return
+                try:
+                    dispatch = repository.begin_guidance_dispatch(
+                        message_id,
+                        self.worker_id,
+                        canonical_contact_id=canonical_contact_id,
+                        recipient_phone_hash=recipient_phone_hash,
+                    )
+                except Exception:
+                    dispatch = None
+                if (
+                    not isinstance(dispatch, Mapping)
+                    or dispatch.get("success") is not True
+                    or str(dispatch.get("message_id") or "").strip()
+                    != guidance_message_id
+                ):
+                    error_code = "GUIDANCE_DISPATCH_NOT_STARTED"
+                    try:
+                        repository.release_message(
+                            message_id,
+                            self.worker_id,
+                            next_status="cancelled",
+                            safe_error_code=error_code,
+                        )
+                    except Exception:
+                        pass
+                    _notify_guidance_outbox_status(
+                        guidance_message_id=guidance_message_id,
+                        status="cancelled",
+                        error_code=error_code,
+                    )
+                    return
+            provider_call_started = True
             result = self.solapi_client_factory().send_alimtalk(
-                str(payload.get("to") or ""),
+                (
+                    guidance_recipient_phone
+                    if is_guidance
+                    else str(payload.get("to") or "")
+                ),
                 template_id,
                 variables=(
                     payload.get("variables")
@@ -1214,12 +1949,19 @@ class ClaimRemoteService:
                 ),
                 disable_sms=True,
             )
+            provider_message_id = str(result.message_id or result.group_id)
             repository.release_message(
                 message_id,
                 self.worker_id,
                 next_status="sent",
-                provider_message_id=str(result.message_id or result.group_id),
+                provider_message_id=provider_message_id,
             )
+            if is_guidance:
+                _notify_guidance_outbox_status(
+                    guidance_message_id=guidance_message_id,
+                    status="sent",
+                    provider_message_id=provider_message_id,
+                )
         except Exception as exc:
             code = _safe_error_code(
                 getattr(exc, "code", ""),
@@ -1229,16 +1971,33 @@ class ClaimRemoteService:
             retryable = code in {"TIMEOUT", "NETWORK_ERROR"} or (
                 http_status == 429 or http_status >= 500
             )
+            guidance_outcome_unknown = (
+                is_guidance
+                and provider_call_started
+                and (
+                    retryable
+                    or code
+                    in {
+                        "INVALID_RESPONSE",
+                        "ALIMTALK_SEND_FAILED",
+                    }
+                )
+            )
+            if guidance_outcome_unknown:
+                code = "GUIDANCE_PROVIDER_OUTCOME_UNKNOWN"
+            if is_guidance and provider_call_started:
+                retryable = False
             attempt_count = int(row.get("attempt_count") or 0)
             max_attempts = int(row.get("max_attempts") or 1)
+            next_status = (
+                "retry"
+                if retryable and attempt_count < max_attempts
+                else "failed"
+            )
             repository.release_message(
                 message_id,
                 self.worker_id,
-                next_status=(
-                    "retry"
-                    if retryable and attempt_count < max_attempts
-                    else "failed"
-                ),
+                next_status=next_status,
                 secure_payload=(
                     repository.decrypt_payload(
                         row.get("secure_payload_ciphertext")
@@ -1250,6 +2009,12 @@ class ClaimRemoteService:
                 + timedelta(seconds=min(300, 5 * max(1, attempt_count))),
                 safe_error_code=code,
             )
+            if is_guidance and next_status == "failed":
+                _notify_guidance_outbox_status(
+                    guidance_message_id=guidance_message_id,
+                    status="failed",
+                    error_code=code,
+                )
 
 
 _DEFAULT_SERVICE: ClaimRemoteService | None = None
@@ -1267,6 +2032,25 @@ def create_public_claim_service() -> ClaimRemoteService:
                 or "true"
             ).strip().lower() not in {"0", "false", "no", "off"}
             _DEFAULT_SERVICE = ClaimRemoteService(start_worker=enabled)
+            task_automation_enabled = str(
+                os.environ.get("OASIS_TASK_AUTOMATION_ENABLED", "true")
+                or "true"
+            ).strip().lower() not in {"0", "false", "no", "off"}
+            if task_automation_enabled:
+                # This consumer only creates internal CRM tasks.  It is
+                # independent from the Tilko authentication/collection worker
+                # and must remain active when that worker is disabled.
+                try:
+                    from guidance_task_automation import (  # noqa: PLC0415
+                        start_guidance_task_automation_worker,
+                    )
+
+                    start_guidance_task_automation_worker()
+                except Exception:
+                    # A DB lease allows safe recovery after restart.  Raw
+                    # connector errors are deliberately not logged because
+                    # upstream details can contain request information.
+                    pass
         return _DEFAULT_SERVICE
 
 
@@ -1284,4 +2068,23 @@ def create_staff_claim_invite(
         requested_by=requested_by,
         customer_name=customer_name,
         customer_phone=customer_phone,
+    )
+
+
+def create_prospect_self_input_invite(
+    *,
+    owner_user_id: str,
+    requested_by: str,
+    company_uid: str,
+    guidance_type: str,
+    guidance_message_id: str,
+) -> dict[str, Any]:
+    """Create, but do not send, a DB-discovery self-input invite."""
+
+    return create_public_claim_service().create_prospect_self_input_invite(
+        owner_user_id=owner_user_id,
+        requested_by=requested_by,
+        company_uid=company_uid,
+        guidance_type=guidance_type,
+        guidance_message_id=guidance_message_id,
     )

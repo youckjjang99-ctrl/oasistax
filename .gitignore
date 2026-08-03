@@ -28,6 +28,7 @@ RUN_V*_UPDATE.bat
 README_v*_적용방법.md
 CHANGELOG_v*.md
 !CHANGELOG_v9.9.0.md
+!CHANGELOG_v9.10.0.md
 
 # Keep the common v8 updater files
 !update_engine.py

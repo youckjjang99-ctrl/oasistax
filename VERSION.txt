@@ -1,1 +1,1 @@
-v9.9.0-data-safety
+v9.10.0-kakao-guidance

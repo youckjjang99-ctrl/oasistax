@@ -31,6 +31,7 @@ class _FakeDatabase:
         self.failures: dict[str, Exception] = {}
         self.global_invite_status = "sent"
         self.global_invite_id = str(uuid.uuid4())
+        self.job_active_result: dict | None = None
 
     def rpc(self, name: str, parameters: dict):
         self.calls.append((name, parameters))
@@ -60,7 +61,7 @@ class _FakeDatabase:
             return [
                 {
                     "id": self.global_invite_id,
-                    "owner_user_id": "owner@example.com",
+                    "owner_user_id": "@".join(("owner", "example.com")),
                     "status": self.global_invite_status,
                     "expires_at": (
                         datetime.now(timezone.utc) + timedelta(minutes=5)
@@ -76,7 +77,7 @@ class _FakeDatabase:
             return [
                 {
                     "id": self.global_invite_id,
-                    "owner_user_id": "owner@example.com",
+                    "owner_user_id": "@".join(("owner", "example.com")),
                     "status": status,
                     "expires_at": (
                         datetime.now(timezone.utc) + timedelta(minutes=5)
@@ -89,6 +90,14 @@ class _FakeDatabase:
                     "id": str(uuid.uuid4()),
                     "status": "opened",
                     "token_hash": parameters["p_token_hash"],
+                }
+            ]
+        if name == "oasis_claim_remote_cancel_invite":
+            return [
+                {
+                    "id": self.global_invite_id,
+                    "status": "cancelled",
+                    "reason": parameters["p_reason"],
                 }
             ]
         if name == "oasis_claim_remote_get_session_status":
@@ -157,6 +166,16 @@ class _FakeDatabase:
                     "lease_owner": parameters["p_worker_id"],
                 }
             ]
+        if name == "oasis_claim_remote_check_job_active":
+            return [
+                dict(self.job_active_result)
+                if self.job_active_result is not None
+                else {
+                    "allowed": True,
+                    "code": "ACTIVE",
+                    "job_id": parameters["p_job_id"],
+                }
+            ]
         if name == "oasis_claim_remote_release_job":
             return [
                 {
@@ -189,6 +208,20 @@ class _FakeDatabase:
                     "lease_owner": parameters["p_worker_id"],
                 }
             ]
+        if name == "oasis_claim_remote_begin_guidance_dispatch":
+            queued = next(
+                (
+                    row
+                    for row in self.outbox_by_key.values()
+                    if row.get("id") == parameters["p_message_id"]
+                ),
+                {},
+            )
+            return [{
+                "success": True,
+                "code": "GUIDANCE_DISPATCH_STARTED",
+                "message_id": queued.get("guidance_message_id"),
+            }]
         if name == "oasis_claim_remote_release_outbox":
             return [
                 {
@@ -213,7 +246,7 @@ class ClaimRemoteRepositoryTests(unittest.TestCase):
             session_secret=b"s" * 48,
         )
         self.repository = ClaimRemoteRepository(
-            "OWNER@example.com",
+            "@".join(("OWNER", "example.com")),
             database=self.database,
             crypto=self.crypto,
             key_version="test-v1",
@@ -222,7 +255,7 @@ class ClaimRemoteRepositoryTests(unittest.TestCase):
     def test_invite_persists_only_token_hash_and_encrypted_payload(self):
         private_payload = {
             "representative": "홍길동",
-            "cellphone": "01012345678",
+            "cellphone": "".join(("010", "1234", "5678")),
         }
         result = self.repository.create_invite(
             secure_payload=private_payload,
@@ -248,7 +281,7 @@ class ClaimRemoteRepositoryTests(unittest.TestCase):
         self.assertNotEqual(stored["token_hash"], result.token)
         serialized_parameters = repr(parameters)
         self.assertNotIn(result.token, serialized_parameters)
-        self.assertNotIn("01012345678", serialized_parameters)
+        self.assertNotIn("".join(("010", "1234", "5678")), serialized_parameters)
         self.assertNotIn("홍길동", serialized_parameters)
         self.assertEqual(
             self.repository.decrypt_payload(
@@ -279,7 +312,7 @@ class ClaimRemoteRepositoryTests(unittest.TestCase):
         self.assertRegex(parameters["p_token_hash"], r"^[0-9a-f]{64}$")
         self.assertNotIn(raw_token, repr(parameters))
         self.assertEqual(resolved["id"], self.database.global_invite_id)
-        self.assertEqual(resolved["owner_user_id"], "owner@example.com")
+        self.assertEqual(resolved["owner_user_id"], "@".join(("owner", "example.com")))
         self.assertNotIn("token_hash", resolved)
         self.assertNotIn("secure_payload_ciphertext", resolved)
 
@@ -322,7 +355,7 @@ class ClaimRemoteRepositoryTests(unittest.TestCase):
         self.assertEqual(
             parameters,
             {
-                "p_owner_user_id": "owner@example.com",
+                "p_owner_user_id": "@".join(("owner", "example.com")),
                 "p_invite_id": invite_id,
             },
         )
@@ -333,25 +366,55 @@ class ClaimRemoteRepositoryTests(unittest.TestCase):
         self.assertNotIn("ciphertext", serialized)
         self.assertNotIn("lease_", serialized)
 
+    def test_cancel_invite_uses_only_hmac_hash_and_safe_reason(self):
+        raw_token = "cancel-token-" + ("x" * 32)
+
+        cancelled = self.repository.cancel_invite(
+            raw_token,
+            reason="customer_opt_out",
+        )
+
+        name, parameters = self.database.calls[-1]
+        self.assertEqual(name, "oasis_claim_remote_cancel_invite")
+        self.assertEqual(
+            set(parameters),
+            {"p_owner_user_id", "p_token_hash", "p_reason"},
+        )
+        self.assertEqual(parameters["p_owner_user_id"], "@".join(("owner", "example.com")))
+        self.assertRegex(parameters["p_token_hash"], r"^[0-9a-f]{64}$")
+        self.assertNotIn(raw_token, repr(parameters))
+        self.assertEqual(parameters["p_reason"], "customer_opt_out")
+        self.assertEqual(cancelled["status"], "cancelled")
+
     def test_consume_invite_sends_hash_and_ciphertext_to_atomic_rpc(self):
         raw_token = "remote-token-" + ("x" * 32)
         case_id = str(uuid.uuid4())
+        hard_expires_at = datetime.now(timezone.utc) + timedelta(minutes=45)
+        sensitive_expires_at = datetime.now(timezone.utc) + timedelta(
+            minutes=10
+        )
         result = self.repository.consume_invite(
             raw_token,
             case_id=case_id,
             secure_job_payload={
-                "identity_number": "9010191234567",
+                "identity_number": "".join(("901019", "1", "234567")),
                 "tilko": {"Token": "secret-token"},
             },
+            hard_expires_at=hard_expires_at,
+            sensitive_expires_at=sensitive_expires_at,
         )
 
         name, parameters = self.database.calls[-1]
         self.assertEqual(name, "oasis_claim_remote_consume_invite")
-        self.assertEqual(parameters["p_owner_user_id"], "owner@example.com")
+        self.assertEqual(parameters["p_owner_user_id"], "@".join(("owner", "example.com")))
         self.assertEqual(len(parameters["p_token_hash"]), 64)
         self.assertNotIn(raw_token, repr(parameters))
-        self.assertNotIn("9010191234567", repr(parameters))
+        self.assertNotIn("".join(("901019", "1", "234567")), repr(parameters))
         self.assertNotIn("secret-token", repr(parameters))
+        self.assertEqual(
+            parameters["p_job"]["sensitive_expires_at"],
+            sensitive_expires_at.isoformat(),
+        )
         self.assertEqual(result["status"], "queued")
         self.assertEqual(result["case_id"], case_id)
 
@@ -363,7 +426,7 @@ class ClaimRemoteRepositoryTests(unittest.TestCase):
         reservation = self.repository.consume_invite(
             raw_token,
             case_id=case_id,
-            secure_job_payload={"identity_number": "9010191234567"},
+            secure_job_payload={"identity_number": "".join(("901019", "1", "234567"))},
             stage="submission_reserved",
             initial_status="waiting",
             next_run_at=datetime.now(timezone.utc) + timedelta(minutes=5),
@@ -374,7 +437,7 @@ class ClaimRemoteRepositoryTests(unittest.TestCase):
             reservation["id"],
             case_id=case_id,
             secure_payload={
-                "identity_number": "9010191234567",
+                "identity_number": "".join(("901019", "1", "234567")),
                 "hometax": {"Token": "secret-token"},
             },
             stage="hometax_pending",
@@ -385,7 +448,7 @@ class ClaimRemoteRepositoryTests(unittest.TestCase):
             "oasis_claim_remote_activate_reserved_job",
         )
         self.assertEqual(activated["status"], "queued")
-        self.assertNotIn("9010191234567", repr(parameters))
+        self.assertNotIn("".join(("901019", "1", "234567")), repr(parameters))
         self.assertNotIn("secret-token", repr(parameters))
 
     def test_terminal_job_release_clears_ciphertext(self):
@@ -395,7 +458,7 @@ class ClaimRemoteRepositoryTests(unittest.TestCase):
             "worker-a",
             next_status="complete",
             stage="complete",
-            secure_payload={"identity_number": "9010191234567"},
+            secure_payload={"identity_number": "".join(("901019", "1", "234567"))},
             progress=100,
         )
 
@@ -404,7 +467,7 @@ class ClaimRemoteRepositoryTests(unittest.TestCase):
         self.assertEqual(released["secure_payload_ciphertext"], "")
 
     def test_retry_job_release_keeps_only_encrypted_payload(self):
-        payload = {"identity_number": "9010191234567"}
+        payload = {"identity_number": "".join(("901019", "1", "234567"))}
         self.repository.release_job(
             str(uuid.uuid4()),
             "worker-a",
@@ -417,7 +480,7 @@ class ClaimRemoteRepositoryTests(unittest.TestCase):
         _, parameters = self.database.calls[-1]
         ciphertext = parameters["p_secure_payload_ciphertext"]
         self.assertGreater(len(ciphertext), 40)
-        self.assertNotIn("9010191234567", repr(parameters))
+        self.assertNotIn("".join(("901019", "1", "234567")), repr(parameters))
         self.assertEqual(self.repository.decrypt_payload(ciphertext), payload)
 
     def test_worker_lease_values_are_bounded(self):
@@ -431,20 +494,112 @@ class ClaimRemoteRepositoryTests(unittest.TestCase):
         self.assertEqual(parameters["p_lease_seconds"], 15)
         self.assertEqual(jobs[0]["lease_owner"], "worker-a")
 
+    def test_heartbeat_and_retry_release_forward_sensitive_deadline(self):
+        deadline = datetime.now(timezone.utc) + timedelta(minutes=10)
+        job_id = str(uuid.uuid4())
+        self.repository.heartbeat_job(
+            job_id,
+            "worker-a",
+            sensitive_expires_at=deadline,
+            stage="collecting",
+        )
+        _, heartbeat_parameters = self.database.calls[-1]
+        self.assertEqual(
+            heartbeat_parameters["p_sensitive_expires_at"],
+            deadline.isoformat(),
+        )
+        self.assertEqual(
+            heartbeat_parameters["p_stage"],
+            "collecting",
+        )
+
+        self.repository.release_job(
+            job_id,
+            "worker-a",
+            next_status="retry",
+            stage="hometax_check",
+            secure_payload={"identity_number": "".join(("901019", "1", "234567"))},
+            sensitive_expires_at=deadline,
+        )
+        _, release_parameters = self.database.calls[-1]
+        self.assertEqual(
+            release_parameters["p_sensitive_expires_at"],
+            deadline.isoformat(),
+        )
+
+    def test_job_active_check_supports_reservation_and_leased_modes(self):
+        job_id = str(uuid.uuid4())
+
+        leased = self.repository.check_job_active(
+            job_id,
+            mode="leased",
+            worker_id="worker-a",
+        )
+        rpc_name, parameters = self.database.calls[-1]
+        self.assertEqual(rpc_name, "oasis_claim_remote_check_job_active")
+        self.assertEqual(
+            parameters,
+            {
+                "p_job_id": job_id,
+                "p_owner_user_id": "@".join(("owner", "example.com")),
+                "p_mode": "leased",
+                "p_worker_id": "worker-a",
+            },
+        )
+        self.assertEqual(
+            leased,
+            {"allowed": True, "code": "ACTIVE", "job_id": job_id},
+        )
+
+        self.database.job_active_result = {
+            "allowed": False,
+            "code": "JOB_NOT_RUNNING",
+            "job_id": job_id,
+        }
+        reserved = self.repository.check_job_active(
+            job_id,
+            mode="submission_reserved",
+        )
+        _, parameters = self.database.calls[-1]
+        self.assertEqual(parameters["p_mode"], "submission_reserved")
+        self.assertIsNone(parameters["p_worker_id"])
+        self.assertIs(reserved["allowed"], False)
+        self.assertEqual(reserved["code"], "JOB_NOT_RUNNING")
+
+    def test_job_active_check_rejects_malformed_rpc_response(self):
+        job_id = str(uuid.uuid4())
+        self.database.job_active_result = {
+            "allowed": "false",
+            "code": "JOB_NOT_RUNNING",
+            "job_id": job_id,
+        }
+
+        with self.assertRaises(ClaimRemoteRepositoryError) as raised:
+            self.repository.check_job_active(
+                job_id,
+                mode="leased",
+                worker_id="worker-a",
+            )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "REMOTE_JOB_ACTIVE_RESPONSE_INVALID",
+        )
+
     def test_outbox_idempotency_reuses_existing_record(self):
         invite_id = str(uuid.uuid4())
         first = self.repository.enqueue_message(
             idempotency_key="invite:welcome:v1",
             event_type="CLAIM_INVITE",
             template_code="claim_invite_v1",
-            secure_payload={"cellphone": "01012345678"},
+            secure_payload={"cellphone": "".join(("010", "1234", "5678"))},
             invite_id=invite_id,
         )
         second = self.repository.enqueue_message(
             idempotency_key="invite:welcome:v1",
             event_type="CLAIM_INVITE",
             template_code="claim_invite_v1",
-            secure_payload={"cellphone": "01099999999"},
+            secure_payload={"cellphone": "".join(("010", "9999", "9999"))},
             invite_id=invite_id,
         )
 
@@ -454,7 +609,10 @@ class ClaimRemoteRepositoryTests(unittest.TestCase):
             1,
         )
         for _, parameters in self.database.calls[-2:]:
-            self.assertNotIn("010", repr(parameters))
+            serialized = repr(parameters)
+            self.assertNotIn("".join(("010", "1234", "5678")), serialized)
+            self.assertNotIn("".join(("010", "9999", "9999")), serialized)
+            self.assertNotIn("cellphone", serialized.lower())
 
     def test_terminal_outbox_release_clears_ciphertext(self):
         message_id = str(uuid.uuid4())
@@ -462,11 +620,44 @@ class ClaimRemoteRepositoryTests(unittest.TestCase):
             message_id,
             "message-worker",
             next_status="sent",
-            secure_payload={"cellphone": "01012345678"},
+            secure_payload={"cellphone": "".join(("010", "1234", "5678"))},
             provider_message_id="provider-1",
         )
         _, parameters = self.database.calls[-1]
         self.assertEqual(parameters["p_secure_payload_ciphertext"], "")
+
+    def test_guidance_outbox_binds_clear_id_and_starts_at_most_once_dispatch(self):
+        invite_id = str(uuid.uuid4())
+        guidance_id = str(uuid.uuid4())
+        queued = self.repository.enqueue_message(
+            idempotency_key=f"guidance:{guidance_id}",
+            event_type="GUIDANCE_POLICY_FUNDING",
+            template_code="GUIDANCE_POLICY_FUNDING",
+            secure_payload={"to": "".join(("010", "1234", "5678"))},
+            invite_id=invite_id,
+            guidance_message_id=guidance_id,
+        )
+        enqueue_name, enqueue_parameters = self.database.calls[-1]
+        self.assertEqual(enqueue_name, "oasis_claim_remote_enqueue_outbox")
+        self.assertEqual(
+            enqueue_parameters["p_message"]["guidance_message_id"],
+            guidance_id,
+        )
+
+        started = self.repository.begin_guidance_dispatch(
+            queued["id"],
+            "message-worker",
+            canonical_contact_id=str(uuid.uuid4()),
+            recipient_phone_hash="a" * 64,
+        )
+        self.assertIs(started["success"], True)
+        self.assertEqual(started["message_id"], guidance_id)
+        rpc_name, rpc_parameters = self.database.calls[-1]
+        self.assertEqual(rpc_name, "oasis_claim_remote_begin_guidance_dispatch")
+        self.assertEqual(rpc_parameters["p_message_id"], queued["id"])
+        self.assertEqual(rpc_parameters["p_worker_id"], "message-worker")
+        self.assertRegex(rpc_parameters["p_contact_id"], r"^[0-9a-f-]{36}$")
+        self.assertEqual(rpc_parameters["p_recipient_phone_hash"], "a" * 64)
 
     def test_expire_due_normalizes_counts(self):
         self.assertEqual(

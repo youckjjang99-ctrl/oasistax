@@ -13,6 +13,7 @@ from cloud_db import CloudDatabase, cloud_is_configured
 DEFAULT_KEY_VERSION = "v1"
 DEFAULT_INVITE_TTL_SECONDS = 24 * 60 * 60
 DEFAULT_JOB_TTL_SECONDS = 45 * 60
+DEFAULT_SENSITIVE_TTL_SECONDS = 10 * 60
 DEFAULT_OUTBOX_TTL_SECONDS = 24 * 60 * 60
 
 
@@ -390,6 +391,29 @@ class ClaimRemoteRepository:
             error_code="REMOTE_INVITE_OPEN_FAILED",
         )
 
+    def cancel_invite(
+        self,
+        token: str,
+        *,
+        reason: str = "customer_opt_out",
+    ) -> dict[str, Any]:
+        """Cancel an invite and its pending work via one atomic RPC."""
+
+        selected_reason = _bounded_text(reason, 120)
+        if not selected_reason:
+            selected_reason = "customer_opt_out"
+        return _first_row(
+            self._rpc(
+                "oasis_claim_remote_cancel_invite",
+                {
+                    "p_owner_user_id": self.owner_user_id,
+                    "p_token_hash": self.token_hash(token),
+                    "p_reason": selected_reason,
+                },
+            ),
+            error_code="REMOTE_INVITE_CANCEL_FAILED",
+        )
+
     def get_session_status(self, invite_id: str) -> dict[str, Any]:
         """Return only browser-session-safe invite and job status fields."""
 
@@ -411,6 +435,7 @@ class ClaimRemoteRepository:
         case_id: str,
         secure_job_payload: dict[str, Any],
         hard_expires_at: datetime | None = None,
+        sensitive_expires_at: datetime | None = None,
         job_id: str | None = None,
         stage: str = "hometax_request",
         max_attempts: int = 12,
@@ -422,10 +447,17 @@ class ClaimRemoteRepository:
             "작업",
         )
         selected_case_id = _required_uuid(case_id, "경정청구")
+        selected_now = _utc_now()
         selected_expiry = hard_expires_at or (
-            _utc_now() + timedelta(seconds=DEFAULT_JOB_TTL_SECONDS)
+            selected_now + timedelta(seconds=DEFAULT_JOB_TTL_SECONDS)
         )
-        if selected_expiry <= _utc_now():
+        selected_sensitive_expiry = sensitive_expires_at or (
+            selected_now + timedelta(seconds=DEFAULT_SENSITIVE_TTL_SECONDS)
+        )
+        if (
+            selected_expiry <= selected_now
+            or selected_sensitive_expiry <= selected_now
+        ):
             raise ClaimRemoteRepositoryError(
                 "백그라운드 작업 만료시각은 현재 이후여야 합니다.",
                 error_code="REMOTE_JOB_EXPIRY_INVALID",
@@ -444,6 +476,9 @@ class ClaimRemoteRepository:
                     ),
                     "payload_key_version": self.key_version,
                     "hard_expires_at": _iso(selected_expiry),
+                    "sensitive_expires_at": _iso(
+                        min(selected_sensitive_expiry, selected_expiry)
+                    ),
                     "max_attempts": max(1, min(int(max_attempts), 100)),
                     "initial_status": _bounded_text(
                         str(initial_status or "queued").lower(),
@@ -538,6 +573,8 @@ class ClaimRemoteRepository:
         worker_id: str,
         *,
         lease_seconds: int = 60,
+        sensitive_expires_at: datetime | None = None,
+        stage: str | None = None,
     ) -> dict[str, Any]:
         return _first_row(
             self._rpc(
@@ -549,10 +586,84 @@ class ClaimRemoteRepository:
                         15,
                         min(int(lease_seconds), 600),
                     ),
+                    "p_sensitive_expires_at": (
+                        _iso(sensitive_expires_at)
+                        if sensitive_expires_at is not None
+                        else None
+                    ),
+                    "p_stage": (
+                        _bounded_text(str(stage).lower(), 80)
+                        if stage is not None
+                        else None
+                    ),
                 },
             ),
             error_code="REMOTE_JOB_HEARTBEAT_FAILED",
         )
+
+    def check_job_active(
+        self,
+        job_id: str,
+        *,
+        mode: str,
+        worker_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Return a PII-free, point-in-time provider-call decision.
+
+        ``submission_reserved`` covers the synchronous first authentication
+        request before a worker lease exists. ``leased`` additionally binds
+        the decision to the current worker and its unexpired lease.
+        """
+
+        expected_job_id = _required_uuid(job_id, "작업")
+        selected_mode = _bounded_text(mode, 40).lower()
+        if selected_mode not in {"submission_reserved", "leased"}:
+            raise ClaimRemoteRepositoryError(
+                "작업 활성 상태 확인 방식을 확인할 수 없습니다.",
+                error_code="REMOTE_JOB_ACTIVE_MODE_INVALID",
+            )
+        selected_worker = (
+            _required_worker(worker_id)
+            if selected_mode == "leased"
+            else None
+        )
+        result = _first_row(
+            self._rpc(
+                "oasis_claim_remote_check_job_active",
+                {
+                    "p_job_id": expected_job_id,
+                    "p_owner_user_id": self.owner_user_id,
+                    "p_mode": selected_mode,
+                    "p_worker_id": selected_worker,
+                },
+            ),
+            error_code="REMOTE_JOB_ACTIVE_CHECK_FAILED",
+        )
+        allowed = result.get("allowed")
+        code = _bounded_text(result.get("code"), 80).upper()
+        try:
+            returned_job_id = str(
+                uuid.UUID(str(result.get("job_id") or "").strip())
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ClaimRemoteRepositoryError(
+                "작업 활성 상태 응답을 확인할 수 없습니다.",
+                error_code="REMOTE_JOB_ACTIVE_RESPONSE_INVALID",
+            ) from exc
+        if (
+            not isinstance(allowed, bool)
+            or returned_job_id != expected_job_id
+            or not re.fullmatch(r"[A-Z0-9_-]{1,80}", code)
+        ):
+            raise ClaimRemoteRepositoryError(
+                "작업 활성 상태 응답을 확인할 수 없습니다.",
+                error_code="REMOTE_JOB_ACTIVE_RESPONSE_INVALID",
+            )
+        return {
+            "allowed": allowed,
+            "code": code,
+            "job_id": returned_job_id,
+        }
 
     def release_job(
         self,
@@ -566,6 +677,7 @@ class ClaimRemoteRepository:
         next_run_at: datetime | None = None,
         safe_message: str = "",
         safe_error_code: str = "",
+        sensitive_expires_at: datetime | None = None,
     ) -> dict[str, Any]:
         terminal = str(next_status or "").strip().lower() in {
             "complete",
@@ -596,6 +708,11 @@ class ClaimRemoteRepository:
                         safe_error_code,
                         80,
                     ),
+                    "p_sensitive_expires_at": (
+                        _iso(sensitive_expires_at)
+                        if sensitive_expires_at is not None
+                        else None
+                    ),
                 },
             ),
             error_code="REMOTE_JOB_RELEASE_FAILED",
@@ -614,6 +731,7 @@ class ClaimRemoteRepository:
         expires_at: datetime | None = None,
         max_attempts: int = 8,
         message_id: str | None = None,
+        guidance_message_id: str | None = None,
     ) -> dict[str, Any]:
         if not invite_id and not case_id:
             raise ClaimRemoteRepositoryError(
@@ -645,6 +763,11 @@ class ClaimRemoteRepository:
                     "case_id": (
                         _required_uuid(case_id, "경정청구")
                         if case_id
+                        else None
+                    ),
+                    "guidance_message_id": (
+                        _required_uuid(guidance_message_id, "안내 메시지")
+                        if guidance_message_id
                         else None
                     ),
                     "event_type": _bounded_text(event_type, 80),
@@ -687,6 +810,44 @@ class ClaimRemoteRepository:
                     ),
                 },
             )
+        )
+
+    def begin_guidance_dispatch(
+        self,
+        message_id: str,
+        worker_id: str,
+        *,
+        canonical_contact_id: str,
+        recipient_phone_hash: str,
+    ) -> dict[str, Any]:
+        """Erase the live guidance destination before the provider call.
+
+        This creates an at-most-once boundary: after it succeeds, an abandoned
+        lease cannot expose a decryptable phone number to an automatic retry.
+        """
+
+        phone_hash = _bounded_text(recipient_phone_hash, 64).lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", phone_hash):
+            raise ClaimRemoteRepositoryError(
+                "발송 연락처 결속을 확인할 수 없습니다.",
+                error_code="REMOTE_GUIDANCE_BINDING_INVALID",
+            )
+        return _first_row(
+            self._rpc(
+                "oasis_claim_remote_begin_guidance_dispatch",
+                {
+                    "p_message_id": _required_uuid(message_id, "메시지"),
+                    "p_worker_id": _required_worker(worker_id),
+                    "p_contact_id": _required_uuid(
+                        canonical_contact_id,
+                        "발송 연락처",
+                    ),
+                    "p_recipient_phone_hash": _bounded_text(
+                        phone_hash, 64
+                    ),
+                },
+            ),
+            error_code="REMOTE_GUIDANCE_DISPATCH_FAILED",
         )
 
     def release_message(

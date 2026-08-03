@@ -66,8 +66,20 @@ class ClaimPublicService(Protocol):
         resident_number: str,
         consent_version: str,
         consents: Mapping[str, bool],
+        company_name: str = "",
+        business_no: str = "",
     ) -> Mapping[str, Any]:
         """Persist consent securely and enqueue the first Hometax auth step."""
+
+    def cancel_customer(
+        self,
+        *,
+        owner_ref: str,
+        invite_id: str,
+        invite_token: str,
+        reason: str = "customer_opt_out",
+    ) -> Mapping[str, Any]:
+        """Cancel the invite and any pending auth or collection work."""
 
     def get_status(
         self,
@@ -143,6 +155,10 @@ class RepositoryClaimPublicService:
             secure_payload = dict(
                 self.repository.decrypt_payload(ciphertext) or {}
             )
+        flow_type = str(
+            secure_payload.get("flow_type") or "staff_targeted"
+        ).strip().lower()
+        self_input = flow_type == "prospect_self_input"
         return {
             "invite_id": str(record.get("id", "") or ""),
             "owner_ref": str(
@@ -152,20 +168,37 @@ class RepositoryClaimPublicService:
             ),
             "status": str(record.get("status", "opened") or "opened"),
             "expires_at": record.get("expires_at"),
-            "name": str(
+            # DB발굴 self-input은 공개 발송 연락처와 대표자 인증정보가
+            # 서로 다른 보안 경계입니다. 오래된/사용자 정의 adapter가
+            # recipient 필드를 넣어도 고객 입력 화면으로 넘기지 않습니다.
+            "name": "" if self_input else str(
                 secure_payload.get("name")
                 or secure_payload.get("recipient_name")
                 or ""
             ),
-            "phone": str(
+            "phone": "" if self_input else str(
                 secure_payload.get("phone")
                 or secure_payload.get("recipient_phone")
                 or ""
+            ),
+            "flow_type": (
+                "prospect_self_input" if self_input else "staff_targeted"
             ),
         }
 
     def submit_customer(self, **payload: Any) -> Mapping[str, Any]:
         return dict(self.submitter(repository=self.repository, **payload) or {})
+
+    def cancel_customer(self, **payload: Any) -> Mapping[str, Any]:
+        invite_token = str(payload.get("invite_token") or "")
+        reason = str(payload.get("reason") or "customer_opt_out")
+        return dict(
+            self.repository.cancel_invite(
+                invite_token,
+                reason=reason,
+            )
+            or {}
+        )
 
     def get_status(
         self,
@@ -214,6 +247,10 @@ class _UnavailableClaimPublicService:
         return {}
 
     def submit_customer(self, **payload: Any) -> Mapping[str, Any]:
+        self._raise()
+        return {}
+
+    def cancel_customer(self, **payload: Any) -> Mapping[str, Any]:
         self._raise()
         return {}
 
@@ -341,6 +378,26 @@ def _validate_resident_number(value: str) -> str:
     return selected
 
 
+def _validate_optional_company_name(value: str) -> str:
+    selected = re.sub(r"\s+", " ", str(value or "")).strip()
+    if any(ord(character) < 32 for character in selected) or len(selected) > 120:
+        raise ClaimPublicGatewayError(
+            "상호명은 120자 이내로 입력해 주세요.",
+            error_code="INVALID_COMPANY_NAME",
+        )
+    return selected
+
+
+def _validate_optional_business_no(value: str) -> str:
+    selected = re.sub(r"\D+", "", str(value or ""))
+    if selected and len(selected) != 10:
+        raise ClaimPublicGatewayError(
+            "사업자등록번호는 숫자 10자리로 입력해 주세요.",
+            error_code="INVALID_BUSINESS_NUMBER",
+        )
+    return selected
+
+
 def _public_snapshot(value: Mapping[str, Any] | None) -> dict[str, Any]:
     source = dict(value or {})
     status = str(source.get("status", "opened") or "opened").lower()[:40]
@@ -348,8 +405,9 @@ def _public_snapshot(value: Mapping[str, Any] | None) -> dict[str, Any]:
     progress = _safe_int(source.get("progress", 0), minimum=0, maximum=100)
     complete = bool(
         source.get("complete")
-        or status in {"complete", "completed", "partial"}
+        or status in {"complete", "completed", "partial", "cancelled"}
     )
+    terminal = complete or status in {"failed", "expired", "cancelled"}
     submitted = bool(
         source.get("submitted")
         or status
@@ -363,8 +421,15 @@ def _public_snapshot(value: Mapping[str, Any] | None) -> dict[str, Any]:
             "completed",
             "partial",
             "failed",
+            "expired",
+            "cancelled",
         }
     )
+    flow_type = str(
+        source.get("flow_type") or "staff_targeted"
+    ).strip().lower()
+    if flow_type not in {"staff_targeted", "prospect_self_input"}:
+        flow_type = "staff_targeted"
     labels = {
         "opened": "고객정보 입력 대기",
         "submitted": "국세청 홈택스 인증 요청 준비",
@@ -387,6 +452,9 @@ def _public_snapshot(value: Mapping[str, Any] | None) -> dict[str, Any]:
         "progress": progress,
         "submitted": submitted,
         "complete": complete,
+        "terminal": terminal,
+        "flow_type": flow_type,
+        "can_cancel": not terminal,
         "label": labels.get(status, "인증 진행 상태 확인"),
         "message": message,
     }
@@ -400,6 +468,7 @@ def _pack_session(
     invite_token: str,
     csrf_token: str,
     expires_at: int,
+    flow_type: str = "staff_targeted",
 ) -> str:
     subject = _session_subject(owner_ref, invite_id)
     signed = crypto.create_session_token(
@@ -413,6 +482,12 @@ def _pack_session(
             "owner_ref": owner_ref,
             "invite_id": invite_id,
             "invite_token": invite_token,
+            "flow_type": (
+                "prospect_self_input"
+                if str(flow_type or "").strip().lower()
+                == "prospect_self_input"
+                else "staff_targeted"
+            ),
             "signed": signed,
         }
     )
@@ -455,6 +530,12 @@ def _unpack_session(
             "csrf": str(signed.get("csrf", "") or ""),
             "exp": int(signed.get("exp", 0) or 0),
             "invite_token": invite_token,
+            "flow_type": (
+                "prospect_self_input"
+                if str(envelope.get("flow_type") or "").strip().lower()
+                == "prospect_self_input"
+                else "staff_targeted"
+            ),
         }
     except (ClaimRemoteCryptoError, TypeError, ValueError) as exc:
         raise ClaimPublicGatewayError(
@@ -526,6 +607,9 @@ def _page(
     button {{ width:100%; min-height:54px; margin-top:22px; border:0;
       border-radius:13px; background:linear-gradient(135deg,#0b51b7,#1676ed);
       color:#fff; font-size:17px; font-weight:800; cursor:pointer; }}
+    button.secondary {{ background:#fff; color:#43546d;
+      border:1px solid #cfd9e6; box-shadow:none; }}
+    .optional {{ color:#7b899d; font-size:12px; font-weight:500; }}
     .error {{ margin:0 0 18px; padding:13px 14px; border-radius:12px;
       background:#fff0f1; color:#aa2434; font-size:14px; }}
     .progress {{ height:10px; overflow:hidden; margin:18px 0 9px;
@@ -550,11 +634,63 @@ def _form_body(
     csrf_token: str,
     name: str = "",
     phone: str = "",
+    company_name: str = "",
+    business_no: str = "",
+    flow_type: str = "staff_targeted",
     error: str = "",
 ) -> str:
     error_html = (
         f'<div class="error" role="alert">{html.escape(error)}</div>'
         if error
+        else ""
+    )
+    self_input = str(flow_type or "").strip().lower() == (
+        "prospect_self_input"
+    )
+    optional_company_html = (
+        f"""
+  <label for="company_name">상호명 <span class="optional">(선택)</span></label>
+  <input id="company_name" name="company_name" type="text" maxlength="120"
+    value="{html.escape(company_name, quote=True)}" autocomplete="organization">
+  <label for="business_no">사업자등록번호 <span class="optional">(선택)</span></label>
+  <input id="business_no" name="business_no" type="text" inputmode="numeric"
+    maxlength="12" value="{html.escape(business_no, quote=True)}"
+    placeholder="숫자 10자리" autocomplete="off">"""
+        if self_input
+        else ""
+    )
+    identity_html = (
+        """
+  <label for="birth_date">생년월일 6자리</label>
+  <input id="birth_date" name="birth_date" type="password"
+    inputmode="numeric" minlength="6" maxlength="6" autocomplete="off"
+    placeholder="YYMMDD" required>
+  <label for="identity_rear">주민등록번호 뒤 7자리</label>
+  <input id="identity_rear" name="identity_rear" type="password"
+    inputmode="numeric" minlength="7" maxlength="7" autocomplete="off"
+    placeholder="인증에 필요한 경우에만 사용" required>"""
+        if self_input
+        else """
+  <label for="resident_number">주민등록번호</label>
+  <input id="resident_number" name="resident_number" type="password"
+    inputmode="numeric" minlength="13" maxlength="14" autocomplete="off"
+        placeholder="숫자 13자리" required>"""
+    )
+    cancel_html = (
+        f"""
+<form method="post" action="/claim/cancel">
+  <input type="hidden" name="csrf_token" value="{html.escape(csrf_token, quote=True)}">
+  <button class="secondary" type="submit">검토신청 취소 및 안내 중단</button>
+</form>"""
+        if self_input
+        else ""
+    )
+    self_input_identity_notice = (
+        """
+  <div class="notice">안내 메시지를 받은 번호와 달라도 괜찮습니다.
+  대표자 본인 명의 휴대전화번호를 입력해 주세요. 입력한 이름·생년월일·
+  휴대전화번호가 간편인증서 가입정보와 일치하지 않으면 인증이 실패할 수 있습니다.</div>"""
+        if self_input
         else ""
     )
     return f"""
@@ -569,11 +705,10 @@ def _form_body(
   <label for="phone">휴대전화번호</label>
   <input id="phone" name="phone" type="tel" inputmode="tel" maxlength="20"
     value="{html.escape(phone, quote=True)}" autocomplete="tel"
-    placeholder="010-0000-0000" required>
-  <label for="resident_number">주민등록번호</label>
-  <input id="resident_number" name="resident_number" type="password"
-    inputmode="numeric" minlength="13" maxlength="14" autocomplete="off"
-    placeholder="숫자 13자리" required>
+    placeholder="대표자 본인 명의 휴대전화 번호" required>
+  {optional_company_html}
+  {identity_html}
+  {self_input_identity_notice}
   <div class="notice">입력한 주민등록번호와 인증 임시정보는 인증·수집 처리에만 사용하며, 작업 완료 또는 만료 시 삭제합니다.</div>
   <label class="check">
     <input name="privacy_consent" type="checkbox" value="yes" required>
@@ -584,7 +719,8 @@ def _form_body(
     <span>국세청 홈택스·근로복지공단 인증 및 자료 조회를 위한 제3자 제공·처리에 동의합니다.</span>
   </label>
   <button type="submit">동의하고 홈택스 인증 요청</button>
-</form>"""
+</form>
+{cancel_html}"""
 
 
 def _status_body(snapshot: Mapping[str, Any]) -> str:
@@ -594,15 +730,27 @@ def _status_body(snapshot: Mapping[str, Any]) -> str:
         if public["message"]
         else ""
     )
-    return f"""
-<h1>{html.escape(public["label"])}</h1>
-<p class="lead">화면을 닫아도 인증 확인과 자료 수집은 안전하게 계속됩니다.</p>
-<section class="card" aria-live="polite">
+    show_progress = bool(
+        int(public["progress"] or 0) > 0
+        or str(public["stage"] or "").startswith("collection")
+        or str(public["status"] or "")
+        in {"complete", "completed", "partial"}
+    )
+    progress_html = (
+        f"""
   <strong>자료 수집 진행률 {public["progress"]}%</strong>
   <div class="progress" role="progressbar" aria-valuemin="0"
     aria-valuemax="100" aria-valuenow="{public["progress"]}">
     <span style="width:{public["progress"]}%"></span>
-  </div>
+  </div>"""
+        if show_progress
+        else ""
+    )
+    return f"""
+<h1>{html.escape(public["label"])}</h1>
+<p class="lead">화면을 닫아도 인증 확인과 자료 수집은 안전하게 계속됩니다.</p>
+<section class="card" aria-live="polite">
+  {progress_html}
   {message_html}
 </section>"""
 
@@ -800,6 +948,7 @@ def create_app(
             invite_token=invite_token,
             csrf_token=csrf_token,
             expires_at=expiry,
+            flow_type=str(invite.get("flow_type") or "staff_targeted"),
         )
         response = RedirectResponse("/claim", status_code=303)
         response.set_cookie(
@@ -840,14 +989,23 @@ def create_app(
             return _page(
                 title="인증 진행 상태",
                 body=_status_body(public),
-                refresh_seconds=None if public["complete"] else 5,
+                refresh_seconds=None if public["terminal"] else 5,
             )
         return _page(
             title="고객정보 입력",
             body=_form_body(
                 csrf_token=session["csrf"],
-                name=str(snapshot.get("name", "") or "")[:50],
-                phone=str(snapshot.get("phone", "") or "")[:20],
+                name=(
+                    ""
+                    if session["flow_type"] == "prospect_self_input"
+                    else str(snapshot.get("name", "") or "")[:50]
+                ),
+                phone=(
+                    ""
+                    if session["flow_type"] == "prospect_self_input"
+                    else str(snapshot.get("phone", "") or "")[:20]
+                ),
+                flow_type=session["flow_type"],
             ),
         )
 
@@ -873,7 +1031,7 @@ def create_app(
                 body.decode("utf-8"),
                 keep_blank_values=True,
                 strict_parsing=False,
-                max_num_fields=12,
+                max_num_fields=18,
             )
         except (UnicodeDecodeError, ValueError) as exc:
             raise ClaimPublicGatewayError(
@@ -895,12 +1053,20 @@ def create_app(
 
         raw_name = field("name")
         raw_phone = field("phone")
+        raw_company_name = field("company_name")
+        raw_business_no = field("business_no")
         try:
             name = _validate_name(raw_name)
             phone = _validate_phone(raw_phone)
             resident_number = _validate_resident_number(
-                field("resident_number")
+                (
+                    field("birth_date") + field("identity_rear")
+                    if session["flow_type"] == "prospect_self_input"
+                    else field("resident_number")
+                )
             )
+            company_name = _validate_optional_company_name(raw_company_name)
+            business_no = _validate_optional_business_no(raw_business_no)
             privacy_consent = field("privacy_consent") == "yes"
             third_party_consent = field("third_party_consent") == "yes"
             if not privacy_consent or not third_party_consent:
@@ -915,6 +1081,9 @@ def create_app(
                     csrf_token=session["csrf"],
                     name=raw_name[:50],
                     phone=raw_phone[:20],
+                    company_name=raw_company_name[:120],
+                    business_no=raw_business_no[:12],
+                    flow_type=session["flow_type"],
                     error=str(exc),
                 ),
             )
@@ -930,6 +1099,8 @@ def create_app(
                 name=name,
                 phone=phone,
                 resident_number=resident_number,
+                company_name=company_name,
+                business_no=business_no,
                 consent_version=CONSENT_VERSION,
                 consents={
                     "privacy_and_unique_identifier": privacy_consent,
@@ -943,6 +1114,61 @@ def create_app(
                 "인증 요청을 시작하지 못했습니다. 잠시 후 다시 시도해 주세요.",
                 status_code=503,
                 error_code="SUBMIT_FAILED",
+            ) from exc
+        return RedirectResponse("/claim", status_code=303)
+
+    @application.post("/claim/cancel")
+    async def cancel_claim(request: Request) -> Any:
+        session = current_session(request)
+        content_type = str(request.headers.get("content-type", "") or "").lower()
+        if not content_type.startswith("application/x-www-form-urlencoded"):
+            raise ClaimPublicGatewayError(
+                "요청 형식이 올바르지 않습니다.",
+                status_code=415,
+                error_code="INVALID_CONTENT_TYPE",
+            )
+        body = await request.body()
+        if len(body) > 1024:
+            raise ClaimPublicGatewayError(
+                "요청 내용이 너무 큽니다.",
+                status_code=413,
+                error_code="FORM_TOO_LARGE",
+            )
+        try:
+            form = parse_qs(
+                body.decode("utf-8"),
+                keep_blank_values=True,
+                strict_parsing=False,
+                max_num_fields=3,
+            )
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ClaimPublicGatewayError(
+                "요청 내용을 확인하지 못했습니다.",
+                error_code="INVALID_FORM",
+            ) from exc
+        csrf_values = form.get("csrf_token", [])
+        csrf_value = str(csrf_values[-1] if csrf_values else "")
+        if not hmac.compare_digest(str(session["csrf"]), csrf_value):
+            raise ClaimPublicGatewayError(
+                "보안 확인값이 만료되었습니다. 안내 링크를 다시 열어 주세요.",
+                status_code=403,
+                error_code="CSRF_FAILED",
+            )
+        try:
+            await _service_call(
+                selected_service.cancel_customer,
+                owner_ref=session["owner_ref"],
+                invite_id=session["invite_id"],
+                invite_token=session["invite_token"],
+                reason="customer_opt_out",
+            )
+        except ClaimPublicGatewayError:
+            raise
+        except Exception as exc:
+            raise ClaimPublicGatewayError(
+                "검토신청 취소를 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                status_code=503,
+                error_code="CANCEL_FAILED",
             ) from exc
         return RedirectResponse("/claim", status_code=303)
 

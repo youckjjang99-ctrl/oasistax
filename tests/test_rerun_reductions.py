@@ -84,8 +84,12 @@ class RerunReductionTests(unittest.TestCase):
         expected_counts = {
             "app.py": 1,  # workbook-backed customer edit refresh
             "enterprise_center.py": 0,
-            "prospect_db_center.py": 3,  # contact refresh, editor reset, result clear
-            "claim_correction_center.py": 2,  # auth-state refresh and dialog close
+            # Three existing data refreshes plus one intentional guidance
+            # confirmation-dialog close.
+            "prospect_db_center.py": 4,
+            # Auth refresh, two soft-delete dialog exits, and the existing
+            # dialog close.  These are user actions, not polling reruns.
+            "claim_correction_center.py": 4,
         }
         for file_name, expected in expected_counts.items():
             with self.subTest(file_name=file_name):
