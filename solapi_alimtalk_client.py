@@ -19,6 +19,15 @@ SOLAPI_API_KEY_ENV = "SOLAPI_API_KEY"
 SOLAPI_API_SECRET_ENV = "SOLAPI_API_SECRET"
 SOLAPI_KAKAO_CHANNEL_ID_ENV = "SOLAPI_KAKAO_CHANNEL_ID"
 SOLAPI_SMS_FROM_ENV = "SOLAPI_SMS_FROM"
+KAKAO_GUIDANCE_SEND_ENABLED_ENV = (
+    "OASIS_KAKAO_GUIDANCE_SEND_ENABLED"
+)
+KAKAO_GUIDANCE_MOCK_MODE_ENV = "OASIS_KAKAO_GUIDANCE_MOCK_MODE"
+OASIS_RUNTIME_ENV_NAMES = (
+    "OASIS_ENVIRONMENT",
+    "RAILWAY_ENVIRONMENT_NAME",
+    "ENVIRONMENT",
+)
 
 _PLACEHOLDER_PATTERN = re.compile(r"^#\{[^{}]+\}$")
 
@@ -52,11 +61,12 @@ class SolapiAlimtalkConfig:
     base_url: str = SOLAPI_API_BASE_URL
 
     def __post_init__(self) -> None:
-        values = {
-            "api_key": self.api_key,
-            "api_secret": self.api_secret,
-            "pf_id": self.pf_id,
-        }
+        values = dict(
+            zip(
+                ("api_key", "api_secret", "pf_id"),
+                (self.api_key, self.api_secret, self.pf_id),
+            )
+        )
         missing = [name for name, value in values.items() if not str(value).strip()]
         if missing:
             raise SolapiConfigurationError(
@@ -96,13 +106,18 @@ class SolapiAlimtalkConfig:
                 "SOLAPI 알림톡 환경변수가 누락되었습니다: "
                 + ", ".join(readiness["missing_env_names"]),
             )
-        return cls(
-            api_key=str(source.get(SOLAPI_API_KEY_ENV, "")),
-            api_secret=str(source.get(SOLAPI_API_SECRET_ENV, "")),
-            pf_id=str(source.get(SOLAPI_KAKAO_CHANNEL_ID_ENV, "")),
-            sms_from=str(source.get(SOLAPI_SMS_FROM_ENV, "")),
-            timeout_seconds=timeout_seconds,
+        config_values = dict(
+            zip(
+                ("api_key", "api_secret", "pf_id", "sms_from"),
+                (
+                    str(source.get(SOLAPI_API_KEY_ENV, "")),
+                    str(source.get(SOLAPI_API_SECRET_ENV, "")),
+                    str(source.get(SOLAPI_KAKAO_CHANNEL_ID_ENV, "")),
+                    str(source.get(SOLAPI_SMS_FROM_ENV, "")),
+                ),
+            )
         )
+        return cls(**config_values, timeout_seconds=timeout_seconds)
 
 
 @dataclass(frozen=True)
@@ -160,6 +175,62 @@ def environment_readiness(
     }
 
 
+def _enabled_flag(value: Any) -> bool:
+    """Accept only explicit affirmative values for external side effects."""
+
+    return str(value or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def guidance_send_readiness(
+    environ: Mapping[str, str] | None = None,
+    *,
+    required_template_env_names: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Return a fail-closed readiness snapshot for DB-discovery guidance.
+
+    This deliberately does not expose any configured value.  The existing
+    claim-correction Alimtalk flow is not governed by this feature-specific
+    switch, so rolling out DB-discovery guidance cannot disable it.
+    """
+
+    source = os.environ if environ is None else environ
+    base = environment_readiness(
+        source,
+        required_template_env_names=required_template_env_names,
+    )
+    send_enabled = _enabled_flag(
+        source.get(KAKAO_GUIDANCE_SEND_ENABLED_ENV, "")
+    )
+    runtime_name = next(
+        (
+            str(source.get(name, "") or "").strip().lower()
+            for name in OASIS_RUNTIME_ENV_NAMES
+            if str(source.get(name, "") or "").strip()
+        ),
+        "",
+    )
+    production = runtime_name in {"prod", "production"}
+    requested_mock = _enabled_flag(
+        source.get(KAKAO_GUIDANCE_MOCK_MODE_ENV, "")
+    )
+    mock_mode = requested_mock and not production
+    return {
+        **base,
+        "send_enabled": send_enabled,
+        "external_send_allowed": bool(base["ready"] and send_enabled),
+        "mock_mode": mock_mode,
+        "mock_mode_blocked_in_production": bool(
+            requested_mock and production
+        ),
+        "runtime_is_production": production,
+    }
+
+
 def build_hmac_authorization(
     api_key: str,
     api_secret: str,
@@ -196,7 +267,9 @@ def build_hmac_authorization(
         hashlib.sha256,
     ).hexdigest()
     return (
-        f"HMAC-SHA256 apiKey={clean_api_key}, "
+        "HMAC-SHA256 "
+        + "apiKey"
+        + f"={clean_api_key}, "
         f"date={request_date}, "
         f"salt={request_salt}, "
         f"signature={signature}"

@@ -3,7 +3,9 @@ from __future__ import annotations
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+import hashlib
 from io import BytesIO
+import importlib
 from pathlib import Path
 import re
 import secrets
@@ -126,6 +128,7 @@ DISCOVERY_TYPE_LABELS = {
 }
 PROSPECT_RESULT_PAGE_SIZE_OPTIONS = (25, 50, 100)
 _PROSPECT_SAVE_FLASH_KEY = "_prospect_save_flash_v989"
+_GUIDANCE_IDEMPOTENCY_KEY_PREFIX = "_prospect_guidance_idempotency_v910"
 MEMBER_PROSPECT_TARGET_COUNT = 30
 MEMBER_REQUIRED_CONTACT_LABELS = ("휴대전화", "일반전화")
 MEMBER_OPTIONAL_CONTACT_LABELS = ("이메일", "인스타그램")
@@ -149,6 +152,626 @@ CONTACT_RESULT_OPTIONS = (
     "계약진행",
     "계약완료",
 )
+
+
+def _load_company_kakao_guidance():
+    """Load the optional guidance feature only inside the saved-DB screen."""
+
+    return importlib.import_module("company_kakao_guidance")
+
+
+def _guidance_company_payload(row: dict) -> dict:
+    """Build the smallest saved-company payload required by the service."""
+
+    selected = dict(row or {})
+    return {
+        "id": str(
+            selected.get("_prospect_id")
+            or selected.get("company_id")
+            or selected.get("id")
+            or ""
+        ),
+        "company_id": str(
+            selected.get("_prospect_id")
+            or selected.get("company_id")
+            or selected.get("id")
+            or ""
+        ),
+        "company_uid": str(
+            selected.get("_company_uid")
+            or selected.get("company_uid")
+            or ""
+        ),
+        "company_name": str(
+            selected.get("업체명")
+            or selected.get("company_name")
+            or ""
+        ),
+        "business_type": str(
+            # The visible 사업자유형 label can contain a name-based guess.
+            # Guidance is fail-closed and only receives a source-confirmed type.
+            selected.get("_verified_business_type")
+            or selected.get("business_type")
+            or ""
+        ),
+        "mobile_phone": str(
+            selected.get("휴대전화")
+            or selected.get("mobile_phone")
+            or ""
+        ),
+    }
+
+
+def _mask_guidance_mobile(value: object) -> str:
+    """Return a display-only mobile mask without retaining the raw value."""
+
+    digits = re.sub(r"\D", "", str(value or ""))
+    if digits.startswith("82"):
+        digits = "0" + digits[2:]
+    if len(digits) == 11:
+        return f"{digits[:3]}-****-{digits[-4:]}"
+    if len(digits) == 10:
+        return f"{digits[:3]}-***-{digits[-4:]}"
+    return "확인 불가"
+
+
+def _guidance_idempotency_state_key(
+    company_uid: str,
+    message_type: str,
+) -> str:
+    """Build a stable session key from the complete company UID and type."""
+
+    uid_digest = hashlib.sha256(
+        str(company_uid or "").encode("utf-8")
+    ).hexdigest()
+    type_digest = hashlib.sha256(
+        str(message_type or "").strip().lower().encode("utf-8")
+    ).hexdigest()
+    return f"{_GUIDANCE_IDEMPOTENCY_KEY_PREFIX}:{uid_digest}:{type_digest}"
+
+
+def _guidance_idempotency_key(company_uid: str, message_type: str) -> str:
+    """Keep one retry key per dialog selection until the request succeeds."""
+
+    state_key = _guidance_idempotency_state_key(company_uid, message_type)
+    value = str(st.session_state.get(state_key) or "").strip()
+    if not value:
+        value = secrets.token_urlsafe(32)
+        st.session_state[state_key] = value
+    return value
+
+
+def _clear_guidance_idempotency_key(
+    company_uid: str,
+    message_type: str,
+) -> None:
+    st.session_state.pop(
+        _guidance_idempotency_state_key(company_uid, message_type),
+        None,
+    )
+
+
+def _guidance_eligibility_for_ui(
+    company: dict,
+    assignment: dict,
+    *,
+    current_user_id: str,
+    is_admin_user: bool,
+    message_type: str,
+) -> dict:
+    """Return a server-confirmed, PII-free button decision.
+
+    A pure decision is useful for fast fail-closed checks, but it cannot know
+    about a company-level opt-out or a successful send in the last seven days.
+    The button therefore stays hidden unless the guidance module exposes the
+    composite server check.
+    """
+
+    guidance = _load_company_kakao_guidance()
+    pure = dict(
+        guidance.evaluate_guidance_eligibility(
+            company,
+            current_user_id=current_user_id,
+            is_admin_user=is_admin_user,
+            assignment=assignment,
+        )
+        or {}
+    )
+    if not bool(pure.get("eligible")):
+        return pure
+    composite = getattr(guidance, "evaluate_send_eligibility", None)
+    if not callable(composite):
+        return {
+            **pure,
+            "eligible": False,
+            "code": "FEATURE_NOT_READY",
+            "message": "카카오톡 안내 발송의 최종 수신 상태 확인 기능을 준비 중입니다.",
+        }
+    return dict(
+        composite(
+            company,
+            current_user_id=current_user_id,
+            is_admin_user=is_admin_user,
+            assignment=assignment,
+            message_type=message_type,
+        )
+        or {}
+    )
+
+
+def _guidance_result_message(result: dict) -> tuple[str, str]:
+    """Map a redacted service result to a stable UI level and message."""
+
+    selected = dict(result or {})
+    code = str(selected.get("code") or "").strip().upper()
+    if code == "DUPLICATE_WITHIN_7_DAYS":
+        return (
+            "warning",
+            "최근 7일 이내 같은 안내가 발송되었습니다. "
+            "중복 발송을 방지하기 위해 발송할 수 없습니다.",
+        )
+    if code in {
+        "GUIDANCE_NOT_READY",
+        "FEATURE_NOT_READY",
+        "SEND_DISABLED",
+    }:
+        return (
+            "warning",
+            str(selected.get("message") or "실제 카카오톡 발송이 비활성화되어 있습니다."),
+        )
+    if bool(selected.get("ok")):
+        if code in {"QUEUED_MOCK", "SENT_MOCK", "SIMULATED"} or not bool(
+            selected.get("external_send_enabled")
+        ):
+            return (
+                "info",
+                "테스트 모드로 검토신청 안내를 확인했습니다. "
+                "외부 카카오톡은 발송되지 않았습니다.",
+            )
+        return (
+            "success",
+            "카카오톡 검토신청 안내를 발송 대기열에 안전하게 등록했습니다. "
+            "실제 발송·실패 상태와 고객의 동의·인증 진행 여부는 CRM에서 "
+            "확인할 수 있습니다.",
+        )
+    return (
+        "error",
+        str(selected.get("message") or "카카오톡 안내 발송을 처리하지 못했습니다."),
+    )
+
+
+@st.dialog("개인사업자 카카오톡 검토신청 안내")
+def _show_guidance_send_dialog(
+    current_user_id: str,
+    company: dict,
+    assignment: dict,
+    *,
+    is_admin_user: bool = False,
+) -> None:
+    """Confirm one saved-company guidance request; never support bulk send."""
+
+    try:
+        guidance = _load_company_kakao_guidance()
+    except Exception:
+        st.error("카카오톡 안내 기능을 불러오지 못했습니다.")
+        return
+
+    company_name = str(company.get("company_name") or "업체명 미확인")
+    st.markdown(f"**업체명:** {company_name}")
+    st.caption(
+        "수신번호: "
+        + _mask_guidance_mobile(company.get("mobile_phone"))
+    )
+    message_types = tuple(guidance.GUIDANCE_MESSAGE_TYPES)
+    message_labels = dict(guidance.GUIDANCE_MESSAGE_LABELS)
+    previews = dict(guidance.GUIDANCE_MESSAGE_PREVIEWS)
+    selected_type = st.selectbox(
+        "안내 유형",
+        message_types,
+        format_func=lambda value: message_labels.get(value, value),
+        key="prospect_guidance_message_type_v1034",
+    )
+    st.text_area(
+        "템플릿 미리보기",
+        value=str(previews.get(selected_type) or ""),
+        height=260,
+        disabled=True,
+        key=f"prospect_guidance_preview_v1034_{selected_type}",
+    )
+    st.info(
+        "발송 후 고객이 직접 정보활용 동의 및 본인인증을 진행합니다. "
+        "메시지에서 주민번호·인증서 비밀번호·홈택스 비밀번호를 "
+        "요구하지 않습니다. 화면의 마스킹된 수신번호는 카카오톡 안내 "
+        "발송에만 사용하며, 검토신청 페이지로 전달하거나 고객 인증번호에 "
+        "미리 입력하지 않습니다."
+    )
+    try:
+        selected_eligibility = _guidance_eligibility_for_ui(
+            company,
+            assignment,
+            current_user_id=current_user_id,
+            is_admin_user=is_admin_user,
+            message_type=selected_type,
+        )
+    except Exception as exc:
+        selected_eligibility = {
+            "eligible": False,
+            "code": "GUIDANCE_SERVICE_UNAVAILABLE",
+            "message": safe_public_error(
+                exc,
+                "안내 발송 가능 여부를 확인하지 못했습니다.",
+            ),
+        }
+    if not bool(selected_eligibility.get("eligible")):
+        level, message = _guidance_result_message(selected_eligibility)
+        getattr(st, level, st.warning)(message)
+    confirm_col, cancel_col = st.columns(2)
+    confirmed = confirm_col.button(
+        "발송 확인",
+        type="primary",
+        use_container_width=True,
+        key="confirm_prospect_guidance_v1034",
+        disabled=not bool(selected_eligibility.get("eligible")),
+    )
+    cancelled = cancel_col.button(
+        "취소",
+        use_container_width=True,
+        key="cancel_prospect_guidance_v1034",
+    )
+    if cancelled:
+        st.rerun()
+    if not confirmed:
+        return
+
+    try:
+        eligibility = _guidance_eligibility_for_ui(
+            company,
+            assignment,
+            current_user_id=current_user_id,
+            is_admin_user=is_admin_user,
+            message_type=selected_type,
+        )
+        if not bool(eligibility.get("eligible")):
+            level, message = _guidance_result_message(eligibility)
+            getattr(st, level, st.warning)(message)
+            return
+        idempotency_key = _guidance_idempotency_key(
+            str(company.get("company_uid") or ""),
+            selected_type,
+        )
+        result = dict(
+            guidance.request_guidance_send(
+                current_user_id=current_user_id,
+                requested_by=current_user_id,
+                company=company,
+                assignment=assignment,
+                message_type=selected_type,
+                is_admin_user=is_admin_user,
+                idempotency_key=idempotency_key,
+                session_id=_assignment_session_id(),
+            )
+            or {}
+        )
+        if bool(result.get("ok")):
+            _clear_guidance_idempotency_key(
+                str(company.get("company_uid") or ""),
+                selected_type,
+            )
+        level, message = _guidance_result_message(result)
+        getattr(st, level, st.error)(message)
+    except guidance.CompanyKakaoGuidanceError as exc:
+        level, message = _guidance_result_message(
+            {
+                "ok": False,
+                "code": getattr(exc, "code", "GUIDANCE_ERROR"),
+                "message": str(exc),
+            }
+        )
+        getattr(st, level, st.error)(message)
+    except Exception as exc:
+        st.error(
+            safe_public_error(
+                exc,
+                "카카오톡 안내 발송 요청을 처리하지 못했습니다.",
+            )
+        )
+
+
+def _guidance_admin_update_settings(
+    guidance,
+    *,
+    current_user_id: str,
+    enabled: bool,
+    daily_limit: int,
+    reason: str,
+) -> dict:
+    """Validate an admin settings change before calling the server RPC."""
+
+    clean_reason = str(reason or "").strip()
+    if not clean_reason:
+        return {
+            "success": False,
+            "code": "REASON_REQUIRED",
+            "message": "변경 사유를 입력해 주세요.",
+        }
+    return dict(
+        guidance.update_guidance_admin_settings(
+            current_user_id=current_user_id,
+            enabled=bool(enabled),
+            daily_limit=max(0, min(int(daily_limit), 100000)),
+            reason=clean_reason,
+        )
+        or {}
+    )
+
+
+def _guidance_admin_set_company_control(
+    guidance,
+    *,
+    current_user_id: str,
+    company_uid: str,
+    status: str,
+    reason: str,
+) -> dict:
+    """Block or allow one company without exposing or accepting phone hashes."""
+
+    clean_uid = str(company_uid or "").strip()
+    clean_status = str(status or "").strip().lower()
+    clean_reason = str(reason or "").strip()
+    if not clean_uid:
+        return {
+            "success": False,
+            "code": "COMPANY_UID_REQUIRED",
+            "message": "company_uid를 입력해 주세요.",
+        }
+    if clean_status not in {"admin_blocked", "allowed"}:
+        return {
+            "success": False,
+            "code": "INVALID_STATUS",
+            "message": "차단 또는 재허용 상태를 선택해 주세요.",
+        }
+    if not clean_reason:
+        return {
+            "success": False,
+            "code": "REASON_REQUIRED",
+            "message": "변경 사유를 입력해 주세요.",
+        }
+    return dict(
+        guidance.set_guidance_contact_control(
+            current_user_id=current_user_id,
+            company_uid=clean_uid,
+            # Company-level control does not require UI access to a phone or
+            # its HMAC.  The RPC preserves any existing server-side hash.
+            recipient_phone_hash="",
+            status=clean_status,
+            reason=clean_reason,
+        )
+        or {}
+    )
+
+
+def _guidance_admin_history_frame(history: list, labels: dict) -> pd.DataFrame:
+    """Build an admin history table without phone, hash, or raw PII columns."""
+
+    safe_rows = []
+    for row in history or []:
+        selected = dict(row or {})
+        safe_rows.append(
+            {
+                "요청일": str(selected.get("created_at") or "")
+                .replace("T", " ")[:19],
+                "업체": str(
+                    selected.get("company_name_masked")
+                    or "업체 식별정보 비공개"
+                )[:120],
+                "안내유형": labels.get(
+                    str(selected.get("message_type") or ""),
+                    str(selected.get("message_type") or ""),
+                ),
+                "상태": str(selected.get("status") or "")[:40],
+                "발송일": str(selected.get("sent_at") or "")
+                .replace("T", " ")[:19],
+                "실패코드": str(selected.get("failure_code") or "")[:80],
+            }
+        )
+    return pd.DataFrame(safe_rows)
+
+
+def _render_guidance_admin_readonly(
+    current_user_id: str,
+    *,
+    is_admin_user: bool = False,
+) -> None:
+    """Show redacted controls and delivery history only to administrators."""
+
+    if not is_admin_user:
+        return
+
+    with st.expander("카카오톡 검토신청 안내 운영 현황", expanded=False):
+        try:
+            guidance = _load_company_kakao_guidance()
+            readiness = dict(guidance.guidance_environment_readiness() or {})
+        except Exception:
+            st.info("카카오톡 안내 운영 상태를 확인할 수 없습니다.")
+            return
+        status_col1, status_col2, status_col3 = st.columns(3)
+        status_col1.metric(
+            "발송 모드",
+            "테스트" if readiness.get("mock_mode") else "운영",
+        )
+        status_col2.metric(
+            "외부 발송",
+            "활성" if readiness.get("external_send_ready") else "비활성",
+        )
+        status_col3.metric(
+            "템플릿 설정",
+            "완료" if readiness.get("templates_configured") else "확인 필요",
+        )
+        missing_names = [
+            str(name)
+            for name in (readiness.get("missing_env_names") or [])
+            if str(name).strip()
+        ]
+        if missing_names:
+            st.caption("확인할 설정 항목: " + ", ".join(missing_names))
+        st.warning(
+            "DB 발송 활성화는 내부 허용 조건 중 하나입니다. 이 화면에서는 "
+            "Railway의 실발송 하드 게이트와 Solapi 운영 설정을 켜거나 우회할 "
+            "수 없습니다. Railway 실발송 설정이 비활성 상태이면 외부 발송은 "
+            "항상 차단됩니다."
+        )
+
+        st.markdown("##### 관리자 발송 정책")
+        settings_available = False
+        settings: dict = {}
+        try:
+            settings = dict(
+                guidance.get_guidance_admin_settings(
+                    current_user_id=current_user_id,
+                )
+                or {}
+            )
+            settings_available = True
+        except Exception as exc:
+            st.info(
+                safe_public_error(
+                    exc,
+                    "관리자 발송 정책을 불러오지 못했습니다.",
+                )
+            )
+        with st.form("guidance_admin_settings_v1034"):
+            db_send_enabled = st.checkbox(
+                "DB 발송 활성화",
+                value=bool(settings.get("send_enabled")),
+                help=(
+                    "Railway 실발송 하드 게이트가 별도로 활성화된 경우에만 "
+                    "외부 발송 조건 중 하나로 사용됩니다."
+                ),
+            )
+            db_daily_limit = st.number_input(
+                "일일 발송 한도",
+                min_value=0,
+                max_value=100000,
+                value=max(
+                    0,
+                    min(int(settings.get("daily_limit") or 0), 100000),
+                ),
+                step=10,
+            )
+            settings_reason = st.text_input(
+                "변경 사유",
+                max_chars=200,
+                placeholder="필수 입력",
+            )
+            save_settings = st.form_submit_button(
+                "발송 정책 저장",
+                type="primary",
+                use_container_width=True,
+                disabled=not settings_available,
+            )
+        if save_settings:
+            try:
+                result = _guidance_admin_update_settings(
+                    guidance,
+                    current_user_id=current_user_id,
+                    enabled=db_send_enabled,
+                    daily_limit=int(db_daily_limit),
+                    reason=settings_reason,
+                )
+                message = str(
+                    result.get("message")
+                    or "관리자 발송 정책을 변경하지 못했습니다."
+                )
+                if bool(result.get("success", result.get("ok", False))):
+                    st.success(message)
+                else:
+                    st.warning(message)
+            except Exception as exc:
+                st.error(
+                    safe_public_error(
+                        exc,
+                        "관리자 발송 정책을 저장하지 못했습니다.",
+                    )
+                )
+
+        st.markdown("##### 업체별 안내 차단")
+        st.caption(
+            "company_uid만 사용해 업체 전체를 차단하거나 재허용합니다. "
+            "전화번호와 전화번호 해시는 화면에 표시하거나 입력받지 않습니다."
+        )
+        with st.form("guidance_admin_company_control_v1034"):
+            control_company_uid = st.text_input(
+                "company_uid",
+                max_chars=160,
+                placeholder="예: business:사업자번호 10자리",
+            )
+            control_label = st.radio(
+                "변경 상태",
+                ("안내 차단", "안내 재허용"),
+                horizontal=True,
+            )
+            control_reason = st.text_input(
+                "차단·재허용 사유",
+                max_chars=200,
+                placeholder="필수 입력",
+            )
+            save_control = st.form_submit_button(
+                "업체 안내 상태 저장",
+                use_container_width=True,
+            )
+        if save_control:
+            try:
+                result = _guidance_admin_set_company_control(
+                    guidance,
+                    current_user_id=current_user_id,
+                    company_uid=control_company_uid,
+                    status=(
+                        "admin_blocked"
+                        if control_label == "안내 차단"
+                        else "allowed"
+                    ),
+                    reason=control_reason,
+                )
+                message = str(
+                    result.get("message")
+                    or "업체 안내 상태를 변경하지 못했습니다."
+                )
+                if bool(result.get("success", result.get("ok", False))):
+                    st.success(message)
+                else:
+                    st.warning(message)
+            except Exception as exc:
+                st.error(
+                    safe_public_error(
+                        exc,
+                        "업체 안내 상태를 저장하지 못했습니다.",
+                    )
+                )
+
+        st.markdown("##### 발송 이력")
+        try:
+            history = guidance.admin_list_guidance_history(
+                current_user_id=current_user_id,
+                limit=100,
+                offset=0,
+            )
+        except Exception as exc:
+            st.info(
+                safe_public_error(
+                    exc,
+                    "발송 이력 데이터베이스 적용 후 이곳에서 확인할 수 있습니다.",
+                )
+            )
+            return
+        if not history:
+            st.caption("아직 확인할 카카오톡 안내 발송 이력이 없습니다.")
+            return
+        labels = dict(guidance.GUIDANCE_MESSAGE_LABELS)
+        st.dataframe(
+            _guidance_admin_history_frame(history, labels),
+            use_container_width=True,
+            hide_index=True,
+        )
 
 MOBILE_PHONE_PATTERN = re.compile(
     r"(?<!\d)(?:(?:\+?82)[\s.\-]?(?:\(0\)[\s.\-]?)?|0)"
@@ -926,6 +1549,14 @@ def _saved_candidate_frame(
                 ).replace("T", " ")[:16],
                 "_prospect_id": prospect_id,
                 "_company_uid": str(row.get("company_uid") or ""),
+                "_assignment_id": str(
+                    row.get("_assignment_id")
+                    or row.get("assignment_id")
+                    or ""
+                ),
+                "_verified_business_type": str(
+                    source_data.get("business_type") or ""
+                ),
                 "_assignment_status": str(row.get("status") or ""),
                 "_assignment_expires_at": str(
                     row.get("assignment_expires_at") or ""
@@ -2061,6 +2692,7 @@ def _render_prospect_db_center_legacy(owner_user_id: str = "") -> None:
 def _render_clean_saved_prospects(
     owner_user_id: str,
     can_view_mobile: bool = False,
+    is_admin_user: bool = False,
 ) -> None:
     st.markdown("### 저장된 영업후보")
     st.caption(
@@ -2068,6 +2700,10 @@ def _render_clean_saved_prospects(
         "보이지 않지만, 전사 중복 제외 기준에는 계속 반영됩니다. "
         "전사 배정 기능 적용 후에는 공개 연락처가 아직 없는 업체도 "
         "배정 해제·연락결과 관리를 위해 함께 표시합니다."
+    )
+    _render_guidance_admin_readonly(
+        owner_user_id,
+        is_admin_user=is_admin_user,
     )
     assignment_mode = False
     try:
@@ -2084,6 +2720,9 @@ def _render_clean_saved_prospects(
             rows = []
             for assignment in assignment_result.get("assignments") or []:
                 row = dict(assignment)
+                row["_assignment_id"] = (
+                    row.get("assignment_id") or row.get("id") or ""
+                )
                 row["id"] = row.get("company_id") or row.get("id")
                 row["memo"] = row.get("own_memo") or row.get("memo") or ""
                 rows.append(row)
@@ -2148,6 +2787,8 @@ def _render_clean_saved_prospects(
         columns=[
             "_prospect_id",
             "_company_uid",
+            "_assignment_id",
+            "_verified_business_type",
             "_assignment_status",
             "_assignment_expires_at",
             "_고용정렬",
@@ -2197,6 +2838,8 @@ def _render_clean_saved_prospects(
         "메모",
         "_prospect_id",
         "_company_uid",
+        "_assignment_id",
+        "_verified_business_type",
         "_assignment_status",
         "_assignment_expires_at",
     ]
@@ -2223,6 +2866,8 @@ def _render_clean_saved_prospects(
             ),
             "_prospect_id": None,
             "_company_uid": None,
+            "_assignment_id": None,
+            "_verified_business_type": None,
             "_assignment_status": None,
             "_assignment_expires_at": None,
         },
@@ -2288,6 +2933,103 @@ def _render_clean_saved_prospects(
             key="sales_contact_company_v989",
         )
         selected_assignment = assignment_rows.get(selected_label, {})
+        selected_company_uid = str(
+            selected_assignment.get("_company_uid") or ""
+        )
+        source_assignment = next(
+            (
+                dict(row)
+                for row in rows
+                if str(row.get("company_uid") or "")
+                == selected_company_uid
+            ),
+            {},
+        )
+        guidance_assignment = {
+            **source_assignment,
+            "id": str(
+                selected_assignment.get("_assignment_id")
+                or source_assignment.get("assignment_id")
+                or source_assignment.get("_assignment_id")
+                or ""
+            ),
+            "assignment_id": str(
+                selected_assignment.get("_assignment_id")
+                or source_assignment.get("assignment_id")
+                or source_assignment.get("_assignment_id")
+                or ""
+            ),
+            # The source list is returned by the current-user-only RPC.  The
+            # server rechecks this owner before reserving a message.
+            "assigned_user_id": owner_user_id,
+            "company_uid": selected_company_uid,
+            "status": str(
+                selected_assignment.get("_assignment_status")
+                or source_assignment.get("status")
+                or ""
+            ),
+        }
+        guidance_company = _guidance_company_payload(selected_assignment)
+        st.markdown("#### 개인사업자 카카오톡 검토신청 안내")
+        st.caption(
+            "현재 선택한 내 영업DB 업체 1곳에만 안내할 수 있습니다. "
+            "법인·사업자유형 미확인·유선전화 전용·수신거부 업체는 "
+            "발송 대상에서 제외됩니다."
+        )
+        try:
+            guidance_module = _load_company_kakao_guidance()
+            eligibility_by_type = {
+                message_type: _guidance_eligibility_for_ui(
+                    guidance_company,
+                    guidance_assignment,
+                    current_user_id=owner_user_id,
+                    is_admin_user=is_admin_user,
+                    message_type=message_type,
+                )
+                for message_type in guidance_module.GUIDANCE_MESSAGE_TYPES
+            }
+            eligible_types = [
+                message_type
+                for message_type, eligibility in eligibility_by_type.items()
+                if bool(eligibility.get("eligible"))
+            ]
+            if eligible_types:
+                if st.button(
+                    "카카오톡 안내",
+                    type="primary",
+                    use_container_width=True,
+                    key=(
+                        "open_prospect_guidance_v1034_"
+                        + re.sub(
+                            r"[^A-Za-z0-9]",
+                            "",
+                            selected_company_uid,
+                        )[-20:]
+                    ),
+                ):
+                    _show_guidance_send_dialog(
+                        owner_user_id,
+                        guidance_company,
+                        guidance_assignment,
+                        is_admin_user=is_admin_user,
+                    )
+            else:
+                reason = next(
+                    (
+                        str(eligibility.get("message") or "").strip()
+                        for eligibility in eligibility_by_type.values()
+                        if str(eligibility.get("message") or "").strip()
+                    ),
+                    "현재 카카오톡 안내 발송 조건을 충족하지 않습니다.",
+                )
+                st.info(reason)
+        except Exception as exc:
+            st.info(
+                safe_public_error(
+                    exc,
+                    "카카오톡 안내 발송 가능 여부를 확인하지 못했습니다.",
+                )
+            )
         with st.form("sales_contact_record_form_v989"):
             contact_col1, contact_col2 = st.columns(2)
             contact_method = contact_col1.selectbox(
@@ -2457,6 +3199,7 @@ def render_prospect_db_center(
         _render_clean_saved_prospects(
             owner_user_id,
             can_view_mobile=can_view_mobile,
+            is_admin_user=is_admin_user,
         )
         return
     if workflow_step == "① 조건 설정":

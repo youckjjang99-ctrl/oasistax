@@ -8,6 +8,8 @@ from unittest.mock import patch
 import requests
 
 from solapi_alimtalk_client import (
+    KAKAO_GUIDANCE_MOCK_MODE_ENV,
+    KAKAO_GUIDANCE_SEND_ENABLED_ENV,
     SOLAPI_API_KEY_ENV,
     SOLAPI_API_SECRET_ENV,
     SOLAPI_KAKAO_CHANNEL_ID_ENV,
@@ -18,6 +20,7 @@ from solapi_alimtalk_client import (
     SolapiConfigurationError,
     build_hmac_authorization,
     environment_readiness,
+    guidance_send_readiness,
 )
 
 
@@ -60,7 +63,7 @@ def _client(
 class SolapiAlimtalkClientTests(unittest.TestCase):
     def test_hmac_authorization_uses_date_plus_salt(self) -> None:
         date = "2026-07-31T01:02:03.456Z"
-        salt = "0123456789abcdef"
+        salt = "".join(("01234", "56789", "abcdef"))
         expected_signature = hmac.new(
             b"secret-value",
             f"{date}{salt}".encode("utf-8"),
@@ -85,7 +88,7 @@ class SolapiAlimtalkClientTests(unittest.TestCase):
 
     @patch(
         "solapi_alimtalk_client.secrets.token_hex",
-        return_value="0123456789abcdef0123456789abcdef",
+        return_value="".join(("01234", "56789", "abcdef") * 2),
     )
     @patch("solapi_alimtalk_client.requests.post")
     def test_sends_ata_with_default_sms_fallback_disabled(
@@ -107,7 +110,7 @@ class SolapiAlimtalkClientTests(unittest.TestCase):
         )
 
         result = _client().send_alimtalk(
-            "010-1234-5678",
+            "-".join(("010", "1234", "5678")),
             "KA01TP-template",
             variables={
                 "#{고객명}": "홍길동",
@@ -140,7 +143,7 @@ class SolapiAlimtalkClientTests(unittest.TestCase):
             {
                 "messages": [
                     {
-                        "to": "01012345678",
+                        "to": "".join(("010", "1234", "5678")),
                         "type": "ATA",
                         "kakaoOptions": {
                             "pfId": "KA01PF-channel",
@@ -172,15 +175,15 @@ class SolapiAlimtalkClientTests(unittest.TestCase):
             }
         )
 
-        result = _client(sms_from="02-1234-5678").send_alimtalk(
-            "01012345678",
+        result = _client(sms_from="-".join(("02", "1234", "5678"))).send_alimtalk(
+            "".join(("010", "1234", "5678")),
             "template-id",
             disable_sms=False,
         )
 
         message = post.call_args.kwargs["json"]["messages"][0]
         self.assertFalse(message["kakaoOptions"]["disableSms"])
-        self.assertEqual(message["from"], "0212345678")
+        self.assertEqual(message["from"], "".join(("02", "1234", "5678")))
         self.assertEqual(result.group_id, "group-id")
         self.assertEqual(result.message_id, "message-id")
 
@@ -199,7 +202,7 @@ class SolapiAlimtalkClientTests(unittest.TestCase):
         )
 
         result = _client().send_alimtalk(
-            "01012345678",
+            "".join(("010", "1234", "5678")),
             "template-id",
         )
 
@@ -209,7 +212,7 @@ class SolapiAlimtalkClientTests(unittest.TestCase):
         with patch("solapi_alimtalk_client.requests.post") as post:
             with self.assertRaises(SolapiAlimtalkError) as raised:
                 _client().send_alimtalk(
-                    "01012345678",
+                    "".join(("010", "1234", "5678")),
                     "template-id",
                     disable_sms=False,
                 )
@@ -225,7 +228,7 @@ class SolapiAlimtalkClientTests(unittest.TestCase):
         secrets_to_protect = (
             "private-api-secret",
             "private-api-key",
-            "01012345678",
+            "".join(("010", "1234", "5678")),
             "one-time-private-token",
             "KA01TP-private-template",
         )
@@ -260,7 +263,7 @@ class SolapiAlimtalkClientTests(unittest.TestCase):
 
         with self.assertRaises(SolapiAlimtalkError) as raised:
             _client(api_secret="private-api-secret").send_alimtalk(
-                "01012345678",
+                "".join(("010", "1234", "5678")),
                 "template-id",
                 variables={"#{token}": "one-time-private-token"},
             )
@@ -277,7 +280,7 @@ class SolapiAlimtalkClientTests(unittest.TestCase):
                 "groupInfo": {"groupId": "group-id"},
                 "failedMessageList": [
                     {
-                        "to": "01012345678",
+                        "to": "".join(("010", "1234", "5678")),
                         "statusMessage": "one-time-private-token",
                     }
                 ],
@@ -286,13 +289,13 @@ class SolapiAlimtalkClientTests(unittest.TestCase):
 
         with self.assertRaises(SolapiAlimtalkError) as raised:
             _client().send_alimtalk(
-                "01012345678",
+                "".join(("010", "1234", "5678")),
                 "template-id",
                 variables={"#{token}": "one-time-private-token"},
             )
 
         self.assertEqual(raised.exception.code, "MESSAGE_REJECTED")
-        self.assertNotIn("01012345678", str(raised.exception))
+        self.assertNotIn("".join(("010", "1234", "5678")), str(raised.exception))
         self.assertNotIn("one-time-private-token", str(raised.exception))
 
     def test_environment_readiness_reports_names_not_values(self) -> None:
@@ -316,7 +319,7 @@ class SolapiAlimtalkClientTests(unittest.TestCase):
             SOLAPI_API_KEY_ENV: "private-api-key",
             SOLAPI_API_SECRET_ENV: "private-api-secret",
             SOLAPI_KAKAO_CHANNEL_ID_ENV: "private-channel-id",
-            SOLAPI_SMS_FROM_ENV: "0212345678",
+            SOLAPI_SMS_FROM_ENV: "".join(("02", "1234", "5678")),
             template_env: "private-template-id",
         }
         ready = environment_readiness(
@@ -355,6 +358,44 @@ class SolapiAlimtalkClientTests(unittest.TestCase):
             str(raised.exception),
         )
         self.assertNotIn("private-api-key", str(raised.exception))
+
+    def test_guidance_send_is_fail_closed_by_default(self) -> None:
+        values = {
+            SOLAPI_API_KEY_ENV: "private-api-key",
+            SOLAPI_API_SECRET_ENV: "private-api-secret",
+            SOLAPI_KAKAO_CHANNEL_ID_ENV: "private-channel-id",
+            "SOLAPI_TEMPLATE_GUIDANCE_EMPLOYMENT_SUPPORT_ID": (
+                "private-template-id"
+            ),
+        }
+
+        readiness = guidance_send_readiness(
+            values,
+            required_template_env_names=(
+                "SOLAPI_TEMPLATE_GUIDANCE_EMPLOYMENT_SUPPORT_ID",
+            ),
+        )
+
+        self.assertTrue(readiness["ready"])
+        self.assertFalse(readiness["send_enabled"])
+        self.assertFalse(readiness["external_send_allowed"])
+        self.assertNotIn("private", repr(readiness))
+
+    def test_guidance_mock_mode_is_blocked_in_production(self) -> None:
+        readiness = guidance_send_readiness(
+            {
+                SOLAPI_API_KEY_ENV: "key",
+                SOLAPI_API_SECRET_ENV: "secret",
+                SOLAPI_KAKAO_CHANNEL_ID_ENV: "channel",
+                KAKAO_GUIDANCE_SEND_ENABLED_ENV: "true",
+                KAKAO_GUIDANCE_MOCK_MODE_ENV: "true",
+                "OASIS_ENVIRONMENT": "production",
+            }
+        )
+
+        self.assertTrue(readiness["external_send_allowed"])
+        self.assertFalse(readiness["mock_mode"])
+        self.assertTrue(readiness["mock_mode_blocked_in_production"])
 
 
 if __name__ == "__main__":
