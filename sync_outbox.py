@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,6 +16,14 @@ from runtime_error_log import sanitize_public_text
 OUTBOX_FEATURE_FLAG = "OASIS_DURABLE_OUTBOX_V1"
 DEFAULT_MAX_ATTEMPTS = 8
 MAX_ERROR_LENGTH = 500
+_RPC_FUNCTION_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_ALLOWED_OUTBOX_RPC_FUNCTIONS = {"oasis_upsert_customer_profile"}
+_CUSTOMER_PROFILE_SUCCESS_STATUSES = {
+    "linked",
+    "linked_review_required",
+    "unlinked",
+    "ambiguous_review",
+}
 
 
 class LocalOutboxCorruptionError(RuntimeError):
@@ -64,8 +73,15 @@ def build_idempotency_key(
 
 def _entity_fingerprint(payload: dict[str, Any]) -> str:
     rows = payload.get("rows") if isinstance(payload, dict) else None
-    first_row = rows[0] if isinstance(rows, list) and rows else {}
-    material = _canonical_json(first_row if isinstance(first_row, dict) else {})
+    first_row = rows[0] if isinstance(rows, list) and rows else None
+    fingerprint_value = (
+        first_row
+        if isinstance(first_row, dict)
+        else payload.get("parameters", {})
+    )
+    material = _canonical_json(
+        fingerprint_value if isinstance(fingerprint_value, dict) else {}
+    )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
 
 
@@ -121,6 +137,71 @@ def make_outbox_job(
         "owner_user_id": str(owner_user_id),
         "job_type": str(job_type),
         "entity_type": str(table),
+        "entity_id": _entity_fingerprint(payload),
+        "payload": payload,
+        "idempotency_key": build_idempotency_key(
+            str(owner_user_id), str(job_type), payload
+        ),
+        "status": "pending",
+        "attempt_count": 0,
+        "max_attempts": max(1, int(max_attempts)),
+        "next_retry_at": now,
+        "last_error_code": "initial_sync_failed" if error else "",
+        "last_error_summary": sanitize_error_summary(error),
+        "created_at": now,
+        "updated_at": now,
+        "completed_at": None,
+    }
+
+
+def _validate_rpc_function_name(value: Any) -> str:
+    function_name = str(value or "").strip()
+    if not _RPC_FUNCTION_NAME.fullmatch(function_name):
+        raise ValueError("올바르지 않은 RPC 함수명입니다.")
+    if function_name not in _ALLOWED_OUTBOX_RPC_FUNCTIONS:
+        raise ValueError("허용되지 않은 동기화 RPC 함수입니다.")
+    return function_name
+
+
+def _normalized_owner(value: Any) -> str:
+    # PostgreSQL text equality is case-sensitive; do not broaden owner scope.
+    return str(value or "").strip()
+
+
+def _validate_rpc_owner(
+    parameters: dict[str, Any],
+    expected_owner_user_id: str,
+) -> None:
+    expected_owner = _normalized_owner(expected_owner_user_id)
+    payload_owner = _normalized_owner(parameters.get("p_owner_user_id"))
+    if not expected_owner or payload_owner != expected_owner:
+        raise ValueError("동기화 RPC 소유자 범위가 일치하지 않습니다.")
+
+
+def make_rpc_outbox_job(
+    owner_user_id: str,
+    job_type: str,
+    function_name: str,
+    parameters: dict[str, Any],
+    *,
+    error: Any = "",
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+) -> dict[str, Any]:
+    """Build a durable RPC job without projecting parameters into table rows."""
+    safe_function_name = _validate_rpc_function_name(function_name)
+    safe_parameters = dict(parameters or {})
+    _validate_rpc_owner(safe_parameters, owner_user_id)
+    payload = {
+        "operation": "rpc",
+        "function_name": safe_function_name,
+        "parameters": safe_parameters,
+    }
+    now = _iso()
+    return {
+        "id": str(uuid.uuid4()),
+        "owner_user_id": str(owner_user_id),
+        "job_type": str(job_type),
+        "entity_type": f"rpc:{payload['function_name']}",
         "entity_id": _entity_fingerprint(payload),
         "payload": payload,
         "idempotency_key": build_idempotency_key(
@@ -195,6 +276,89 @@ def enqueue_outbox(
     return "local", job
 
 
+def enqueue_rpc_outbox(
+    path: Path,
+    owner_user_id: str,
+    job_type: str,
+    function_name: str,
+    parameters: dict[str, Any],
+    *,
+    error: Any = "",
+    db: CloudDatabase | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Queue an RPC call while retaining its full validated parameter set."""
+    job = make_rpc_outbox_job(
+        owner_user_id,
+        job_type,
+        function_name,
+        parameters,
+        error=error,
+    )
+    if durable_outbox_enabled() and (db is not None or cloud_is_configured()):
+        try:
+            enqueue_cloud_outbox(db or CloudDatabase(), job)
+            return "cloud", job
+        except Exception as exc:
+            job["last_error_code"] = "cloud_outbox_unavailable"
+            job["last_error_summary"] = sanitize_error_summary(exc)
+    enqueue_local_outbox(path, job)
+    return "local", job
+
+
+def _dispatch_outbox_payload(
+    payload: dict[str, Any],
+    upsert: Callable[[str, list[dict[str, Any]], str], Any],
+    rpc: Callable[[str, dict[str, Any]], Any] | None = None,
+    *,
+    expected_owner_user_id: str = "",
+) -> Any:
+    operation = str(payload.get("operation") or "upsert").strip().lower()
+    if operation == "upsert":
+        rows = payload.get("rows")
+        if not isinstance(rows, list):
+            raise ValueError("동기화 upsert 행 형식이 올바르지 않습니다.")
+        return upsert(
+            str(payload.get("table") or ""),
+            list(rows),
+            str(payload.get("on_conflict") or ""),
+        )
+    if operation == "rpc":
+        if rpc is None:
+            raise RuntimeError("RPC 동기화 실행기가 준비되지 않았습니다.")
+        parameters = payload.get("parameters")
+        if not isinstance(parameters, dict):
+            raise ValueError("동기화 RPC 매개변수 형식이 올바르지 않습니다.")
+        _validate_rpc_owner(parameters, expected_owner_user_id)
+        function_name = _validate_rpc_function_name(
+            payload.get("function_name")
+        )
+        result = rpc(
+            function_name,
+            dict(parameters),
+        )
+        if function_name == "oasis_upsert_customer_profile":
+            if isinstance(result, list):
+                response = next(
+                    (item for item in result if isinstance(item, dict)),
+                    {},
+                )
+            elif isinstance(result, dict):
+                response = result
+            else:
+                response = {}
+            customer_id = str(response.get("customer_id") or "").strip()
+            link_status = str(
+                response.get("link_status") or ""
+            ).strip().lower()
+            if (
+                not customer_id
+                or link_status not in _CUSTOMER_PROFILE_SUCCESS_STATUSES
+            ):
+                raise RuntimeError("customer_profile_sync_rejected")
+        return result
+    raise ValueError("지원하지 않는 동기화 작업 형식입니다.")
+
+
 def _is_due(item: dict[str, Any], now: datetime) -> bool:
     value = str(item.get("next_retry_at") or "")
     if not value:
@@ -211,6 +375,8 @@ def _is_due(item: dict[str, Any], now: datetime) -> bool:
 def retry_local_outbox(
     path: Path,
     upsert: Callable[[str, list[dict[str, Any]], str], Any],
+    *,
+    rpc: Callable[[str, dict[str, Any]], Any] | None = None,
 ) -> dict[str, int]:
     queue = load_local_outbox(path)
     now = _utc_now()
@@ -232,10 +398,11 @@ def retry_local_outbox(
             "on_conflict": item.get("on_conflict"),
         }
         try:
-            upsert(
-                str(payload["table"]),
-                list(payload["rows"]),
-                str(payload["on_conflict"]),
+            _dispatch_outbox_payload(
+                payload,
+                upsert,
+                rpc,
+                expected_owner_user_id=str(item.get("owner_user_id") or ""),
             )
             item["status"] = "complete"
             item["completed_at"] = _iso()
@@ -311,10 +478,11 @@ def retry_cloud_outbox(
             failed += 1
             continue
         try:
-            db.upsert(
-                str(payload["table"]),
-                list(payload["rows"]),
-                str(payload["on_conflict"]),
+            _dispatch_outbox_payload(
+                payload,
+                db.upsert,
+                db.rpc,
+                expected_owner_user_id=claimed_owner,
             )
             completed = db.rpc(
                 "oasis_complete_sync_outbox",

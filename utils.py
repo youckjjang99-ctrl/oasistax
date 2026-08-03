@@ -719,7 +719,13 @@ def count_user_cumulative_rows(user_id):
     except Exception:
         return 0
 
-def append_user_customer_db(uploaded_excel_path, user_id, manager_name=""):
+def append_user_customer_db(
+    uploaded_excel_path,
+    user_id,
+    manager_name="",
+    *,
+    return_saved_rows=False,
+):
     """
     v3.5.2:
     고객DB 업로드 시 사업자등록번호가 이미 누적DB에 존재하는 행은 추가하지 않는다.
@@ -732,7 +738,10 @@ def append_user_customer_db(uploaded_excel_path, user_id, manager_name=""):
         df_new = pd.read_excel(uploaded_excel_path, sheet_name=CUSTOMER_DB_SHEET_NAME)
         df_new = _normalize_customer_db_frame(df_new, columns)
         if df_new.empty:
-            return cumulative_path, 0
+            result = (cumulative_path, 0)
+            if return_saved_rows:
+                return (*result, pd.DataFrame(columns=columns))
+            return result
 
         df_old = _read_cumulative_customer_db(cumulative_path, columns)
 
@@ -757,7 +766,10 @@ def append_user_customer_db(uploaded_excel_path, user_id, manager_name=""):
                 df_new = df_new.loc[~already_exists].copy()
 
         if df_new.empty:
-            return cumulative_path, 0
+            result = (cumulative_path, 0)
+            if return_saved_rows:
+                return (*result, pd.DataFrame(columns=columns))
+            return result
 
         df_all = (
             pd.concat([df_old, df_new], ignore_index=True, sort=False)
@@ -765,10 +777,16 @@ def append_user_customer_db(uploaded_excel_path, user_id, manager_name=""):
             else df_new
         )
         _write_cumulative_customer_db(cumulative_path, df_all, columns)
-        return cumulative_path, len(df_new)
+        result = (cumulative_path, len(df_new))
+        if return_saved_rows:
+            return (*result, df_new.copy())
+        return result
 
     except Exception:
-        return cumulative_path, 0
+        result = (cumulative_path, 0)
+        if return_saved_rows:
+            return (*result, pd.DataFrame(columns=get_customer_db_columns()))
+        return result
 
 
 # ================================

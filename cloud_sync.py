@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
 from cloud_db import (
     CloudDatabase,
     TABLE_CRM,
-    TABLE_CUSTOMERS,
     TABLE_FINANCIALS,
     TABLE_MATCHING_PREFERENCES,
     TABLE_REGISTRY,
@@ -14,11 +14,13 @@ from cloud_db import (
     cloud_is_configured,
     normalize_business_no,
 )
+from performance_cache import invalidate_cache
 from utils import get_user_dirs
 from sync_outbox import (
     cloud_outbox_status,
     durable_outbox_enabled,
     enqueue_outbox,
+    enqueue_rpc_outbox,
     load_local_outbox,
     local_outbox_status,
     retry_cloud_outbox,
@@ -58,16 +60,27 @@ def _enqueue(
     )
 
 
-def retry_cloud_sync_queue(user_id: str) -> dict[str, int]:
+def retry_cloud_sync_queue(
+    user_id: str,
+    *,
+    db: CloudDatabase | None = None,
+) -> dict[str, int]:
     local_status = local_outbox_status(_queue_path(user_id))
-    if not cloud_is_configured():
+    if db is None and not cloud_is_configured():
         return {
             "success": 0,
             "failed": int(local_status.get("queued", 0)),
             "dead_letter": int(local_status.get("dead_letter", 0)),
         }
 
-    db = CloudDatabase()
+    try:
+        database = db or CloudDatabase()
+    except Exception:
+        return {
+            "success": 0,
+            "failed": max(1, int(local_status.get("queued", 0))),
+            "dead_letter": int(local_status.get("dead_letter", 0)),
+        }
     success = 0
     failed = 0
     dead_letter = 0
@@ -75,7 +88,7 @@ def retry_cloud_sync_queue(user_id: str) -> dict[str, int]:
     if durable_outbox_enabled():
         try:
             durable_result = retry_cloud_outbox(
-                db,
+                database,
                 owner_user_id=user_id,
                 worker_id=f"app-{user_id}",
             )
@@ -85,10 +98,17 @@ def retry_cloud_sync_queue(user_id: str) -> dict[str, int]:
             # Migration/RPC availability must never destroy the local fallback.
             failed += 1
 
-    local_result = retry_local_outbox(_queue_path(user_id), db.upsert)
-    success += int(local_result.get("success", 0))
-    failed += int(local_result.get("failed", 0))
-    dead_letter += int(local_result.get("dead_letter", 0))
+    try:
+        local_result = retry_local_outbox(
+            _queue_path(user_id),
+            database.upsert,
+            rpc=database.rpc,
+        )
+        success += int(local_result.get("success", 0))
+        failed += int(local_result.get("failed", 0))
+        dead_letter += int(local_result.get("dead_letter", 0))
+    except Exception:
+        failed += max(1, int(local_status.get("queued", 0)))
     return {"success": success, "failed": failed, "dead_letter": dead_letter}
 
 
@@ -120,36 +140,357 @@ def _safe_upsert(
         return False, "클라우드 저장에 실패하여 안전한 재시도 대기열에 보관했습니다."
 
 
+def _exact_business_no(value: Any) -> str:
+    raw = "" if value is None else str(value)
+    digits = re.sub(r"[^0-9]", "", raw)
+    if len(digits) != 10:
+        return ""
+    return normalize_business_no(digits)
+
+
+def _rpc_function_unavailable(exc: Exception, function_name: str) -> bool:
+    message = str(exc or "").lower()
+    function_name = str(function_name or "").lower()
+    return (
+        "pgrst202" in message
+        or "could not find the function" in message
+        or (
+            function_name in message
+            and (
+                "does not exist" in message
+                or "undefined function" in message
+                or "42883" in message
+            )
+        )
+    )
+
+
+def _first_nonblank_text(*values: Any) -> str:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text.lower() not in {"", "nan", "none", "nat", "<na>"}:
+            return text
+    return ""
+
+
+def _customer_sync_data(
+    customer_data: dict[str, Any],
+    *,
+    customer_id: str = "",
+    previous_business_no: str = "",
+) -> tuple[dict[str, Any], str, str]:
+    data = dict(customer_data) if isinstance(customer_data, dict) else {}
+    resolved_customer_id = _first_nonblank_text(
+        customer_id,
+        data.get("_customer_id"),
+    )
+    resolved_previous_business_no = _first_nonblank_text(
+        previous_business_no,
+        data.get("_previous_business_no"),
+    )
+    for field in (
+        "_customer_id",
+        "_company_uid",
+        "_lifecycle_status",
+        "_cloud_updated_at",
+        "_previous_business_no",
+    ):
+        data.pop(field, None)
+    return data, resolved_customer_id, resolved_previous_business_no
+
+
+def _customer_profile_parameters(
+    user_id: str,
+    data: dict[str, Any],
+    *,
+    business_no: str,
+    source: str,
+    manager_name: str,
+    customer_id: str,
+    previous_business_no: str,
+) -> dict[str, Any]:
+    previous_value = (
+        normalize_business_no(previous_business_no)
+        if previous_business_no
+        else None
+    )
+    return {
+        "p_owner_user_id": user_id,
+        "p_business_no": business_no,
+        "p_company_name": data.get("업체명", data.get("기업명")),
+        "p_representative_name": data.get("대표자명", data.get("대표자")),
+        "p_industry_name": data.get("업종명", data.get("업종")),
+        "p_address": data.get("사업장 소재지", data.get("주소")),
+        "p_manager_name": manager_name or data.get("담당자"),
+        "p_source": source,
+        "p_customer_data": data,
+        "p_customer_id": customer_id or None,
+        "p_previous_business_no": previous_value,
+    }
+
+
+_PROFILE_SUCCESS_LINK_STATUSES = {
+    "linked",
+    "linked_review_required",
+    "unlinked",
+    "ambiguous_review",
+}
+
+
+def _customer_profile_rpc_succeeded(value: Any) -> bool:
+    if isinstance(value, list):
+        row = next((item for item in value if isinstance(item, dict)), {})
+    elif isinstance(value, dict):
+        row = value
+    else:
+        row = {}
+    customer_id = _first_nonblank_text(row.get("customer_id"))
+    link_status = str(row.get("link_status") or "").strip().lower()
+    return bool(
+        customer_id
+        and link_status in _PROFILE_SUCCESS_LINK_STATUSES
+    )
+
+
+def _enqueue_customer_profile(
+    user_id: str,
+    parameters: dict[str, Any],
+    error: Any,
+    *,
+    db: CloudDatabase | None,
+) -> bool:
+    try:
+        enqueue_rpc_outbox(
+            _queue_path(user_id),
+            user_id,
+            "customer",
+            "oasis_upsert_customer_profile",
+            parameters,
+            error=error,
+            db=db,
+        )
+        return True
+    except Exception:
+        # A malformed/corrupted existing queue is intentionally never replaced.
+        return False
+
+
+def _sync_customer_snapshot_once(
+    user_id: str,
+    customer_data: dict[str, Any],
+    *,
+    source: str,
+    manager_name: str,
+    customer_id: str,
+    previous_business_no: str,
+    db: CloudDatabase | None,
+    retry_queue: bool,
+) -> tuple[bool, str, str]:
+    data, resolved_customer_id, resolved_previous_business_no = (
+        _customer_sync_data(
+            customer_data,
+            customer_id=customer_id,
+            previous_business_no=previous_business_no,
+        )
+    )
+    business_no = _exact_business_no(
+        data.get("사업자등록번호", data.get("사업자번호", ""))
+    )
+    if not business_no:
+        return (
+            False,
+            "사업자등록번호가 없어 고객 동기화를 건너뛰었습니다.",
+            "skipped",
+        )
+
+    parameters = _customer_profile_parameters(
+        user_id,
+        data,
+        business_no=business_no,
+        source=source,
+        manager_name=manager_name,
+        customer_id=resolved_customer_id,
+        previous_business_no=resolved_previous_business_no,
+    )
+    if db is None:
+        queued = _enqueue_customer_profile(
+            user_id,
+            parameters,
+            "Supabase 설정 없음",
+            db=None,
+        )
+        return (
+            False,
+            (
+                "Supabase 미설정으로 동기화 대기열에 저장했습니다."
+                if queued
+                else "동기화 대기열을 보존하지 못해 저장을 중단했습니다."
+            ),
+            "queued" if queued else "failed",
+        )
+
+    if retry_queue:
+        try:
+            retry_cloud_sync_queue(user_id, db=db)
+        except Exception:
+            # A stale/corrupted prior queue must not block this direct attempt.
+            pass
+
+    try:
+        rpc_result = db.rpc("oasis_upsert_customer_profile", parameters)
+    except Exception as exc:
+        if _rpc_function_unavailable(
+            exc,
+            "oasis_upsert_customer_profile",
+        ):
+            queued = _enqueue_customer_profile(
+                user_id,
+                parameters,
+                exc,
+                db=db,
+            )
+            return (
+                False,
+                (
+                    "고객 원본을 보존해 통합 RPC 재시도 대기열에 보관했습니다."
+                    if queued
+                    else "동기화 대기열을 보존하지 못해 저장을 중단했습니다."
+                ),
+                "queued" if queued else "failed",
+            )
+        else:
+            queued = _enqueue_customer_profile(
+                user_id,
+                parameters,
+                exc,
+                db=db,
+            )
+            return (
+                False,
+                (
+                    "고객 통합 저장이 거부되어 재시도 대기열에 보관했습니다."
+                    if queued
+                    else "동기화 대기열을 보존하지 못해 저장을 중단했습니다."
+                ),
+                "queued" if queued else "failed",
+            )
+    else:
+        if not _customer_profile_rpc_succeeded(rpc_result):
+            queued = _enqueue_customer_profile(
+                user_id,
+                parameters,
+                "customer_profile_rpc_rejected",
+                db=db,
+            )
+            return (
+                False,
+                (
+                    "고객 통합 검증이 완료되지 않아 재시도 대기열에 보관했습니다."
+                    if queued
+                    else "동기화 대기열을 보존하지 못해 저장을 중단했습니다."
+                ),
+                "queued" if queued else "failed",
+            )
+
+    invalidate_cache("registered_customers", str(user_id).strip().lower())
+    return True, "Supabase 동기화 완료", "synced"
+
+
 def sync_customer_snapshot(
     user_id: str,
     customer_data: dict[str, Any],
     source: str = "app",
     manager_name: str = "",
+    *,
+    customer_id: str = "",
+    previous_business_no: str = "",
+    db: CloudDatabase | None = None,
 ) -> tuple[bool, str]:
-    data = dict(customer_data or {})
-    business_no = normalize_business_no(
-        data.get("사업자등록번호", data.get("사업자번호", ""))
-    )
-    if len(business_no.replace("-", "")) != 10:
-        return False, "사업자등록번호가 없어 고객 동기화를 건너뛰었습니다."
+    database = db
+    try:
+        configured = cloud_is_configured()
+    except Exception:
+        configured = False
+    if database is None and configured:
+        try:
+            database = CloudDatabase()
+        except Exception:
+            database = None
+    try:
+        success, message, _status = _sync_customer_snapshot_once(
+            user_id,
+            customer_data,
+            source=source,
+            manager_name=manager_name,
+            customer_id=customer_id,
+            previous_business_no=previous_business_no,
+            db=database,
+            retry_queue=True,
+        )
+    except Exception:
+        return False, "고객 동기화를 안전하게 완료하지 못했습니다."
+    return success, message
 
-    return _safe_upsert(
-        user_id,
-        "customer",
-        TABLE_CUSTOMERS,
-        [{
-            "owner_user_id": user_id,
-            "business_no": business_no,
-            "company_name": data.get("업체명", data.get("기업명")),
-            "representative_name": data.get("대표자명", data.get("대표자")),
-            "industry_name": data.get("업종명", data.get("업종")),
-            "address": data.get("사업장 소재지", data.get("주소")),
-            "manager_name": manager_name or data.get("담당자"),
-            "source": source,
-            "customer_data": data,
-        }],
-        "owner_user_id,business_no",
-    )
+
+def sync_customer_snapshots(
+    user_id: str,
+    customer_rows: list[dict[str, Any]],
+    source: str = "app",
+    manager_name: str = "",
+    *,
+    db: CloudDatabase | None = None,
+) -> dict[str, int]:
+    rows = list(customer_rows or [])
+    summary = {
+        "attempted": len(rows),
+        "synced": 0,
+        "queued": 0,
+        "skipped": 0,
+        "failed": 0,
+    }
+    database = db
+    try:
+        configured = cloud_is_configured()
+    except Exception:
+        configured = False
+    if database is None and configured:
+        try:
+            database = CloudDatabase()
+        except Exception:
+            database = None
+    if database is not None:
+        try:
+            retry_cloud_sync_queue(user_id, db=database)
+        except Exception:
+            pass
+
+    for row in rows:
+        if not isinstance(row, dict):
+            summary["skipped"] += 1
+            continue
+        try:
+            success, _message, status = _sync_customer_snapshot_once(
+                user_id,
+                row,
+                source=source,
+                manager_name=manager_name,
+                customer_id="",
+                previous_business_no="",
+                db=database,
+                retry_queue=False,
+            )
+        except Exception:
+            summary["failed"] += 1
+            continue
+        if success:
+            summary["synced"] += 1
+        elif status in summary:
+            summary[status] += 1
+        else:
+            summary["failed"] += 1
+    return summary
 
 
 def sync_crm_record(

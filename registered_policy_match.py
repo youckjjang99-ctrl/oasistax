@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+from collections import Counter, defaultdict, deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -14,15 +15,166 @@ from openpyxl import load_workbook
 from performance_cache import cache_generation
 
 
+_CLOUD_METADATA_COLUMNS = (
+    "_customer_id",
+    "_company_uid",
+    "_lifecycle_status",
+    "_cloud_updated_at",
+)
+
+
 def normalize_business_no(value: Any) -> str:
-    digits = re.sub(r"[^0-9]", "", str(value or ""))
+    raw = "" if value is None else str(value)
+    digits = re.sub(r"[^0-9]", "", raw)
     if len(digits) == 10:
         return f"{digits[:3]}-{digits[3:5]}-{digits[5:]}"
-    return str(value or "").strip()
+    return raw.strip()
 
 
 def normalize_text(value: Any) -> str:
-    return re.sub(r"\s+", "", str(value or "").strip()).lower()
+    raw = "" if value is None else str(value)
+    return re.sub(r"\s+", "", raw.strip()).lower()
+
+
+def _business_no_merge_key(value: Any) -> str:
+    """Return an identity key only for an exact ten-digit business number."""
+    raw = "" if value is None else str(value)
+    digits = re.sub(r"[^0-9]", "", raw)
+    return digits if len(digits) == 10 else ""
+
+
+def _is_blank_customer_value(value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        missing = pd.isna(value)
+        if isinstance(missing, bool) and missing:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip().lower() in {
+        "",
+        "nan",
+        "none",
+        "nat",
+        "<na>",
+    }
+
+
+def _merge_registered_customer_frames(
+    local_df: pd.DataFrame | None,
+    cloud_df: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """Losslessly union local and cloud rows using only strong identity.
+
+    A key is merged only when it occurs exactly once in each source. Duplicate
+    candidates remain separate so source ordering can never attach the wrong
+    cloud customer UUID.  For a unique identified pair, a nonblank local value
+    wins and the cloud value only fills a blank. Rows without a ten-digit
+    business number never match one another.
+    """
+    local = (
+        local_df.copy()
+        if isinstance(local_df, pd.DataFrame)
+        else pd.DataFrame()
+    )
+    cloud = (
+        cloud_df.copy()
+        if isinstance(cloud_df, pd.DataFrame)
+        else pd.DataFrame()
+    )
+    local.columns = [str(column).strip() for column in local.columns]
+    cloud.columns = [str(column).strip() for column in cloud.columns]
+    local = local.reset_index(drop=True)
+    cloud = cloud.reset_index(drop=True)
+
+    columns = list(local.columns)
+    columns.extend(column for column in cloud.columns if column not in columns)
+    if not columns:
+        return pd.DataFrame()
+
+    local_rows = local.to_dict(orient="records")
+    cloud_rows = cloud.to_dict(orient="records")
+    local_key_counts = Counter(
+        key
+        for row in local_rows
+        if (key := _business_no_merge_key(row.get("사업자등록번호")))
+    )
+    cloud_key_counts = Counter(
+        key
+        for row in cloud_rows
+        if (key := _business_no_merge_key(row.get("사업자등록번호")))
+    )
+    cloud_by_business_no: dict[str, deque[int]] = defaultdict(deque)
+    for index, row in enumerate(cloud_rows):
+        key = _business_no_merge_key(row.get("사업자등록번호"))
+        if (
+            key
+            and local_key_counts.get(key) == 1
+            and cloud_key_counts.get(key) == 1
+        ):
+            cloud_by_business_no[key].append(index)
+
+    consumed_cloud_rows: set[int] = set()
+    merged_rows: list[dict[str, Any]] = []
+    for local_row in local_rows:
+        key = _business_no_merge_key(local_row.get("사업자등록번호"))
+        cloud_index = (
+            cloud_by_business_no[key].popleft()
+            if key and cloud_by_business_no.get(key)
+            else None
+        )
+        if cloud_index is None:
+            merged_rows.append(
+                {column: local_row.get(column, pd.NA) for column in columns}
+            )
+            continue
+
+        consumed_cloud_rows.add(cloud_index)
+        cloud_row = cloud_rows[cloud_index]
+        merged: dict[str, Any] = {}
+        for column in columns:
+            local_value = local_row.get(column, pd.NA)
+            cloud_value = cloud_row.get(column, pd.NA)
+            if column in _CLOUD_METADATA_COLUMNS:
+                merged[column] = (
+                    local_value
+                    if _is_blank_customer_value(cloud_value)
+                    else cloud_value
+                )
+            else:
+                merged[column] = (
+                    cloud_value
+                    if _is_blank_customer_value(local_value)
+                    else local_value
+                )
+        merged_rows.append(merged)
+
+    for index, cloud_row in enumerate(cloud_rows):
+        if index in consumed_cloud_rows:
+            continue
+        merged_rows.append(
+            {column: cloud_row.get(column, pd.NA) for column in columns}
+        )
+
+    return pd.DataFrame(merged_rows, columns=columns).reset_index(drop=True)
+
+
+def _rpc_function_unavailable(exc: Exception, function_name: str) -> bool:
+    message = str(exc or "").lower()
+    function_name = str(function_name or "").lower()
+    return (
+        "pgrst202" in message
+        or "could not find the function" in message
+        or (
+            function_name in message
+            and (
+                "does not exist" in message
+                or "undefined function" in message
+                or "42883" in message
+            )
+        )
+    )
 
 
 def _owner_user_id_from_cumulative_path(cumulative_path: Path) -> str:
@@ -67,12 +219,25 @@ def _load_registered_customers_from_cloud(
             return None
 
         database = CloudDatabase()
-        rows = database.select_all(
-            TABLE_CUSTOMERS,
-            filters={"owner_user_id": owner_user_id},
-            order="company_name.asc,id.asc",
-            max_rows=50000,
-        )
+        try:
+            rows = database.rpc(
+                "oasis_list_unified_customers",
+                {"p_owner_user_id": owner_user_id},
+            )
+            if not isinstance(rows, list):
+                rows = [rows] if isinstance(rows, dict) else []
+        except Exception as exc:
+            if not _rpc_function_unavailable(
+                exc,
+                "oasis_list_unified_customers",
+            ):
+                return None
+            rows = database.select_all(
+                TABLE_CUSTOMERS,
+                filters={"owner_user_id": owner_user_id},
+                order="company_name.asc,id.asc",
+                max_rows=50000,
+            )
 
         # Service-role 조회는 소유자 조건을 절대 제거하지 않는다.
     except Exception:
@@ -96,8 +261,11 @@ def _load_registered_customers_from_cloud(
             if value is not None and str(value).strip():
                 record[field] = value
 
-        if record:
-            records.append(record)
+        record["_customer_id"] = row.get("id")
+        record["_company_uid"] = row.get("company_uid")
+        record["_lifecycle_status"] = row.get("lifecycle_status")
+        record["_cloud_updated_at"] = row.get("updated_at")
+        records.append(record)
 
     df = pd.DataFrame(records)
     if df.empty:
@@ -145,10 +313,11 @@ def _load_registered_customers_cached(
 ) -> pd.DataFrame:
     """Cache one user-scoped customer list for a short, bounded period."""
     del file_mtime_ns, file_size, generation
+    local_df = _load_registered_customers_from_excel(
+        Path(cumulative_path_str)
+    )
     cloud_df = _load_registered_customers_from_cloud(owner_user_id)
-    if cloud_df is not None:
-        return cloud_df
-    return _load_registered_customers_from_excel(Path(cumulative_path_str))
+    return _merge_registered_customer_frames(local_df, cloud_df)
 
 
 def load_registered_customers(
@@ -184,10 +353,30 @@ def build_customer_labels(df: pd.DataFrame) -> tuple[list[str], dict[str, int]]:
     used: dict[str, int] = {}
 
     for index, row in df.iterrows():
-        company = str(row.get("업체명", "") or "").strip()
-        representative = str(row.get("대표자명", "") or "").strip()
+        lifecycle_value = row.get("_lifecycle_status", "")
+        lifecycle_status = (
+            ""
+            if _is_blank_customer_value(lifecycle_value)
+            else str(lifecycle_value).strip().lower()
+        )
+        if lifecycle_status == "archived":
+            continue
+        company_value = row.get("업체명", "")
+        representative_value = row.get("대표자명", "")
+        company = (
+            ""
+            if _is_blank_customer_value(company_value)
+            else str(company_value).strip()
+        )
+        representative = (
+            ""
+            if _is_blank_customer_value(representative_value)
+            else str(representative_value).strip()
+        )
         business_no = normalize_business_no(
-            row.get("사업자등록번호", "")
+            ""
+            if _is_blank_customer_value(row.get("사업자등록번호", ""))
+            else row.get("사업자등록번호", "")
         )
 
         if not company:

@@ -34,6 +34,7 @@ from cloud_sync import (
     get_cloud_sync_status,
     retry_cloud_sync_queue,
     sync_customer_snapshot,
+    sync_customer_snapshots,
     sync_crm_record,
 )
 from matching_preferences import (
@@ -1189,7 +1190,22 @@ def render_customer_management_page(user_id):
                 update_values,
             )
             if ok:
+                synced_customer = {
+                    str(key): ("" if pd.isna(value) else value)
+                    for key, value in selected_row.to_dict().items()
+                    if str(key) != "CRM상태"
+                }
+                synced_customer.update(update_values)
+                sync_ok, sync_message = sync_customer_snapshot(
+                    user_id,
+                    synced_customer,
+                    source="customer_management_edit",
+                    manager_name=CURRENT_USER_NAME,
+                    previous_business_no=selected_biz,
+                )
                 st.success(msg)
+                if not sync_ok:
+                    st.warning(sync_message)
                 # The workbook changed after its dependent cards were rendered;
                 # one explicit refresh is required to load the new file revision.
                 st.rerun()
@@ -2086,17 +2102,16 @@ elif active_tab == "통합 정책자금 매칭":
         cumulative_db_path,
         owner_user_id=CURRENT_USER_ID,
     )
+    customer_labels, customer_row_map = build_customer_labels(
+        registered_customers
+    )
 
-    if registered_customers.empty:
+    if registered_customers.empty or not customer_labels:
         st.info(
             "등록된 고객이 없습니다. 먼저 기업등록 또는 고객DB 업로드로 "
             "고객을 등록해주세요."
         )
     else:
-        customer_labels, customer_row_map = build_customer_labels(
-            registered_customers
-        )
-
         selected_customer_label = st.selectbox(
             "매칭할 등록 고객",
             customer_labels,
@@ -2507,10 +2522,17 @@ elif active_tab == "통합 정책자금 매칭":
                     for warn in validation_warnings:
                         st.write(f"- {warn}")
 
-            cumulative_path, saved_rows = append_user_customer_db(
+            cumulative_path, saved_rows, saved_customer_rows = append_user_customer_db(
                 uploaded_save_path,
                 CURRENT_USER_ID,
-                manager_name=manager_name.strip() or CURRENT_USER_NAME
+                manager_name=manager_name.strip() or CURRENT_USER_NAME,
+                return_saved_rows=True,
+            )
+            customer_sync_summary = sync_customer_snapshots(
+                CURRENT_USER_ID,
+                saved_customer_rows.to_dict(orient="records"),
+                source="excel_upload",
+                manager_name=manager_name.strip() or CURRENT_USER_NAME,
             )
             from customer_asset_storage import store_private_customer_asset
 
@@ -2529,6 +2551,15 @@ elif active_tab == "통합 정책자금 매칭":
             st.session_state.latest_upload_file = str(uploaded_save_path)
             if saved_rows:
                 st.success(f"업로드 완료: {uploaded_save_name} / 누적DB {saved_rows}건 저장")
+                if (
+                    customer_sync_summary.get("queued")
+                    or customer_sync_summary.get("skipped")
+                    or customer_sync_summary.get("failed")
+                ):
+                    st.warning(
+                        "고객 원본은 누적DB에 보존됐으며 식별 불가 또는 대기 중인 "
+                        "일부 행은 클라우드 통합 완료로 집계하지 않았습니다."
+                    )
             else:
                 st.success(f"업로드 완료: {uploaded_save_name}")
 
@@ -2809,6 +2840,14 @@ elif active_tab == "기업등록":
                     extracted_data,
                     source="cretop",
                 )
+                if is_dup:
+                    sync_customer_snapshot(
+                        CURRENT_USER_ID,
+                        extracted_data,
+                        source="cretop_existing_customer_refresh",
+                        manager_name=CURRENT_USER_NAME,
+                        previous_business_no=business_no,
+                    )
 
             st.session_state["cretop_pdf_hash"] = pdf_hash
             st.session_state["cretop_pdf_save_path"] = str(pdf_save_path)

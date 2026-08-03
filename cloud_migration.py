@@ -11,17 +11,23 @@ import pandas as pd
 from cloud_db import (
     CloudDatabase,
     TABLE_CRM,
-    TABLE_CUSTOMERS,
     TABLE_FINANCIALS,
     TABLE_MIGRATIONS,
     TABLE_REGISTRY,
     TABLE_STOCK,
     normalize_business_no,
 )
+from cloud_sync import sync_customer_snapshots
+from runtime_error_log import safe_public_error
 from utils import get_user_cumulative_db_path, get_user_dirs
 
 
-MIGRATION_VERSION = "v4.0.0"
+MIGRATION_VERSION = "v9.11.0"
+
+
+def _migration_error(label: str, exc: Exception) -> str:
+    """Return a bounded, PII-free migration failure for UI and audit storage."""
+    return f"{label}: {safe_public_error(exc, '데이터 복사에 실패했습니다.')}"
 
 
 def _clean_value(value: Any) -> Any:
@@ -89,6 +95,8 @@ def migrate_user_data(
     dirs = get_user_dirs(user_id)
     result = {
         "customers": 0,
+        "customer_unresolved": 0,
+        "customer_queued": 0,
         "crm": 0,
         "financials": 0,
         "registry": 0,
@@ -100,31 +108,38 @@ def migrate_user_data(
     if customer_path.exists():
         try:
             df = pd.read_excel(customer_path, sheet_name="고객DB").dropna(how="all")
-            rows = []
-            for index, row in df.iterrows():
-                data = _clean_record(row.to_dict())
-                business_no = normalize_business_no(
-                    data.get("사업자등록번호", "")
+            customer_rows = [
+                _clean_record(row.to_dict())
+                for _, row in df.iterrows()
+            ]
+            sync_result = sync_customer_snapshots(
+                user_id,
+                customer_rows,
+                source="excel_migration",
+                manager_name=manager_name,
+                db=db,
+            )
+            result["customers"] = int(sync_result.get("synced", 0))
+            result["customer_unresolved"] = int(
+                sync_result.get("skipped", 0)
+            )
+            result["customer_queued"] = int(sync_result.get("queued", 0))
+            if result["customer_unresolved"]:
+                result["errors"].append(
+                    "고객DB: 식별 불가 행 "
+                    f"{result['customer_unresolved']}건은 원본에 보존했습니다."
                 )
-                if len(business_no.replace("-", "")) != 10:
-                    business_no = f"legacy-{user_id}-{index}"
-
-                rows.append({
-                    "owner_user_id": user_id,
-                    "business_no": business_no,
-                    "company_name": data.get("업체명"),
-                    "representative_name": data.get("대표자명"),
-                    "industry_name": data.get("업종명"),
-                    "address": data.get("사업장 소재지"),
-                    "manager_name": data.get("담당자") or manager_name,
-                    "source": "excel_migration",
-                    "customer_data": data,
-                })
-
-            db.upsert(TABLE_CUSTOMERS, rows, "owner_user_id,business_no")
-            result["customers"] = len(rows)
+            if result["customer_queued"]:
+                result["errors"].append(
+                    "고객DB: 클라우드 통합 재시도 대기 "
+                    f"{result['customer_queued']}건"
+                )
+            if sync_result.get("failed"):
+                result["errors"].append(
+                    "고객DB: 일부 고객 통합 저장을 재확인해야 합니다."
+                )
         except Exception as exc:
-            result["errors"].append(f"고객DB: {exc}")
+            result["errors"].append(_migration_error("고객DB", exc))
 
     crm_data = _load_json(dirs["base"] / "crm_data.json", {})
     crm_customers = crm_data.get("customers", {}) if isinstance(crm_data, dict) else {}
@@ -145,7 +160,7 @@ def migrate_user_data(
             db.upsert(TABLE_CRM, rows, "owner_user_id,business_no")
             result["crm"] = len(rows)
         except Exception as exc:
-            result["errors"].append(f"CRM: {exc}")
+            result["errors"].append(_migration_error("CRM", exc))
 
     for filename, table, key_name, result_key in [
         ("stock_financial_cache.json", TABLE_FINANCIALS, "financial_data", "financials"),
@@ -166,7 +181,7 @@ def migrate_user_data(
                 db.upsert(table, rows, "owner_user_id,business_no")
                 result[result_key] = len(rows)
             except Exception as exc:
-                result["errors"].append(f"{filename}: {exc}")
+                result["errors"].append(_migration_error(filename, exc))
 
     stock_data = _load_json(dirs["base"] / "stock_valuations.json", [])
     if isinstance(stock_data, list):
@@ -186,7 +201,7 @@ def migrate_user_data(
             db.upsert(TABLE_STOCK, rows, "owner_user_id,record_id")
             result["stock_valuations"] = len(rows)
         except Exception as exc:
-            result["errors"].append(f"주가평가: {exc}")
+            result["errors"].append(_migration_error("주가평가", exc))
 
     try:
         db.insert(TABLE_MIGRATIONS, [{
@@ -198,6 +213,6 @@ def migrate_user_data(
             },
         }])
     except Exception as exc:
-        result["errors"].append(f"이관이력: {exc}")
+        result["errors"].append(_migration_error("이관이력", exc))
 
     return result
