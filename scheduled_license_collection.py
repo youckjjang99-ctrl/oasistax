@@ -12,9 +12,6 @@ import localdata_contact_client
 from cloud_db import CloudDatabase
 from korea_regions import ALL_DISTRICTS, ALL_PROVINCES
 from licensed_business_repository import save_businesses, save_sync_run
-from scheduled_employment_contact_enrichment import (
-    run_enrichment as run_employment_contact_enrichment,
-)
 from scheduled_license_phone_enrichment import run_enrichment
 
 
@@ -388,21 +385,7 @@ def main() -> int:
         )
         collection_status = collection_status or run_enrichment()
 
-    employment_status = run_employment_contact_enrichment(
-        stage=os.environ.get("EMPLOYMENT_CONTACT_STAGE", "phone"),
-        phone_provider=os.environ.get(
-            "EMPLOYMENT_PHONE_PROVIDER",
-            "auto",
-        ),
-        workers=int(os.environ.get("EMPLOYMENT_CONTACT_WORKERS", "0")),
-        batch_size=int(
-            os.environ.get("EMPLOYMENT_CONTACT_BATCH_SIZE", "200")
-        ),
-        max_records=int(
-            os.environ.get("EMPLOYMENT_CONTACT_MAX_RECORDS", "0")
-        ),
-    )
-    return collection_status or employment_status
+    return collection_status
 
 
 if __name__ == "__main__":

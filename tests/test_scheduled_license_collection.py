@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -7,6 +8,19 @@ import scheduled_license_collection
 
 
 class ScheduledLicenseCollectionTest(unittest.TestCase):
+    @patch.object(sys, "argv", ["scheduled_license_collection.py"])
+    @patch(
+        "scheduled_license_collection.localdata_contact_client.is_enabled",
+        return_value=False,
+    )
+    def test_disabled_license_collection_does_not_start_other_collectors(
+        self,
+        _is_enabled,
+    ) -> None:
+        result = scheduled_license_collection.main()
+
+        self.assertEqual(result, 0)
+
     @patch("scheduled_license_collection._upsert_progress")
     @patch("scheduled_license_collection.save_sync_run")
     @patch("scheduled_license_collection.save_businesses", return_value=1)

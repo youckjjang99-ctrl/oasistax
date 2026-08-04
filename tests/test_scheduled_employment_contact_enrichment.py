@@ -7,6 +7,57 @@ import scheduled_employment_contact_enrichment as job
 
 
 class EmploymentContactEnrichmentTest(unittest.TestCase):
+    @patch.object(job.requests, "get")
+    @patch.object(job, "CloudDatabase")
+    def test_digital_selection_excludes_phone_only_sources(
+        self,
+        cloud_database,
+        request_get,
+    ) -> None:
+        db = Mock()
+        db.headers = {}
+        db.config.timeout = 20
+        db._url.return_value = "https://example.supabase.co/rest/v1/contacts"
+        cloud_database.return_value = db
+        response = Mock(ok=True, text="[]")
+        response.json.return_value = []
+        request_get.return_value = response
+
+        job._select_rows(stage="digital", status="pending", limit=25)
+
+        self.assertEqual(
+            request_get.call_args.kwargs["params"]["source_type"],
+            "not.in.(comwel_all_employers)",
+        )
+
+    @patch.object(job.requests, "get")
+    @patch.object(job, "CloudDatabase")
+    def test_phone_selection_keeps_phone_only_sources_eligible(
+        self,
+        cloud_database,
+        request_get,
+    ) -> None:
+        db = Mock()
+        db.headers = {}
+        db.config.timeout = 20
+        db._url.return_value = "https://example.supabase.co/rest/v1/contacts"
+        cloud_database.return_value = db
+        response = Mock(ok=True, text="[]")
+        response.json.return_value = []
+        request_get.return_value = response
+
+        job._select_rows(
+            stage="phone",
+            status="pending",
+            limit=25,
+            phone_provider="kakao",
+        )
+
+        self.assertNotIn(
+            "source_type",
+            request_get.call_args.kwargs["params"],
+        )
+
     @patch.object(job.time, "sleep")
     @patch.object(job.requests, "patch")
     @patch.object(job, "CloudDatabase")
