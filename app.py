@@ -665,6 +665,7 @@ def _navigate_to_main_menu(target: str) -> None:
     """Update both sidebar selectors before Streamlit's natural button rerun."""
     group_by_target = {
         "홈": "주요업무",
+        "업무함": "주요업무",
         "DB발굴": "주요업무",
         "기업등록": "주요업무",
         "기업 컨설팅": "주요업무",
@@ -1857,6 +1858,7 @@ with st.sidebar:
     menu_groups = {
         "주요업무": {
             "홈": "홈",
+            "업무함": "업무함",
             "DB발굴": "DB발굴",
             "기업등록": "기업등록",
             "기업 컨설팅": "기업관리센터",
@@ -1928,6 +1930,7 @@ with st.sidebar:
 
     menu_labels = {
         "홈": "홈",
+        "업무함": "업무함",
         "DB발굴": "DB발굴",
         "기업등록": "기업등록",
         "기업 컨설팅": "기업 컨설팅",
@@ -1991,7 +1994,7 @@ if active_tab in local_customer_routes:
         if "실패" not in restore_message:
             st.session_state[restore_session_key] = True
 
-if active_tab == "홈":
+if active_tab in {"홈", "업무함"}:
     crm_restore_session_key = f"cloud_crm_restore_{CURRENT_USER_ID}"
     crm_restore_attempt_key = f"{crm_restore_session_key}_attempted_at"
     last_attempt = float(
@@ -2007,7 +2010,10 @@ if active_tab == "홈":
         crm_restore_result = restore_crm_from_cloud(CURRENT_USER_ID)
         st.session_state["cloud_crm_restore_result"] = crm_restore_result
         restore_message = str(crm_restore_result.get("message", "") or "")
-        if "실패" not in restore_message:
+        if not any(
+            marker in restore_message
+            for marker in ("실패", "설정되지 않아", "사용자 ID가 없습니다")
+        ):
             st.session_state[crm_restore_session_key] = True
 
 st.markdown(f"""
@@ -2037,6 +2043,27 @@ if active_tab == "홈":
         st.success(crm_restore_notice.get("message", ""))
 
     render_home_page(CURRENT_USER_ID, CURRENT_USER_NAME)
+
+elif active_tab == "업무함":
+    from work_inbox import render_work_inbox_page
+
+    crm_restore_notice = st.session_state.get(
+        "cloud_crm_restore_result",
+        {},
+    )
+    crm_restore_message = str(crm_restore_notice.get("message", "") or "")
+    crm_restore_ok = bool(
+        st.session_state.get(f"cloud_crm_restore_{CURRENT_USER_ID}")
+    ) and not any(
+        marker in crm_restore_message
+        for marker in ("실패", "설정되지 않아", "사용자 ID가 없습니다")
+    )
+    render_work_inbox_page(
+        CURRENT_USER_ID,
+        CURRENT_USER_NAME,
+        navigate=_navigate_to_main_menu,
+        crm_restore_ok=crm_restore_ok,
+    )
 
 elif active_tab == "기업관리센터":
     from enterprise_center import render_enterprise_management_center
