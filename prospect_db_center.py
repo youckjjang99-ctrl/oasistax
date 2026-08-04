@@ -2893,23 +2893,31 @@ def _render_clean_saved_prospects(
         return
 
     contacts: list[dict] = []
-    canonical_contacts_ready = False
+    canonical_contact_lookup_failed = False
     try:
         if contact_table_status()[0]:
-            canonical_contacts_ready = True
             contacts = list_contacts_for_prospects(
                 [str(row.get("id") or "") for row in rows],
                 owner_user_id,
             )
     except Exception:
         contacts = []
+        canonical_contact_lookup_failed = True
 
     frame = _saved_candidate_frame(
         rows,
         contacts,
         can_view_mobile=can_view_mobile,
-        canonical_contacts_only=canonical_contacts_ready,
+        # Existing public contact details remain visible even when no canonical
+        # row exists. Send eligibility remains fail-closed because the
+        # _canonical_* flags are derived only from canonical rows.
+        canonical_contacts_only=False,
     )
+    if canonical_contact_lookup_failed:
+        st.warning(
+            "정규 연락처 상태를 확인하지 못해 기존 공개 연락처만 표시합니다. "
+            "안전 확인이 끝날 때까지 보내기 버튼은 사용할 수 없습니다."
+        )
     if not frame.empty:
         frame["대표전화"] = frame["대표전화"].map(normalize_phone)
         frame["휴대전화"] = frame["휴대전화"].map(normalize_phone)

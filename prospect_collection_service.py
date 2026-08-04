@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from contact_matching import normalize_phone
 from prospect_db_repository import (
+    GrowthSearchTimeoutError,
     _snapshot_identity,
     existing_prospect_identities,
     load_fast_growth_candidates,
@@ -569,7 +570,8 @@ def collect_contactable_growth_companies(
             error_message = str(exc)
             error_code = (
                 "GROWTH_SEARCH_TIMEOUT"
-                if "조회 시간이 초과" in error_message
+                if isinstance(exc, GrowthSearchTimeoutError)
+                or "조회 시간이 초과" in error_message
                 else "GROWTH_SEARCH_FAILED"
             )
             stats["elapsed_seconds"] = round(

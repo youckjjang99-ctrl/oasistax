@@ -23,6 +23,11 @@ TABLE_EMPLOYEE_SNAPSHOTS = "oasis_nps_employee_snapshots"
 TABLE_NPS_GROWTH = "oasis_nps_growth_leads"
 TABLE_COMWEL_GROWTH = "oasis_comwel_annual_growth"
 
+
+class GrowthSearchTimeoutError(RuntimeError):
+    """Raised when the precomputed growth search exceeds a safe time limit."""
+
+
 SUPABASE_PROVINCE_NAMES = {
     "11": "서울특별시",
     "26": "부산광역시",
@@ -407,19 +412,25 @@ def load_fast_growth_candidates(
         "p_limit": row_limit,
         "p_business_type": normalized_business_type,
     }
-    response = requests.post(
-        f"{config.url}/rest/v1/rpc/oasis_search_employment_growth_v2",
-        headers=_rest_headers(),
-        data=json.dumps(payload, ensure_ascii=False),
-        timeout=max(config.timeout, 60),
-    )
+    try:
+        response = requests.post(
+            f"{config.url}/rest/v1/rpc/oasis_search_employment_growth_v2",
+            headers=_rest_headers(),
+            data=json.dumps(payload, ensure_ascii=False),
+            timeout=max(config.timeout, 60),
+        )
+    except requests.Timeout as exc:
+        raise GrowthSearchTimeoutError(
+            "성장기업 조회 시간이 초과되었습니다. 지역·업종 등 조회 조건을 "
+            "선택한 뒤 다시 시도해 주세요."
+        ) from exc
     if not response.ok:
         response_text = str(response.text or "")
         if (
             "57014" in response_text
             or "statement timeout" in response_text.lower()
         ):
-            raise RuntimeError(
+            raise GrowthSearchTimeoutError(
                 "성장기업 조회 시간이 초과되었습니다. 지역·업종 등 "
                 "조회 조건을 선택한 뒤 다시 시도해 주세요."
             )

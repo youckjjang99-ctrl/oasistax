@@ -72,6 +72,99 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
         self.assertEqual(compact.loc[0, "문자보내기"], "💬")
         self.assertEqual(compact.loc[0, "카카오톡보내기"], "🟡")
 
+    def test_source_phone_stays_visible_when_contact_table_has_no_rows(self):
+        phone = _phone("010", "0000", "0000")
+        candidate = {
+            "id": "prospect-1",
+            "company_name": "테스트 업체",
+            "business_no": _business_number("000", "00", "00000"),
+            "industry_name": "서비스업",
+            "employee_count": 12,
+            "source_data": {
+                "sales_intelligence_v971": {
+                    "phone": phone,
+                    "email": _email("sales"),
+                    "instagram": "@sample",
+                    "instagram_url": "https://example.invalid/sample",
+                }
+            },
+        }
+        display = prospect._saved_candidate_frame(
+            [candidate],
+            [],
+            can_view_mobile=True,
+        ).assign(
+            _company_uid="source:" + ("a" * 64),
+            _assignment_id="assignment-1",
+            _assignment_status="assigned",
+        )
+        compact = prospect._saved_prospect_table_frame(
+            display,
+            can_view_mobile=True,
+        )
+
+        self.assertEqual(compact.loc[0, "연락처"], phone)
+        self.assertFalse(bool(display.loc[0, "_canonical_mobile_available"]))
+        self.assertFalse(bool(display.loc[0, "_canonical_email_available"]))
+        for column in prospect.OUTREACH_COLUMN_CHANNELS:
+            self.assertTrue(pd.isna(compact.loc[0, column]))
+
+        captured: dict[str, pd.DataFrame] = {}
+
+        class _StopAfterSavedProspectTable(RuntimeError):
+            pass
+
+        def capture_table(frame, **_kwargs):
+            captured["frame"] = frame.copy()
+            raise _StopAfterSavedProspectTable
+
+        with patch.object(
+            prospect,
+            "_show_outreach_result_notice",
+        ), patch.object(
+            prospect,
+            "_assignment_feature_status",
+            return_value=(False, "not ready"),
+        ), patch.object(
+            prospect,
+            "list_prospects",
+            return_value=[candidate],
+        ), patch.object(
+            prospect,
+            "contact_table_status",
+            return_value=(True, "ready"),
+        ), patch.object(
+            prospect,
+            "list_contacts_for_prospects",
+            return_value=[],
+        ), patch.object(
+            prospect,
+            "_excel_bytes",
+            return_value=b"fixture",
+        ), patch.object(
+            prospect.st,
+            "markdown",
+        ), patch.object(
+            prospect.st,
+            "caption",
+        ), patch.object(
+            prospect.st,
+            "download_button",
+        ), patch.object(
+            prospect.st,
+            "dataframe",
+            side_effect=capture_table,
+        ):
+            with self.assertRaises(_StopAfterSavedProspectTable):
+                prospect._render_clean_saved_prospects(
+                    "owner-1",
+                    can_view_mobile=True,
+                )
+
+        self.assertEqual(captured["frame"].loc[0, "연락처"], phone)
+        for column in prospect.OUTREACH_COLUMN_CHANNELS:
+            self.assertTrue(pd.isna(captured["frame"].loc[0, column]))
+
     def test_dnc_row_has_no_send_buttons(self):
         compact = prospect._saved_prospect_table_frame(
             self._frame(blocked=True),

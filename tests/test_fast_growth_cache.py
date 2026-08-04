@@ -5,6 +5,8 @@ import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import requests
+
 from prospect_collection_service import collect_contactable_growth_companies
 from prospect_db_repository import load_fast_growth_candidates
 
@@ -198,6 +200,43 @@ class FastGrowthCacheTest(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "조회 시간이 초과"):
             load_fast_growth_candidates("", limit=100)
+
+    def test_read_timeout_maps_to_safe_exception_and_growth_error_code(self):
+        timeout_detail = "internal upstream detail"
+        with patch(
+            "prospect_db_repository.get_cloud_config",
+            return_value=SimpleNamespace(
+                configured=True,
+                url="https://example.supabase.co",
+                timeout=20,
+            ),
+        ), patch(
+            "prospect_db_repository._rest_headers",
+            return_value={"Authorization": "Bearer test"},
+        ), patch(
+            "prospect_db_repository.requests.post",
+            side_effect=requests.exceptions.ReadTimeout(timeout_detail),
+        ), patch(
+            "prospect_collection_service.existing_prospect_identities",
+            return_value=(set(), set(), set()),
+        ), patch(
+            "prospect_collection_service.fetch_nps_workplaces",
+        ) as fetch_nps:
+            with self.assertRaisesRegex(RuntimeError, "조회 시간이 초과") as error:
+                load_fast_growth_candidates("", limit=100)
+
+            self.assertNotIn(timeout_detail, str(error.exception))
+            result = collect_contactable_growth_companies(
+                "",
+                target_count=100,
+                growth_only=True,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "GROWTH_SEARCH_TIMEOUT")
+        self.assertIn("조회 시간이 초과", result["message"])
+        self.assertNotIn(timeout_detail, result["message"])
+        fetch_nps.assert_not_called()
 
     @patch("prospect_collection_service.remove_existing_prospects")
     @patch(
