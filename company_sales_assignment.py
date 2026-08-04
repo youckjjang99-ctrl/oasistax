@@ -13,6 +13,9 @@ RPC_FEATURE_READY = "oasis_company_sales_assignment_feature_ready"
 RPC_RELEASE_EXPIRED = "oasis_release_expired_company_assignments"
 RPC_CLAIM_COMPANY = "oasis_claim_company_sales_assignment"
 RPC_CLAIM_AND_SAVE_COMPANY = "oasis_claim_and_save_company_sales_assignment"
+RPC_CLAIM_SAVE_PROMOTE_CONTACTS = (
+    "oasis_claim_save_and_promote_prospect_contacts"
+)
 RPC_LIST_USER = "oasis_list_user_company_assignments"
 RPC_FILTER_BLOCKED = "oasis_filter_blocked_company_uids"
 RPC_RESOLVE_CANDIDATE_UIDS = "oasis_resolve_candidate_company_uids"
@@ -189,6 +192,7 @@ _ASSIGNMENT_FIELDS = {
     "contact_count",
     "released_at",
     "released_reason",
+    "promoted_contact_count",
     "permanently_excluded",
     "created_at",
     "updated_at",
@@ -728,6 +732,10 @@ def claim_and_save_company(
     db: CloudDatabase | None = None,
 ) -> dict[str, Any]:
     """Atomically claim and mirror one public company snapshot."""
+    source_payload = dict(company_payload or {})
+    contact_candidates = source_payload.pop("contact_candidates", [])
+    if not isinstance(contact_candidates, list):
+        contact_candidates = []
     allowed_payload_fields = {
         "source",
         "source_key",
@@ -754,18 +762,23 @@ def claim_and_save_company(
     }
     payload = {
         key: value
-        for key, value in dict(company_payload or {}).items()
+        for key, value in source_payload.items()
         if key in allowed_payload_fields
     }
     payload["company_uid"] = _company_uid(company_uid)
+    rpc_name = RPC_CLAIM_AND_SAVE_COMPANY
+    parameters = {
+        "p_current_user_id": _user_id(current_user_id),
+        "p_company_uid": payload["company_uid"],
+        "p_company_payload": payload,
+        "p_session_id": _bounded(session_id, 200) or None,
+    }
+    if contact_candidates:
+        rpc_name = RPC_CLAIM_SAVE_PROMOTE_CONTACTS
+        parameters["p_contact_candidates"] = contact_candidates[:8]
     raw, error = _rpc(
-        RPC_CLAIM_AND_SAVE_COMPANY,
-        {
-            "p_current_user_id": _user_id(current_user_id),
-            "p_company_uid": payload["company_uid"],
-            "p_company_payload": payload,
-            "p_session_id": _bounded(session_id, 200) or None,
-        },
+        rpc_name,
+        parameters,
         db=db,
     )
     if error:

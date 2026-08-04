@@ -40,6 +40,7 @@ from public_data_api import (
     test_nps_connection,
 )
 from prospect_db_repository import (
+    build_review_contact_candidates,
     company_contact_is_suppressed,
     contact_table_status,
     legacy_phone_contact_hash,
@@ -131,6 +132,7 @@ DISCOVERY_TYPE_LABELS = {
 }
 PROSPECT_RESULT_PAGE_SIZE_OPTIONS = (25, 50, 100)
 _PROSPECT_SAVE_FLASH_KEY = "_prospect_save_flash_v989"
+_PROSPECT_SAVE_APPROVAL_KEY = "_prospect_save_approval_v1042"
 _OUTREACH_REQUEST_KEY = "_saved_prospect_outreach_request_v1040"
 _OUTREACH_RESULT_KEY = "_saved_prospect_outreach_result_v1040"
 _OUTREACH_ATTEMPTS_KEY = "_saved_prospect_outreach_attempts_v1040"
@@ -1408,6 +1410,252 @@ def _outreach_compliance_error(
     if not confirmed:
         return "수신 동의와 광고성 정보 발송 요건을 확인해 주세요."
     return ""
+
+
+def _review_contact_candidate_counts(
+    items: list[dict],
+) -> dict[str, int]:
+    counts = {
+        "mobile_phone": 0,
+        "landline_phone": 0,
+        "email": 0,
+        "instagram": 0,
+        "total": 0,
+    }
+    for item in items:
+        for candidate in build_review_contact_candidates(dict(item or {})):
+            contact_type = str(candidate.get("contact_type") or "")
+            if contact_type == "phone":
+                phone_key = (
+                    "mobile_phone"
+                    if is_mobile_phone(candidate.get("contact_value"))
+                    else "landline_phone"
+                )
+                counts[phone_key] += 1
+            elif contact_type in {"email", "instagram"}:
+                counts[contact_type] += 1
+            counts["total"] += 1
+    return counts
+
+
+def _approved_prospect_save_notices(
+    save_result: dict,
+) -> list[dict[str, str]]:
+    saved_count = int(save_result.get("saved_count") or 0)
+    already_owned_count = int(
+        save_result.get("already_owned_count") or 0
+    )
+    newly_saved_count = max(0, saved_count - already_owned_count)
+    promoted_contact_count = int(
+        save_result.get("promoted_contact_count") or 0
+    )
+    failures = [
+        row
+        for row in (save_result.get("results") or [])
+        if not row.get("ok")
+    ]
+    notices: list[dict[str, str]] = []
+    if newly_saved_count:
+        notices.append(
+            {
+                "level": "success",
+                "message": (
+                    "저장 완료: "
+                    f"{newly_saved_count:,}개 업체를 내 영업DB에 "
+                    "담았습니다. 24시간 안에 연락결과를 기록해 주세요."
+                ),
+            }
+        )
+    if promoted_contact_count:
+        notices.append(
+            {
+                "level": "success",
+                "message": (
+                    f"정규 연락처 {promoted_contact_count:,}건을 "
+                    "검토 필요 상태로 승격했습니다."
+                ),
+            }
+        )
+    if already_owned_count:
+        notices.append(
+            {
+                "level": "info",
+                "message": (
+                    f"{already_owned_count:,}개 업체는 이미 내 영업DB에 "
+                    "있어 중복 저장하지 않았으며, 승인한 연락처 후보만 "
+                    "현재 업체에 반영했습니다."
+                ),
+            }
+        )
+    failure_codes = {str(row.get("code") or "") for row in failures}
+    if failure_codes & {"ASSIGNMENT_CONFLICT", "ALREADY_ASSIGNED"}:
+        notices.append(
+            {
+                "level": "warning",
+                "message": (
+                    "다른 담당자가 먼저 배정받은 업체입니다. "
+                    "검색 결과를 새로고침합니다."
+                ),
+            }
+        )
+    if failure_codes & {
+        "MAX_UNCONTACTED_REACHED",
+        "LIMIT_REACHED",
+        "UNCONTACTED_LIMIT_REACHED",
+    }:
+        notices.append(
+            {
+                "level": "warning",
+                "message": (
+                    "미접촉 배정 DB는 최대 30개까지 보유할 수 있습니다. "
+                    "기존 DB의 연락결과를 기록하거나 배정을 해제한 후 "
+                    "다시 시도해 주세요."
+                ),
+            }
+        )
+    handled_codes = {
+        "ASSIGNMENT_CONFLICT",
+        "ALREADY_ASSIGNED",
+        "MAX_UNCONTACTED_REACHED",
+        "LIMIT_REACHED",
+        "UNCONTACTED_LIMIT_REACHED",
+    }
+    for row in failures:
+        if str(row.get("code") or "") not in handled_codes:
+            notices.append(
+                {
+                    "level": "warning",
+                    "message": str(row.get("message") or "저장 실패"),
+                }
+            )
+    return notices
+
+
+@st.dialog("정규 연락처 승격 승인")
+def _show_prospect_save_approval_dialog(
+    owner_user_id: str,
+    request: dict,
+) -> None:
+    selected_items = [
+        dict(item)
+        for item in (request.get("items") or [])
+        if isinstance(item, dict)
+    ]
+    counts = _review_contact_candidate_counts(selected_items)
+    if not selected_items or not counts["total"]:
+        st.error("승격할 연락처 후보가 없습니다. 다시 선택해 주세요.")
+        if st.button("닫기", use_container_width=True):
+            st.session_state.pop(_PROSPECT_SAVE_APPROVAL_KEY, None)
+            st.rerun(scope="app")
+        return
+
+    st.markdown(
+        f"**휴대전화 후보 {counts['mobile_phone']:,}건을 검토 필요 상태의 "
+        "정규 연락처로 승격하는 것을 승인해 주세요.**"
+    )
+    st.caption(
+        f"선택 업체 {len(selected_items):,}개 · "
+        f"휴대전화 {counts['mobile_phone']:,}건 · "
+        f"일반전화 {counts['landline_phone']:,}건 · "
+        f"이메일 {counts['email']:,}건 · "
+        f"인스타그램 {counts['instagram']:,}건"
+    )
+    st.info(
+        "이 승인은 공개 수집된 연락처 후보를 영업DB에 반영하는 "
+        "담당자 승인입니다. 수신자의 광고성 정보 수신 동의로 기록되지 "
+        "않으며, 실제 문자·카카오톡·이메일 발송 전 별도로 확인합니다."
+    )
+    approve_column, cancel_column = st.columns(2)
+    if cancel_column.button("취소", use_container_width=True):
+        st.session_state.pop(_PROSPECT_SAVE_APPROVAL_KEY, None)
+        st.rerun(scope="app")
+    if not approve_column.button(
+        "승인하고 내 영업DB에 담기",
+        type="primary",
+        use_container_width=True,
+    ):
+        return
+
+    try:
+        save_result = save_assigned_prospects(
+            selected_items,
+            owner_user_id,
+            session_id=_assignment_session_id(),
+            promote_review_contacts=True,
+        )
+        notices = _approved_prospect_save_notices(save_result)
+        post_save_contact = request.get("post_save_contact")
+        if isinstance(post_save_contact, dict):
+            successful_rows = [
+                row
+                for row in (save_result.get("results") or [])
+                if row.get("ok")
+            ]
+            if successful_rows:
+                saved_assignment = dict(
+                    successful_rows[0].get("assignment") or {}
+                )
+                contact_result = sales_assignments.record_contact(
+                    owner_user_id,
+                    saved_assignment.get("company_id"),
+                    saved_assignment.get("company_uid"),
+                    post_save_contact.get("method"),
+                    post_save_contact.get("result"),
+                    notes=post_save_contact.get("notes"),
+                    next_contact_at=post_save_contact.get("next_contact_at"),
+                    session_id=_assignment_session_id(),
+                )
+                notices.append(
+                    {
+                        "level": (
+                            "success" if contact_result.get("ok") else "warning"
+                        ),
+                        "message": str(
+                            contact_result.get("message")
+                            or "연락결과 기록을 확인하지 못했습니다."
+                        ),
+                    }
+                )
+        result_state_key = str(request.get("result_state_key") or "")
+        selection_state_key = str(
+            request.get("selection_state_key") or ""
+        )
+        result_revision_key = str(
+            request.get("result_revision_key") or ""
+        )
+        if not all(
+            (result_state_key, selection_state_key, result_revision_key)
+        ):
+            raise ValueError("저장 화면 상태를 확인하지 못했습니다.")
+        result = dict(st.session_state.get(result_state_key) or {})
+        result_items = list(result.get("items") or [])
+        saved_uids = {
+            str((row.get("assignment") or {}).get("company_uid") or "")
+            for row in (save_result.get("results") or [])
+            if row.get("ok")
+        }
+        result["items"] = [
+            item
+            for item in result_items
+            if str(item.get("company_uid") or "") not in saved_uids
+        ]
+        result["found_count"] = len(result["items"])
+        result.pop("assignment_warning", None)
+        st.session_state[result_state_key] = result
+        st.session_state[selection_state_key] = []
+        st.session_state[result_revision_key] = int(
+            st.session_state.get(result_revision_key, 0) or 0
+        ) + 1
+        if notices:
+            st.session_state[_PROSPECT_SAVE_FLASH_KEY] = (
+                notices
+            )
+        st.session_state.pop(_PROSPECT_SAVE_APPROVAL_KEY, None)
+        st.rerun()
+    except Exception as exc:
+        st.error(
+            safe_public_error(exc, "영업후보 저장에 실패했습니다.")
+        )
 
 
 def _finish_outreach_dialog(level: str, message: str) -> None:
@@ -4195,127 +4443,25 @@ def render_prospect_db_center(
                 disabled=not selected_items or not assignment_ready,
                 key=f"save_prospects_v1012_{discovery_type}",
             ):
-                try:
-                    save_result = save_assigned_prospects(
-                        selected_items,
-                        owner_user_id,
-                        session_id=_assignment_session_id(),
-                    )
-                    saved_count = int(save_result.get("saved_count") or 0)
-                    already_owned_count = int(
-                        save_result.get("already_owned_count") or 0
-                    )
-                    newly_saved_count = max(
-                        0,
-                        saved_count - already_owned_count,
-                    )
-                    failures = [
-                        row
-                        for row in (save_result.get("results") or [])
-                        if not row.get("ok")
-                    ]
-                    save_notices: list[dict[str, str]] = []
-                    if newly_saved_count:
-                        save_notices.append(
-                            {
-                                "level": "success",
-                                "message": (
-                                    "저장 완료: "
-                                    f"{newly_saved_count:,}개 업체를 내 "
-                                    "영업DB에 담았습니다. 24시간 안에 "
-                                    "연락결과를 기록해 주세요."
-                                ),
-                            }
-                        )
-                    if already_owned_count:
-                        save_notices.append(
-                            {
-                                "level": "info",
-                                "message": (
-                                    f"{already_owned_count:,}개 업체는 이미 "
-                                    "내 영업DB에 있어 중복 저장하지 "
-                                    "않았습니다. ③ 저장된 영업후보에서 "
-                                    "기존 상세정보를 확인할 수 있습니다."
-                                ),
-                            }
-                        )
-                    failure_codes = {
-                        str(row.get("code") or "") for row in failures
-                    }
-                    if failure_codes & {
-                        "ASSIGNMENT_CONFLICT",
-                        "ALREADY_ASSIGNED",
-                    }:
-                        save_notices.append(
-                            {
-                                "level": "warning",
-                                "message": (
-                                    "다른 담당자가 먼저 배정받은 "
-                                    "업체입니다. 검색 결과를 "
-                                    "새로고침합니다."
-                                ),
-                            }
-                        )
-                    if failure_codes & {
-                        "MAX_UNCONTACTED_REACHED",
-                        "LIMIT_REACHED",
-                        "UNCONTACTED_LIMIT_REACHED",
-                    }:
-                        save_notices.append(
-                            {
-                                "level": "warning",
-                                "message": (
-                                    "미접촉 배정 DB는 최대 30개까지 "
-                                    "보유할 수 있습니다. 기존 DB의 "
-                                    "연락결과를 기록하거나 배정을 "
-                                    "해제한 후 다시 시도해 주세요."
-                                ),
-                            }
-                        )
-                    for row in failures:
-                        if str(row.get("code") or "") not in {
-                            "ASSIGNMENT_CONFLICT",
-                            "ALREADY_ASSIGNED",
-                            "MAX_UNCONTACTED_REACHED",
-                            "LIMIT_REACHED",
-                            "UNCONTACTED_LIMIT_REACHED",
-                        }:
-                            save_notices.append(
-                                {
-                                    "level": "warning",
-                                    "message": str(
-                                        row.get("message") or "저장 실패"
-                                    ),
-                                }
-                            )
-
-                    saved_uids = {
-                        str((row.get("assignment") or {}).get("company_uid") or "")
-                        for row in (save_result.get("results") or [])
-                        if row.get("ok")
-                    }
-                    result["items"] = [
-                        item
-                        for item in items
-                        if str(item.get("company_uid") or "") not in saved_uids
-                    ]
-                    result["found_count"] = len(result["items"])
-                    # A fresh save result is already shown once through the
-                    # flash notice.  Do not repeat a stale assignment warning
-                    # from the cached search result below it after rerun.
-                    result.pop("assignment_warning", None)
-                    st.session_state[result_state_key] = result
-                    st.session_state[selection_state_key] = []
-                    st.session_state[result_revision_key] = int(
-                        st.session_state.get(result_revision_key, 0) or 0
-                    ) + 1
-                    if save_notices:
-                        st.session_state[_PROSPECT_SAVE_FLASH_KEY] = (
-                            save_notices
-                        )
-                    st.rerun()
-                except Exception as exc:
-                    st.error(safe_public_error(exc, "영업후보 저장에 실패했습니다."))
+                st.session_state[_PROSPECT_SAVE_APPROVAL_KEY] = {
+                    "items": deepcopy(selected_items),
+                    "result_state_key": result_state_key,
+                    "selection_state_key": selection_state_key,
+                    "result_revision_key": result_revision_key,
+                    "discovery_type": discovery_type,
+                }
+            pending_save_approval = st.session_state.get(
+                _PROSPECT_SAVE_APPROVAL_KEY
+            )
+            if (
+                isinstance(pending_save_approval, dict)
+                and pending_save_approval.get("discovery_type")
+                == discovery_type
+            ):
+                _show_prospect_save_approval_dialog(
+                    owner_user_id,
+                    pending_save_approval,
+                )
 
             if assignment_ready and len(selected_items) == 1:
                 with st.expander(
@@ -4371,69 +4517,30 @@ def render_prospect_db_center(
                             )
                         else:
                             quick_item = selected_items[0]
-                            quick_claim = save_assigned_prospects(
-                                [quick_item],
+                            approval_request = {
+                                "items": [deepcopy(quick_item)],
+                                "result_state_key": result_state_key,
+                                "selection_state_key": selection_state_key,
+                                "result_revision_key": result_revision_key,
+                                "discovery_type": discovery_type,
+                                "post_save_contact": {
+                                    "method": quick_method,
+                                    "result": quick_result,
+                                    "notes": quick_notes,
+                                    "next_contact_at": (
+                                        quick_next_date.isoformat()
+                                        if quick_schedule
+                                        else None
+                                    ),
+                                },
+                            }
+                            st.session_state[
+                                _PROSPECT_SAVE_APPROVAL_KEY
+                            ] = approval_request
+                            _show_prospect_save_approval_dialog(
                                 owner_user_id,
-                                session_id=_assignment_session_id(),
+                                approval_request,
                             )
-                            quick_rows = list(
-                                quick_claim.get("results") or []
-                            )
-                            quick_row = quick_rows[0] if quick_rows else {}
-                            if not quick_row.get("ok"):
-                                st.warning(
-                                    quick_row.get("message")
-                                    or quick_claim.get("message")
-                                    or "업체를 배정하지 못했습니다."
-                                )
-                            else:
-                                quick_assignment = dict(
-                                    quick_row.get("assignment") or {}
-                                )
-                                quick_uid = str(
-                                    quick_assignment.get("company_uid")
-                                    or quick_item.get("company_uid")
-                                    or sales_assignments.build_company_uid(
-                                        quick_item
-                                    )
-                                )
-                                quick_contact = (
-                                    sales_assignments.record_contact(
-                                        owner_user_id,
-                                        quick_assignment.get("company_id"),
-                                        quick_uid,
-                                        quick_method,
-                                        quick_result,
-                                        notes=quick_notes,
-                                        next_contact_at=(
-                                            quick_next_date.isoformat()
-                                            if quick_schedule
-                                            else None
-                                        ),
-                                        session_id=_assignment_session_id(),
-                                    )
-                                )
-                                if quick_contact.get("ok"):
-                                    st.success(quick_contact.get("message"))
-                                    result["items"] = [
-                                        item
-                                        for item in items
-                                        if str(item.get("company_uid") or "")
-                                        != quick_uid
-                                    ]
-                                    result["found_count"] = len(
-                                        result["items"]
-                                    )
-                                    st.session_state[result_state_key] = result
-                                    st.session_state[selection_state_key] = []
-                                    st.session_state[result_revision_key] = int(
-                                        st.session_state.get(
-                                            result_revision_key, 0
-                                        )
-                                        or 0
-                                    ) + 1
-                                else:
-                                    st.error(quick_contact.get("message"))
 
         failures = result.get("failures") or []
         if failures:

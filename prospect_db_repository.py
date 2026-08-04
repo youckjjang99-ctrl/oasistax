@@ -72,6 +72,121 @@ def _company_address_key(company_name: Any, address: Any) -> str:
     return f"{name}|{place}"
 
 
+_REVIEW_EMAIL_PATTERN = re.compile(
+    r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
+)
+
+
+def _normalize_review_phone(value: Any) -> str:
+    digits = re.sub(r"\D", "", str(value or ""))
+    if digits.startswith("00820"):
+        digits = "0" + digits[5:]
+    elif digits.startswith("0082"):
+        digits = "0" + digits[4:]
+    elif digits.startswith("820"):
+        digits = "0" + digits[3:]
+    elif digits.startswith("82"):
+        digits = "0" + digits[2:]
+    if not re.fullmatch(r"0[0-9]{8,10}", digits):
+        return ""
+    return digits
+
+
+def build_review_contact_candidates(
+    prospect: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Build the bounded contact set an operator can approve at save time.
+
+    Approval only promotes public collection results into the canonical
+    contact table with ``review_required`` status.  It is deliberately not a
+    recipient marketing-consent record.
+    """
+
+    analysis = (
+        prospect.get("영업분석")
+        if isinstance(prospect.get("영업분석"), dict)
+        else {}
+    )
+    candidates: list[dict[str, Any]] = []
+
+    try:
+        phone_confidence = int(analysis.get("phone_confidence") or 0)
+    except (TypeError, ValueError):
+        phone_confidence = 0
+    primary_phone = _normalize_review_phone(
+        prospect.get("대표전화") or analysis.get("phone")
+    )
+    for raw_phone in (
+        prospect.get("휴대전화"),
+        prospect.get("일반전화"),
+        primary_phone,
+    ):
+        phone = _normalize_review_phone(raw_phone)
+        if not phone:
+            continue
+        candidates.append(
+            {
+                "contact_type": "phone",
+                "contact_value": phone,
+                "source_url": "",
+                "confidence": min(100, max(0, phone_confidence)),
+                "is_primary": not primary_phone or phone == primary_phone,
+            }
+        )
+
+    email = str(prospect.get("이메일") or analysis.get("email") or "").strip()
+    if (
+        3 <= len(email) <= 254
+        and "\r" not in email
+        and "\n" not in email
+        and _REVIEW_EMAIL_PATTERN.fullmatch(email)
+    ):
+        candidates.append(
+            {
+                "contact_type": "email",
+                "contact_value": email.casefold(),
+                "source_url": "",
+                "confidence": 0,
+                "is_primary": True,
+            }
+        )
+
+    instagram_url = str(
+        prospect.get("인스타그램URL") or analysis.get("instagram_url") or ""
+    ).strip()
+    instagram = str(
+        prospect.get("인스타그램") or analysis.get("instagram") or ""
+    ).strip()
+    instagram_value = instagram or instagram_url
+    safe_instagram_url = (
+        instagram_url
+        if re.match(r"^https?://", instagram_url, flags=re.IGNORECASE)
+        and len(instagram_url) <= 2000
+        else ""
+    )
+    if instagram_value and len(instagram_value) <= 500:
+        candidates.append(
+            {
+                "contact_type": "instagram",
+                "contact_value": instagram_value,
+                "source_url": safe_instagram_url,
+                "confidence": 0,
+                "is_primary": True,
+            }
+        )
+
+    unique: dict[tuple[str, str], dict[str, Any]] = {}
+    for candidate in candidates:
+        key = (
+            str(candidate.get("contact_type") or ""),
+            str(candidate.get("contact_value") or ""),
+        )
+        unique.setdefault(key, candidate)
+    return list(unique.values())[:8]
+
+
 def _recent_opening_source_key(row: dict[str, Any]) -> str:
     """사업자번호가 없어도 중복되지 않는 신규개업 후보 키를 만든다."""
     business_no = re.sub(
@@ -796,6 +911,7 @@ def _database_row(
     owner_user_id: str,
     *,
     include_assignment_fields: bool = False,
+    include_review_contacts: bool = False,
 ) -> dict[str, Any]:
     now = datetime.now(timezone.utc).isoformat()
     source_data = dict(prospect.get("원본데이터") or {})
@@ -870,6 +986,8 @@ def _database_row(
                 "nps_workplace_management_no": nps_workplace_management_no,
             }
         )
+    if include_review_contacts:
+        row["contact_candidates"] = build_review_contact_candidates(prospect)
     return row
 
 
@@ -918,6 +1036,7 @@ def save_assigned_prospects(
     owner_user_id: str,
     *,
     session_id: str = "",
+    promote_review_contacts: bool = False,
 ) -> dict[str, Any]:
     """Atomically claim companies and mirror them to the existing sales DB.
 
@@ -938,6 +1057,19 @@ def save_assigned_prospects(
     invalid_results: list[dict[str, Any]] = []
     for item in prospects:
         candidate = dict(item)
+        if (
+            promote_review_contacts
+            and not build_review_contact_candidates(candidate)
+        ):
+            invalid_results.append(
+                {
+                    "ok": False,
+                    "code": "INVALID_INPUT",
+                    "message": "승격할 연락처 후보가 없습니다.",
+                    "assignment": {},
+                }
+            )
+            continue
         try:
             uid = build_company_uid(candidate)
         except ValueError as exc:
@@ -972,6 +1104,7 @@ def save_assigned_prospects(
             item,
             owner_user_id,
             include_assignment_fields=True,
+            include_review_contacts=promote_review_contacts,
         )
         for item in prepared
     ]
@@ -1003,6 +1136,11 @@ def save_assigned_prospects(
 
     results = [*claim_rows, *invalid_results]
     failure_count = sum(1 for result in results if not result.get("ok"))
+    promoted_contact_count = sum(
+        int((result.get("assignment") or {}).get("promoted_contact_count") or 0)
+        for result in results
+        if result.get("ok")
+    )
     return {
         **claim_result,
         "ok": not invalid_results and bool(claim_result.get("ok")),
@@ -1013,6 +1151,7 @@ def save_assigned_prospects(
         "already_owned_count": already_owned_count,
         "success_count": success_count,
         "failure_count": failure_count,
+        "promoted_contact_count": promoted_contact_count,
         "results": results,
     }
 
