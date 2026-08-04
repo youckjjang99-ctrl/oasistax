@@ -348,43 +348,15 @@ begin
             'Kakao recovery cohort changed before snapshot; recovery aborted';
     end if;
 
-    select jsonb_build_object(
-        'row_count', count(*),
-        'with_contact_count', count(*) filter (
-            where mobile_phone <> ''
-               or landline_phone <> ''
-               or email <> ''
-               or instagram_id <> ''
-               or instagram_url <> ''
-        ),
-        'digital_pending_count', count(*) filter (
-            where digital_status = 'pending'
-        ),
-        'digital_processing_count', count(*) filter (
-            where digital_status = 'processing'
-        ),
-        'digital_matched_count', count(*) filter (
-            where digital_status = 'matched'
-        ),
-        'digital_no_match_count', count(*) filter (
-            where digital_status = 'no_match'
-        ),
-        'digital_error_count', count(*) filter (
-            where digital_status = 'error'
-        ),
-        'digital_attempt_sum', coalesce(sum(digital_attempt_count), 0),
-        'digital_checked_count', count(*) filter (
-            where digital_checked_at is not null
-        ),
-        'digital_next_check_count', count(*) filter (
-            where digital_next_check_at is not null
-        ),
-        'digital_error_text_count', count(*) filter (
-            where digital_last_error <> ''
-        )
-    )
-    into v_invariants_before
-    from public.oasis_employment_contacts;
+    -- Avoid a full-table scan over the multi-million-row contact table. Every
+    -- target row is locked and signature-checked above; the full prior row is
+    -- snapshotted below, and non-mutated columns are compared after update.
+    v_invariants_before := jsonb_build_object(
+        'target_count', v_target_count,
+        'moved_count', v_moved_count,
+        'stuck_count', v_stuck_count,
+        'signature_count', v_signature_count
+    );
 
     insert into oasis_private.oasis_kakao_queue_recovery_runs (
         recovery_key,
@@ -498,74 +470,28 @@ begin
 
     select count(*)
     into v_remaining_moved_count
-    from public.oasis_employment_contacts ec
-    where ec.source_type in ('comwel_all_employers', 'nps_monthly')
+    from oasis_private.oasis_kakao_queue_recovery_items backup
+    join public.oasis_employment_contacts ec
+      on ec.contact_key = backup.contact_key
+    where backup.run_id = v_run_id
+      and backup.cohort = 'moved'
       and ec.phone_provider_stage = 'naver'
       and ec.phone_status = 'pending'
-      and ec.status = 'pending'
-      and ec.employee_growth = 0
-      and ec.is_new_company is false
-      and ec.phone_attempt_count = 1
-      and ec.attempt_count = 1
-      and ec.phone_checked_at = ec.checked_at
-      and ec.phone_next_check_at = ec.phone_checked_at
-      and ec.next_check_at = ec.checked_at
-      and ec.phone_checked_at >= timestamptz '2026-08-03 17:44:51+00'
-      and ec.phone_checked_at < timestamptz '2026-08-04 04:30:32+00'
-      and ec.mobile_phone = ''
-      and ec.landline_phone = ''
-      and ec.email = ''
-      and ec.instagram_id = ''
-      and ec.instagram_url = ''
-      and ec.contact_sources = '{}'::jsonb
-      and ec.phone_last_error = ''
-      and ec.last_error = ''
-      and ec.digital_status = 'pending'
-      and ec.digital_attempt_count = 0;
+      and ec.status = 'pending';
 
-    select jsonb_build_object(
-        'row_count', count(*),
-        'with_contact_count', count(*) filter (
-            where mobile_phone <> ''
-               or landline_phone <> ''
-               or email <> ''
-               or instagram_id <> ''
-               or instagram_url <> ''
-        ),
-        'digital_pending_count', count(*) filter (
-            where digital_status = 'pending'
-        ),
-        'digital_processing_count', count(*) filter (
-            where digital_status = 'processing'
-        ),
-        'digital_matched_count', count(*) filter (
-            where digital_status = 'matched'
-        ),
-        'digital_no_match_count', count(*) filter (
-            where digital_status = 'no_match'
-        ),
-        'digital_error_count', count(*) filter (
-            where digital_status = 'error'
-        ),
-        'digital_attempt_sum', coalesce(sum(digital_attempt_count), 0),
-        'digital_checked_count', count(*) filter (
-            where digital_checked_at is not null
-        ),
-        'digital_next_check_count', count(*) filter (
-            where digital_next_check_at is not null
-        ),
-        'digital_error_text_count', count(*) filter (
-            where digital_last_error <> ''
-        )
-    )
-    into v_invariants_after
-    from public.oasis_employment_contacts;
+    v_invariants_after := jsonb_build_object(
+        'target_count', v_target_count,
+        'updated_count', v_updated_count,
+        'missing_count', v_missing_count,
+        'invalid_state_count', v_invalid_state_count,
+        'preserved_difference_count', v_preserved_difference_count,
+        'remaining_moved_count', v_remaining_moved_count
+    );
 
     if v_missing_count <> 0
        or v_invalid_state_count <> 0
        or v_preserved_difference_count <> 0
-       or v_remaining_moved_count <> 0
-       or v_invariants_after is distinct from v_invariants_before then
+       or v_remaining_moved_count <> 0 then
         raise exception
             'Kakao recovery invariant verification failed; recovery aborted';
     end if;

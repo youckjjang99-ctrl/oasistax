@@ -8,7 +8,7 @@ MIGRATION = (
     ROOT
     / "supabase"
     / "migrations"
-    / "20260804141121_recover_20260804_kakao_queue.sql"
+    / "20260804165657_recover_20260804_kakao_queue.sql"
 ).read_text(encoding="utf-8")
 SQL = " ".join(MIGRATION.lower().split())
 
@@ -125,10 +125,20 @@ def test_post_update_verification_preserves_contact_and_digital_state() -> None:
     assert "to_jsonb(ec) - v_mutated_columns" in SQL
     assert "backup.prior_state - v_mutated_columns" in SQL
     assert "v_remaining_moved_count <> 0" in SQL
-    assert "v_invariants_after is distinct from v_invariants_before" in SQL
-    assert "'with_contact_count'" in SQL
-    assert "'digital_attempt_sum'" in SQL
-    assert "'digital_error_text_count'" in SQL
+    assert "'preserved_difference_count'" in SQL
+    assert "'invalid_state_count'" in SQL
+
+
+def test_recovery_avoids_multi_million_row_global_invariant_scans() -> None:
+    assert "from public.oasis_employment_contacts;" not in SQL
+    remaining_start = SQL.index("into v_remaining_moved_count")
+    remaining_end = SQL.index("v_invariants_after :=", remaining_start)
+    remaining_sql = SQL[remaining_start:remaining_end]
+    assert "oasis_kakao_queue_recovery_items backup" in remaining_sql
+    assert "backup.run_id = v_run_id" in remaining_sql
+    assert "'target_count', v_target_count" in SQL
+    assert "'signature_count', v_signature_count" in SQL
+    assert "'updated_count', v_updated_count" in SQL
 
 
 def test_migration_never_emits_rows_or_sensitive_payloads() -> None:
