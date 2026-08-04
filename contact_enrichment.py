@@ -3,11 +3,13 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timezone
+import re
 from threading import Lock
 from time import monotonic
 from typing import Any
 
 import kakao_local_client
+import kakao_provider_call
 import localdata_contact_client
 import naver_web_search_client
 from contact_matching import is_mobile_phone
@@ -20,6 +22,50 @@ CACHE_TTL_SECONDS = 30 * 60
 CACHE_MAX_ITEMS = 500
 _CACHE: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
 _CACHE_LOCK = Lock()
+_SAFE_PROVIDER_ERROR = re.compile(
+    r"^(?:KEY_MISSING|TIMEOUT|NETWORK_ERROR|INVALID_JSON|"
+    r"HTTP_[0-9]{3}|HTTP_ERROR)$"
+)
+
+
+def _safe_provider_error_code(value: Any) -> str:
+    code = str(value or "").strip().upper()
+    return code if _SAFE_PROVIDER_ERROR.fullmatch(code) else "PROVIDER_ERROR"
+
+
+def _kakao_provider_error_result(
+    kakao: dict[str, Any],
+) -> dict[str, Any]:
+    safe_error_code = _safe_provider_error_code(
+        kakao.get("safe_error_code") or kakao.get("status")
+    )
+    request_count = max(0, int(kakao.get("request_count") or 0))
+    return {
+        "ok": False,
+        "status": "provider_error",
+        "outcome": "error",
+        "safe_error_code": safe_error_code,
+        "contacts": [],
+        "website_url": "",
+        "website_confidence": 0,
+        "trace": [
+            {
+                "stage": "kakao",
+                "status": "ERROR",
+                "outcome": "error",
+                "safe_error_code": safe_error_code,
+                "request_count": request_count,
+            }
+        ],
+        "provider_results": {
+            "kakao": {
+                "outcome": "error",
+                "safe_error_code": safe_error_code,
+                "request_count": request_count,
+            }
+        },
+        "cache_hit": False,
+    }
 
 
 def api_statuses() -> dict[str, dict[str, Any]]:
@@ -32,7 +78,7 @@ def api_statuses() -> dict[str, dict[str, Any]]:
 
 def test_connections() -> dict[str, Any]:
     with ThreadPoolExecutor(max_workers=3) as executor:
-        kakao_future = executor.submit(kakao_local_client.test_connection)
+        kakao_future = executor.submit(kakao_provider_call.test_connection)
         naver_future = executor.submit(naver_web_search_client.test_connection)
         localdata_future = (
             executor.submit(
@@ -248,6 +294,7 @@ def enrich_company(
     skip_kakao: bool = False,
     skip_naver: bool = False,
     skip_localdata: bool = False,
+    kakao_runtime_managed: bool = False,
     bulk_mode: bool = False,
     contact_stage: str = "all",
     max_website_candidates: int = 3,
@@ -265,6 +312,7 @@ def enrich_company(
             skip_kakao,
             skip_naver,
             skip_localdata,
+            kakao_runtime_managed,
             bulk_mode,
             stage,
             max_website_candidates,
@@ -274,6 +322,14 @@ def enrich_company(
     )
     cached_result = _cached(cache_key)
     if cached_result is not None:
+        provider_results = cached_result.get("provider_results")
+        if isinstance(provider_results, dict):
+            kakao_result = provider_results.get("kakao")
+            if isinstance(kakao_result, dict):
+                kakao_result["request_count"] = 0
+        for row in cached_result.get("trace") or []:
+            if isinstance(row, dict) and row.get("stage") == "kakao":
+                row["request_count"] = 0
         cached_result["cache_hit"] = True
         return cached_result
     company_name = str(
@@ -298,7 +354,10 @@ def enrich_company(
             None
             if skip_kakao or not collect_phone
             else executor.submit(
-                kakao_local_client.search_company, company_name, address
+                kakao_provider_call.search_company,
+                company_name,
+                address,
+                managed_externally=kakao_runtime_managed,
             )
         )
         naver_phone_future = (
@@ -330,6 +389,25 @@ def enrich_company(
             if kakao_future is None
             else kakao_future.result()
         )
+        declared_kakao_outcome = str(
+            kakao.get("outcome") or ""
+        ).strip().lower()
+        if kakao_future is not None and (
+            not kakao.get("ok")
+            or declared_kakao_outcome not in {"matched", "no_match"}
+        ):
+            for pending in (naver_phone_future, naver_local_future):
+                if pending is not None:
+                    pending.cancel()
+            if kakao.get("ok"):
+                kakao = {
+                    "ok": False,
+                    "outcome": "error",
+                    "status": "INVALID_JSON",
+                    "safe_error_code": "INVALID_JSON",
+                    "request_count": int(kakao.get("request_count") or 0),
+                }
+            return _kakao_provider_error_result(kakao)
         naver_phones = (
             {
                 "candidates": [],
@@ -349,7 +427,8 @@ def enrich_company(
         {
             "stage": "kakao",
             "status": kakao.get("status"),
-            "message": kakao.get("message"),
+            "outcome": kakao.get("outcome"),
+            "request_count": int(kakao.get("request_count") or 0),
         }
     )
     kakao_best = next(
@@ -364,6 +443,25 @@ def enrich_company(
         contact = _phone_contact(kakao_best)
         if contact:
             contacts.append(contact)
+    kakao_outcome = "matched" if any(
+        row.get("source_type") == "kakao_local"
+        and row.get("contact_type") == "phone"
+        and row.get("verification_status") == "auto_verified"
+        for row in contacts
+    ) else "no_match"
+    if (
+        kakao_future is not None
+        and kakao_outcome != declared_kakao_outcome
+    ):
+        return _kakao_provider_error_result(
+            {
+                "ok": False,
+                "outcome": "error",
+                "status": "INVALID_JSON",
+                "safe_error_code": "INVALID_JSON",
+                "request_count": int(kakao.get("request_count") or 0),
+            }
+        )
     trace.append(
         {
             "stage": "naver_local",
@@ -596,10 +694,22 @@ def enrich_company(
         "company_name": company_name,
         "address": address,
         "status": status,
+        "outcome": (
+            "skipped" if kakao_future is None else kakao_outcome
+        ),
         "contacts": contacts,
         "website_url": website_url,
         "website_confidence": website_confidence,
         "trace": trace,
+        "provider_results": {
+            "kakao": {
+                "outcome": (
+                    "skipped" if kakao_future is None else kakao_outcome
+                ),
+                "safe_error_code": "",
+                "request_count": int(kakao.get("request_count") or 0),
+            }
+        },
         "collected_at": collected_at,
         "cache_hit": False,
     }

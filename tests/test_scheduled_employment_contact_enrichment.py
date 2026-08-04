@@ -1,12 +1,39 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timezone
 from unittest.mock import Mock, patch
 
 import scheduled_employment_contact_enrichment as job
 
 
 class EmploymentContactEnrichmentTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.guard_state_patcher = patch.object(
+            job.kakao_provider_runtime,
+            "get_guard_state",
+            return_value={
+                "state": job.kakao_provider_runtime.GUARD_STATE_READY,
+                "guard_generation": 0,
+            },
+        )
+        self.guard_trip_patcher = patch.object(
+            job.kakao_provider_runtime,
+            "trip_guard",
+            return_value=True,
+        )
+        self.held_work_patcher = patch.object(
+            job,
+            "_has_kakao_no_match_holds",
+            return_value=False,
+        )
+        self.guard_state = self.guard_state_patcher.start()
+        self.guard_trip = self.guard_trip_patcher.start()
+        self.held_work = self.held_work_patcher.start()
+        self.addCleanup(self.guard_state_patcher.stop)
+        self.addCleanup(self.guard_trip_patcher.stop)
+        self.addCleanup(self.held_work_patcher.stop)
+
     @patch.object(job.requests, "get")
     @patch.object(job, "CloudDatabase")
     def test_digital_selection_excludes_phone_only_sources(
@@ -56,6 +83,10 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
         self.assertNotIn(
             "source_type",
             request_get.call_args.kwargs["params"],
+        )
+        self.assertEqual(
+            request_get.call_args.kwargs["params"]["phone_last_error"],
+            f"neq.{job.KAKAO_NO_MATCH_HELD}",
         )
 
     @patch.object(job.time, "sleep")
@@ -138,18 +169,12 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
         "key_status",
         return_value={"configured": True},
     )
-    @patch.object(
-        job.kakao_local_client,
-        "key_status",
-        return_value={"configured": True},
-    )
     @patch.object(job, "_enrich_one", side_effect=RuntimeError("db timeout"))
     @patch.object(job, "_eligible_rows")
     def test_single_row_failure_does_not_abort_daily_run(
         self,
         eligible,
         _enrich_one,
-        _kakao_key,
         _naver_key,
     ) -> None:
         eligible.side_effect = [
@@ -159,7 +184,7 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
 
         result = job.run_enrichment(
             stage="phone",
-            phone_provider="auto",
+            phone_provider="naver",
             max_records=1,
         )
 
@@ -170,16 +195,10 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
         "key_status",
         return_value={"configured": True},
     )
-    @patch.object(
-        job.kakao_local_client,
-        "key_status",
-        return_value={"configured": True},
-    )
     @patch.object(job, "_eligible_rows")
     def test_auto_provider_finishes_kakao_queue_before_naver(
         self,
         eligible,
-        _kakao_key,
         _naver_key,
     ) -> None:
         eligible.side_effect = [
@@ -187,11 +206,41 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
             [],
         ]
 
-        result = job.run_enrichment(
-            stage="phone",
-            phone_provider="auto",
-            max_records=1,
-        )
+        with patch.multiple(
+            job.kakao_provider_runtime,
+            acquire_lease=Mock(return_value=True),
+            release_lease=Mock(return_value=True),
+            renew_lease=Mock(return_value=True),
+            get_daily_usage=Mock(
+                return_value={"request_count": 1, "blocked_until": ""}
+            ),
+            test_connection_and_record=Mock(
+                return_value={
+                    "ok": True,
+                    "category": "CONNECTED",
+                    "request_count": 1,
+                }
+            ),
+            reserve_quota=Mock(
+                return_value={
+                    "request_count": 3,
+                    "reserved": True,
+                    "blocked_until": "",
+                }
+            ),
+            reconcile_usage=Mock(
+                return_value={"request_count": 1, "blocked_until": ""}
+            ),
+        ), patch.object(
+            job,
+            "_clear_stale_kakao_no_match_holds",
+            return_value=None,
+        ):
+            result = job.run_enrichment(
+                stage="phone",
+                phone_provider="auto",
+                max_records=1,
+            )
 
         self.assertEqual(result, 0)
         self.assertEqual(
@@ -212,6 +261,12 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
     ) -> None:
         enrich.return_value = {
             "ok": True,
+            "provider_results": {
+                "kakao": {
+                    "outcome": "matched",
+                    "request_count": 1,
+                }
+            },
             "contacts": [
                 {
                     "contact_type": "phone",
@@ -345,7 +400,16 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
     @patch.object(
         job,
         "enrich_company",
-        return_value={"ok": True, "contacts": []},
+        return_value={
+            "ok": True,
+            "provider_results": {
+                "kakao": {
+                    "outcome": "no_match",
+                    "request_count": 2,
+                }
+            },
+            "contacts": [],
+        },
     )
     def test_kakao_no_match_moves_to_naver_queue(
         self,
@@ -363,7 +427,7 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
             "phone",
             "kakao",
         )
-        self.assertEqual(result["status"], "fallback")
+        self.assertEqual(result["status"], "no_match")
         saved = patch_row.call_args_list[-1].args[1]
         self.assertEqual(saved["status"], "pending")
         self.assertEqual(saved["phone_status"], "pending")
@@ -372,6 +436,77 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
         self.assertIn("phone_next_check_at", saved)
         self.assertFalse(enrich.call_args.kwargs["skip_kakao"])
         self.assertTrue(enrich.call_args.kwargs["skip_naver"])
+
+    @patch.object(job, "_patch", return_value=True)
+    @patch.object(job, "enrich_company")
+    def test_existing_phone_does_not_mask_a_fresh_kakao_no_match(
+        self,
+        enrich,
+        patch_row,
+    ) -> None:
+        enrich.return_value = {
+            "ok": True,
+            "provider_results": {
+                "kakao": {
+                    "outcome": "no_match",
+                    "request_count": 2,
+                }
+            },
+            "contacts": [],
+        }
+
+        result = job._enrich_one(
+            {
+                "contact_key": "place:existing-phone",
+                "status": "matched",
+                "phone_status": "pending",
+                "phone_provider_stage": "kakao",
+                "mobile_phone": "-".join(("010", "0000", "0000")),
+                "company_name": "test",
+                "address": "test",
+            },
+            "phone",
+            "kakao",
+        )
+
+        self.assertEqual(result["outcome"], "no_match")
+        saved = patch_row.call_args_list[-1].args[1]
+        self.assertEqual(saved["phone_status"], "pending")
+        self.assertEqual(saved["phone_provider_stage"], "naver")
+
+    @patch.object(job, "_patch", return_value=True)
+    @patch.object(job, "enrich_company")
+    def test_unknown_kakao_outcome_is_not_treated_as_no_match(
+        self,
+        enrich,
+        patch_row,
+    ) -> None:
+        enrich.return_value = {
+            "ok": True,
+            "provider_results": {
+                "kakao": {
+                    "outcome": "unexpected",
+                    "request_count": 1,
+                }
+            },
+            "contacts": [],
+        }
+
+        result = job._enrich_one(
+            {
+                "contact_key": "place:unknown-outcome",
+                "phone_status": "pending",
+                "phone_provider_stage": "kakao",
+                "company_name": "test",
+            },
+            "phone",
+            "kakao",
+        )
+
+        self.assertEqual(result["outcome"], "error")
+        self.assertEqual(result["safe_error_code"], "INVALID_JSON")
+        saved = patch_row.call_args_list[-1].args[1]
+        self.assertEqual(saved["phone_provider_stage"], "kakao")
 
     @patch.object(job, "_patch", return_value=True)
     @patch.object(
@@ -439,7 +574,7 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
         saved = patch_row.call_args_list[-1].args[1]
         self.assertEqual(saved["phone_status"], "error")
         self.assertEqual(saved["phone_provider_stage"], "naver")
-        self.assertIn("UpstreamLimitError", saved["phone_last_error"])
+        self.assertEqual(saved["phone_last_error"], "HTTP_429")
 
     @patch.object(job, "_patch", return_value=True)
     @patch.object(
@@ -476,6 +611,859 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
             ],
             "naver",
         )
+
+    @patch.object(job, "_patch", return_value=True)
+    @patch.object(job, "enrich_company")
+    def test_kakao_provider_error_stays_in_kakao_with_safe_code(
+        self,
+        enrich,
+        patch_row,
+    ) -> None:
+        enrich.return_value = {
+            "ok": False,
+            "status": "provider_error",
+            "safe_error_code": "HTTP_500",
+            "provider_results": {
+                "kakao": {
+                    "outcome": "error",
+                    "safe_error_code": "HTTP_500",
+                    "request_count": 2,
+                }
+            },
+            "contacts": [],
+        }
+
+        result = job._enrich_one(
+            {
+                "contact_key": "place:error",
+                "phone_status": "pending",
+                "phone_provider_stage": "kakao",
+                "company_name": "test",
+                "address": "test",
+            },
+            "phone",
+            "kakao",
+        )
+
+        self.assertEqual(result["outcome"], "error")
+        self.assertTrue(result["provider_error"])
+        self.assertEqual(result["safe_error_code"], "HTTP_500")
+        self.assertEqual(result["request_count"], 2)
+        saved = patch_row.call_args_list[-1].args[1]
+        self.assertEqual(saved["phone_provider_stage"], "kakao")
+        self.assertEqual(saved["phone_status"], "error")
+        self.assertEqual(saved["phone_last_error"], "HTTP_500")
+        self.assertNotIn("response", str(saved).lower())
+
+    @patch.object(job, "_patch", return_value=True)
+    @patch.object(job, "enrich_company")
+    def test_kakao_no_match_can_be_held_until_guard_passes(
+        self,
+        enrich,
+        patch_row,
+    ) -> None:
+        enrich.return_value = {
+            "ok": True,
+            "contacts": [],
+            "provider_results": {
+                "kakao": {
+                    "outcome": "no_match",
+                    "safe_error_code": "",
+                    "request_count": 2,
+                }
+            },
+        }
+
+        result = job._enrich_one(
+            {
+                "contact_key": "place:held",
+                "phone_status": "pending",
+                "phone_provider_stage": "kakao",
+                "company_name": "test",
+                "address": "test",
+            },
+            "phone",
+            "kakao",
+            hold_kakao_no_match=True,
+        )
+
+        self.assertEqual(result["outcome"], "no_match")
+        self.assertTrue(result["held"])
+        self.assertEqual(result["request_count"], 2)
+        saved = patch_row.call_args_list[-1].args[1]
+        self.assertEqual(saved["phone_provider_stage"], "kakao")
+        self.assertEqual(saved["phone_status"], "pending")
+        self.assertEqual(
+            saved["phone_last_error"],
+            job.KAKAO_NO_MATCH_HELD,
+        )
+
+    @patch.object(job, "_patch", return_value=True)
+    @patch.object(job, "enrich_company")
+    def test_cached_kakao_result_does_not_increment_request_usage(
+        self,
+        enrich,
+        _patch_row,
+    ) -> None:
+        enrich.return_value = {
+            "ok": True,
+            "cache_hit": True,
+            "contacts": [],
+            "provider_results": {
+                "kakao": {
+                    "outcome": "no_match",
+                    "request_count": 2,
+                }
+            },
+        }
+
+        result = job._enrich_one(
+            {
+                "contact_key": "place:cached",
+                "phone_status": "pending",
+                "phone_provider_stage": "kakao",
+                "company_name": "test",
+            },
+            "phone",
+            "kakao",
+        )
+
+        self.assertEqual(result["outcome"], "no_match")
+        self.assertEqual(result["request_count"], 0)
+
+    @patch.object(job, "_patch", return_value=True)
+    @patch.object(job, "enrich_company")
+    @patch.object(
+        job,
+        "_now",
+        return_value=datetime(2026, 8, 4, 3, 0, tzinfo=timezone.utc),
+    )
+    def test_kakao_429_waits_until_next_kst_quota_reset(
+        self,
+        _now,
+        enrich,
+        patch_row,
+    ) -> None:
+        enrich.return_value = {
+            "ok": False,
+            "safe_error_code": "HTTP_429",
+            "provider_results": {
+                "kakao": {
+                    "outcome": "error",
+                    "safe_error_code": "HTTP_429",
+                    "request_count": 1,
+                }
+            },
+            "contacts": [],
+        }
+
+        result = job._enrich_one(
+            {
+                "contact_key": "place:quota",
+                "phone_status": "pending",
+                "phone_provider_stage": "kakao",
+                "company_name": "test",
+            },
+            "phone",
+            "kakao",
+        )
+
+        self.assertTrue(result["halt"])
+        saved = patch_row.call_args_list[-1].args[1]
+        self.assertEqual(saved["phone_last_error"], "HTTP_429")
+        self.assertEqual(
+            saved["phone_next_check_at"],
+            "2026-08-04T15:00:00+00:00",
+        )
+
+    @patch.object(job, "_patch")
+    @patch.object(job, "enrich_company")
+    def test_kakao_429_survives_error_state_patch_failure(
+        self,
+        enrich,
+        patch_row,
+    ) -> None:
+        patch_row.side_effect = [True, RuntimeError("database unavailable")]
+        enrich.return_value = {
+            "ok": False,
+            "safe_error_code": "HTTP_429",
+            "provider_results": {
+                "kakao": {
+                    "outcome": "error",
+                    "safe_error_code": "HTTP_429",
+                    "request_count": 1,
+                }
+            },
+            "contacts": [],
+        }
+
+        result = job._enrich_one(
+            {
+                "contact_key": "place:quota-patch-failure",
+                "phone_status": "pending",
+                "phone_provider_stage": "kakao",
+                "company_name": "test",
+            },
+            "phone",
+            "kakao",
+        )
+
+        self.assertEqual(result["safe_error_code"], "HTTP_429")
+        self.assertEqual(result["request_count"], 1)
+        self.assertTrue(result["halt"])
+        self.assertTrue(result["fatal"])
+
+    @patch.object(job, "_eligible_rows")
+    @patch.object(job, "_clear_stale_kakao_no_match_holds")
+    def test_failed_preflight_stops_before_queue_selection(
+        self,
+        clear_holds,
+        eligible,
+    ) -> None:
+        with patch.multiple(
+            job.kakao_provider_runtime,
+            acquire_lease=Mock(return_value=True),
+            release_lease=Mock(return_value=True),
+            get_daily_usage=Mock(
+                return_value={"request_count": 0, "blocked_until": ""}
+            ),
+            test_connection_and_record=Mock(
+                return_value={
+                    "ok": False,
+                    "category": "AUTH_ERROR",
+                    "safe_error_code": "HTTP_401",
+                    "request_count": 1,
+                }
+            ),
+        ):
+            result = job.run_enrichment(
+                stage="phone",
+                phone_provider="kakao",
+            )
+
+        self.assertEqual(result, job.EXIT_PREFLIGHT_FAILED)
+        eligible.assert_not_called()
+        clear_holds.assert_not_called()
+
+    @patch.object(job, "_eligible_rows")
+    def test_lease_conflict_stops_before_preflight_or_queue(
+        self,
+        eligible,
+    ) -> None:
+        preflight = Mock()
+        with patch.multiple(
+            job.kakao_provider_runtime,
+            acquire_lease=Mock(return_value=False),
+            release_lease=Mock(return_value=True),
+            test_connection_and_record=preflight,
+        ):
+            result = job.run_enrichment(
+                stage="phone",
+                phone_provider="kakao",
+            )
+
+        self.assertEqual(result, job.EXIT_LEASE_UNAVAILABLE)
+        preflight.assert_not_called()
+        eligible.assert_not_called()
+
+    @patch.object(job, "_eligible_rows")
+    def test_blocked_guard_stops_before_hold_check_preflight_and_queue(
+        self,
+        eligible,
+    ) -> None:
+        self.guard_state.return_value = {
+            "state": job.kakao_provider_runtime.GUARD_STATE_BLOCKED,
+            "guard_generation": 3,
+            "guard_reason": (
+                job.kakao_provider_runtime.GUARD_REASON_INITIAL_ZERO_MATCH_RATE
+            ),
+        }
+        preflight = Mock()
+        with patch.multiple(
+            job.kakao_provider_runtime,
+            acquire_lease=Mock(return_value=True),
+            release_lease=Mock(return_value=True),
+            test_connection_and_record=preflight,
+        ):
+            result = job.run_enrichment(
+                stage="phone",
+                phone_provider="kakao",
+            )
+
+        self.assertEqual(result, job.EXIT_PROVIDER_GUARD)
+        self.held_work.assert_not_called()
+        preflight.assert_not_called()
+        eligible.assert_not_called()
+
+    @patch.object(job, "_eligible_rows")
+    def test_orphaned_holds_trip_guard_before_preflight_and_queue(
+        self,
+        eligible,
+    ) -> None:
+        self.held_work.return_value = True
+        preflight = Mock()
+        with patch.multiple(
+            job.kakao_provider_runtime,
+            acquire_lease=Mock(return_value=True),
+            release_lease=Mock(return_value=True),
+            test_connection_and_record=preflight,
+        ):
+            result = job.run_enrichment(
+                stage="phone",
+                phone_provider="kakao",
+            )
+
+        self.assertEqual(result, job.EXIT_PROVIDER_GUARD)
+        self.guard_trip.assert_called_once()
+        self.assertEqual(
+            self.guard_trip.call_args.args[2],
+            job.kakao_provider_runtime.GUARD_REASON_ORPHANED_HOLDS,
+        )
+        preflight.assert_not_called()
+        eligible.assert_not_called()
+
+    @patch.object(job, "_eligible_rows")
+    @patch.object(job, "_clear_stale_kakao_no_match_holds")
+    def test_approved_resume_preflight_failure_keeps_holds_and_approval(
+        self,
+        clear_holds,
+        eligible,
+    ) -> None:
+        self.guard_state.return_value = {
+            "state": (
+                job.kakao_provider_runtime.GUARD_STATE_RESUME_APPROVED
+            ),
+            "guard_generation": 4,
+        }
+        consume = Mock(return_value=True)
+        with patch.multiple(
+            job.kakao_provider_runtime,
+            acquire_lease=Mock(return_value=True),
+            release_lease=Mock(return_value=True),
+            get_daily_usage=Mock(
+                return_value={"request_count": 0, "blocked_until": ""}
+            ),
+            test_connection_and_record=Mock(
+                return_value={
+                    "ok": False,
+                    "category": "AUTH_ERROR",
+                    "safe_error_code": "HTTP_401",
+                }
+            ),
+            consume_guard_resume=consume,
+        ):
+            result = job.run_enrichment(
+                stage="phone",
+                phone_provider="kakao",
+            )
+
+        self.assertEqual(result, job.EXIT_PREFLIGHT_FAILED)
+        clear_holds.assert_not_called()
+        consume.assert_not_called()
+        eligible.assert_not_called()
+
+    @patch.object(job, "_eligible_rows", return_value=[])
+    @patch.object(job, "_clear_stale_kakao_no_match_holds")
+    def test_approved_resume_resets_then_consumes_before_queue(
+        self,
+        clear_holds,
+        eligible,
+    ) -> None:
+        events: list[str] = []
+        self.guard_state.return_value = {
+            "state": (
+                job.kakao_provider_runtime.GUARD_STATE_RESUME_APPROVED
+            ),
+            "guard_generation": 5,
+        }
+        clear_holds.side_effect = lambda: events.append("reset")
+
+        def consume(*_args, **_kwargs):
+            events.append("consume")
+            return True
+
+        eligible.side_effect = lambda *_args, **_kwargs: (
+            events.append("queue") or []
+        )
+        with patch.multiple(
+            job.kakao_provider_runtime,
+            acquire_lease=Mock(return_value=True),
+            release_lease=Mock(return_value=True),
+            get_daily_usage=Mock(
+                return_value={"request_count": 1, "blocked_until": ""}
+            ),
+            test_connection_and_record=Mock(
+                return_value={"ok": True, "category": "CONNECTED"}
+            ),
+            consume_guard_resume=Mock(side_effect=consume),
+        ):
+            result = job.run_enrichment(
+                stage="phone",
+                phone_provider="kakao",
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(events, ["reset", "consume", "queue"])
+
+    @patch.object(job, "_release_kakao_no_match_holds")
+    @patch.object(job.kakao_provider_runtime, "renew_lease", return_value=True)
+    @patch.object(job.kakao_provider_runtime, "reconcile_usage")
+    @patch.object(job.kakao_provider_runtime, "reserve_quota")
+    @patch.object(job, "_enrich_one")
+    @patch.object(job, "_eligible_rows")
+    def test_actual_kakao_request_count_is_persisted(
+        self,
+        eligible,
+        enrich_one,
+        reserve_quota,
+        reconcile_usage,
+        _renew,
+        release_holds,
+    ) -> None:
+        eligible.side_effect = [[{"contact_key": "place:1"}], []]
+        enrich_one.return_value = {
+            "status": "no_match",
+            "outcome": "no_match",
+            "request_count": 2,
+            "held": True,
+            "contact_key": "place:1",
+        }
+        reserve_quota.return_value = {
+            "request_count": 3,
+            "reserved": True,
+            "blocked_until": "",
+            "quota_date": "2026-08-05",
+        }
+        reconcile_usage.return_value = {
+            "request_count": 3,
+            "blocked_until": "",
+        }
+
+        result = job._run_provider_batches(
+            stage="phone",
+            phone_provider="kakao",
+            workers=1,
+            batch_size=20,
+            max_records=10,
+            max_requests=85000,
+            daily_request_count=1,
+            lease_token="lease",
+        )
+
+        self.assertEqual(result, 0)
+        reserve_quota.assert_called_once_with(2, 85000)
+        reconcile_usage.assert_called_once_with(
+            2,
+            2,
+            "",
+            reservation_date="2026-08-05",
+        )
+        release_holds.assert_called_once_with(["place:1"])
+
+    @patch.object(job, "_release_kakao_no_match_holds")
+    @patch.object(job.kakao_provider_runtime, "renew_lease", return_value=True)
+    @patch.object(job.kakao_provider_runtime, "reconcile_usage")
+    @patch.object(job.kakao_provider_runtime, "reserve_quota")
+    @patch.object(job, "_enrich_one")
+    @patch.object(job, "_eligible_rows")
+    def test_ten_consecutive_provider_errors_stop_job(
+        self,
+        eligible,
+        enrich_one,
+        reserve_quota,
+        reconcile_usage,
+        _renew,
+        release_holds,
+    ) -> None:
+        eligible.return_value = [
+            {"contact_key": f"place:{index}"} for index in range(10)
+        ]
+        enrich_one.return_value = {
+            "status": "error",
+            "outcome": "error",
+            "request_count": 1,
+            "provider_error": True,
+            "safe_error_code": "HTTP_500",
+        }
+        reserve_quota.return_value = {
+            "request_count": 21,
+            "reserved": True,
+            "blocked_until": "",
+        }
+        reconcile_usage.return_value = {
+            "request_count": 11,
+            "blocked_until": "",
+        }
+
+        result = job._run_provider_batches(
+            stage="phone",
+            phone_provider="kakao",
+            workers=10,
+            batch_size=200,
+            max_records=100,
+            max_requests=85000,
+            daily_request_count=1,
+            lease_token="lease",
+        )
+
+        self.assertEqual(result, job.EXIT_PROVIDER_GUARD)
+        self.assertEqual(enrich_one.call_count, 10)
+        release_holds.assert_not_called()
+        self.guard_trip.assert_called_once()
+        self.assertEqual(
+            self.guard_trip.call_args.args[2],
+            (
+                job.kakao_provider_runtime.GUARD_REASON_CONSECUTIVE_PROVIDER_ERRORS
+            ),
+        )
+
+    @patch.object(job, "_release_kakao_no_match_holds")
+    @patch.object(job.kakao_provider_runtime, "renew_lease", return_value=True)
+    @patch.object(job.kakao_provider_runtime, "reconcile_usage")
+    @patch.object(job.kakao_provider_runtime, "reserve_quota")
+    @patch.object(job, "_enrich_one")
+    @patch.object(job, "_eligible_rows")
+    def test_http_429_blocks_more_batches_and_records_quota_code(
+        self,
+        eligible,
+        enrich_one,
+        reserve_quota,
+        reconcile_usage,
+        _renew,
+        release_holds,
+    ) -> None:
+        eligible.return_value = [
+            {"contact_key": "place:no-match"},
+            {"contact_key": "place:quota"},
+        ]
+
+        def provider_result(row, *_args, **_kwargs):
+            if row["contact_key"] == "place:no-match":
+                return {
+                    "status": "no_match",
+                    "outcome": "no_match",
+                    "request_count": 2,
+                    "held": True,
+                    "contact_key": row["contact_key"],
+                }
+            return {
+                "status": "error",
+                "outcome": "error",
+                "request_count": 1,
+                "provider_error": True,
+                "safe_error_code": "HTTP_429",
+                "halt": True,
+            }
+
+        enrich_one.side_effect = provider_result
+        reserve_quota.return_value = {
+            "request_count": 5,
+            "reserved": True,
+            "blocked_until": "",
+            "quota_date": "2026-08-05",
+        }
+        reconcile_usage.return_value = {
+            "request_count": 4,
+            "blocked_until": "2026-08-04T15:00:00+00:00",
+        }
+
+        result = job._run_provider_batches(
+            stage="phone",
+            phone_provider="kakao",
+            workers=1,
+            batch_size=200,
+            max_records=100,
+            max_requests=85000,
+            daily_request_count=1,
+            lease_token="lease",
+        )
+
+        self.assertEqual(result, job.EXIT_PROVIDER_QUOTA)
+        self.assertEqual(eligible.call_count, 1)
+        reserve_quota.assert_called_once_with(4, 85000)
+        reconcile_usage.assert_called_once_with(
+            4,
+            3,
+            "HTTP_429",
+            reservation_date="2026-08-05",
+        )
+        release_holds.assert_not_called()
+
+    @patch.object(job, "_release_kakao_no_match_holds")
+    @patch.object(job.kakao_provider_runtime, "renew_lease", return_value=True)
+    @patch.object(job.kakao_provider_runtime, "reconcile_usage")
+    @patch.object(job.kakao_provider_runtime, "reserve_quota")
+    @patch.object(job, "_enrich_one")
+    @patch.object(job, "_eligible_rows")
+    def test_initial_all_no_match_guard_retains_kakao_rows(
+        self,
+        eligible,
+        enrich_one,
+        reserve_quota,
+        reconcile_usage,
+        _renew,
+        release_holds,
+    ) -> None:
+        eligible.return_value = [
+            {"contact_key": f"place:{index}"} for index in range(3)
+        ]
+        enrich_one.side_effect = lambda row, *_args, **_kwargs: {
+            "status": "no_match",
+            "outcome": "no_match",
+            "request_count": 2,
+            "held": True,
+            "contact_key": row["contact_key"],
+        }
+        reserve_quota.return_value = {
+            "request_count": 7,
+            "reserved": True,
+            "blocked_until": "",
+        }
+        reconcile_usage.return_value = {
+            "request_count": 7,
+            "blocked_until": "",
+        }
+
+        with patch.object(job, "KAKAO_INITIAL_ZERO_MATCH_LIMIT", 3):
+            result = job._run_provider_batches(
+                stage="phone",
+                phone_provider="kakao",
+                workers=3,
+                batch_size=200,
+                max_records=100,
+                max_requests=85000,
+                daily_request_count=1,
+                lease_token="lease",
+            )
+
+        self.assertEqual(result, job.EXIT_PROVIDER_GUARD)
+        release_holds.assert_not_called()
+        self.guard_trip.assert_called_once()
+        self.assertEqual(
+            self.guard_trip.call_args.args[2],
+            job.kakao_provider_runtime.GUARD_REASON_INITIAL_ZERO_MATCH_RATE,
+        )
+
+    @patch.object(job, "_release_kakao_no_match_holds")
+    @patch.object(job.kakao_provider_runtime, "renew_lease", return_value=True)
+    @patch.object(job.kakao_provider_runtime, "reconcile_usage")
+    @patch.object(job.kakao_provider_runtime, "reserve_quota")
+    @patch.object(job, "_enrich_one")
+    @patch.object(job, "_eligible_rows")
+    def test_rolling_zero_match_guard_retains_recent_rows(
+        self,
+        eligible,
+        enrich_one,
+        reserve_quota,
+        reconcile_usage,
+        _renew,
+        release_holds,
+    ) -> None:
+        eligible.side_effect = [
+            [{"contact_key": f"matched:{index}"} for index in range(3)],
+            [{"contact_key": f"held:{index}"} for index in range(5)],
+        ]
+
+        def outcome(row, *_args, **_kwargs):
+            matched = str(row["contact_key"]).startswith("matched:")
+            return {
+                "status": "matched" if matched else "no_match",
+                "outcome": "matched" if matched else "no_match",
+                "request_count": 1,
+                "held": not matched,
+                "contact_key": row["contact_key"],
+            }
+
+        enrich_one.side_effect = outcome
+        reserve_quota.side_effect = [
+            {
+                "request_count": 7,
+                "reserved": True,
+                "blocked_until": "",
+            },
+            {
+                "request_count": 14,
+                "reserved": True,
+                "blocked_until": "",
+            },
+        ]
+        reconcile_usage.side_effect = [
+            {"request_count": 4, "blocked_until": ""},
+            {"request_count": 9, "blocked_until": ""},
+        ]
+
+        with patch.object(job, "KAKAO_INITIAL_ZERO_MATCH_LIMIT", 3), \
+             patch.object(job, "KAKAO_ROLLING_ZERO_MATCH_LIMIT", 5):
+            result = job._run_provider_batches(
+                stage="phone",
+                phone_provider="kakao",
+                workers=5,
+                batch_size=200,
+                max_records=100,
+                max_requests=85000,
+                daily_request_count=1,
+                lease_token="lease",
+            )
+
+        self.assertEqual(result, job.EXIT_PROVIDER_GUARD)
+        release_holds.assert_not_called()
+        self.guard_trip.assert_called_once()
+        self.assertEqual(
+            self.guard_trip.call_args.args[2],
+            job.kakao_provider_runtime.GUARD_REASON_ROLLING_ZERO_MATCH_RATE,
+        )
+
+    @patch.object(job, "_release_kakao_no_match_holds")
+    @patch.object(job.kakao_provider_runtime, "renew_lease", return_value=True)
+    @patch.object(job.kakao_provider_runtime, "reconcile_usage")
+    @patch.object(job.kakao_provider_runtime, "reserve_quota")
+    @patch.object(job, "_enrich_one")
+    @patch.object(job, "_eligible_rows")
+    def test_request_limit_reserves_two_calls_per_company(
+        self,
+        eligible,
+        enrich_one,
+        reserve_quota,
+        reconcile_usage,
+        _renew,
+        release_holds,
+    ) -> None:
+        eligible.return_value = [{"contact_key": "place:1"}]
+        enrich_one.return_value = {
+            "status": "no_match",
+            "outcome": "no_match",
+            "request_count": 2,
+            "held": True,
+            "contact_key": "place:1",
+        }
+        reserve_quota.return_value = {
+            "request_count": 10,
+            "reserved": True,
+            "blocked_until": "",
+            "quota_date": "2026-08-05",
+        }
+        reconcile_usage.return_value = {
+            "request_count": 10,
+            "blocked_until": "",
+        }
+
+        result = job._run_provider_batches(
+            stage="phone",
+            phone_provider="kakao",
+            workers=10,
+            batch_size=200,
+            max_records=100,
+            max_requests=10,
+            daily_request_count=8,
+            lease_token="lease",
+        )
+
+        self.assertEqual(result, job.EXIT_DAILY_QUOTA)
+        self.assertEqual(eligible.call_args.args[0], 1)
+        reserve_quota.assert_called_once_with(2, 10)
+        reconcile_usage.assert_called_once_with(
+            2,
+            2,
+            "",
+            reservation_date="2026-08-05",
+        )
+        release_holds.assert_called_once_with(["place:1"])
+
+    @patch.object(job, "_release_kakao_no_match_holds")
+    @patch.object(job.kakao_provider_runtime, "reconcile_usage")
+    @patch.object(
+        job.kakao_provider_runtime,
+        "reserve_quota",
+        return_value={
+            "request_count": 84_999,
+            "reserved": False,
+            "blocked_until": "",
+            "last_safe_error_code": "",
+        },
+    )
+    @patch.object(job, "_enrich_one")
+    @patch.object(
+        job,
+        "_eligible_rows",
+        return_value=[{"contact_key": "place:1"}],
+    )
+    def test_atomic_quota_denial_stops_before_provider_call(
+        self,
+        _eligible,
+        enrich_one,
+        reserve_quota,
+        reconcile_usage,
+        release_holds,
+    ) -> None:
+        result = job._run_provider_batches(
+            stage="phone",
+            phone_provider="kakao",
+            workers=1,
+            batch_size=1,
+            max_records=1,
+            max_requests=85_000,
+            daily_request_count=84_998,
+            lease_token="lease",
+        )
+
+        self.assertEqual(result, job.EXIT_DAILY_QUOTA)
+        reserve_quota.assert_called_once_with(2, 85_000)
+        enrich_one.assert_not_called()
+        reconcile_usage.assert_not_called()
+        release_holds.assert_not_called()
+
+    @patch.object(job, "_release_kakao_no_match_holds")
+    @patch.object(job.kakao_provider_runtime, "renew_lease", return_value=True)
+    @patch.object(job.kakao_provider_runtime, "reconcile_usage")
+    @patch.object(
+        job.kakao_provider_runtime,
+        "reserve_quota",
+        return_value={
+            "request_count": 3,
+            "reserved": True,
+            "blocked_until": "",
+            "quota_date": "2026-08-05",
+        },
+    )
+    @patch.object(job, "_enrich_one", side_effect=RuntimeError("worker lost"))
+    @patch.object(
+        job,
+        "_eligible_rows",
+        return_value=[{"contact_key": "place:1"}],
+    )
+    def test_unknown_worker_failure_keeps_full_quota_reservation(
+        self,
+        _eligible,
+        _enrich_one,
+        _reserve_quota,
+        reconcile_usage,
+        _renew,
+        release_holds,
+    ) -> None:
+        reconcile_usage.return_value = {
+            "request_count": 3,
+            "blocked_until": "",
+        }
+
+        result = job._run_provider_batches(
+            stage="phone",
+            phone_provider="kakao",
+            workers=1,
+            batch_size=1,
+            max_records=1,
+            max_requests=85_000,
+            daily_request_count=1,
+            lease_token="lease",
+        )
+
+        self.assertEqual(result, 0)
+        reconcile_usage.assert_called_once_with(
+            2,
+            2,
+            "PROVIDER_ERROR",
+            reservation_date="2026-08-05",
+        )
+        release_holds.assert_not_called()
 
 
 if __name__ == "__main__":

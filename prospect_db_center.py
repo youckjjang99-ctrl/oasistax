@@ -2993,7 +2993,10 @@ def _render_prospect_db_center_legacy(owner_user_id: str = "") -> None:
         for index, prospect_id in enumerate(selected_ids, start=1):
             prospect = row_by_id[prospect_id]
             try:
-                result = enrich_company(prospect)
+                result = enrich_company(
+                    prospect,
+                    kakao_runtime_managed=False,
+                )
                 result["prospect_id"] = prospect_id
                 result["saved_count"] = save_prospect_contacts(
                     prospect_id,
