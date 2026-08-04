@@ -164,7 +164,7 @@ class ContactCollectionTest(unittest.TestCase):
     @patch("contact_enrichment.localdata_contact_client.search_company")
     @patch("contact_enrichment.naver_web_search_client.search_public_phones")
     @patch("contact_enrichment.naver_web_search_client.search_company")
-    @patch("contact_enrichment.kakao_local_client.search_company")
+    @patch("contact_enrichment.kakao_provider_call.search_company")
     def test_enrichment_labels_public_business_mobile_and_caches(
         self,
         kakao,
@@ -175,7 +175,10 @@ class ContactCollectionTest(unittest.TestCase):
         inspect,
     ) -> None:
         kakao.return_value = {
+            "ok": True,
             "status": "SUCCESS",
+            "outcome": "no_match",
+            "request_count": 2,
             "message": "",
             "candidates": [],
         }
@@ -226,14 +229,28 @@ class ContactCollectionTest(unittest.TestCase):
         self.assertEqual(phone["verification_status"], "auto_verified")
         self.assertFalse(first["cache_hit"])
         self.assertTrue(second["cache_hit"])
+        self.assertEqual(
+            second["provider_results"]["kakao"]["request_count"],
+            0,
+        )
+        self.assertEqual(second["trace"][0]["request_count"], 0)
         self.assertEqual(kakao.call_count, 1)
         self.assertEqual(naver_local.call_count, 1)
         self.assertEqual(naver_phone.call_count, 1)
+        self.assertEqual(first["outcome"], "no_match")
+        self.assertEqual(
+            first["provider_results"]["kakao"],
+            {
+                "outcome": "no_match",
+                "safe_error_code": "",
+                "request_count": 2,
+            },
+        )
 
     @patch("contact_enrichment.localdata_contact_client.search_company")
     @patch("contact_enrichment.naver_web_search_client.search_public_phones")
     @patch("contact_enrichment.naver_web_search_client.search_company")
-    @patch("contact_enrichment.kakao_local_client.search_company")
+    @patch("contact_enrichment.kakao_provider_call.search_company")
     def test_kakao_only_stage_does_not_call_naver(
         self,
         kakao,
@@ -242,7 +259,10 @@ class ContactCollectionTest(unittest.TestCase):
         localdata,
     ) -> None:
         kakao.return_value = {
+            "ok": True,
             "status": "SUCCESS",
+            "outcome": "matched",
+            "request_count": 1,
             "message": "",
             "candidates": [
                 {
@@ -276,6 +296,186 @@ class ContactCollectionTest(unittest.TestCase):
         naver_local.assert_not_called()
         naver_phone.assert_not_called()
         localdata.assert_not_called()
+        self.assertEqual(
+            result["provider_results"]["kakao"]["outcome"],
+            "matched",
+        )
+        self.assertEqual(result["outcome"], "matched")
+        self.assertEqual(
+            result["provider_results"]["kakao"]["request_count"],
+            1,
+        )
+
+    @patch("contact_enrichment.localdata_contact_client.search_company")
+    @patch("contact_enrichment.naver_web_search_client.search_public_phones")
+    @patch("contact_enrichment.naver_web_search_client.search_company")
+    @patch("contact_enrichment.kakao_provider_call.search_company")
+    def test_kakao_provider_error_is_propagated_and_not_cached(
+        self,
+        kakao,
+        naver_local,
+        naver_phone,
+        localdata,
+    ) -> None:
+        kakao.return_value = {
+            "ok": False,
+            "status": "ERROR",
+            "outcome": "error",
+            "safe_error_code": "HTTP_500",
+            "request_count": 2,
+            "message": "must not escape",
+            "candidates": [],
+        }
+        prospect = {
+            "company_name": "test company",
+            "address": "test address",
+        }
+
+        first = contact_enrichment.enrich_company(
+            prospect,
+            skip_naver=True,
+            skip_localdata=True,
+            bulk_mode=True,
+            contact_stage="phone",
+        )
+        second = contact_enrichment.enrich_company(
+            prospect,
+            skip_naver=True,
+            skip_localdata=True,
+            bulk_mode=True,
+            contact_stage="phone",
+        )
+
+        self.assertFalse(first["ok"])
+        self.assertEqual(first["status"], "provider_error")
+        self.assertEqual(first["outcome"], "error")
+        self.assertEqual(first["safe_error_code"], "HTTP_500")
+        self.assertEqual(first["contacts"], [])
+        self.assertEqual(
+            first["provider_results"]["kakao"],
+            {
+                "outcome": "error",
+                "safe_error_code": "HTTP_500",
+                "request_count": 2,
+            },
+        )
+        self.assertNotIn("message", first["trace"][0])
+        self.assertNotIn("must not escape", repr(first))
+        self.assertNotIn("company_name", first)
+        self.assertNotIn("address", first)
+        self.assertFalse(first["cache_hit"])
+        self.assertFalse(second["cache_hit"])
+        self.assertEqual(kakao.call_count, 2)
+        naver_local.assert_not_called()
+        naver_phone.assert_not_called()
+        localdata.assert_not_called()
+
+    @patch("contact_enrichment.kakao_provider_call.search_company")
+    def test_unknown_kakao_error_code_is_sanitized(self, kakao) -> None:
+        kakao.return_value = {
+            "ok": False,
+            "status": "ERROR",
+            "outcome": "error",
+            "safe_error_code": "secret-provider-detail",
+            "request_count": 1,
+            "candidates": [],
+        }
+
+        result = contact_enrichment.enrich_company(
+            {"company_name": "test company", "address": "test address"},
+            skip_naver=True,
+            skip_localdata=True,
+            bulk_mode=True,
+            contact_stage="phone",
+        )
+
+        self.assertEqual(result["safe_error_code"], "PROVIDER_ERROR")
+        self.assertNotIn("secret-provider-detail", repr(result))
+
+    @patch("contact_enrichment.kakao_provider_call.search_company")
+    def test_unknown_success_outcome_is_a_provider_error(self, kakao) -> None:
+        kakao.return_value = {
+            "ok": True,
+            "status": "SUCCESS",
+            "outcome": "unexpected",
+            "request_count": 1,
+            "candidates": [],
+        }
+
+        result = contact_enrichment.enrich_company(
+            {"company_name": "test company", "address": "test address"},
+            skip_naver=True,
+            skip_localdata=True,
+            bulk_mode=True,
+            contact_stage="phone",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["outcome"], "error")
+        self.assertEqual(result["safe_error_code"], "INVALID_JSON")
+        self.assertEqual(result["provider_results"]["kakao"]["request_count"], 1)
+
+    @patch("contact_enrichment.kakao_provider_call.search_company")
+    def test_declared_match_without_a_trusted_contact_is_an_error(
+        self,
+        kakao,
+    ) -> None:
+        kakao.return_value = {
+            "ok": True,
+            "status": "MATCHED",
+            "outcome": "matched",
+            "request_count": 1,
+            "candidates": [],
+        }
+
+        result = contact_enrichment.enrich_company(
+            {"company_name": "test company", "address": "test address"},
+            skip_naver=True,
+            skip_localdata=True,
+            bulk_mode=True,
+            contact_stage="phone",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["outcome"], "error")
+        self.assertEqual(result["safe_error_code"], "INVALID_JSON")
+
+    @patch("contact_enrichment.localdata_contact_client.search_company")
+    @patch(
+        "contact_enrichment.naver_web_search_client.search_public_phones",
+        side_effect=RuntimeError("sensitive naver failure"),
+    )
+    @patch(
+        "contact_enrichment.naver_web_search_client.search_company",
+        side_effect=RuntimeError("sensitive naver failure"),
+    )
+    @patch("contact_enrichment.kakao_provider_call.search_company")
+    def test_kakao_error_cannot_be_masked_by_other_provider_failures(
+        self,
+        kakao,
+        _naver_local,
+        _naver_phone,
+        localdata,
+    ) -> None:
+        kakao.return_value = {
+            "ok": False,
+            "outcome": "error",
+            "status": "HTTP_401",
+            "safe_error_code": "HTTP_401",
+            "request_count": 1,
+            "candidates": [],
+        }
+
+        result = contact_enrichment.enrich_company(
+            {"company_name": "test company", "address": "test address"},
+            skip_localdata=True,
+            contact_stage="phone",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["safe_error_code"], "HTTP_401")
+        self.assertNotIn("sensitive naver failure", repr(result))
+        localdata.assert_not_called()
 
     @patch(
         "sales_intelligence.localdata_contact_client.is_enabled",
@@ -283,7 +483,7 @@ class ContactCollectionTest(unittest.TestCase):
     )
     @patch("sales_intelligence.naver_web_search_client.search_company")
     @patch("sales_intelligence.naver_web_search_client.search_public_phones")
-    @patch("sales_intelligence.kakao_local_client.search_company")
+    @patch("sales_intelligence.kakao_provider_call.search_company")
     def test_mobile_is_selected_before_higher_score_landline(
         self,
         kakao,

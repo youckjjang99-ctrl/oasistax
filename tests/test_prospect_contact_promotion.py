@@ -26,7 +26,7 @@ CONFLICT_FIX_MIGRATION = (
     ROOT
     / "supabase"
     / "migrations"
-    / "20260804131811_fix_prospect_contact_conflict_ambiguity.sql"
+    / "20260804132543_fix_prospect_contact_conflict_ambiguity.sql"
 ).read_text(encoding="utf-8")
 V911_MIGRATION = (
     ROOT
@@ -38,7 +38,7 @@ V911_SERVICE_GRANT_MIGRATION = (
     ROOT
     / "supabase"
     / "migrations"
-    / "20260804133000_fix_v911_index_dependency_acl.sql"
+    / "20260804133529_v911_normalizer_acl.sql"
 ).read_text(encoding="utf-8")
 
 SYNTHETIC_MOBILE = "".join(("010", "1234", "5678"))

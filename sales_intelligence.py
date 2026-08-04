@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
 
-import kakao_local_client
+import kakao_provider_call
 import localdata_contact_client
 import naver_web_search_client
 from contact_enrichment import enrich_company
@@ -199,7 +199,7 @@ def _best_phone(
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {
             "kakao": executor.submit(
-                kakao_local_client.search_company,
+                kakao_provider_call.search_company,
                 company_name,
                 address,
                 timeout=10,

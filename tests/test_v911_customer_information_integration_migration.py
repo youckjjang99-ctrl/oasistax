@@ -18,7 +18,7 @@ SERVICE_GRANT_MIGRATION_PATH = (
     ROOT
     / "supabase"
     / "migrations"
-    / "20260804133000_fix_v911_index_dependency_acl.sql"
+    / "20260804133529_v911_normalizer_acl.sql"
 )
 SERVICE_GRANT_SQL_LOWER = SERVICE_GRANT_MIGRATION_PATH.read_text(
     encoding="utf-8"

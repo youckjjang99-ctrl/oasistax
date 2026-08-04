@@ -33,8 +33,26 @@ class EmploymentPhonePipelineTest(unittest.TestCase):
                 phone_provider="kakao",
                 workers=12,
                 batch_size=200,
-                max_records=pipeline.KAKAO_DAILY_SAFE_RECORDS,
+                max_records=0,
+                max_requests=pipeline.KAKAO_DAILY_SAFE_REQUESTS,
             ),
+        )
+
+    @patch.object(
+        pipeline,
+        "run_enrichment",
+        side_effect=[pipeline.EXIT_DAILY_QUOTA, 0],
+    )
+    def test_safe_request_limit_still_drains_existing_naver_queue(
+        self,
+        run_enrichment,
+    ) -> None:
+        result = pipeline.run_phone_pipeline()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            [item.kwargs["phone_provider"] for item in run_enrichment.call_args_list],
+            ["kakao", "naver"],
         )
 
 

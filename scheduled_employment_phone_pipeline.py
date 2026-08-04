@@ -4,7 +4,8 @@ import json
 import os
 
 from scheduled_employment_contact_enrichment import (
-    KAKAO_DAILY_SAFE_RECORDS,
+    EXIT_DAILY_QUOTA,
+    KAKAO_DAILY_SAFE_REQUESTS,
     NAVER_DAILY_SAFE_RECORDS,
     run_enrichment,
 )
@@ -27,9 +28,9 @@ def run_phone_pipeline() -> int:
     """
     workers = _env_int("EMPLOYMENT_CONTACT_WORKERS", 12)
     batch_size = _env_int("EMPLOYMENT_CONTACT_BATCH_SIZE", 200)
-    kakao_limit = _env_int(
-        "EMPLOYMENT_KAKAO_MAX_RECORDS",
-        KAKAO_DAILY_SAFE_RECORDS,
+    kakao_request_limit = _env_int(
+        "EMPLOYMENT_KAKAO_MAX_REQUESTS",
+        KAKAO_DAILY_SAFE_REQUESTS,
     )
     naver_limit = _env_int(
         "EMPLOYMENT_NAVER_MAX_RECORDS",
@@ -42,7 +43,7 @@ def run_phone_pipeline() -> int:
                 "job": "employment-phone-pipeline",
                 "status": "started",
                 "order": ["kakao", "naver"],
-                "kakao_max_records": kakao_limit,
+                "kakao_max_requests": kakao_request_limit,
                 "naver_max_records": naver_limit,
             },
             ensure_ascii=False,
@@ -55,9 +56,10 @@ def run_phone_pipeline() -> int:
         phone_provider="kakao",
         workers=workers,
         batch_size=batch_size,
-        max_records=kakao_limit,
+        max_records=0,
+        max_requests=kakao_request_limit,
     )
-    if kakao_result != 0:
+    if kakao_result not in {0, EXIT_DAILY_QUOTA}:
         return kakao_result
 
     naver_result = run_enrichment(
