@@ -67,6 +67,7 @@ declare
         'oasis_admin_release_company_assignment',
         'oasis_admin_set_sales_user_limit',
         'oasis_claim_and_save_company_sales_assignment',
+        'oasis_claim_save_and_promote_prospect_contacts',
         'oasis_claim_company_sales_assignment',
         'oasis_company_sales_assignment_feature_ready',
         'oasis_company_sales_phone_fingerprint',
