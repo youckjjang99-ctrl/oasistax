@@ -10,10 +10,10 @@ from prospect_db_repository import load_fast_growth_candidates
 
 
 class _Response:
-    def __init__(self, rows):
-        self.ok = True
-        self.status_code = 200
-        self.text = "rows"
+    def __init__(self, rows, *, ok=True, status_code=200, text="rows"):
+        self.ok = ok
+        self.status_code = status_code
+        self.text = text
         self._rows = rows
 
     def json(self):
@@ -170,6 +170,35 @@ class FastGrowthCacheTest(unittest.TestCase):
         self.assertEqual(payload["p_province_code"], "51")
         self.assertEqual(payload["p_province_name"], "강원특별자치도")
 
+    @patch(
+        "prospect_db_repository.get_cloud_config",
+        return_value=SimpleNamespace(
+            configured=True,
+            url="https://example.supabase.co",
+            timeout=20,
+        ),
+    )
+    @patch(
+        "prospect_db_repository._rest_headers",
+        return_value={"Authorization": "Bearer test"},
+    )
+    @patch("prospect_db_repository.requests.post")
+    def test_statement_timeout_returns_safe_actionable_error(
+        self,
+        request_post,
+        _headers,
+        _config,
+    ) -> None:
+        request_post.return_value = _Response(
+            [],
+            ok=False,
+            status_code=500,
+            text='{"code":"57014","message":"statement timeout"}',
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "조회 시간이 초과"):
+            load_fast_growth_candidates("", limit=100)
+
     @patch("prospect_collection_service.remove_existing_prospects")
     @patch(
         "prospect_collection_service.remove_existing_customers",
@@ -239,6 +268,31 @@ class FastGrowthCacheTest(unittest.TestCase):
         )
         self.assertIn("Supabase", result["message"])
         self.assertEqual(events[0]["stage"], "precomputed")
+        fetch_nps.assert_not_called()
+
+    @patch("prospect_collection_service.fetch_nps_workplaces")
+    @patch(
+        "prospect_collection_service.load_fast_growth_candidates",
+        side_effect=RuntimeError("성장기업 조회 시간이 초과되었습니다."),
+    )
+    @patch(
+        "prospect_collection_service.existing_prospect_identities",
+        return_value=(set(), set(), set()),
+    )
+    def test_precomputed_timeout_exposes_safe_error_code(
+        self,
+        _identities,
+        _cached,
+        fetch_nps,
+    ) -> None:
+        result = collect_contactable_growth_companies(
+            "",
+            target_count=100,
+            growth_only=True,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "GROWTH_SEARCH_TIMEOUT")
         fetch_nps.assert_not_called()
 
 

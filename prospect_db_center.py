@@ -3664,11 +3664,19 @@ def render_prospect_db_center(
         return
     if result:
         if not result.get("ok", True):
-            st.error("검색 자료를 불러오지 못했습니다.")
-            st.info(
-                "잠시 후 다시 조회해 주세요. 같은 문제가 계속되면 "
-                "관리자에게 데이터 연결 상태 확인을 요청해 주세요."
-            )
+            if result.get("error_code") == "GROWTH_SEARCH_TIMEOUT":
+                st.error("성장기업 검색 시간이 초과되었습니다.")
+                st.info(
+                    "지역이나 업종 등 조회 조건을 선택한 뒤 다시 "
+                    "시도해 주세요. 문제가 계속되면 관리자에게 "
+                    "검색 성능 확인을 요청해 주세요."
+                )
+            else:
+                st.error("검색 자료를 불러오지 못했습니다.")
+                st.info(
+                    "잠시 후 다시 조회해 주세요. 같은 문제가 계속되면 "
+                    "관리자에게 데이터 연결 상태 확인을 요청해 주세요."
+                )
             with st.expander("오류 상세", expanded=False):
                 st.caption(
                     result.get(
