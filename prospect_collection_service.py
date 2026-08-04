@@ -566,6 +566,12 @@ def collect_contactable_growth_companies(
                 ),
             }
         except Exception as exc:
+            error_message = str(exc)
+            error_code = (
+                "GROWTH_SEARCH_TIMEOUT"
+                if "조회 시간이 초과" in error_message
+                else "GROWTH_SEARCH_FAILED"
+            )
             stats["elapsed_seconds"] = round(
                 time.monotonic() - started_at,
                 1,
@@ -575,8 +581,9 @@ def collect_contactable_growth_companies(
                 "ok": False,
                 "message": (
                     "Supabase에 저장된 고용증가 업체를 불러오지 "
-                    f"못했습니다: {exc}"
+                    f"못했습니다: {error_message}"
                 ),
+                "error_code": error_code,
                 "items": [],
                 "target_count": target_count,
                 "found_count": 0,

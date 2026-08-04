@@ -410,9 +410,18 @@ def load_fast_growth_candidates(
         timeout=max(config.timeout, 60),
     )
     if not response.ok:
+        response_text = str(response.text or "")
+        if (
+            "57014" in response_text
+            or "statement timeout" in response_text.lower()
+        ):
+            raise RuntimeError(
+                "성장기업 조회 시간이 초과되었습니다. 지역·업종 등 "
+                "조회 조건을 선택한 뒤 다시 시도해 주세요."
+            )
         raise RuntimeError(
             "고용증가·연락처 사전 계산 후보 조회 실패 "
-            f"HTTP {response.status_code}: {response.text[:300]}"
+            f"HTTP {response.status_code}: {response_text[:300]}"
         )
     rows = response.json() if response.text else []
     if not isinstance(rows, list):
