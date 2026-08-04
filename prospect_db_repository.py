@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import hashlib
+import hmac
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -14,6 +16,8 @@ from cloud_db import CloudDatabase, get_cloud_config
 TABLE_PROSPECTS = "oasis_prospect_companies"
 TABLE_CUSTOMERS = "oasis_customers"
 TABLE_CONTACTS = "oasis_prospect_contacts"
+TABLE_CONTACT_CONTROLS = "oasis_company_kakao_contact_controls"
+LEGACY_CONTACT_PHONE_HASH_KEY_ENV = "OASIS_KAKAO_GUIDANCE_PHONE_HASH_KEY"
 TABLE_SEARCH_HISTORY = "oasis_prospect_search_history"
 TABLE_EMPLOYEE_SNAPSHOTS = "oasis_nps_employee_snapshots"
 TABLE_NPS_GROWTH = "oasis_nps_growth_leads"
@@ -1247,7 +1251,8 @@ def list_contacts_for_prospects(
             "select": (
                 "id,prospect_id,contact_type,contact_value,contact_label,"
                 "source_type,source_url,confidence,verification_status,"
-                "is_primary,do_not_contact,collected_at,verified_at,updated_at"
+                "is_primary,do_not_contact,opt_out_at,collected_at,"
+                "verified_at,updated_at"
             ),
             "prospect_id": f"in.({','.join(normalized)})",
             "order": "prospect_id.asc,is_primary.desc,confidence.desc",
@@ -1261,6 +1266,147 @@ def list_contacts_for_prospects(
         )
     rows = response.json() if response.text else []
     return rows if isinstance(rows, list) else []
+
+
+def company_contact_is_suppressed(
+    company_uid: str,
+    *,
+    prospect_id: str = "",
+) -> bool:
+    """Check opt-out flags across every prospect row for one company UID.
+
+    Only identifiers and suppression flags are selected. Contact values are
+    deliberately excluded so this company-wide safety check cannot expose PII.
+    Any lookup failure raises and the caller must fail closed.
+    """
+
+    clean_uid = str(company_uid or "").strip()
+    clean_prospect_id = str(prospect_id or "").strip()
+    if not clean_uid:
+        raise ValueError("업체 공통 식별키가 없습니다.")
+    config = get_cloud_config()
+    company_response = requests.get(
+        f"{config.url}/rest/v1/{TABLE_PROSPECTS}",
+        headers=_rest_headers(),
+        params={
+            "select": "id",
+            "company_uid": f"eq.{clean_uid}",
+            "limit": "1000",
+        },
+        timeout=max(config.timeout, 30),
+    )
+    if not company_response.ok:
+        raise RuntimeError("업체 수신거부 범위를 확인하지 못했습니다.")
+    company_rows = company_response.json() if company_response.text else []
+    if not isinstance(company_rows, list) or len(company_rows) >= 1000:
+        raise RuntimeError("업체 수신거부 범위를 안전하게 확정하지 못했습니다.")
+    prospect_ids = {
+        str(row.get("id") or "").strip()
+        for row in company_rows
+        if isinstance(row, dict) and str(row.get("id") or "").strip()
+    }
+    if clean_prospect_id:
+        prospect_ids.add(clean_prospect_id)
+    if not prospect_ids:
+        raise RuntimeError("업체 수신거부 대상을 찾지 못했습니다.")
+    contact_response = requests.get(
+        f"{config.url}/rest/v1/{TABLE_CONTACTS}",
+        headers=_rest_headers(),
+        params={
+            "select": "prospect_id,do_not_contact,opt_out_at",
+            "prospect_id": f"in.({','.join(sorted(prospect_ids))})",
+        },
+        timeout=max(config.timeout, 30),
+    )
+    if not contact_response.ok:
+        raise RuntimeError("업체 수신거부 상태를 확인하지 못했습니다.")
+    contact_rows = contact_response.json() if contact_response.text else []
+    if not isinstance(contact_rows, list):
+        raise RuntimeError("업체 수신거부 응답을 확인하지 못했습니다.")
+    contact_suppressed = any(
+        isinstance(row, dict)
+        and (bool(row.get("do_not_contact")) or bool(row.get("opt_out_at")))
+        for row in contact_rows
+    )
+    if contact_suppressed:
+        return True
+    control_response = requests.get(
+        f"{config.url}/rest/v1/{TABLE_CONTACT_CONTROLS}",
+        headers=_rest_headers(),
+        params={
+            "select": "status",
+            "company_uid": f"eq.{clean_uid}",
+            "status": "in.(opted_out,admin_blocked)",
+            "limit": "1",
+        },
+        timeout=max(config.timeout, 30),
+    )
+    if not control_response.ok:
+        raise RuntimeError("기존 업체 연락차단 상태를 확인하지 못했습니다.")
+    control_rows = control_response.json() if control_response.text else []
+    if not isinstance(control_rows, list):
+        raise RuntimeError("기존 업체 연락차단 응답을 확인하지 못했습니다.")
+    return bool(control_rows)
+
+
+def legacy_phone_contact_hash(recipient_phone: str) -> str:
+    """Return the historical DNC HMAC without persisting a raw phone."""
+
+    digits = re.sub(r"\D", "", str(recipient_phone or ""))
+    if digits.startswith("82"):
+        digits = "0" + digits[2:]
+    if not re.fullmatch(r"01(?:0\d{8}|[16789]\d{7,8})", digits):
+        raise ValueError("수신거부 확인용 휴대전화 형식이 올바르지 않습니다.")
+    hash_key = str(
+        os.environ.get(LEGACY_CONTACT_PHONE_HASH_KEY_ENV, "") or ""
+    ).strip()
+    if len(hash_key) < 32:
+        raise RuntimeError("기존 수신거부 확인용 보안키가 설정되지 않았습니다.")
+    phone_hash = hmac.new(
+        hash_key.encode("utf-8"),
+        digits.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+    return phone_hash
+
+
+def legacy_phone_contact_is_suppressed(
+    company_uid: str,
+    recipient_phone: str,
+) -> bool:
+    """Honor historical phone-hash opt-outs even if a company UID changed.
+
+    The canonical phone is HMAC-hashed locally with the same key used by the
+    retired Kakao guidance flow. Only the hash and company UID reach Supabase.
+    Missing or malformed inputs fail closed by raising to the caller.
+    """
+
+    clean_uid = str(company_uid or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9:_-]{1,180}", clean_uid):
+        raise ValueError("업체 공통 식별키 형식을 확인할 수 없습니다.")
+    phone_hash = legacy_phone_contact_hash(recipient_phone)
+
+    config = get_cloud_config()
+    response = requests.get(
+        f"{config.url}/rest/v1/{TABLE_CONTACT_CONTROLS}",
+        headers=_rest_headers(),
+        params={
+            "select": "status",
+            "or": (
+                f"(company_uid.eq.{clean_uid},"
+                f"recipient_phone_hash.eq.{phone_hash})"
+            ),
+            "status": "in.(opted_out,admin_blocked)",
+            "limit": "1",
+        },
+        timeout=max(config.timeout, 30),
+    )
+    if not response.ok:
+        raise RuntimeError("기존 전화번호 수신거부 상태를 확인하지 못했습니다.")
+    rows = response.json() if response.text else []
+    if not isinstance(rows, list):
+        raise RuntimeError("기존 전화번호 수신거부 응답을 확인하지 못했습니다.")
+    return bool(rows)
 
 
 def save_sales_analysis(
