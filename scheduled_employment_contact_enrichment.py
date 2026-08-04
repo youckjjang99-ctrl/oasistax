@@ -23,6 +23,7 @@ CONTACT_TYPES = {"phone", "email", "instagram"}
 CONTACT_STAGES = {"phone", "digital"}
 PHONE_PROVIDERS = {"auto", "kakao", "naver"}
 PHONE_PROVIDER_FIELD = "phone_provider_stage"
+PHONE_ONLY_SOURCE_TYPES = {"comwel_all_employers"}
 KAKAO_DAILY_SAFE_RECORDS = 90000
 NAVER_DAILY_SAFE_RECORDS = 12000
 DB_PATCH_RETRY_ATTEMPTS = 4
@@ -93,6 +94,12 @@ def _select_rows(
     }
     if stage == "phone" and phone_provider:
         params[PHONE_PROVIDER_FIELD] = f"eq.{phone_provider}"
+    if stage == "digital":
+        params["source_type"] = (
+            "not.in.("
+            + ",".join(sorted(PHONE_ONLY_SOURCE_TYPES))
+            + ")"
+        )
     if due_before:
         params[next_check_field] = f"lte.{due_before}"
         params["order"] = f"{next_check_field}.asc,updated_at.asc"
