@@ -10,6 +10,7 @@
 - 격리 Supabase에서 동일 SQL 2회 적용, 동일 시각 영업 1,001건 키셋 경계, 원천행 불변 해시, 관련 4개 표 백업·복구 지문을 검증했다.
 - 전체 회귀 `877 passed, 1 skipped, 87 subtests passed`, 보호 기능 회귀 `407 passed, 1 skipped, 54 subtests passed`, Privacy Guard를 통과했다.
 - 운영 적용 전후 핵심 11개 표·보호 4개 표·대기열 10개 표의 건수와 고객 ID·`company_uid`·상태 지문이 모두 동일했다.
+- GitHub PR #71을 `main`에 반영했고, 기능 커밋 기준 Railway 주 앱·경정청구 인증 게이트웨이·전화 일간수집·자격 월간수집 네 서비스의 배포 성공을 확인했다.
 
 ---
 
