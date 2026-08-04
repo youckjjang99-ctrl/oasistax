@@ -1,1 +1,1 @@
-v9.11.0-customer-integration
+v9.12.0-central-work-inbox

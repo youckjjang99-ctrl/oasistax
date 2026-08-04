@@ -135,6 +135,23 @@ class CrmPerformanceTests(unittest.TestCase):
         self.assertEqual(result["restored"], 0)
         database.assert_not_called()
 
+    def test_cloud_crm_restore_failure_does_not_expose_raw_error(self):
+        private_error = "private-service-token-detail"
+        with patch(
+            "cloud_crm_restore.load_crm_data",
+            return_value={"customers": {}},
+        ), patch(
+            "cloud_crm_restore.cloud_is_configured",
+            return_value=True,
+        ), patch(
+            "cloud_crm_restore.CloudDatabase",
+            side_effect=RuntimeError(private_error),
+        ):
+            result = cloud_crm_restore.restore_crm_from_cloud("owner")
+
+        self.assertEqual(result["message"], "Supabase CRM 조회 실패")
+        self.assertNotIn(private_error, repr(result))
+
     def test_customer_template_never_falls_back_to_live_root_database(self):
         app_source = (ROOT / "app.py").read_text(encoding="utf-8")
         start = app_source.index("def get_customer_template_download")

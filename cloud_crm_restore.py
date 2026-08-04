@@ -78,8 +78,8 @@ def restore_crm_from_cloud(user_id: str) -> dict[str, Any]:
             order="id.asc",
             max_rows=50000,
         )
-    except Exception as exc:
-        result["message"] = f"Supabase CRM 조회 실패: {exc}"
+    except Exception:
+        result["message"] = "Supabase CRM 조회 실패"
         return result
 
     company_map: dict[str, str] = {}
