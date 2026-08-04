@@ -136,6 +136,9 @@ _PROSPECT_SAVE_APPROVAL_KEY = "_prospect_save_approval_v1042"
 _OUTREACH_REQUEST_KEY = "_saved_prospect_outreach_request_v1040"
 _OUTREACH_RESULT_KEY = "_saved_prospect_outreach_result_v1040"
 _OUTREACH_ATTEMPTS_KEY = "_saved_prospect_outreach_attempts_v1040"
+_CONTACT_RESULTS_FLASH_KEY = "_contact_results_flash_v1050"
+_CONTACT_RESULTS_SELECTION_KEY = "contact_results_assignment_v1050"
+_CONTACT_RESULTS_RESET_SELECTION_KEY = "_contact_results_reset_selection_v1050"
 OUTREACH_ALLOWED_ASSIGNMENT_STATUSES = frozenset(
     {"assigned", "pending_contact", "contacted", "consulting", "follow_up"}
 )
@@ -3096,6 +3099,48 @@ def _render_prospect_db_center_legacy(owner_user_id: str = "") -> None:
         )
 
 
+def _load_user_assignment_rows(owner_user_id: str) -> dict:
+    """Load only the current user's assignments through the existing RPC."""
+
+    ready, ready_message = _assignment_feature_status()
+    if not ready:
+        return {
+            "ok": False,
+            "message": ready_message,
+            "rows": [],
+        }
+
+    _release_expired_assignments_if_due(owner_user_id)
+    assignment_result = sales_assignments.list_user_assignments(
+        owner_user_id,
+        limit=1000,
+    )
+    if not assignment_result.get("ok"):
+        return {
+            "ok": False,
+            "message": str(
+                assignment_result.get("message")
+                or "내 영업후보를 불러오지 못했습니다."
+            ),
+            "rows": [],
+        }
+
+    rows: list[dict] = []
+    for assignment in assignment_result.get("assignments") or []:
+        row = dict(assignment)
+        row["_assignment_id"] = (
+            row.get("assignment_id") or row.get("id") or ""
+        )
+        row["id"] = row.get("company_id") or row.get("id")
+        row["memo"] = row.get("own_memo") or row.get("memo") or ""
+        rows.append(row)
+    return {
+        "ok": True,
+        "message": "",
+        "rows": rows,
+    }
+
+
 def _render_clean_saved_prospects(
     owner_user_id: str,
     can_view_mobile: bool = False,
@@ -3106,30 +3151,14 @@ def _render_clean_saved_prospects(
         "내가 저장한 영업후보만 표시합니다. 다른 사용자가 저장한 업체는 "
         "보이지 않지만, 전사 중복 제외 기준에는 계속 반영됩니다. "
         "전사 배정 기능 적용 후에는 공개 연락처가 아직 없는 업체도 "
-        "배정 해제·연락결과 관리를 위해 함께 표시합니다."
+        "저장·배정 현황 확인을 위해 함께 표시합니다."
     )
     _show_outreach_result_notice()
     assignment_mode = False
     try:
-        ready, _ready_message = _assignment_feature_status()
-        if ready:
-            _release_expired_assignments_if_due(owner_user_id)
-            assignment_result = sales_assignments.list_user_assignments(
-                owner_user_id,
-                limit=1000,
-            )
-        else:
-            assignment_result = {"ok": False}
+        assignment_result = _load_user_assignment_rows(owner_user_id)
         if assignment_result.get("ok"):
-            rows = []
-            for assignment in assignment_result.get("assignments") or []:
-                row = dict(assignment)
-                row["_assignment_id"] = (
-                    row.get("assignment_id") or row.get("id") or ""
-                )
-                row["id"] = row.get("company_id") or row.get("id")
-                row["memo"] = row.get("own_memo") or row.get("memo") or ""
-                rows.append(row)
+            rows = list(assignment_result.get("rows") or [])
             assignment_mode = True
         else:
             rows = list_prospects(owner_user_id, limit=1000)
@@ -3321,208 +3350,268 @@ def _render_clean_saved_prospects(
             except Exception:
                 st.error("메모를 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.")
 
-    if assignment_mode:
-        st.markdown("#### 연락결과 기록")
-        st.caption(
-            "통화·이메일·문자·카카오톡·상담 결과를 저장하면 담당자가 "
-            "확정되고 전사 중복연락 방지 상태가 함께 갱신됩니다."
-        )
-        assignment_rows = {
-            (
-                f"{row.get('업체명', '')} · "
-                f"{row.get('배정상태', '')} · "
-                f"{str(row.get('_company_uid') or '')[-10:]}"
-            ): row
-            for row in frame.to_dict("records")
-            if str(row.get("_company_uid") or "")
-        }
-        selected_label = st.selectbox(
-            "연락결과를 기록할 업체",
-            list(assignment_rows),
-            key="sales_contact_company_v989",
-        )
-        selected_assignment = assignment_rows.get(selected_label, {})
-        selected_company_uid = str(
-            selected_assignment.get("_company_uid") or ""
-        )
-        with st.form("sales_contact_record_form_v989"):
-            contact_col1, contact_col2 = st.columns(2)
-            contact_method = contact_col1.selectbox(
-                "연락방식",
-                CONTACT_METHOD_OPTIONS,
-            )
-            contact_result = contact_col2.selectbox(
-                "연락결과",
-                CONTACT_RESULT_OPTIONS,
-            )
-            schedule_next_contact = st.checkbox(
-                "다음 연락예정일 지정",
-                value=False,
-            )
-            next_contact_date = st.date_input(
-                "다음 연락예정일",
-                disabled=not schedule_next_contact,
-                help="‘재연락 요청’ 선택 시 반드시 지정합니다.",
-            )
-            contact_notes = st.text_area(
-                "상담내용",
-                max_chars=10_000,
-                placeholder="고객 반응과 후속조치 내용을 기록해 주세요.",
-            )
-            contact_submitted = st.form_submit_button(
-                "연락결과 저장",
-                type="primary",
-                use_container_width=True,
-            )
-        if contact_submitted:
-            if contact_result == "재연락 요청" and not schedule_next_contact:
-                st.error("재연락 요청은 다음 연락예정일을 입력해 주세요.")
-            else:
-                contact_save_result = sales_assignments.record_contact(
-                    owner_user_id,
-                    selected_assignment.get("_prospect_id"),
-                    selected_assignment.get("_company_uid"),
-                    contact_method,
-                    contact_result,
-                    notes=contact_notes,
-                    next_contact_at=(
-                        next_contact_date.isoformat()
-                        if schedule_next_contact
-                        else None
-                    ),
-                    session_id=_assignment_session_id(),
-                )
-                if contact_save_result.get("ok"):
-                    st.success(contact_save_result.get("message"))
-                else:
-                    st.error(contact_save_result.get("message"))
 
-        with st.expander("내 연락이력", expanded=False):
-            contact_history_result = sales_assignments.list_company_contacts(
+def _render_contact_results(owner_user_id: str) -> None:
+    """Render contact management for the signed-in user's assignments only."""
+
+    st.markdown("### 연락결과 기록")
+    st.caption(
+        "통화·이메일·문자·카카오톡·상담 결과를 저장하면 담당자가 "
+        "확정되고 전사 중복연락 방지 상태가 함께 갱신됩니다."
+    )
+
+    pending_notice = st.session_state.pop(_CONTACT_RESULTS_FLASH_KEY, None)
+    if isinstance(pending_notice, dict):
+        message = str(pending_notice.get("message") or "").strip()
+        if message:
+            level = str(pending_notice.get("level") or "info").strip().lower()
+            getattr(st, level, st.info)(message)
+
+    try:
+        assignment_result = _load_user_assignment_rows(owner_user_id)
+    except Exception as exc:
+        st.warning(safe_public_error(exc, "영업후보를 불러오지 못했습니다."))
+        return
+    if not assignment_result.get("ok"):
+        st.warning(
+            assignment_result.get("message")
+            or "연락결과 관리 기능을 준비하지 못했습니다."
+        )
+        return
+
+    rows = list(assignment_result.get("rows") or [])
+    if not rows:
+        st.info("연락결과를 기록할 저장·배정 영업후보가 없습니다.")
+        return
+
+    assignments_by_id: dict[str, dict] = {}
+    assignment_labels: dict[str, str] = {}
+    for row in rows:
+        assignment_id = str(row.get("_assignment_id") or "")
+        company_uid = str(row.get("company_uid") or "")
+        if not assignment_id or not company_uid:
+            continue
+        assignments_by_id[assignment_id] = row
+        company_name = str(row.get("company_name") or "업체명 미확인")
+        status_label = sales_assignments.assignment_status_label(
+            row.get("status")
+        )
+        assignment_labels[assignment_id] = (
+            f"{company_name} · {status_label} · {assignment_id[-8:]}"
+        )
+    if not assignments_by_id:
+        st.info("연락결과를 기록할 저장·배정 영업후보가 없습니다.")
+        return
+
+    if st.session_state.pop(_CONTACT_RESULTS_RESET_SELECTION_KEY, False):
+        st.session_state.pop(_CONTACT_RESULTS_SELECTION_KEY, None)
+    selected_assignment_id = st.selectbox(
+        "연락결과를 기록할 업체",
+        list(assignments_by_id),
+        format_func=lambda value: assignment_labels.get(value, "업체명 미확인"),
+        key=_CONTACT_RESULTS_SELECTION_KEY,
+    )
+    selected_assignment = assignments_by_id.get(selected_assignment_id, {})
+    selected_company_uid = str(selected_assignment.get("company_uid") or "")
+
+    with st.form("contact_results_record_form_v1050", clear_on_submit=True):
+        contact_col1, contact_col2 = st.columns(2)
+        contact_method = contact_col1.selectbox(
+            "연락방식",
+            CONTACT_METHOD_OPTIONS,
+            key="contact_results_method_v1050",
+        )
+        contact_result = contact_col2.selectbox(
+            "연락결과",
+            CONTACT_RESULT_OPTIONS,
+            key="contact_results_result_v1050",
+        )
+        schedule_next_contact = st.checkbox(
+            "다음 연락예정일 지정",
+            value=False,
+            key="contact_results_schedule_v1050",
+        )
+        next_contact_date = st.date_input(
+            "다음 연락예정일",
+            disabled=not schedule_next_contact,
+            help="‘재연락 요청’ 선택 시 반드시 지정합니다.",
+            key="contact_results_next_date_v1050",
+        )
+        contact_notes = st.text_area(
+            "상담내용",
+            max_chars=10_000,
+            placeholder="고객 반응과 후속조치 내용을 기록해 주세요.",
+            key="contact_results_notes_v1050",
+        )
+        contact_submitted = st.form_submit_button(
+            "연락결과 저장",
+            type="primary",
+            use_container_width=True,
+        )
+    if contact_submitted:
+        if contact_result == "재연락 요청" and not schedule_next_contact:
+            st.error("재연락 요청은 다음 연락예정일을 입력해 주세요.")
+        else:
+            contact_save_result = sales_assignments.record_contact(
                 owner_user_id,
-                selected_assignment.get("_company_uid"),
+                selected_assignment.get("company_id"),
+                selected_company_uid,
+                contact_method,
+                contact_result,
+                notes=contact_notes,
+                next_contact_at=(
+                    next_contact_date.isoformat()
+                    if schedule_next_contact
+                    else None
+                ),
+                session_id=_assignment_session_id(),
+            )
+            if contact_save_result.get("ok"):
+                st.session_state[_CONTACT_RESULTS_FLASH_KEY] = {
+                    "level": "success",
+                    "message": "연락결과를 저장했습니다.",
+                }
+                st.rerun()
+            else:
+                st.error(
+                    contact_save_result.get("message")
+                    or "연락결과를 저장하지 못했습니다."
+                )
+
+    with st.expander("내 연락이력", expanded=False):
+        contact_history_result = sales_assignments.list_company_contacts(
+            owner_user_id,
+            selected_company_uid,
+            limit=200,
+        )
+        if contact_history_result.get("ok") and contact_history_result.get(
+            "contacts"
+        ):
+            contact_history_frame = pd.DataFrame(
+                contact_history_result["contacts"]
+            ).rename(
+                columns={
+                    "contact_method": "연락방식",
+                    "contact_result": "연락결과",
+                    "notes": "상담내용",
+                    "contacted_at": "연락일시",
+                    "next_contact_at": "다음 연락예정일",
+                }
+            )
+            st.dataframe(
+                contact_history_frame[
+                    [
+                        column
+                        for column in [
+                            "연락방식",
+                            "연락결과",
+                            "상담내용",
+                            "연락일시",
+                            "다음 연락예정일",
+                        ]
+                        if column in contact_history_frame.columns
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+        elif contact_history_result.get("ok"):
+            st.info("기록된 연락이력이 없습니다.")
+        else:
+            st.error(
+                contact_history_result.get("message")
+                or "연락이력을 불러오지 못했습니다."
+            )
+
+    with st.expander("자동 발송 이력", expanded=False):
+        outreach_history_result = (
+            sales_outreach_repository.list_outreach_history(
+                owner_user_id,
+                selected_company_uid,
                 limit=200,
             )
-            if contact_history_result.get("ok") and contact_history_result.get(
-                "contacts"
-            ):
-                contact_history_frame = pd.DataFrame(
-                    contact_history_result["contacts"]
-                ).rename(
-                    columns={
-                        "contact_method": "연락방식",
-                        "contact_result": "연락결과",
-                        "notes": "상담내용",
-                        "contacted_at": "연락일시",
-                        "next_contact_at": "다음 연락예정일",
+        )
+        outreach_rows = list(outreach_history_result.get("history") or [])
+        if outreach_history_result.get("ok") and outreach_rows:
+            outreach_history_frame = pd.DataFrame(
+                [
+                    {
+                        "채널": OUTREACH_CHANNEL_LABELS.get(
+                            str(row.get("channel") or ""),
+                            str(row.get("channel") or ""),
+                        ),
+                        "처리상태": OUTREACH_HISTORY_STATUS_LABELS.get(
+                            str(row.get("status") or ""),
+                            str(row.get("status") or ""),
+                        ),
+                        "안전결과코드": str(row.get("safe_result_code") or ""),
+                        "요청일시": str(row.get("reserved_at") or "").replace(
+                            "T", " "
+                        )[:19],
+                        "종료일시": str(row.get("finalized_at") or "").replace(
+                            "T", " "
+                        )[:19],
                     }
-                )
-                st.dataframe(
-                    contact_history_frame[
-                        [
-                            column
-                            for column in [
-                                "연락방식",
-                                "연락결과",
-                                "상담내용",
-                                "연락일시",
-                                "다음 연락예정일",
-                            ]
-                            if column in contact_history_frame.columns
-                        ]
-                    ],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-            elif contact_history_result.get("ok"):
-                st.info("기록된 연락이력이 없습니다.")
-            else:
-                st.error(contact_history_result.get("message"))
+                    for row in outreach_rows
+                ]
+            )
+            st.dataframe(
+                outreach_history_frame,
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption(
+                "수신처·메시지 본문·녹음파일·증빙 경로는 저장하지 않습니다."
+            )
+        elif outreach_history_result.get("ok"):
+            st.info("자동 발송 이력이 없습니다.")
+        else:
+            st.warning(
+                outreach_history_result.get("message")
+                or "자동 발송 이력을 불러오지 못했습니다."
+            )
 
-        with st.expander("자동 발송 이력", expanded=False):
-            outreach_history_result = (
-                sales_outreach_repository.list_outreach_history(
-                    owner_user_id,
-                    selected_assignment.get("_company_uid"),
-                    limit=200,
+    selected_contact_count = int(
+        selected_assignment.get("contact_count") or 0
+    )
+    selected_status = str(selected_assignment.get("status") or "")
+    if selected_contact_count == 0 and selected_status == "assigned":
+        with st.expander("미접촉 임시 배정 해제", expanded=False):
+            with st.form("contact_results_release_form_v1050"):
+                release_reason = st.text_input(
+                    "해제 사유",
+                    max_chars=500,
+                    key="contact_results_release_reason_v1050",
                 )
-            )
-            outreach_rows = list(
-                outreach_history_result.get("history") or []
-            )
-            if outreach_history_result.get("ok") and outreach_rows:
-                outreach_history_frame = pd.DataFrame(
-                    [
-                        {
-                            "채널": OUTREACH_CHANNEL_LABELS.get(
-                                str(row.get("channel") or ""),
-                                str(row.get("channel") or ""),
-                            ),
-                            "처리상태": OUTREACH_HISTORY_STATUS_LABELS.get(
-                                str(row.get("status") or ""),
-                                str(row.get("status") or ""),
-                            ),
-                            "안전결과코드": str(
-                                row.get("safe_result_code") or ""
-                            ),
-                            "요청일시": str(
-                                row.get("reserved_at") or ""
-                            ).replace("T", " ")[:19],
-                            "종료일시": str(
-                                row.get("finalized_at") or ""
-                            ).replace("T", " ")[:19],
+                release_submitted = st.form_submit_button(
+                    "이 업체 배정 해제",
+                    use_container_width=True,
+                )
+            if release_submitted:
+                if not release_reason.strip():
+                    st.error("배정 해제 사유를 입력해 주세요.")
+                else:
+                    release_result = sales_assignments.release_assignment(
+                        owner_user_id,
+                        selected_assignment.get("company_id"),
+                        selected_company_uid,
+                        reason=release_reason,
+                        session_id=_assignment_session_id(),
+                    )
+                    if release_result.get("ok"):
+                        st.session_state[_CONTACT_RESULTS_FLASH_KEY] = {
+                            "level": "success",
+                            "message": "미접촉 임시 배정을 해제했습니다.",
                         }
-                        for row in outreach_rows
-                    ]
-                )
-                st.dataframe(
-                    outreach_history_frame,
-                    use_container_width=True,
-                    hide_index=True,
-                )
-                st.caption(
-                    "수신처·메시지 본문·녹음파일·증빙 경로는 저장하지 않습니다."
-                )
-            elif outreach_history_result.get("ok"):
-                st.info("자동 발송 이력이 없습니다.")
-            else:
-                st.warning(
-                    outreach_history_result.get("message")
-                    or "자동 발송 이력을 불러오지 못했습니다."
-                )
-
-        selected_contact_count = int(
-            selected_assignment.get("연락횟수") or 0
-        )
-        selected_status = str(
-            selected_assignment.get("_assignment_status") or ""
-        )
-        if selected_contact_count == 0 and selected_status == "assigned":
-            with st.expander("미접촉 임시 배정 해제", expanded=False):
-                with st.form("sales_assignment_release_form_v989"):
-                    release_reason = st.text_input(
-                        "해제 사유",
-                        max_chars=500,
-                    )
-                    release_submitted = st.form_submit_button(
-                        "이 업체 배정 해제",
-                        use_container_width=True,
-                    )
-                if release_submitted:
-                    if not release_reason.strip():
-                        st.error("배정 해제 사유를 입력해 주세요.")
+                        st.session_state[
+                            _CONTACT_RESULTS_RESET_SELECTION_KEY
+                        ] = True
+                        st.rerun()
                     else:
-                        release_result = sales_assignments.release_assignment(
-                            owner_user_id,
-                            selected_assignment.get("_prospect_id"),
-                            selected_assignment.get("_company_uid"),
-                            reason=release_reason,
-                            session_id=_assignment_session_id(),
+                        st.error(
+                            release_result.get("message")
+                            or "배정을 해제하지 못했습니다."
                         )
-                        if release_result.get("ok"):
-                            st.success(release_result.get("message"))
-                        else:
-                            st.error(release_result.get("message"))
 
 
 def render_prospect_db_center(
@@ -3544,6 +3633,7 @@ def render_prospect_db_center(
         "① 조건 설정",
         "② 검색 결과",
         "③ 저장된 영업후보",
+        "④ 연락결과 기록",
     }:
         st.session_state["prospect_workflow_step_v1020"] = (
             pending_workflow_step
@@ -3552,7 +3642,12 @@ def render_prospect_db_center(
         st.session_state["prospect_workflow_step_v1020"] = "① 조건 설정"
     workflow_step = st.pills(
         "DB발굴 작업 단계",
-        ["① 조건 설정", "② 검색 결과", "③ 저장된 영업후보"],
+        [
+            "① 조건 설정",
+            "② 검색 결과",
+            "③ 저장된 영업후보",
+            "④ 연락결과 기록",
+        ],
         key="prospect_workflow_step_v1020",
         label_visibility="collapsed",
     )
@@ -3563,6 +3658,9 @@ def render_prospect_db_center(
             can_view_mobile=can_view_mobile,
             is_admin_user=is_admin_user,
         )
+        return
+    if workflow_step == "④ 연락결과 기록":
+        _render_contact_results(owner_user_id)
         return
     if workflow_step == "① 조건 설정":
         _render_search_history(owner_user_id)
@@ -4011,7 +4109,7 @@ def render_prospect_db_center(
         st.info(
             "조건을 선택해 조회하면 결과가 ‘② 검색 결과’ 단계에 "
             "표시됩니다. 저장한 업체는 ‘③ 저장된 영업후보’에서 "
-            "관리할 수 있습니다."
+            "확인하고 ‘④ 연락결과 기록’에서 후속조치를 관리할 수 있습니다."
         )
         return
     result = _sanitize_search_result(
@@ -4156,7 +4254,7 @@ def render_prospect_db_center(
             st.info(
                 f"이미 내 영업DB에 저장된 업체 {own_excluded:,}건은 "
                 "신규 결과에서 제외했습니다. ③ 저장된 영업후보에서 "
-                "기존 담당 상태와 연락이력을 확인할 수 있습니다."
+                "업체를 확인하고 ④ 연락결과 기록에서 이력을 관리할 수 있습니다."
             )
         if result.get("assignment_view_warning") and is_admin_user:
             st.caption(
