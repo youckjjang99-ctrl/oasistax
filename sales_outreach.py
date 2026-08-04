@@ -1,0 +1,970 @@
+"""Fail-closed server-side adapters for salesperson-authored outreach.
+
+The public functions in this module deliberately return only redacted status
+objects.  Recipient addresses, message bodies, credentials, and provider
+responses must never be logged or surfaced to the UI.
+
+External sends are disabled unless ``OUTREACH_ENABLED`` is explicitly true.
+There is intentionally no mock mode in production code; tests inject a fake
+``requests.Session`` instead.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+from datetime import datetime
+from typing import Any, Mapping
+from zoneinfo import ZoneInfo
+
+import requests
+
+
+CHANNEL_EMAIL = "email"
+CHANNEL_SMS = "sms"
+CHANNEL_KAKAO = "kakao"
+
+OUTREACH_ENABLED_ENV = "OUTREACH_ENABLED"
+OUTREACH_COMPLIANCE_CONFIRMED_ENV = "OUTREACH_COMPLIANCE_CONFIRMED"
+OUTREACH_TIMEOUT_SECONDS_ENV = "OUTREACH_HTTP_TIMEOUT_SECONDS"
+OUTREACH_SMS_FREE_OPT_OUT_NUMBER_ENV = "OUTREACH_SMS_FREE_OPT_OUT_NUMBER"
+OUTREACH_EMAIL_OPT_OUT_TEXT_ENV = "OUTREACH_EMAIL_OPT_OUT_TEXT"
+OUTREACH_SENDER_NAME_ENV = "OUTREACH_SENDER_NAME"
+OUTREACH_SENDER_EMAIL_ENV = "OUTREACH_SENDER_EMAIL"
+OUTREACH_SENDER_PHONE_ENV = "OUTREACH_SENDER_PHONE"
+OUTREACH_SENDER_ADDRESS_ENV = "OUTREACH_SENDER_ADDRESS"
+LEGACY_CONTACT_PHONE_HASH_KEY_ENV = "OASIS_KAKAO_GUIDANCE_PHONE_HASH_KEY"
+
+SMSKOREA_USER_ID_ENV = "SMSKOREA_USER_ID"
+SMSKOREA_SEC_API_KEY_ENV = "SMSKOREA_SEC_API_KEY"
+SMSKOREA_SENDER_ENV = "SMSKOREA_SENDER"
+SMSKOREA_MESSAGE_SECRET_MODE_ENV = "SMSKOREA_MESSAGE_SECRET_MODE"
+SMSKOREA_SECRET_MODE_INCLUDE = "include"
+SMSKOREA_SECRET_MODE_OMIT = "omit"
+
+HIWORKS_OFFICE_TOKEN_ENV = "HIWORKS_OFFICE_TOKEN"
+HIWORKS_USER_ID_ENV = "HIWORKS_USER_ID"
+
+KAKAO_BIZ_CLIENT_ID_ENV = "KAKAO_BIZ_CLIENT_ID"
+KAKAO_BIZ_CLIENT_SECRET_ENV = "KAKAO_BIZ_CLIENT_SECRET"
+KAKAO_BIZ_SENDER_KEY_ENV = "KAKAO_BIZ_SENDER_KEY"
+KAKAO_BIZ_SENDER_NO_ENV = "KAKAO_BIZ_SENDER_NO"
+KAKAO_BIZ_TEMPLATE_CODE_ENV = "KAKAO_BIZ_TEMPLATE_CODE"
+KAKAO_BIZ_CONTRACT_CONFIRMED_ENV = "KAKAO_BIZ_CONTRACT_CONFIRMED"
+
+SMSKOREA_TOKEN_URL = "https://api.smsko.co.kr/api/v1/token"
+SMSKOREA_MESSAGE_URL = "https://api.smsko.co.kr/api/v1/message"
+HIWORKS_SEND_MAIL_URL = (
+    "https://api.hiworks.com/office/v2/webmail/sendMail"
+)
+KAKAO_BIZ_BASE_URL = "https://bizmsg-web.kakaoenterprise.com"
+KAKAO_BIZ_TOKEN_URL = f"{KAKAO_BIZ_BASE_URL}/v2/oauth/token"
+KAKAO_BIZ_SEND_URL = f"{KAKAO_BIZ_BASE_URL}/v2/send/kakao"
+
+_DEFAULT_TIMEOUT_SECONDS = 10.0
+_EMAIL_PATTERN = re.compile(
+    r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
+)
+_PHONE_ALLOWED_PATTERN = re.compile(r"^[+0-9() .-]+$")
+_SAFE_IDEMPOTENCY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
+
+_CHANNEL_ENV_NAMES = {
+    CHANNEL_EMAIL: (
+        HIWORKS_OFFICE_TOKEN_ENV,
+        HIWORKS_USER_ID_ENV,
+        OUTREACH_EMAIL_OPT_OUT_TEXT_ENV,
+        OUTREACH_SENDER_NAME_ENV,
+        OUTREACH_SENDER_EMAIL_ENV,
+        OUTREACH_SENDER_PHONE_ENV,
+        OUTREACH_SENDER_ADDRESS_ENV,
+        LEGACY_CONTACT_PHONE_HASH_KEY_ENV,
+    ),
+    CHANNEL_SMS: (
+        SMSKOREA_USER_ID_ENV,
+        SMSKOREA_SEC_API_KEY_ENV,
+        SMSKOREA_SENDER_ENV,
+        SMSKOREA_MESSAGE_SECRET_MODE_ENV,
+        OUTREACH_SMS_FREE_OPT_OUT_NUMBER_ENV,
+        OUTREACH_SENDER_NAME_ENV,
+        LEGACY_CONTACT_PHONE_HASH_KEY_ENV,
+    ),
+    CHANNEL_KAKAO: (
+        KAKAO_BIZ_CLIENT_ID_ENV,
+        KAKAO_BIZ_CLIENT_SECRET_ENV,
+        KAKAO_BIZ_SENDER_KEY_ENV,
+        KAKAO_BIZ_SENDER_NO_ENV,
+        KAKAO_BIZ_TEMPLATE_CODE_ENV,
+        KAKAO_BIZ_CONTRACT_CONFIRMED_ENV,
+        LEGACY_CONTACT_PHONE_HASH_KEY_ENV,
+    ),
+}
+
+_PROVIDER_NAMES = {
+    CHANNEL_EMAIL: "hiworks",
+    CHANNEL_SMS: "smskorea",
+    CHANNEL_KAKAO: "kakao_i_connect",
+}
+
+
+def _status(
+    ok: bool,
+    code: str,
+    message: str,
+    provider_id: str = "",
+) -> dict[str, Any]:
+    """Build the only status shape permitted to cross the UI boundary."""
+
+    # Provider identifiers are not required by the UI and can contain a
+    # recipient address or other provider-controlled PII. Never return them.
+    del provider_id
+    return {
+        "ok": bool(ok),
+        "code": str(code),
+        "message": str(message),
+        "provider_id": "",
+    }
+
+
+def _enabled(value: Any) -> bool:
+    return str(value or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _timeout_seconds(source: Mapping[str, str]) -> float:
+    raw = str(source.get(OUTREACH_TIMEOUT_SECONDS_ENV, "") or "").strip()
+    if not raw:
+        return _DEFAULT_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_TIMEOUT_SECONDS
+    if not 0.5 <= value <= 30.0:
+        return _DEFAULT_TIMEOUT_SECONDS
+    return value
+
+
+def channel_readiness(channel: str) -> dict[str, Any]:
+    """Return readiness using environment *names* only, never values.
+
+    Kakao i Connect Message requires a separate provider contract.  The
+    contract-confirmation flag is therefore required in addition to the
+    credentials.  문자코리아's current official PHP/GAS and Python/Java
+    examples disagree about sending ``sec_apiKey`` in the message request.
+    ``SMSKOREA_MESSAGE_SECRET_MODE`` must be explicitly set to ``include`` or
+    ``omit`` according to the approved account manual; an unset/invalid value
+    keeps the adapter disabled.
+    """
+
+    clean_channel = str(channel or "").strip().lower()
+    if clean_channel not in _CHANNEL_ENV_NAMES:
+        return {
+            "channel": clean_channel,
+            "provider": "",
+            "ready": False,
+            "send_enabled": False,
+            "external_send_allowed": False,
+            "required_env_names": [],
+            "missing_env_names": [],
+            "code": "UNSUPPORTED_CHANNEL",
+            "message": "지원하지 않는 발송 방식입니다.",
+        }
+
+    source = os.environ
+    channel_env_names = _CHANNEL_ENV_NAMES[clean_channel]
+    missing = [
+        name
+        for name in channel_env_names
+        if not str(source.get(name, "") or "").strip()
+    ]
+
+    code = "READY"
+    message = "발송 설정이 준비되었습니다."
+
+    if len(
+        str(source.get(LEGACY_CONTACT_PHONE_HASH_KEY_ENV, "") or "").strip()
+    ) < 32:
+        if LEGACY_CONTACT_PHONE_HASH_KEY_ENV not in missing:
+            missing.append(LEGACY_CONTACT_PHONE_HASH_KEY_ENV)
+        code = "OUTREACH_HMAC_KEY_REQUIRED"
+        message = "발송 중복방지 보안키 설정이 필요합니다."
+
+    if clean_channel == CHANNEL_SMS:
+        secret_mode = str(
+            source.get(SMSKOREA_MESSAGE_SECRET_MODE_ENV, "") or ""
+        ).strip().lower()
+        if secret_mode not in {
+            SMSKOREA_SECRET_MODE_INCLUDE,
+            SMSKOREA_SECRET_MODE_OMIT,
+        }:
+            if SMSKOREA_MESSAGE_SECRET_MODE_ENV not in missing:
+                missing.append(SMSKOREA_MESSAGE_SECRET_MODE_ENV)
+            code = "SMSKOREA_SCHEMA_CONFIRMATION_REQUIRED"
+            message = (
+                "문자코리아 승인 문서에 맞는 요청 형식 확인이 필요합니다."
+            )
+
+    if clean_channel == CHANNEL_KAKAO and not _enabled(
+        source.get(KAKAO_BIZ_CONTRACT_CONFIRMED_ENV, "")
+    ):
+        if KAKAO_BIZ_CONTRACT_CONFIRMED_ENV not in missing:
+            missing.append(KAKAO_BIZ_CONTRACT_CONFIRMED_ENV)
+        code = "KAKAO_CONTRACT_REQUIRED"
+        message = "카카오 i Connect Message 계약 확인이 필요합니다."
+
+    send_enabled = _enabled(source.get(OUTREACH_ENABLED_ENV, ""))
+    if not send_enabled:
+        if OUTREACH_ENABLED_ENV not in missing:
+            missing.append(OUTREACH_ENABLED_ENV)
+        if code == "READY":
+            code = "OUTREACH_DISABLED"
+            message = "외부 발송 기능이 비활성화되어 있습니다."
+
+    compliance_confirmed = _enabled(
+        source.get(OUTREACH_COMPLIANCE_CONFIRMED_ENV, "")
+    )
+    if not compliance_confirmed:
+        if OUTREACH_COMPLIANCE_CONFIRMED_ENV not in missing:
+            missing.append(OUTREACH_COMPLIANCE_CONFIRMED_ENV)
+        if code == "READY":
+            code = "COMPLIANCE_CONFIRMATION_REQUIRED"
+            message = "광고 수신동의·무료 수신거부 운영 준비 확인이 필요합니다."
+
+    if clean_channel == CHANNEL_SMS:
+        opt_out_digits = re.sub(
+            r"\D",
+            "",
+            str(source.get(OUTREACH_SMS_FREE_OPT_OUT_NUMBER_ENV, "") or ""),
+        )
+        if not re.fullmatch(r"080\d{7}", opt_out_digits):
+            if OUTREACH_SMS_FREE_OPT_OUT_NUMBER_ENV not in missing:
+                missing.append(OUTREACH_SMS_FREE_OPT_OUT_NUMBER_ENV)
+            code = "FREE_OPT_OUT_CONFIGURATION_REQUIRED"
+            message = "등록된 무료 수신거부 번호 설정이 필요합니다."
+
+    if clean_channel == CHANNEL_EMAIL:
+        invalid_sender_fields: list[str] = []
+        if not _validate_email(
+            str(source.get(OUTREACH_SENDER_EMAIL_ENV, "") or "")
+        ):
+            invalid_sender_fields.append(OUTREACH_SENDER_EMAIL_ENV)
+        sender_phone_digits = re.sub(
+            r"\D",
+            "",
+            str(source.get(OUTREACH_SENDER_PHONE_ENV, "") or ""),
+        )
+        if not 8 <= len(sender_phone_digits) <= 15:
+            invalid_sender_fields.append(OUTREACH_SENDER_PHONE_ENV)
+        sender_address = str(
+            source.get(OUTREACH_SENDER_ADDRESS_ENV, "") or ""
+        ).strip()
+        if len(sender_address) < 5:
+            invalid_sender_fields.append(OUTREACH_SENDER_ADDRESS_ENV)
+        if invalid_sender_fields:
+            for name in invalid_sender_fields:
+                if name not in missing:
+                    missing.append(name)
+            code = "SENDER_CONFIGURATION_REQUIRED"
+            message = "이메일 전송자 표시 정보를 확인해 주세요."
+
+    if missing and code == "READY":
+        code = "CONFIGURATION_MISSING"
+        message = "발송 서비스 환경 설정을 확인해 주세요."
+
+    required = [
+        OUTREACH_ENABLED_ENV,
+        OUTREACH_COMPLIANCE_CONFIRMED_ENV,
+        *channel_env_names,
+    ]
+    ready = not missing
+    return {
+        "channel": clean_channel,
+        "provider": _PROVIDER_NAMES[clean_channel],
+        "ready": ready,
+        "send_enabled": send_enabled,
+        "external_send_allowed": ready,
+        "required_env_names": list(dict.fromkeys(required)),
+        "missing_env_names": list(dict.fromkeys(missing)),
+        "code": code if not ready else "READY",
+        "message": message if not ready else "발송 설정이 준비되었습니다.",
+    }
+
+
+def _normalize_local_mobile(recipient: str) -> str | None:
+    raw = str(recipient or "").strip()
+    if not raw or not _PHONE_ALLOWED_PATTERN.fullmatch(raw):
+        return None
+    digits = re.sub(r"\D", "", raw)
+    if digits.startswith("82"):
+        digits = "0" + digits[2:]
+    if len(digits) not in {10, 11}:
+        return None
+    if not re.fullmatch(r"01(?:0|1|6|7|8|9)\d{7,8}", digits):
+        return None
+    return digits
+
+
+def _normalize_kakao_mobile(recipient: str) -> str | None:
+    local = _normalize_local_mobile(recipient)
+    if local is None:
+        return None
+    return "82" + local[1:]
+
+
+def _validate_email(recipient: str) -> bool:
+    clean = str(recipient or "").strip()
+    return bool(
+        3 <= len(clean) <= 254
+        and "\r" not in clean
+        and "\n" not in clean
+        and _EMAIL_PATTERN.fullmatch(clean)
+    )
+
+
+def _sms_body_bytes(body: str) -> int | None:
+    try:
+        return len(str(body).encode("euc-kr"))
+    except UnicodeEncodeError:
+        return None
+
+
+def _prepare_compliant_message(
+    channel: str,
+    subject: str,
+    body: str,
+    source: Mapping[str, str],
+) -> tuple[str, str]:
+    """Add mandatory advertising disclosures around free-form user content."""
+
+    clean_channel = str(channel or "").strip().lower()
+    clean_subject = str(subject or "").strip()
+    clean_body = str(body or "").strip()
+    if not _enabled(source.get(OUTREACH_COMPLIANCE_CONFIRMED_ENV, "")):
+        return clean_subject, clean_body
+
+    if clean_channel == CHANNEL_EMAIL:
+        subject_text = re.sub(
+            r"^\s*\(광고\)\s*",
+            "",
+            clean_subject,
+            count=1,
+        )
+        sender_name = str(
+            source.get(OUTREACH_SENDER_NAME_ENV, "") or ""
+        ).strip()
+        sender_email = str(
+            source.get(OUTREACH_SENDER_EMAIL_ENV, "") or ""
+        ).strip()
+        sender_phone = str(
+            source.get(OUTREACH_SENDER_PHONE_ENV, "") or ""
+        ).strip()
+        sender_address = str(
+            source.get(OUTREACH_SENDER_ADDRESS_ENV, "") or ""
+        ).strip()
+        opt_out = str(
+            source.get(OUTREACH_EMAIL_OPT_OUT_TEXT_ENV, "") or ""
+        ).strip()
+        footer = (
+            "\n\n---\n"
+            f"전송자: {sender_name}\n"
+            f"이메일: {sender_email}\n"
+            f"전화: {sender_phone}\n"
+            f"주소: {sender_address}\n"
+            f"{opt_out}"
+        )
+        return f"(광고) {subject_text}".strip(), clean_body + footer
+
+    if clean_channel == CHANNEL_SMS:
+        free_body = re.sub(
+            r"^\s*\(광고\)\s*",
+            "",
+            clean_body,
+            count=1,
+        )
+        sender_name = str(
+            source.get(OUTREACH_SENDER_NAME_ENV, "") or ""
+        ).strip()
+        sender_phone = str(
+            source.get(SMSKOREA_SENDER_ENV, "") or ""
+        ).strip()
+        opt_out = str(
+            source.get(OUTREACH_SMS_FREE_OPT_OUT_NUMBER_ENV, "") or ""
+        ).strip()
+        prepared_body = (
+            f"(광고){sender_name}\n{free_body}\n{sender_phone}\n"
+            f"무료수신거부 {opt_out}"
+        )
+        prepared_subject = clean_subject
+        body_bytes = _sms_body_bytes(prepared_body)
+        if body_bytes is not None and body_bytes > 90 and not prepared_subject:
+            prepared_subject = f"{sender_name} 안내"
+        return prepared_subject, prepared_body
+
+    return clean_subject, clean_body
+
+
+def validate_message(
+    channel: str,
+    recipient: str,
+    subject: str,
+    body: str,
+) -> dict[str, Any]:
+    """Validate an outbound message without exposing its content."""
+
+    clean_channel = str(channel or "").strip().lower()
+    clean_subject = str(subject or "").strip()
+    clean_body = str(body or "")
+
+    if clean_channel not in _CHANNEL_ENV_NAMES:
+        return _status(
+            False,
+            "UNSUPPORTED_CHANNEL",
+            "지원하지 않는 발송 방식입니다.",
+        )
+    if not clean_body.strip():
+        return _status(False, "BODY_REQUIRED", "발송 내용을 입력해 주세요.")
+    if clean_channel == CHANNEL_EMAIL and not clean_subject:
+        return _status(
+            False,
+            "SUBJECT_REQUIRED",
+            "이메일 제목을 입력해 주세요.",
+        )
+
+    clean_subject, clean_body = _prepare_compliant_message(
+        clean_channel,
+        clean_subject,
+        clean_body,
+        os.environ,
+    )
+
+    if clean_channel == CHANNEL_EMAIL:
+        if not _validate_email(recipient):
+            return _status(
+                False,
+                "INVALID_RECIPIENT",
+                "유효한 이메일 주소를 확인해 주세요.",
+            )
+        if not clean_subject:
+            return _status(
+                False,
+                "SUBJECT_REQUIRED",
+                "이메일 제목을 입력해 주세요.",
+            )
+        if len(clean_subject) > 200:
+            return _status(
+                False,
+                "SUBJECT_TOO_LONG",
+                "이메일 제목이 너무 깁니다.",
+            )
+        if len(clean_body) > 100_000:
+            return _status(
+                False,
+                "BODY_TOO_LONG",
+                "이메일 내용이 너무 깁니다.",
+            )
+    elif clean_channel == CHANNEL_SMS:
+        if _normalize_local_mobile(recipient) is None:
+            return _status(
+                False,
+                "INVALID_RECIPIENT",
+                "유효한 휴대전화 번호를 확인해 주세요.",
+            )
+        body_bytes = _sms_body_bytes(clean_body)
+        if body_bytes is None:
+            return _status(
+                False,
+                "SMS_ENCODING_UNSUPPORTED",
+                "문자코리아에서 지원하는 문자로 내용을 입력해 주세요.",
+            )
+        if body_bytes > 2_000:
+            return _status(
+                False,
+                "BODY_TOO_LONG",
+                "문자 내용이 발송 한도를 초과했습니다.",
+            )
+        if body_bytes > 90 and not clean_subject:
+            return _status(
+                False,
+                "SUBJECT_REQUIRED",
+                "장문 문자 제목을 입력해 주세요.",
+            )
+        if len(clean_subject) > 100:
+            return _status(
+                False,
+                "SUBJECT_TOO_LONG",
+                "문자 제목이 너무 깁니다.",
+            )
+    elif clean_channel == CHANNEL_KAKAO:
+        if _normalize_kakao_mobile(recipient) is None:
+            return _status(
+                False,
+                "INVALID_RECIPIENT",
+                "유효한 휴대전화 번호를 확인해 주세요.",
+            )
+        if len(clean_body) > 1_000:
+            return _status(
+                False,
+                "BODY_TOO_LONG",
+                "카카오톡 내용이 발송 한도를 초과했습니다.",
+            )
+        if len(clean_subject) > 50:
+            return _status(
+                False,
+                "SUBJECT_TOO_LONG",
+                "카카오톡 제목이 너무 깁니다.",
+            )
+
+    return _status(True, "VALID", "발송 내용을 확인했습니다.")
+
+
+def _valid_idempotency_key(value: str) -> bool:
+    return bool(_SAFE_IDEMPOTENCY_PATTERN.fullmatch(str(value or "").strip()))
+
+
+def _within_standard_send_hours() -> bool:
+    hour = datetime.now(ZoneInfo("Asia/Seoul")).hour
+    return 8 <= hour < 21
+
+
+def _response_json(response: Any) -> dict[str, Any] | None:
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _http_failure(status_code: int | None) -> dict[str, Any]:
+    if status_code in {401, 403}:
+        return _status(
+            False,
+            "PROVIDER_AUTH_FAILED",
+            "발송 서비스 인증을 확인해 주세요.",
+        )
+    if status_code == 429:
+        return _status(
+            False,
+            "PROVIDER_RATE_LIMITED",
+            "발송 요청이 많아 잠시 후 다시 시도해 주세요.",
+        )
+    return _status(
+        False,
+        "PROVIDER_HTTP_ERROR",
+        "외부 발송 서비스가 요청을 처리하지 못했습니다.",
+    )
+
+
+def _post(
+    session: requests.Session,
+    url: str,
+    *,
+    timeout: float,
+    delivery_ambiguous: bool = False,
+    expected_status_codes: set[int] | None = None,
+    **kwargs: Any,
+) -> tuple[Any | None, dict[str, Any] | None]:
+    network_failure = _status(
+        False,
+        "DELIVERY_UNKNOWN" if delivery_ambiguous else "PROVIDER_NETWORK_ERROR",
+        (
+            "발송 접수 여부를 확인할 수 없습니다. 공급자 관리 화면에서 확인해 주세요."
+            if delivery_ambiguous
+            else "외부 발송 서비스에 연결하지 못했습니다."
+        ),
+    )
+    try:
+        response = session.post(url, timeout=timeout, **kwargs)
+    except requests.RequestException:
+        return None, network_failure
+    except Exception:
+        # Injected/custom sessions can raise non-requests transport errors.
+        # Never include the exception because it may contain request secrets.
+        return None, network_failure
+    status_code = getattr(response, "status_code", None)
+    status_ok = bool(
+        isinstance(status_code, int)
+        and 200 <= status_code < 300
+        and (
+            expected_status_codes is None
+            or status_code in expected_status_codes
+        )
+    )
+    if not status_ok:
+        if delivery_ambiguous and (
+            not isinstance(status_code, int)
+            or status_code == 408
+            or status_code >= 500
+            or 200 <= status_code < 400
+        ):
+            return None, _status(
+                False,
+                "DELIVERY_UNKNOWN",
+                "발송 접수 여부를 확인할 수 없습니다. 공급자 관리 화면에서 확인해 주세요.",
+            )
+        return None, _http_failure(status_code)
+    return response, None
+
+
+def _send_sms(
+    recipient: str,
+    subject: str,
+    body: str,
+    *,
+    session: requests.Session,
+    source: Mapping[str, str],
+    timeout: float,
+) -> dict[str, Any]:
+    token_response, failure = _post(
+        session,
+        SMSKOREA_TOKEN_URL,
+        timeout=timeout,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        json={
+            "userId": str(source[SMSKOREA_USER_ID_ENV]),
+            "sec_apiKey": str(source[SMSKOREA_SEC_API_KEY_ENV]),
+        },
+    )
+    if failure is not None:
+        return failure
+    token_payload = _response_json(token_response)
+    token_result = (
+        token_payload.get("result")
+        if isinstance(token_payload, dict)
+        else None
+    )
+    access_token = (
+        str(token_result.get("accessToken", "")).strip()
+        if isinstance(token_result, dict)
+        else ""
+    )
+    if not access_token:
+        return _status(
+            False,
+            "PROVIDER_RESPONSE_INVALID",
+            "문자 발송 서비스 인증 응답을 확인해 주세요.",
+        )
+
+    body_bytes = _sms_body_bytes(body) or 0
+    message_type = "sms" if body_bytes <= 90 else "lms"
+    message_payload: dict[str, Any] = {
+        "userId": str(source[SMSKOREA_USER_ID_ENV]),
+        "sender": re.sub(r"\D", "", str(source[SMSKOREA_SENDER_ENV])),
+        "receiver": [_normalize_local_mobile(recipient)],
+        "title": str(subject or "").strip(),
+        "message": str(body),
+        "messageType": message_type,
+    }
+    secret_mode = str(
+        source[SMSKOREA_MESSAGE_SECRET_MODE_ENV]
+    ).strip().lower()
+    if secret_mode == SMSKOREA_SECRET_MODE_INCLUDE:
+        message_payload["sec_apiKey"] = str(
+            source[SMSKOREA_SEC_API_KEY_ENV]
+        )
+
+    _message_response, failure = _post(
+        session,
+        SMSKOREA_MESSAGE_URL,
+        timeout=timeout,
+        delivery_ambiguous=True,
+        expected_status_codes={200},
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        json=message_payload,
+    )
+    if failure is not None:
+        return failure
+    # 문자코리아's public guide does not document a stable provider message ID.
+    # HTTP 200 means accepted, not final delivery, so do not claim delivery.
+    return _status(
+        True,
+        "ACCEPTED",
+        "문자코리아에 발송 요청이 접수되었습니다.",
+    )
+
+
+def _send_email(
+    recipient: str,
+    subject: str,
+    body: str,
+    *,
+    session: requests.Session,
+    source: Mapping[str, str],
+    timeout: float,
+) -> dict[str, Any]:
+    # Supplying (None, value) makes requests generate multipart/form-data with
+    # the required boundary while keeping every field as plain form text.
+    files = {
+        "to": (None, str(recipient).strip()),
+        "user_id": (None, str(source[HIWORKS_USER_ID_ENV])),
+        "cc": (None, ""),
+        "bcc": (None, ""),
+        "subject": (None, str(subject).strip()),
+        "content": (None, str(body)),
+        "save_sent_mail": (None, "Y"),
+    }
+    response, failure = _post(
+        session,
+        HIWORKS_SEND_MAIL_URL,
+        timeout=timeout,
+        delivery_ambiguous=True,
+        expected_status_codes={200},
+        headers={
+            "Accept": "application/json",
+            "Authorization": (
+                f"Bearer {str(source[HIWORKS_OFFICE_TOKEN_ENV])}"
+            ),
+        },
+        files=files,
+    )
+    if failure is not None:
+        return failure
+    payload = _response_json(response)
+    if not isinstance(payload, dict) or "code" not in payload:
+        return _status(
+            False,
+            "DELIVERY_UNKNOWN",
+            "메일 발송 접수 여부를 확인할 수 없습니다. 하이웍스 발송내역을 확인해 주세요.",
+        )
+    payload_result = (
+        payload.get("result") if isinstance(payload, dict) else None
+    )
+    success_list = (
+        payload_result.get("successList")
+        if isinstance(payload_result, dict)
+        else None
+    )
+    clean_recipient = str(recipient).strip().casefold()
+    recipient_accepted = bool(
+        isinstance(success_list, list)
+        and any(
+            str(item or "").strip().casefold() == clean_recipient
+            for item in success_list
+        )
+    )
+    if (
+        not isinstance(payload, dict)
+        or str(payload.get("code", "")) != "SUC"
+        or not recipient_accepted
+    ):
+        return _status(
+            False,
+            "PROVIDER_REJECTED",
+            "하이웍스가 메일 발송 요청을 승인하지 않았습니다.",
+        )
+    return _status(True, "ACCEPTED", "하이웍스 메일 발송을 접수했습니다.")
+
+
+def _send_kakao(
+    recipient: str,
+    subject: str,
+    body: str,
+    idempotency_key: str,
+    *,
+    session: requests.Session,
+    source: Mapping[str, str],
+    timeout: float,
+) -> dict[str, Any]:
+    client_id = str(source[KAKAO_BIZ_CLIENT_ID_ENV])
+    client_secret_value = str(source[KAKAO_BIZ_CLIENT_SECRET_ENV])
+    token_response, failure = _post(
+        session,
+        KAKAO_BIZ_TOKEN_URL,
+        timeout=timeout,
+        headers={
+            "Accept": "*/*",
+            "Authorization": f"Basic {client_id} {client_secret_value}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        data={"grant_type": "client_credentials"},
+    )
+    if failure is not None:
+        return failure
+    token_payload = _response_json(token_response)
+    token_code = (
+        str(token_payload.get("code", ""))
+        if isinstance(token_payload, dict)
+        else ""
+    )
+    access_token = (
+        str(token_payload.get("access_token", "")).strip()
+        if isinstance(token_payload, dict)
+        else ""
+    )
+    if token_code not in {"200", "201"} or not access_token:
+        return _status(
+            False,
+            "PROVIDER_RESPONSE_INVALID",
+            "카카오톡 발송 서비스 인증 응답을 확인해 주세요.",
+        )
+
+    cid = "oasis-" + hashlib.sha256(
+        str(idempotency_key).encode("utf-8")
+    ).hexdigest()[:32]
+    message_payload = {
+        "message_type": "FT",
+        "sender_key": str(source[KAKAO_BIZ_SENDER_KEY_ENV]),
+        "cid": cid,
+        "template_code": str(source[KAKAO_BIZ_TEMPLATE_CODE_ENV]),
+        "phone_number": _normalize_kakao_mobile(recipient),
+        "sender_no": re.sub(
+            r"\D", "", str(source[KAKAO_BIZ_SENDER_NO_ENV])
+        ),
+        "message": str(body),
+        "ad_flag": "Y",
+        "fall_back_yn": False,
+    }
+    if str(subject or "").strip():
+        message_payload["title"] = str(subject).strip()
+
+    response, failure = _post(
+        session,
+        KAKAO_BIZ_SEND_URL,
+        timeout=timeout,
+        delivery_ambiguous=True,
+        expected_status_codes={200},
+        headers={
+            "Accept": "*/*",
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        json=message_payload,
+    )
+    if failure is not None:
+        return failure
+    payload = _response_json(response)
+    provider_code = (
+        str(payload.get("code", "")) if isinstance(payload, dict) else ""
+    )
+    if not isinstance(payload, dict) or not provider_code:
+        return _status(
+            False,
+            "DELIVERY_UNKNOWN",
+            "카카오톡 발송 접수 여부를 확인할 수 없습니다. 공급자 발송내역을 확인해 주세요.",
+        )
+    if provider_code not in {"100", "200"}:
+        return _status(
+            False,
+            "PROVIDER_REJECTED",
+            "카카오톡 발송 요청이 승인되지 않았습니다.",
+        )
+    provider_id = str(payload.get("uid", "")) if isinstance(payload, dict) else ""
+    return _status(
+        True,
+        "ACCEPTED",
+        "카카오톡 발송 요청이 접수되었습니다.",
+        provider_id,
+    )
+
+
+def send_outreach(
+    channel: str,
+    recipient: str,
+    subject: str,
+    body: str,
+    idempotency_key: str,
+    session: requests.Session | None = None,
+) -> dict[str, Any]:
+    """Validate and submit one outbound message through the selected provider.
+
+    The function never raises provider details to its caller and never performs
+    network I/O unless both the global hard gate and all channel settings are
+    explicitly ready.
+    """
+
+    clean_channel = str(channel or "").strip().lower()
+    readiness = channel_readiness(clean_channel)
+    if not readiness["external_send_allowed"]:
+        return _status(
+            False,
+            str(readiness.get("code") or "CONFIGURATION_NOT_READY"),
+            str(
+                readiness.get("message")
+                or "발송 서비스 설정을 확인해 주세요."
+            ),
+        )
+    validation = validate_message(clean_channel, recipient, subject, body)
+    if not validation["ok"]:
+        return validation
+    prepared_subject, prepared_body = _prepare_compliant_message(
+        clean_channel,
+        subject,
+        body,
+        os.environ,
+    )
+    if not _valid_idempotency_key(idempotency_key):
+        return _status(
+            False,
+            "IDEMPOTENCY_KEY_REQUIRED",
+            "중복 발송 방지 키를 확인해 주세요.",
+        )
+
+    if clean_channel in {CHANNEL_SMS, CHANNEL_KAKAO} and not (
+        _within_standard_send_hours()
+    ):
+        return _status(
+            False,
+            "NIGHT_SEND_BLOCKED",
+            "문자·카카오톡 영업 발송은 오전 8시부터 오후 9시 전까지만 가능합니다.",
+        )
+
+    source = os.environ
+    timeout = _timeout_seconds(source)
+    client = session or requests.Session()
+    owns_session = session is None
+    try:
+        if clean_channel == CHANNEL_SMS:
+            return _send_sms(
+                recipient,
+                prepared_subject,
+                prepared_body,
+                session=client,
+                source=source,
+                timeout=timeout,
+            )
+        if clean_channel == CHANNEL_EMAIL:
+            return _send_email(
+                recipient,
+                prepared_subject,
+                prepared_body,
+                session=client,
+                source=source,
+                timeout=timeout,
+            )
+        return _send_kakao(
+            recipient,
+            prepared_subject,
+            prepared_body,
+            idempotency_key,
+            session=client,
+            source=source,
+            timeout=timeout,
+        )
+    finally:
+        if owns_session:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+
+__all__ = [
+    "CHANNEL_EMAIL",
+    "CHANNEL_SMS",
+    "CHANNEL_KAKAO",
+    "channel_readiness",
+    "validate_message",
+    "send_outreach",
+]

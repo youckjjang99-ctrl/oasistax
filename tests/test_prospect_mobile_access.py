@@ -13,8 +13,8 @@ from prospect_db_center import (
 
 
 class ProspectMobileAccessTests(unittest.TestCase):
-    def test_member_mobile_visibility_is_enabled_in_prospect_center(self):
-        self.assertTrue(
+    def test_mobile_visibility_never_widens_authenticated_permission(self):
+        self.assertFalse(
             _effective_prospect_mobile_visibility(
                 False,
                 is_admin_user=False,
