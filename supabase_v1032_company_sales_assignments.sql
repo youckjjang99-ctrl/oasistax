@@ -3145,7 +3145,7 @@ begin
             now(),
             now()
         )
-        on conflict (prospect_id, contact_type, contact_value) do update
+        on conflict on constraint oasis_prospect_contacts_unique do update
         set
             contact_label = excluded.contact_label,
             source_type = excluded.source_type,

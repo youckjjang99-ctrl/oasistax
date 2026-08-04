@@ -14,6 +14,15 @@ MIGRATION_PATH = (
 )
 SQL = MIGRATION_PATH.read_text(encoding="utf-8")
 SQL_LOWER = SQL.lower()
+SERVICE_GRANT_MIGRATION_PATH = (
+    ROOT
+    / "supabase"
+    / "migrations"
+    / "20260804133000_fix_v911_index_dependency_acl.sql"
+)
+SERVICE_GRANT_SQL_LOWER = SERVICE_GRANT_MIGRATION_PATH.read_text(
+    encoding="utf-8"
+).lower()
 
 
 def _function_sql(name: str) -> str:
@@ -488,8 +497,26 @@ class CustomerInformationIntegrationMigrationTests(unittest.TestCase):
             r"public[.]oasis_list_unified_customers\(text\)\s+to\s+service_role",
         )
 
+        self.assertRegex(
+            SERVICE_GRANT_SQL_LOWER,
+            r"revoke\s+all\s+on\s+function\s+"
+            r"public[.]oasis_v911_normalize_business_no\(text\)\s+"
+            r"from\s+public,\s*anon,\s*authenticated,\s*service_role",
+        )
+        self.assertRegex(
+            SERVICE_GRANT_SQL_LOWER,
+            r"grant\s+execute\s+on\s+function\s+"
+            r"public[.]oasis_v911_normalize_business_no\(text\)\s+"
+            r"to\s+service_role",
+        )
+        self.assertNotRegex(
+            SERVICE_GRANT_SQL_LOWER,
+            r"grant\s+execute[^;]*"
+            r"oasis_v911_normalize_business_no\(text\)[^;]*"
+            r"to\s+(?:public|anon|authenticated)",
+        )
+
         for helper in (
-            "oasis_v911_normalize_business_no",
             "oasis_v911_lossless_jsonb_merge",
             "oasis_v911_company_uid_candidates",
             "oasis_v911_ensure_customer_company_link",

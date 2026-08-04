@@ -22,6 +22,24 @@ BACKUP_MIGRATION = (
     / "migrations"
     / "20260804113337_assignment_release_backup_store.sql"
 ).read_text(encoding="utf-8")
+CONFLICT_FIX_MIGRATION = (
+    ROOT
+    / "supabase"
+    / "migrations"
+    / "20260804131811_fix_prospect_contact_conflict_ambiguity.sql"
+).read_text(encoding="utf-8")
+V911_MIGRATION = (
+    ROOT
+    / "supabase"
+    / "migrations"
+    / "20260804020000_v911_customer_information_integration.sql"
+).read_text(encoding="utf-8")
+V911_SERVICE_GRANT_MIGRATION = (
+    ROOT
+    / "supabase"
+    / "migrations"
+    / "20260804133000_fix_v911_index_dependency_acl.sql"
+).read_text(encoding="utf-8")
 
 SYNTHETIC_MOBILE = "".join(("010", "1234", "5678"))
 SYNTHETIC_LANDLINE = "".join(("02", "1234", "5678"))
@@ -155,6 +173,58 @@ class ProspectContactPromotionTests(unittest.TestCase):
         self.assertIn(
             "oasis_claim_save_and_promote_prospect_contacts",
             RLS.lower(),
+        )
+
+    def test_contact_upsert_uses_named_constraint_without_output_ambiguity(self):
+        expected = (
+            "on conflict on constraint oasis_prospect_contacts_unique "
+            "do update"
+        )
+        ambiguous = (
+            "on conflict (prospect_id, contact_type, contact_value) "
+            "do update"
+        )
+        for sql in (SQL, CONFLICT_FIX_MIGRATION):
+            normalized = " ".join(sql.lower().split())
+            self.assertIn(expected, normalized)
+            self.assertNotIn(ambiguous, normalized)
+
+        fix_sql = CONFLICT_FIX_MIGRATION.lower()
+        self.assertIn(
+            "create or replace function "
+            "public.oasis_claim_save_and_promote_prospect_contacts",
+            fix_sql,
+        )
+        self.assertIn("from public, anon, authenticated", fix_sql)
+        self.assertIn("to service_role", fix_sql)
+
+    def test_service_role_can_maintain_normalized_business_number_index(self):
+        v911_sql = " ".join(V911_MIGRATION.lower().split())
+        grant_sql = " ".join(V911_SERVICE_GRANT_MIGRATION.lower().split())
+        helper = "public.oasis_v911_normalize_business_no(text)"
+
+        self.assertIn(
+            "create index if not exists "
+            "idx_oasis_prospects_owner_normalized_business_no",
+            v911_sql,
+        )
+        self.assertIn(
+            "public.oasis_v911_normalize_business_no(business_no)",
+            v911_sql,
+        )
+        self.assertIn(
+            f"grant execute on function {helper} to service_role",
+            grant_sql,
+        )
+        self.assertIn(
+            f"revoke all on function {helper} "
+            "from public, anon, authenticated, service_role",
+            grant_sql,
+        )
+        self.assertNotIn(f"grant execute on function {helper} to anon", grant_sql)
+        self.assertNotIn(
+            f"grant execute on function {helper} to authenticated",
+            grant_sql,
         )
 
     def test_ui_requires_explicit_approval_and_keeps_send_consent_separate(self):
