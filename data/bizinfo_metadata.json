@@ -1,6 +1,6 @@
 {
   "status": "success",
-  "generated_at": "2026-08-05T04:27:47+09:00",
+  "generated_at": "2026-08-06T04:25:19+09:00",
   "source": "github-actions",
   "record_count": 1000,
   "successful_pages": 10,
@@ -10,7 +10,7 @@
       "page": 1,
       "success": true,
       "status_code": 200,
-      "elapsed_seconds": 5.51,
+      "elapsed_seconds": 4.61,
       "row_count": 100,
       "message": "정상"
     },
@@ -18,7 +18,7 @@
       "page": 2,
       "success": true,
       "status_code": 200,
-      "elapsed_seconds": 2.41,
+      "elapsed_seconds": 2.59,
       "row_count": 100,
       "message": "정상"
     },
@@ -50,7 +50,7 @@
       "page": 6,
       "success": true,
       "status_code": 200,
-      "elapsed_seconds": 0.68,
+      "elapsed_seconds": 0.87,
       "row_count": 100,
       "message": "정상"
     },
