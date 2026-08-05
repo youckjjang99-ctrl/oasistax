@@ -152,3 +152,18 @@ def test_other_company_migration_is_disjoint_and_service_role_only() -> None:
     assert "from public, anon, authenticated" in normalized
     assert "to service_role" in normalized
     assert "security invoker" in normalized
+
+
+def test_other_company_correction_uses_comwel_source_facts() -> None:
+    migration = Path(
+        "supabase/migrations/"
+        "20260805182421_correct_other_company_source_fields.sql"
+    ).read_text(encoding="utf-8")
+    normalized = " ".join(migration.lower().split())
+
+    assert "join public.oasis_comwel_annual_growth w" in normalized
+    assert "w.workers_2025 as current_employee_count" in normalized
+    assert "w.growth_2024_2025 <= 0" in normalized
+    assert "w.is_new_2025 is false" in normalized
+    assert "w.province = trim(p_province_name)" in normalized
+    assert "w.district = trim(p_district)" in normalized
