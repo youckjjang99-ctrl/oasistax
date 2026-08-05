@@ -1208,12 +1208,8 @@ def filter_company_availability(
         row["assignment_relation"] = relation
         if relation == "blocked":
             blocked_items.append(row)
-            if is_admin_user:
-                visible.append(row)
         elif relation == "own":
             own_items.append(row)
-            if is_admin_user:
-                visible.append(row)
         else:
             visible.append(row)
     # A row without a deterministic common identity cannot be safely assigned
@@ -1233,8 +1229,8 @@ def filter_company_availability(
         "items": visible,
         "blocked_items": blocked_items,
         "own_items": own_items,
-        "excluded_count": (
-            0 if is_admin_user else len(blocked_items) + len(unresolved)
+        "excluded_count": len(blocked_items) + (
+            0 if is_admin_user else len(unresolved)
         ),
         "own_count": len(own_items),
         "warning": warning,

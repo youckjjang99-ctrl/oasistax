@@ -1,11 +1,14 @@
 import inspect
 import unittest
+from unittest.mock import patch
 
+import prospect_db_center as prospect
 from claim_correction_center import (
     _render_auto_claim_monitor,
     render_claim_correction_center,
 )
 from prospect_db_center import (
+    _checked_result_page_keys_from_editor_state,
     _merge_result_page_selection,
     _result_page_window,
     render_prospect_db_center,
@@ -55,12 +58,87 @@ class PartialRenderingPerformanceTests(unittest.TestCase):
             {"page-1-a", "page-2-b", "page-3-a"},
         )
 
+    def test_editor_patch_keeps_unchecked_row_cleared_on_rerun(self):
+        editor_state = {
+            "edited_rows": {
+                0: {"선택": False},
+                2: {"선택": True},
+            }
+        }
+
+        checked = _checked_result_page_keys_from_editor_state(
+            ["row-a", "row-b", "row-c"],
+            {"row-a", "row-b"},
+            editor_state,
+        )
+
+        self.assertEqual(checked, {"row-b", "row-c"})
+        self.assertEqual(
+            _checked_result_page_keys_from_editor_state(
+                ["row-a", "row-b", "row-c"],
+                {"row-a", "row-b"},
+                editor_state,
+            ),
+            {"row-b", "row-c"},
+        )
+
+    def test_editor_callback_updates_persistent_selection_before_rerun(self):
+        session_state = {
+            "selection": ["row-a", "row-b", "other-page"],
+            "editor": {"edited_rows": {"0": {"선택": False}}},
+        }
+
+        with patch.object(prospect.st, "session_state", session_state):
+            prospect._sync_result_editor_selection(
+                "editor",
+                "selection",
+                ["row-a", "row-b"],
+                {"row-a", "row-b"},
+            )
+
+        self.assertEqual(
+            session_state["selection"],
+            ["other-page", "row-b"],
+        )
+
+    def test_select_all_callback_selects_and_clears_every_result(self):
+        session_state = {
+            "select-all": True,
+            "selection": ["row-a"],
+            "generation": 2,
+        }
+        with patch.object(prospect.st, "session_state", session_state):
+            prospect._set_all_result_selection(
+                "select-all",
+                "selection",
+                "generation",
+                {"row-a", "row-b"},
+            )
+            self.assertEqual(session_state["selection"], ["row-a", "row-b"])
+            self.assertEqual(session_state["generation"], 3)
+
+            session_state["select-all"] = False
+            prospect._set_all_result_selection(
+                "select-all",
+                "selection",
+                "generation",
+                {"row-a", "row-b"},
+            )
+
+        self.assertEqual(session_state["selection"], [])
+        self.assertEqual(session_state["generation"], 4)
+
     def test_prospect_editor_only_receives_the_visible_page(self):
         source = inspect.getsource(render_prospect_db_center)
 
         self.assertIn("PROSPECT_RESULT_PAGE_SIZE_OPTIONS", source)
         self.assertIn("page_display[visible_columns]", source)
         self.assertIn("_merge_result_page_selection(", source)
+        self.assertIn('st.checkbox(\n                "전체 선택"', source)
+        self.assertIn("on_change=_sync_result_editor_selection", source)
+        self.assertIn("editor_baseline_key", source)
+        self.assertIn('st.column_config.CheckboxColumn("✓")', source)
+        self.assertNotIn('st.column_config.CheckboxColumn("저장")', source)
         self.assertIn("이번 발굴결과 엑셀 다운로드", source)
 
 

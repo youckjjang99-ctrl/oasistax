@@ -385,7 +385,7 @@ def _filter_assignment_search_result(
     copied["found_count"] = len(visible)
     stats["saved_prospect_excluded"] = int(
         stats.get("saved_prospect_excluded") or 0
-    ) + excluded_count + (0 if is_admin_user else own_count)
+    ) + excluded_count + own_count
     stats["assignment_blocked_excluded"] = excluded_count
     stats["already_my_db_excluded"] = own_count
     copied["stats"] = stats
@@ -586,6 +586,94 @@ def _merge_result_page_selection(
     normalized_selected.difference_update(normalized_page)
     normalized_selected.update(normalized_checked & normalized_page)
     return normalized_selected
+
+
+def _checked_result_page_keys_from_editor_state(
+    page_source_keys: list[str],
+    baseline_checked_keys: set[str],
+    editor_state: object,
+) -> set[str]:
+    """Apply Streamlit's row patches to one immutable page baseline."""
+
+    checked = {
+        str(key)
+        for key in baseline_checked_keys
+        if str(key or "").strip()
+    }
+    if not isinstance(editor_state, dict):
+        return checked
+    edited_rows = editor_state.get("edited_rows")
+    if not isinstance(edited_rows, dict):
+        return checked
+    for raw_index, changes in edited_rows.items():
+        if not isinstance(changes, dict) or "선택" not in changes:
+            continue
+        try:
+            row_index = int(raw_index)
+        except (TypeError, ValueError):
+            continue
+        if row_index < 0 or row_index >= len(page_source_keys):
+            continue
+        source_key = str(page_source_keys[row_index] or "").strip()
+        if not source_key:
+            continue
+        if bool(changes.get("선택")):
+            checked.add(source_key)
+        else:
+            checked.discard(source_key)
+    return checked
+
+
+def _sync_result_editor_selection(
+    editor_key: str,
+    selection_state_key: str,
+    page_source_keys: list[str],
+    baseline_checked_keys: set[str],
+) -> None:
+    """Persist checkbox edits before Streamlit rebuilds the result table."""
+
+    page_keys = {
+        str(key) for key in page_source_keys if str(key or "").strip()
+    }
+    checked_keys = _checked_result_page_keys_from_editor_state(
+        page_source_keys,
+        baseline_checked_keys,
+        st.session_state.get(editor_key, {}),
+    )
+    selected_keys = {
+        str(key)
+        for key in st.session_state.get(selection_state_key, [])
+        if str(key or "").strip()
+    }
+    st.session_state[selection_state_key] = sorted(
+        _merge_result_page_selection(
+            selected_keys,
+            page_keys,
+            checked_keys,
+        )
+    )
+
+
+def _set_all_result_selection(
+    checkbox_key: str,
+    selection_state_key: str,
+    editor_generation_key: str,
+    result_source_keys: set[str],
+) -> None:
+    """Select or clear every currently displayed search result."""
+
+    if bool(st.session_state.get(checkbox_key)):
+        selected = {
+            str(key)
+            for key in result_source_keys
+            if str(key or "").strip()
+        }
+    else:
+        selected = set()
+    st.session_state[selection_state_key] = sorted(selected)
+    st.session_state[editor_generation_key] = (
+        int(st.session_state.get(editor_generation_key, 0) or 0) + 1
+    )
 
 
 def _is_stock_company(value: object) -> bool:
@@ -4620,9 +4708,13 @@ def render_prospect_db_center(
                 )
             )
             page_display = display.iloc[page_start:page_end].copy()
-            page_display["선택"] = (
-                page_display["source_key"].astype(str).isin(selected_keys)
-            )
+            page_source_keys = [
+                str(value)
+                for value in page_display["source_key"].tolist()
+            ]
+            page_keys = {
+                value for value in page_source_keys if value.strip()
+            }
             st.caption(
                 f"전체 {len(display):,}건 중 "
                 f"{page_start + 1:,}~{page_end:,}건을 표시합니다. "
@@ -4652,6 +4744,62 @@ def render_prospect_db_center(
                 ]
                 if column in display.columns
             ]
+            result_revision = int(
+                st.session_state.get(result_revision_key, 0) or 0
+            )
+            editor_generation_key = (
+                "prospect_editor_generation_v1014_"
+                f"{discovery_type}_{region_name}_{district_name}_"
+                f"{result_revision}"
+            )
+            select_all_key = (
+                "prospect_select_all_v1014_"
+                f"{discovery_type}_{region_name}_{district_name}_"
+                f"{result_revision}"
+            )
+            all_results_selected = bool(visible_result_keys) and (
+                selected_keys == visible_result_keys
+            )
+            if select_all_key not in st.session_state:
+                st.session_state[select_all_key] = all_results_selected
+            elif bool(st.session_state.get(select_all_key)) != (
+                all_results_selected
+            ):
+                st.session_state[select_all_key] = all_results_selected
+            st.checkbox(
+                "전체 선택",
+                key=select_all_key,
+                on_change=_set_all_result_selection,
+                args=(
+                    select_all_key,
+                    selection_state_key,
+                    editor_generation_key,
+                    visible_result_keys,
+                ),
+                help="현재 검색 결과 전체를 선택하거나 선택 해제합니다.",
+            )
+            editor_generation = int(
+                st.session_state.get(editor_generation_key, 0) or 0
+            )
+            editor_key = (
+                "prospect_editor_v1014_"
+                f"{discovery_type}_{region_name}_{district_name}_"
+                f"{result_revision}_{int(page_size)}_{page_number}_"
+                f"{editor_generation}"
+            )
+            editor_baseline_key = f"_{editor_key}_baseline"
+            if editor_baseline_key not in st.session_state:
+                st.session_state[editor_baseline_key] = sorted(
+                    selected_keys & page_keys
+                )
+            baseline_checked_keys = {
+                str(value)
+                for value in st.session_state.get(editor_baseline_key, [])
+                if str(value or "").strip()
+            }
+            page_display["선택"] = page_display["source_key"].astype(
+                str
+            ).isin(baseline_checked_keys)
             edited = st.data_editor(
                 page_display[visible_columns],
                 use_container_width=True,
@@ -4662,7 +4810,7 @@ def render_prospect_db_center(
                     if column != "선택"
                 ],
                 column_config={
-                    "선택": st.column_config.CheckboxColumn("저장"),
+                    "선택": st.column_config.CheckboxColumn("✓"),
                     **(
                         {
                             "휴대전화": st.column_config.TextColumn(
@@ -4682,18 +4830,15 @@ def render_prospect_db_center(
                     ),
                     "source_key": None,
                 },
-                key=(
-                    "prospect_editor_v1012_"
-                    f"{discovery_type}_{region_name}_{district_name}_"
-                    f"{int(st.session_state.get(result_revision_key, 0) or 0)}_"
-                    f"{int(page_size)}_{page_number}"
+                key=editor_key,
+                on_change=_sync_result_editor_selection,
+                args=(
+                    editor_key,
+                    selection_state_key,
+                    page_source_keys,
+                    baseline_checked_keys,
                 ),
             )
-            page_keys = {
-                str(value)
-                for value in page_display["source_key"].tolist()
-                if str(value or "").strip()
-            }
             checked_page_keys = {
                 str(value)
                 for value in edited.loc[
