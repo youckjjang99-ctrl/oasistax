@@ -85,9 +85,10 @@ class RerunReductionTests(unittest.TestCase):
             "app.py": 1,  # workbook-backed customer edit refresh
             "enterprise_center.py": 0,
             # Three existing data refreshes, two intentional free-form
-            # outreach exits, and two contact-result refreshes after a
-            # successful record or temporary-assignment release.
-            "prospect_db_center.py": 7,
+            # outreach exits, two contact-result refreshes after a
+            # successful record or temporary-assignment release, and one
+            # administrator return-review result refresh.
+            "prospect_db_center.py": 8,
             # Auth refresh, two soft-delete dialog exits, and the existing
             # dialog close.  These are user actions, not polling reruns.
             "claim_correction_center.py": 4,

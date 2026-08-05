@@ -139,6 +139,8 @@ _OUTREACH_ATTEMPTS_KEY = "_saved_prospect_outreach_attempts_v1040"
 _CONTACT_RESULTS_FLASH_KEY = "_contact_results_flash_v1050"
 _CONTACT_RESULTS_SELECTION_KEY = "contact_results_assignment_v1050"
 _CONTACT_RESULTS_RESET_SELECTION_KEY = "_contact_results_reset_selection_v1050"
+_RETURN_DB_ADMIN_FLASH_KEY = "_return_db_admin_flash_v1070"
+_RETURN_DB_ADMIN_SELECTION_KEY = "return_db_admin_assignment_v1070"
 OUTREACH_ALLOWED_ASSIGNMENT_STATUSES = frozenset(
     {"assigned", "pending_contact", "contacted", "consulting", "follow_up"}
 )
@@ -3446,7 +3448,10 @@ def _render_contact_results(owner_user_id: str) -> None:
         if return_result.get("ok"):
             st.session_state[_CONTACT_RESULTS_FLASH_KEY] = {
                 "level": "success",
-                "message": "업체를 반납해 내 배정 DB에서 제외했습니다.",
+                "message": (
+                    "업체를 반납해 내 배정 DB에서 제외하고 "
+                    "관리자 검토함으로 이동했습니다."
+                ),
             }
             st.session_state[_CONTACT_RESULTS_RESET_SELECTION_KEY] = True
             st.rerun()
@@ -3455,6 +3460,19 @@ def _render_contact_results(owner_user_id: str) -> None:
                 return_result.get("message")
                 or "업체를 반납하지 못했습니다."
             )
+
+    selected_memo = str(selected_assignment.get("memo") or "").strip()
+    st.markdown("#### 업체 메모")
+    if selected_memo:
+        st.text_area(
+            "③ 저장된 영업후보에서 저장한 메모",
+            value=selected_memo,
+            height=100,
+            disabled=True,
+            key=f"contact_results_memo_v1070_{selected_assignment_id}",
+        )
+    else:
+        st.caption("③ 저장된 영업후보에 저장된 업체 메모가 없습니다.")
 
     schedule_next_contact = st.checkbox(
         "다음 연락예정일 지정",
@@ -3615,6 +3633,215 @@ def _render_contact_results(owner_user_id: str) -> None:
                 or "자동 발송 이력을 불러오지 못했습니다."
             )
 
+
+def _return_db_review_rows(
+    assignments: list[dict],
+    audit_rows: list[dict],
+) -> list[dict]:
+    """Return admin-review rows for explicit Contact Results returns."""
+
+    return_audit_by_uid: dict[str, dict] = {}
+    ordered_audit = sorted(
+        audit_rows,
+        key=lambda row: str(row.get("created_at") or ""),
+        reverse=True,
+    )
+    for audit_row in ordered_audit:
+        new_value = audit_row.get("new_value")
+        if not isinstance(new_value, dict):
+            continue
+        company_uid = str(audit_row.get("company_uid") or "")
+        if (
+            company_uid
+            and company_uid not in return_audit_by_uid
+            and str(audit_row.get("action") or "") == "assignment_released"
+            and str(new_value.get("reason") or "")
+            == "contact_results_return"
+        ):
+            return_audit_by_uid[company_uid] = audit_row
+
+    review_rows: list[dict] = []
+    for assignment in assignments:
+        if (
+            str(assignment.get("status") or "") != "long_hold"
+            or str(assignment.get("released_reason") or "")
+            != "contact_results_return"
+            or bool(assignment.get("permanently_excluded"))
+        ):
+            continue
+        row = dict(assignment)
+        return_audit = return_audit_by_uid.get(
+            str(row.get("company_uid") or ""),
+            {},
+        )
+        row["_returned_by_name"] = str(
+            return_audit.get("user_name")
+            or row.get("first_assigned_user_name")
+            or "담당자 미확인"
+        )
+        row["_returned_at"] = str(
+            return_audit.get("created_at") or row.get("released_at") or ""
+        )
+        review_rows.append(row)
+    return review_rows
+
+
+def _render_return_db_admin(current_user_id: str) -> None:
+    """Render the administrator-only queue for user-returned assignments."""
+
+    from auth import is_admin
+
+    st.markdown("### 반납DB 관리")
+    if not is_admin(current_user_id):
+        st.error("관리자만 반납 DB를 확인할 수 있습니다.")
+        return
+
+    pending_notice = st.session_state.pop(_RETURN_DB_ADMIN_FLASH_KEY, None)
+    if isinstance(pending_notice, dict):
+        message = str(pending_notice.get("message") or "").strip()
+        if message:
+            level = str(pending_notice.get("level") or "info").lower()
+            getattr(st, level, st.info)(message)
+
+    st.caption(
+        "영업담당자가 ④ 연락결과 기록에서 반납한 업체를 검토합니다. "
+        "검토 전에는 다른 담당자가 다시 배정받을 수 없습니다."
+    )
+    assignment_result = sales_assignments.list_admin_assignments(
+        current_user_id,
+        statuses=["long_hold"],
+        limit=1000,
+    )
+    if not assignment_result.get("ok"):
+        st.error(
+            assignment_result.get("message")
+            or "반납 DB를 불러오지 못했습니다."
+        )
+        return
+
+    audit_result = sales_assignments.list_admin_assignment_audit(
+        current_user_id,
+        limit=1000,
+    )
+    audit_rows = (
+        list(audit_result.get("audit") or [])
+        if audit_result.get("ok")
+        else []
+    )
+    if not audit_result.get("ok"):
+        st.warning("반납 담당자 감사 이력을 확인하지 못했습니다.")
+
+    review_rows = _return_db_review_rows(
+        list(assignment_result.get("assignments") or []),
+        audit_rows,
+    )
+    if not review_rows:
+        st.success("관리자가 검토할 반납 DB가 없습니다.")
+        return
+
+    st.metric("검토 대기", f"{len(review_rows):,}건")
+    review_frame = pd.DataFrame(
+        [
+            {
+                "업체명": str(row.get("company_name") or "업체명 미확인"),
+                "반납 담당자": str(row.get("_returned_by_name") or ""),
+                "반납일시": str(row.get("_returned_at") or "")
+                .replace("T", " ")[:19],
+                "현재상태": "관리자 검토 대기",
+            }
+            for row in review_rows
+        ]
+    )
+    st.dataframe(
+        review_frame,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    review_by_id = {
+        str(row.get("assignment_id") or row.get("id") or ""): row
+        for row in review_rows
+        if str(row.get("assignment_id") or row.get("id") or "")
+    }
+    review_labels = {
+        assignment_id: (
+            f"{str(row.get('company_name') or '업체명 미확인')} · "
+            f"{str(row.get('_returned_at') or '').replace('T', ' ')[:10]}"
+        )
+        for assignment_id, row in review_by_id.items()
+    }
+    selected_assignment_id = st.selectbox(
+        "검토할 반납 업체",
+        list(review_by_id),
+        format_func=lambda value: review_labels.get(value, "업체명 미확인"),
+        key=_RETURN_DB_ADMIN_SELECTION_KEY,
+    )
+    selected_return = review_by_id.get(selected_assignment_id, {})
+
+    with st.form("return_db_admin_review_form_v1070"):
+        review_action = st.radio(
+            "검토 결과",
+            ["재배정 허용", "영구 제외"],
+            horizontal=True,
+        )
+        review_reason = st.text_input(
+            "검토 사유",
+            max_chars=400,
+            placeholder="검토 결과와 판단 근거를 입력해 주세요.",
+        )
+        permanent_confirm = st.checkbox(
+            "영구 제외 시 이 업체를 향후 배정 대상에서 제외하는 데 동의합니다.",
+            disabled=review_action != "영구 제외",
+        )
+        review_submitted = st.form_submit_button(
+            "검토 결과 저장",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if not review_submitted:
+        return
+    if not review_reason.strip():
+        st.error("검토 사유를 입력해 주세요.")
+        return
+    if review_action == "영구 제외" and not permanent_confirm:
+        st.error("영구 제외 확인 항목을 체크해 주세요.")
+        return
+
+    company_uid = str(selected_return.get("company_uid") or "")
+    company_id = selected_return.get("company_id")
+    if review_action == "재배정 허용":
+        action_result = sales_assignments.admin_reactivate(
+            current_user_id,
+            company_id,
+            company_uid,
+            reason=f"반납 검토 승인: {review_reason.strip()}",
+            session_id=_assignment_session_id(),
+        )
+        success_message = "검토를 완료하고 업체를 재배정 가능 상태로 전환했습니다."
+    else:
+        action_result = sales_assignments.admin_permanent_exclude(
+            current_user_id,
+            company_id,
+            company_uid,
+            reason=f"반납 검토 영구 제외: {review_reason.strip()}",
+            session_id=_assignment_session_id(),
+        )
+        success_message = "검토를 완료하고 업체를 영구 제외했습니다."
+
+    if action_result.get("ok"):
+        st.session_state[_RETURN_DB_ADMIN_FLASH_KEY] = {
+            "level": "success",
+            "message": success_message,
+        }
+        st.rerun()
+    else:
+        st.error(
+            action_result.get("message")
+            or "반납 DB 검토 결과를 저장하지 못했습니다."
+        )
+
+
 def render_prospect_db_center(
     owner_user_id: str = "",
     *,
@@ -3626,29 +3853,29 @@ def render_prospect_db_center(
         is_admin_user=is_admin_user,
     )
     _show_pending_prospect_save_notices()
-    pending_workflow_step = st.session_state.pop(
-        "_prospect_workflow_step_pending_v1020",
-        None,
-    )
-    if pending_workflow_step in {
+    workflow_steps = [
         "① 조건 설정",
         "② 검색 결과",
         "③ 저장된 영업후보",
         "④ 연락결과 기록",
-    }:
+    ]
+    if is_admin_user:
+        workflow_steps.append("⑤ 반납DB 관리")
+    pending_workflow_step = st.session_state.pop(
+        "_prospect_workflow_step_pending_v1020",
+        None,
+    )
+    if pending_workflow_step in workflow_steps:
         st.session_state["prospect_workflow_step_v1020"] = (
             pending_workflow_step
         )
-    if "prospect_workflow_step_v1020" not in st.session_state:
+    if st.session_state.get(
+        "prospect_workflow_step_v1020"
+    ) not in workflow_steps:
         st.session_state["prospect_workflow_step_v1020"] = "① 조건 설정"
     workflow_step = st.pills(
         "DB발굴 작업 단계",
-        [
-            "① 조건 설정",
-            "② 검색 결과",
-            "③ 저장된 영업후보",
-            "④ 연락결과 기록",
-        ],
+        workflow_steps,
         key="prospect_workflow_step_v1020",
         label_visibility="collapsed",
     )
@@ -3662,6 +3889,9 @@ def render_prospect_db_center(
         return
     if workflow_step == "④ 연락결과 기록":
         _render_contact_results(owner_user_id)
+        return
+    if workflow_step == "⑤ 반납DB 관리":
+        _render_return_db_admin(owner_user_id)
         return
     if workflow_step == "① 조건 설정":
         _render_search_history(owner_user_id)
