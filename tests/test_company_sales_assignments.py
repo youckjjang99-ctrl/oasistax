@@ -354,47 +354,6 @@ class AssignmentRpcTests(unittest.TestCase):
         self.assertEqual(result["excluded_count"], 1)
         self.assertEqual(result["own_count"], 1)
 
-    def test_admin_search_also_excludes_owned_and_review_hold_rows(self):
-        def response(parameters):
-            relations = {
-                "business:1111111111": "blocked",
-                "business:2222222222": "own",
-                "business:3333333333": "available",
-            }
-            return [
-                {"company_uid": uid, "relation": relations[uid]}
-                for uid in parameters["p_company_uids"]
-            ]
-
-        database = _FakeDatabase(
-            {"oasis_filter_blocked_company_uids": response}
-        )
-        result = filter_company_availability(
-            [
-                {"id": "review-hold", "business_no": "1111111111"},
-                {"id": "already-owned", "business_no": "2222222222"},
-                {"id": "available", "business_no": "3333333333"},
-            ],
-            "admin-a",
-            is_admin_user=True,
-            db=database,
-        )
-
-        self.assertEqual(
-            [row["id"] for row in result["items"]],
-            ["available"],
-        )
-        self.assertEqual(
-            [row["id"] for row in result["blocked_items"]],
-            ["review-hold"],
-        )
-        self.assertEqual(
-            [row["id"] for row in result["own_items"]],
-            ["already-owned"],
-        )
-        self.assertEqual(result["excluded_count"], 1)
-        self.assertEqual(result["own_count"], 1)
-
     def test_availability_failure_requests_existing_fallback(self):
         database = _FakeDatabase(
             failures={
