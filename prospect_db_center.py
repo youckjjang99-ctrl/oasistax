@@ -3408,14 +3408,66 @@ def _render_contact_results(owner_user_id: str) -> None:
 
     if st.session_state.pop(_CONTACT_RESULTS_RESET_SELECTION_KEY, False):
         st.session_state.pop(_CONTACT_RESULTS_SELECTION_KEY, None)
-    selected_assignment_id = st.selectbox(
-        "연락결과를 기록할 업체",
-        list(assignments_by_id),
-        format_func=lambda value: assignment_labels.get(value, "업체명 미확인"),
-        key=_CONTACT_RESULTS_SELECTION_KEY,
+    selection_col, return_col = st.columns(
+        [10, 1.4],
+        vertical_alignment="bottom",
     )
+    with selection_col:
+        selected_assignment_id = st.selectbox(
+            "연락결과를 기록할 업체",
+            list(assignments_by_id),
+            format_func=lambda value: assignment_labels.get(
+                value,
+                "업체명 미확인",
+            ),
+            key=_CONTACT_RESULTS_SELECTION_KEY,
+        )
     selected_assignment = assignments_by_id.get(selected_assignment_id, {})
     selected_company_uid = str(selected_assignment.get("company_uid") or "")
+    with return_col:
+        return_submitted = st.button(
+            "반납",
+            help=(
+                "선택한 업체를 내 배정 DB에서 제외하고 미배정 DB로 "
+                "돌려보냅니다. 기존 연락 이력은 유지됩니다."
+            ),
+            key=f"contact_results_return_v1060_{selected_assignment_id}",
+            use_container_width=True,
+            disabled=not selected_company_uid,
+        )
+    if return_submitted:
+        return_result = sales_assignments.release_assignment(
+            owner_user_id,
+            selected_assignment.get("company_id"),
+            selected_company_uid,
+            reason="contact_results_return",
+            session_id=_assignment_session_id(),
+        )
+        if return_result.get("ok"):
+            st.session_state[_CONTACT_RESULTS_FLASH_KEY] = {
+                "level": "success",
+                "message": "업체를 반납해 내 배정 DB에서 제외했습니다.",
+            }
+            st.session_state[_CONTACT_RESULTS_RESET_SELECTION_KEY] = True
+            st.rerun()
+        else:
+            st.error(
+                return_result.get("message")
+                or "업체를 반납하지 못했습니다."
+            )
+
+    schedule_next_contact = st.checkbox(
+        "다음 연락예정일 지정",
+        value=True,
+        key="contact_results_schedule_v1050",
+        help="기본으로 활성화됩니다. 필요하지 않으면 체크를 해제하세요.",
+    )
+    next_contact_date = st.date_input(
+        "다음 연락예정일",
+        disabled=not schedule_next_contact,
+        help="‘재연락 요청’ 선택 시 반드시 지정합니다.",
+        key="contact_results_next_date_v1050",
+    )
 
     with st.form("contact_results_record_form_v1050", clear_on_submit=True):
         contact_col1, contact_col2 = st.columns(2)
@@ -3428,17 +3480,6 @@ def _render_contact_results(owner_user_id: str) -> None:
             "연락결과",
             CONTACT_RESULT_OPTIONS,
             key="contact_results_result_v1050",
-        )
-        schedule_next_contact = st.checkbox(
-            "다음 연락예정일 지정",
-            value=False,
-            key="contact_results_schedule_v1050",
-        )
-        next_contact_date = st.date_input(
-            "다음 연락예정일",
-            disabled=not schedule_next_contact,
-            help="‘재연락 요청’ 선택 시 반드시 지정합니다.",
-            key="contact_results_next_date_v1050",
         )
         contact_notes = st.text_area(
             "상담내용",
@@ -3573,49 +3614,6 @@ def _render_contact_results(owner_user_id: str) -> None:
                 outreach_history_result.get("message")
                 or "자동 발송 이력을 불러오지 못했습니다."
             )
-
-    selected_contact_count = int(
-        selected_assignment.get("contact_count") or 0
-    )
-    selected_status = str(selected_assignment.get("status") or "")
-    if selected_contact_count == 0 and selected_status == "assigned":
-        with st.expander("미접촉 임시 배정 해제", expanded=False):
-            with st.form("contact_results_release_form_v1050"):
-                release_reason = st.text_input(
-                    "해제 사유",
-                    max_chars=500,
-                    key="contact_results_release_reason_v1050",
-                )
-                release_submitted = st.form_submit_button(
-                    "이 업체 배정 해제",
-                    use_container_width=True,
-                )
-            if release_submitted:
-                if not release_reason.strip():
-                    st.error("배정 해제 사유를 입력해 주세요.")
-                else:
-                    release_result = sales_assignments.release_assignment(
-                        owner_user_id,
-                        selected_assignment.get("company_id"),
-                        selected_company_uid,
-                        reason=release_reason,
-                        session_id=_assignment_session_id(),
-                    )
-                    if release_result.get("ok"):
-                        st.session_state[_CONTACT_RESULTS_FLASH_KEY] = {
-                            "level": "success",
-                            "message": "미접촉 임시 배정을 해제했습니다.",
-                        }
-                        st.session_state[
-                            _CONTACT_RESULTS_RESET_SELECTION_KEY
-                        ] = True
-                        st.rerun()
-                    else:
-                        st.error(
-                            release_result.get("message")
-                            or "배정을 해제하지 못했습니다."
-                        )
-
 
 def render_prospect_db_center(
     owner_user_id: str = "",
