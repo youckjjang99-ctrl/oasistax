@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import secrets
 import time
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -63,6 +64,7 @@ from sales_intelligence import analyze_sales_candidate, merge_analysis
 
 
 BASE_DIR = Path(__file__).resolve().parent
+SEOUL_TIMEZONE = ZoneInfo("Asia/Seoul")
 STOCK_COMPANY_MARKERS = ("주식회사", "(주)", "㈜", "（주）")
 EXCLUDED_LEGAL_MARKERS = (
     "농업회사법인",
@@ -3444,6 +3446,58 @@ def _render_clean_saved_prospects(
                 st.error("메모를 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.")
 
 
+def _activity_datetime(value: object) -> datetime | None:
+    """Parse a stored activity timestamp without exposing locale ambiguity."""
+
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(SEOUL_TIMEZONE)
+
+
+def _format_activity_time(value: object) -> str:
+    parsed = _activity_datetime(value)
+    return parsed.strftime("%Y.%m.%d %H:%M") if parsed else "-"
+
+
+def _contact_activity_rows(contacts: list[dict]) -> list[dict]:
+    """Build a newest-first, Korea-time activity timeline for one company."""
+
+    ordered = sorted(
+        contacts,
+        key=lambda row: (
+            _activity_datetime(
+                row.get("contacted_at") or row.get("created_at")
+            )
+            or datetime.min.replace(tzinfo=timezone.utc)
+        ),
+        reverse=True,
+    )
+    return [
+        {
+            "일시 (KST)": _format_activity_time(
+                row.get("contacted_at") or row.get("created_at")
+            ),
+            "연락방식": str(row.get("contact_method") or "-"),
+            "연락결과": str(row.get("contact_result") or "-"),
+            "메모·상담내용": str(row.get("notes") or "").strip() or "-",
+            "다음 연락예정일": _format_activity_time(
+                row.get("next_contact_at")
+            ),
+        }
+        for row in ordered
+    ]
+
+
 def _render_contact_results(owner_user_id: str) -> None:
     """Render contact management for the signed-in user's assignments only."""
 
@@ -3562,6 +3616,41 @@ def _render_contact_results(owner_user_id: str) -> None:
     else:
         st.caption("③ 저장된 영업후보에 저장된 업체 메모가 없습니다.")
 
+    st.markdown("#### 업체 활동 이력")
+    st.caption(
+        "선택한 업체에 저장한 내 연락이력을 한국시간 기준 최신순으로 "
+        "보여줍니다. 연락결과와 메모·상담내용, 다음 연락예정일을 "
+        "한 번에 확인할 수 있습니다."
+    )
+    contact_history_result = sales_assignments.list_company_contacts(
+        owner_user_id,
+        selected_company_uid,
+        limit=200,
+    )
+    contact_history_rows = _contact_activity_rows(
+        list(contact_history_result.get("contacts") or [])
+    )
+    if contact_history_result.get("ok") and contact_history_rows:
+        st.dataframe(
+            pd.DataFrame(contact_history_rows),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "일시 (KST)": st.column_config.TextColumn(width="medium"),
+                "연락방식": st.column_config.TextColumn(width="small"),
+                "연락결과": st.column_config.TextColumn(width="small"),
+                "메모·상담내용": st.column_config.TextColumn(width="large"),
+                "다음 연락예정일": st.column_config.TextColumn(width="medium"),
+            },
+        )
+    elif contact_history_result.get("ok"):
+        st.info("이 업체에 기록된 연락이력이 없습니다.")
+    else:
+        st.error(
+            contact_history_result.get("message")
+            or "업체 활동 이력을 불러오지 못했습니다."
+        )
+
     schedule_next_contact = st.checkbox(
         "다음 연락예정일 지정",
         value=True,
@@ -3627,51 +3716,6 @@ def _render_contact_results(owner_user_id: str) -> None:
                     contact_save_result.get("message")
                     or "연락결과를 저장하지 못했습니다."
                 )
-
-    with st.expander("내 연락이력", expanded=False):
-        contact_history_result = sales_assignments.list_company_contacts(
-            owner_user_id,
-            selected_company_uid,
-            limit=200,
-        )
-        if contact_history_result.get("ok") and contact_history_result.get(
-            "contacts"
-        ):
-            contact_history_frame = pd.DataFrame(
-                contact_history_result["contacts"]
-            ).rename(
-                columns={
-                    "contact_method": "연락방식",
-                    "contact_result": "연락결과",
-                    "notes": "상담내용",
-                    "contacted_at": "연락일시",
-                    "next_contact_at": "다음 연락예정일",
-                }
-            )
-            st.dataframe(
-                contact_history_frame[
-                    [
-                        column
-                        for column in [
-                            "연락방식",
-                            "연락결과",
-                            "상담내용",
-                            "연락일시",
-                            "다음 연락예정일",
-                        ]
-                        if column in contact_history_frame.columns
-                    ]
-                ],
-                use_container_width=True,
-                hide_index=True,
-            )
-        elif contact_history_result.get("ok"):
-            st.info("기록된 연락이력이 없습니다.")
-        else:
-            st.error(
-                contact_history_result.get("message")
-                or "연락이력을 불러오지 못했습니다."
-            )
 
     with st.expander("자동 발송 이력", expanded=False):
         outreach_history_result = (
