@@ -205,6 +205,33 @@ CONTACT_RESULT_OPTIONS = (
     "계약완료",
 )
 
+CONTACT_PROGRESS_LABELS = {
+    "missed": "부재중",
+    "connected": "연락",
+    "sms_sent": "문자발송",
+    "kakao_sent": "카카오톡 발송",
+    "consultation_scheduled": "상담예약",
+    "not_interested": "관심없음",
+    "follow_up_requested": "재연락 요청",
+    "bad_number": "번호오류",
+    "existing_customer": "기존거래처",
+    "contract_in_progress": "계약진행",
+    "contracted": "계약완료",
+    "unreachable": "연락불가",
+    "부재중": "부재중",
+    "연결됨": "연락",
+    "문자발송": "문자발송",
+    "카카오톡 발송": "카카오톡 발송",
+    "상담예약": "상담예약",
+    "관심없음": "관심없음",
+    "재연락 요청": "재연락 요청",
+    "번호오류": "번호오류",
+    "기존거래처": "기존거래처",
+    "계약진행": "계약진행",
+    "계약완료": "계약완료",
+    "연락불가": "연락불가",
+}
+
 
 MOBILE_PHONE_PATTERN = re.compile(
     r"(?<!\d)(?:(?:\+?82)[\s.\-]?(?:\(0\)[\s.\-]?)?|0)"
@@ -3469,6 +3496,11 @@ def _format_activity_time(value: object) -> str:
     return parsed.strftime("%Y.%m.%d %H:%M") if parsed else "-"
 
 
+def _contact_result_label(value: object) -> str:
+    result = str(value or "").strip()
+    return CONTACT_PROGRESS_LABELS.get(result, result or "-")
+
+
 def _contact_activity_rows(contacts: list[dict]) -> list[dict]:
     """Build a newest-first, Korea-time activity timeline for one company."""
 
@@ -3488,7 +3520,7 @@ def _contact_activity_rows(contacts: list[dict]) -> list[dict]:
                 row.get("contacted_at") or row.get("created_at")
             ),
             "연락방식": str(row.get("contact_method") or "-"),
-            "연락결과": str(row.get("contact_result") or "-"),
+            "연락결과": _contact_result_label(row.get("contact_result")),
             "메모·상담내용": str(row.get("notes") or "").strip() or "-",
             "다음 연락예정일": _format_activity_time(
                 row.get("next_contact_at")
@@ -3498,7 +3530,87 @@ def _contact_activity_rows(contacts: list[dict]) -> list[dict]:
     ]
 
 
-def _render_contact_results(owner_user_id: str) -> None:
+def _assignment_contact_phone(
+    assignment: dict,
+    *,
+    can_view_mobile: bool,
+) -> str:
+    """Return the best visible saved phone without widening mobile access."""
+
+    source_data = (
+        assignment.get("source_data")
+        if isinstance(assignment.get("source_data"), dict)
+        else {}
+    )
+    analysis = (
+        source_data.get("sales_intelligence_v971")
+        if isinstance(source_data.get("sales_intelligence_v971"), dict)
+        else {}
+    )
+    mobile_candidates = (
+        assignment.get("mobile_phone"),
+        source_data.get("mobile_phone"),
+    )
+    general_candidates = (
+        assignment.get("landline_phone"),
+        source_data.get("landline_phone"),
+        assignment.get("phone"),
+        source_data.get("phone"),
+        analysis.get("phone"),
+    )
+    candidates = (
+        (*mobile_candidates, *general_candidates)
+        if can_view_mobile
+        else general_candidates
+    )
+    for candidate in candidates:
+        normalized = normalize_phone(candidate)
+        if not normalized:
+            continue
+        if not can_view_mobile and is_mobile_phone(normalized):
+            continue
+        return normalized
+    return ""
+
+
+def _latest_contact_by_company(contacts: list[dict]) -> dict[str, dict]:
+    latest: dict[str, dict] = {}
+    ordered = sorted(
+        contacts,
+        key=lambda row: (
+            _activity_datetime(
+                row.get("contacted_at") or row.get("created_at")
+            )
+            or datetime.min.replace(tzinfo=timezone.utc)
+        ),
+        reverse=True,
+    )
+    for contact in ordered:
+        company_uid = str(contact.get("company_uid") or "").strip()
+        if company_uid and company_uid not in latest:
+            latest[company_uid] = contact
+    return latest
+
+
+def _contact_progress_label(
+    assignment: dict,
+    latest_contact: dict | None,
+) -> str:
+    if latest_contact:
+        result = str(latest_contact.get("contact_result") or "").strip()
+        if result:
+            return _contact_result_label(result)
+    status = str(assignment.get("status") or "").strip()
+    if status in {"assigned", "pending_contact", "배정됨", "연락대기"}:
+        return "미연락"
+    return sales_assignments.assignment_status_label(status)
+
+
+def _render_contact_results(
+    owner_user_id: str,
+    *,
+    can_view_mobile: bool = False,
+) -> None:
     """Render contact management for the signed-in user's assignments only."""
 
     st.markdown("### 연락결과 기록")
@@ -3531,6 +3643,19 @@ def _render_contact_results(owner_user_id: str) -> None:
         st.info("연락결과를 기록할 저장·배정 영업후보가 없습니다.")
         return
 
+    latest_contacts_result = sales_assignments.list_company_contacts(
+        owner_user_id,
+        limit=1000,
+    )
+    latest_contact_by_uid = _latest_contact_by_company(
+        list(latest_contacts_result.get("contacts") or [])
+    )
+    if not latest_contacts_result.get("ok"):
+        st.warning(
+            latest_contacts_result.get("message")
+            or "최신 연락현황을 불러오지 못해 배정상태로 표시합니다."
+        )
+
     assignments_by_id: dict[str, dict] = {}
     assignment_labels: dict[str, str] = {}
     for row in rows:
@@ -3540,11 +3665,17 @@ def _render_contact_results(owner_user_id: str) -> None:
             continue
         assignments_by_id[assignment_id] = row
         company_name = str(row.get("company_name") or "업체명 미확인")
-        status_label = sales_assignments.assignment_status_label(
-            row.get("status")
+        progress_label = _contact_progress_label(
+            row,
+            latest_contact_by_uid.get(company_uid),
+        )
+        contact_phone = _assignment_contact_phone(
+            row,
+            can_view_mobile=can_view_mobile,
         )
         assignment_labels[assignment_id] = (
-            f"{company_name} · {status_label} · {assignment_id[-8:]}"
+            f"{company_name} · {progress_label} · "
+            f"{contact_phone or '연락처 없음'} · {assignment_id[-8:]}"
         )
     if not assignments_by_id:
         st.info("연락결과를 기록할 저장·배정 영업후보가 없습니다.")
@@ -4020,7 +4151,10 @@ def render_prospect_db_center(
         )
         return
     if workflow_step == "④ 연락결과 기록":
-        _render_contact_results(owner_user_id)
+        _render_contact_results(
+            owner_user_id,
+            can_view_mobile=can_view_mobile,
+        )
         return
     if workflow_step == "⑤ 반납DB 관리":
         _render_return_db_admin(owner_user_id)
