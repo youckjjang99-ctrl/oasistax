@@ -22,7 +22,8 @@ class ProspectContactResultsTabTests(unittest.TestCase):
             'if workflow_step == "④ 연락결과 기록":',
             source,
         )
-        self.assertIn("_render_contact_results(owner_user_id)", source)
+        self.assertIn("_render_contact_results(", source)
+        self.assertIn("can_view_mobile=can_view_mobile", source)
         self.assertIn("if is_admin_user:", source)
         self.assertIn('workflow_steps.append("⑤ 반납DB 관리")', source)
         self.assertIn(

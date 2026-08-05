@@ -60,13 +60,16 @@ def test_company_selection_shows_timeline_before_blank_entry_form() -> None:
     source = inspect.getsource(prospect._render_contact_results)
 
     timeline_at = source.index('st.markdown("#### 업체 활동 이력")')
-    query_at = source.index("sales_assignments.list_company_contacts(")
+    query_at = source.index(
+        "sales_assignments.list_company_contacts(",
+        timeline_at,
+    )
     form_at = source.index(
         'with st.form("contact_results_record_form_v1050"'
     )
 
     assert timeline_at < query_at < form_at
-    assert source.count("sales_assignments.list_company_contacts(") == 1
+    assert source.count("sales_assignments.list_company_contacts(") == 2
     assert "최신순" in source
     assert "일시 (KST)" in source
     assert "메모·상담내용" in source
