@@ -31,6 +31,7 @@ from contact_enrichment import api_statuses, enrich_company, test_connections
 from contact_matching import is_mobile_phone, normalize_phone
 from prospect_collection_service import (
     collect_contactable_growth_companies,
+    collect_other_companies,
     collect_recent_opening_companies,
 )
 from public_data_api import (
@@ -107,6 +108,7 @@ BUSINESS_TYPE_LABELS = {
 GROWTH_BASIS_LABELS = {
     "combined": "통합 고용 증가 신호",
     "none": "고용 증가 필터 미사용",
+    "other": "고용증가·신규개업 제외",
 }
 DATA_SOURCE_OPTIONS = {
     "통합 (국민연금 월별 + 근로복지공단 연간)": "combined",
@@ -128,6 +130,7 @@ CONTACT_CHANNEL_LABELS = {
 DISCOVERY_TYPE_OPTIONS = {
     "고용증가기업": "growth",
     "신규개업기업": "recent_opening",
+    "그 외 업체": "other",
 }
 DISCOVERY_TYPE_LABELS = {
     value: label for label, value in DISCOVERY_TYPE_OPTIONS.items()
@@ -4313,7 +4316,11 @@ def render_prospect_db_center(
             (
                 f"신규개업 추정기업 {target_count}개 조회"
                 if discovery_type == "recent_opening"
-                else f"성장기업 {target_count}개 조회"
+                else (
+                    f"그 외 업체 {target_count}개 조회"
+                    if discovery_type == "other"
+                    else f"성장기업 {target_count}개 조회"
+                )
             ),
             type="primary",
             use_container_width=True,
@@ -4325,8 +4332,14 @@ def render_prospect_db_center(
                 "신호를 사업자번호로 중복 제거해 조회합니다."
                 if discovery_type == "recent_opening"
                 else (
-                    "Supabase에 미리 저장된 국민연금 월별·근로복지공단 "
-                    "연간 고용증가와 공개 연락처를 즉시 조회합니다."
+                    "고용증가·신규개업 신호가 모두 없는 업체와 공개 "
+                    "연락처를 즉시 조회합니다."
+                    if discovery_type == "other"
+                    else (
+                        "Supabase에 미리 저장된 국민연금 월별·"
+                        "근로복지공단 연간 고용증가와 공개 연락처를 "
+                        "즉시 조회합니다."
+                    )
                 )
             )
         )
@@ -4342,7 +4355,7 @@ def render_prospect_db_center(
     growth_basis = (
         "recent_opening"
         if discovery_type == "recent_opening"
-        else "combined"
+        else ("other" if discovery_type == "other" else "combined")
     )
     effective_growth_only = discovery_type == "growth"
     start_page = 1
@@ -4386,6 +4399,21 @@ def render_prospect_db_center(
                     progress_state["value"],
                     text=(
                         "신규개업 추정기업 "
+                        f"{event.get('checked', 0)}개 확인 완료"
+                    ),
+                )
+            elif stage == "other":
+                progress_state["value"] = max(progress_state["value"], 0.25)
+                progress_bar.progress(
+                    progress_state["value"],
+                    text="Supabase 그 외 업체 불러오는 중",
+                )
+            elif stage == "other_complete":
+                progress_state["value"] = max(progress_state["value"], 0.8)
+                progress_bar.progress(
+                    progress_state["value"],
+                    text=(
+                        "그 외 업체 "
                         f"{event.get('checked', 0)}개 확인 완료"
                     ),
                 )
@@ -4476,8 +4504,13 @@ def render_prospect_db_center(
                 "추정기업을 찾고 있습니다."
                 if discovery_type == "recent_opening"
                 else (
-                    "기존 고객·저장 영업후보를 제외하고 성장기업을 "
+                    "기존 고객·저장 영업후보를 제외하고 그 외 업체를 "
                     "찾고 있습니다."
+                    if discovery_type == "other"
+                    else (
+                        "기존 고객·저장 영업후보를 제외하고 성장기업을 "
+                        "찾고 있습니다."
+                    )
                 )
             )
         ):
@@ -4489,6 +4522,23 @@ def render_prospect_db_center(
                     maximum_employees=int(maximum_employees),
                     recent_months=int(recent_months),
                     include_comwel_annual=bool(include_comwel_annual),
+                    business_type=business_type,
+                    industry_categories=list(industry_categories),
+                    contact_channels=contact_channels,
+                    district_name=(
+                        ""
+                        if district_name == ALL_DISTRICTS
+                        else district_name
+                    ),
+                    progress=_progress,
+                    exclude_saved_prospects=False,
+                )
+            elif discovery_type == "other":
+                result = collect_other_companies(
+                    REGION_CODES[region_name],
+                    target_count=int(target_count),
+                    minimum_employees=int(minimum_employees),
+                    maximum_employees=int(maximum_employees),
                     business_type=business_type,
                     industry_categories=list(industry_categories),
                     contact_channels=contact_channels,
@@ -4652,7 +4702,11 @@ def render_prospect_db_center(
             (
                 "recent_candidates"
                 if discovery_type == "recent_opening"
-                else "growth_candidates"
+                else (
+                    "other_candidates"
+                    if discovery_type == "other"
+                    else "growth_candidates"
+                )
             ),
             0,
         )
@@ -4665,7 +4719,11 @@ def render_prospect_db_center(
             (
                 "신규개업 추정"
                 if discovery_type == "recent_opening"
-                else "고용 증가 신호"
+                else (
+                    "그 외 업체"
+                    if discovery_type == "other"
+                    else "고용 증가 신호"
+                )
             ),
             f"{signal_count:,}건",
         )
@@ -4723,9 +4781,16 @@ def render_prospect_db_center(
                     "이 조회에 포함되지 않습니다."
                     if discovery_type == "recent_opening"
                     else (
-                        "Supabase 사전 계산 목록과 지역·고용·업종 전용 "
-                        "인덱스를 사용했습니다. 다른 담당자가 배정·"
-                        "연락 중인 업체는 전사 상태 기준으로 제외됩니다."
+                        "고용증가·신규개업 신호가 없는 업체만 전용 "
+                        "인덱스로 조회했습니다. 다른 담당자가 배정·연락 "
+                        "중인 업체는 전사 상태 기준으로 제외됩니다."
+                        if discovery_type == "other"
+                        else (
+                            "Supabase 사전 계산 목록과 지역·고용·업종 "
+                            "전용 인덱스를 사용했습니다. 다른 담당자가 "
+                            "배정·연락 중인 업체는 전사 상태 기준으로 "
+                            "제외됩니다."
+                        )
                     )
                 )
             )
@@ -4781,8 +4846,14 @@ def render_prospect_db_center(
                     "추정 신호와 연락처 조건을 모두 충족한 업체가 없습니다."
                     if discovery_type == "recent_opening"
                     else (
-                        "선택한 지역·고용인원·업종 범위에서 고용 증가 "
-                        "신호와 공개 연락처 조건을 모두 충족한 업체가 없습니다."
+                        "선택한 지역·고용인원·업종 범위에서 그 외 업체와 "
+                        "공개 연락처 조건을 모두 충족한 업체가 없습니다."
+                        if discovery_type == "other"
+                        else (
+                            "선택한 지역·고용인원·업종 범위에서 고용 "
+                            "증가 신호와 공개 연락처 조건을 모두 충족한 "
+                            "업체가 없습니다."
+                        )
                     )
                 )
                 + " 필터 범위를 넓혀 다시 조회해 주세요."
