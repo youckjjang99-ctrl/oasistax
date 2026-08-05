@@ -10,6 +10,7 @@ from prospect_db_repository import (
     _snapshot_identity,
     existing_prospect_identities,
     load_fast_growth_candidates,
+    load_other_company_candidates,
     load_prior_employee_snapshots,
     load_recent_opening_candidates,
     remove_existing_customers,
@@ -371,6 +372,172 @@ def collect_recent_opening_companies(
             "searched_start_page": 0,
             "searched_end_page": 0,
             "priority_basis": "국민연금·근로복지공단 신규개업 추정",
+        }
+
+
+def collect_other_companies(
+    region_code: str,
+    *,
+    target_count: int = 100,
+    minimum_employees: int = 1,
+    maximum_employees: int = 300,
+    business_type: str = "stock",
+    industry_categories: list[str] | None = None,
+    contact_channels: list[str] | None = None,
+    district_name: str = "",
+    progress: ProgressCallback | None = None,
+    exclude_saved_prospects: bool = True,
+) -> dict[str, Any]:
+    """고용증가·신규개업으로 분류되지 않은 사전 저장 업체를 조회."""
+    target_count = min(500, max(1, int(target_count)))
+    minimum_employees = max(1, int(minimum_employees))
+    maximum_employees = max(1, int(maximum_employees))
+    if maximum_employees < minimum_employees:
+        raise ValueError(
+            "최대 고용인원은 최소 고용인원보다 크거나 같아야 합니다."
+        )
+    business_type = str(business_type or "stock").strip().lower()
+    if business_type not in {"stock", "individual", "all"}:
+        business_type = "stock"
+    district_name = str(district_name or "").strip()
+    selected_industries = sorted(
+        {
+            str(value or "").strip()
+            for value in (industry_categories or [])
+            if str(value or "").strip()
+        }
+    )
+    selected_contact_channels = sorted(
+        {
+            str(value or "").strip()
+            for value in (contact_channels or [])
+            if str(value or "").strip()
+            in {"mobile_phone", "landline_phone", "email", "instagram"}
+        }
+    )
+    started_at = time.monotonic()
+    saved_source_keys: set[str] = set()
+    saved_business_nos: set[str] = set()
+    saved_company_address_keys: set[str] = set()
+    duplicate_warning = ""
+    if exclude_saved_prospects:
+        try:
+            (
+                saved_source_keys,
+                saved_business_nos,
+                saved_company_address_keys,
+            ) = existing_prospect_identities()
+        except Exception as exc:
+            duplicate_warning = str(exc)
+
+    stats = {
+        "basic_received": 0,
+        "other_candidates": 0,
+        "growth_candidates": 0,
+        "existing_customer_excluded": 0,
+        "saved_prospect_excluded": 0,
+        "contact_checked": 0,
+        "pages_scanned": 0,
+        "elapsed_seconds": 0.0,
+        "source_mode": "precomputed",
+        "discovery_type": "other",
+    }
+    _notify(progress, stage="other", found=0)
+    try:
+        candidates = load_other_company_candidates(
+            region_code,
+            minimum_employees=minimum_employees,
+            maximum_employees=maximum_employees,
+            business_type=business_type,
+            district_name=district_name,
+            industry_categories=selected_industries,
+            contact_channels=selected_contact_channels,
+            limit=min(500, max(target_count, target_count * 3)),
+        )
+        _notify(
+            progress,
+            stage="other_complete",
+            checked=len(candidates),
+            found=0,
+        )
+        stats["basic_received"] = len(candidates)
+        stats["other_candidates"] = len(candidates)
+        candidates, customer_count = remove_existing_customers(candidates)
+        stats["existing_customer_excluded"] = customer_count
+        prospect_count = 0
+        if exclude_saved_prospects:
+            candidates, prospect_count = remove_existing_prospects(
+                candidates,
+                source_keys=saved_source_keys,
+                business_nos=saved_business_nos,
+                company_address_keys=saved_company_address_keys,
+            )
+        stats["saved_prospect_excluded"] = prospect_count
+        selected = candidates[:target_count]
+        stats["contact_checked"] = len(selected)
+        stats["elapsed_seconds"] = round(
+            time.monotonic() - started_at,
+            1,
+        )
+        return {
+            "ok": True,
+            "items": selected,
+            "target_count": target_count,
+            "found_count": len(selected),
+            "next_page": 1,
+            "stats": stats,
+            "failures": [],
+            "duplicate_warning": duplicate_warning,
+            "snapshot_warning": "",
+            "business_type": business_type,
+            "growth_only": False,
+            "growth_basis": "other",
+            "industry_categories": selected_industries,
+            "contact_channels": selected_contact_channels,
+            "district_name": district_name,
+            "data_source": "employment_contacts",
+            "minimum_employees": minimum_employees,
+            "maximum_employees": maximum_employees,
+            "minimum_growth": 0,
+            "recent_months": 6,
+            "include_comwel_annual": True,
+            "searched_start_page": 0,
+            "searched_end_page": 0,
+            "priority_basis": "고용증가·신규개업 제외 · 사전 수집 연락처",
+        }
+    except Exception as exc:
+        stats["elapsed_seconds"] = round(
+            time.monotonic() - started_at,
+            1,
+        )
+        stats["source_mode"] = "precomputed_error"
+        return {
+            "ok": False,
+            "message": f"Supabase의 그 외 업체를 불러오지 못했습니다. {exc}",
+            "error_code": "OTHER_SEARCH_FAILED",
+            "items": [],
+            "target_count": target_count,
+            "found_count": 0,
+            "next_page": 1,
+            "stats": stats,
+            "failures": [],
+            "duplicate_warning": duplicate_warning,
+            "snapshot_warning": "",
+            "business_type": business_type,
+            "growth_only": False,
+            "growth_basis": "other",
+            "industry_categories": selected_industries,
+            "contact_channels": selected_contact_channels,
+            "district_name": district_name,
+            "data_source": "employment_contacts",
+            "minimum_employees": minimum_employees,
+            "maximum_employees": maximum_employees,
+            "minimum_growth": 0,
+            "recent_months": 6,
+            "include_comwel_annual": True,
+            "searched_start_page": 0,
+            "searched_end_page": 0,
+            "priority_basis": "고용증가·신규개업 제외",
         }
 
 

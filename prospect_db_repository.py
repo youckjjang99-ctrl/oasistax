@@ -657,6 +657,159 @@ def load_fast_growth_candidates(
     return results
 
 
+def load_other_company_candidates(
+    region_code: str,
+    *,
+    minimum_employees: int = 1,
+    maximum_employees: int | None = None,
+    business_type: str = "all",
+    district_name: str = "",
+    industry_categories: list[str] | None = None,
+    contact_channels: list[str] | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """고용증가·신규개업 신호가 없는 사전 저장 업체를 조회."""
+    config = get_cloud_config()
+    if not config.configured:
+        raise RuntimeError("Supabase 환경변수가 설정되지 않았습니다.")
+
+    row_limit = max(1, min(500, int(limit)))
+    minimum_count = max(1, int(minimum_employees))
+    maximum_count = (
+        10000
+        if maximum_employees in (None, "")
+        else max(minimum_count, int(maximum_employees))
+    )
+    district = str(district_name or "").strip()
+    normalized_business_type = str(
+        business_type or "all"
+    ).strip().lower()
+    if normalized_business_type not in {"stock", "individual", "all"}:
+        normalized_business_type = "all"
+    selected_industries = sorted(
+        {
+            str(value or "").strip()
+            for value in (industry_categories or [])
+            if str(value or "").strip()
+        }
+    )
+    selected_channels = sorted(
+        {
+            str(value or "").strip()
+            for value in (contact_channels or [])
+            if str(value or "").strip()
+            in {"mobile_phone", "landline_phone", "email", "instagram"}
+        }
+    )
+    normalized_region_code = re.sub(r"[^0-9]", "", str(region_code or ""))
+    if normalized_region_code in {"0", "00"}:
+        normalized_region_code = ""
+    normalized_region_code = SUPABASE_PROVINCE_CODE_ALIASES.get(
+        normalized_region_code[:2],
+        normalized_region_code[:2],
+    )
+    province_name = SUPABASE_PROVINCE_NAMES.get(
+        normalized_region_code,
+        "",
+    )
+    payload = {
+        "p_province_code": normalized_region_code,
+        "p_province_name": province_name,
+        "p_district": district,
+        "p_min_employees": minimum_count,
+        "p_max_employees": maximum_count,
+        "p_industries": selected_industries,
+        "p_contact_channels": selected_channels,
+        "p_limit": row_limit,
+        "p_business_type": normalized_business_type,
+    }
+    response = requests.post(
+        f"{config.url}/rest/v1/rpc/oasis_search_other_companies_v1",
+        headers=_rest_headers(),
+        data=json.dumps(payload, ensure_ascii=False),
+        timeout=max(config.timeout, 60),
+    )
+    if not response.ok:
+        raise RuntimeError(
+            "그 외 업체·연락처 후보 조회 실패 "
+            f"HTTP {response.status_code}: {response.text[:300]}"
+        )
+    rows = response.json() if response.text else []
+    if not isinstance(rows, list):
+        rows = []
+
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        current_count = int(row.get("current_employee_count") or 0)
+        previous_count = int(row.get("previous_employee_count") or 0)
+        growth = int(row.get("employee_growth") or 0)
+        company_name = str(row.get("company_name") or "")
+        address = str(row.get("address") or "")
+        province = str(row.get("province_name") or "")
+        district_value = str(row.get("district_name") or "")
+        mobile_phone = str(row.get("mobile_phone") or "")
+        landline_phone = str(row.get("landline_phone") or "")
+        preferred_phone = mobile_phone or landline_phone
+        results.append(
+            {
+                "source": "other_company",
+                "source_key": (
+                    "other_company:"
+                    + str(row.get("source_record_key") or "")
+                ),
+                "사업자등록번호": str(row.get("business_no") or ""),
+                "사업장명": company_name,
+                "주소": address,
+                "지역": " ".join(
+                    value
+                    for value in (province, district_value)
+                    if value
+                ),
+                "업종코드": str(row.get("industry_code") or ""),
+                "업종명": str(row.get("industry_name") or ""),
+                "업종분류": str(row.get("industry_category") or "기타"),
+                "휴대전화": mobile_phone,
+                "일반전화": landline_phone,
+                "대표전화": preferred_phone,
+                "전화유형": (
+                    "휴대전화"
+                    if mobile_phone
+                    else ("일반전화" if landline_phone else "")
+                ),
+                "전화출처": "사전 수집 연락처",
+                "이메일": str(row.get("email") or ""),
+                "인스타그램": str(row.get("instagram") or ""),
+                "인스타그램URL": str(row.get("instagram_url") or ""),
+                "연락처상태": str(row.get("contact_status") or ""),
+                "연락처조회일": str(row.get("contact_checked_at") or ""),
+                "영업분석": {
+                    "phone": preferred_phone,
+                    "phone_source": "employment_contact_cache",
+                    "phone_confidence": 90 if preferred_phone else 0,
+                    "email": str(row.get("email") or ""),
+                    "instagram": str(row.get("instagram") or ""),
+                    "instagram_url": str(row.get("instagram_url") or ""),
+                    "contact_status": str(row.get("contact_status") or ""),
+                    "public_contacts": [],
+                },
+                "가입자수": current_count,
+                "이전가입자수": previous_count,
+                "선택고용증가": growth,
+                "고용증가신호": False,
+                "고용증가기준": "other",
+                "고용증가구분": "고용증가·신규개업 해당 없음",
+                "고용자료상태": "PRECOMPUTED",
+                "고용자료메시지": "Supabase 사전 분류 결과",
+                "고용증가판정": "NOT_INCREASED",
+                "자료생성년월": str(row.get("current_period") or ""),
+                "전년자료생성년월": str(row.get("previous_period") or ""),
+                "신규업체": False,
+                "원본데이터": dict(row),
+            }
+        )
+    return results
+
+
 def load_recent_opening_candidates(
     region_code: str,
     *,
@@ -1302,8 +1455,9 @@ def save_search_history(
                     if str(value or "").strip()
                 ],
                 "discovery_type": (
-                    "recent_opening"
-                    if str(discovery_type or "") == "recent_opening"
+                    str(discovery_type or "growth")
+                    if str(discovery_type or "growth")
+                    in {"growth", "recent_opening", "other"}
                     else "growth"
                 ),
                 "recent_months": (
