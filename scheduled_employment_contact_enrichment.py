@@ -339,17 +339,42 @@ def _has_kakao_no_match_holds() -> bool:
     """Return whether a previous guarded run left retryable Kakao holds."""
     db = CloudDatabase()
     result = db.rpc("oasis_has_kakao_no_match_holds", {})
-    if not isinstance(result, bool):
-        raise RuntimeError("Kakao held-row check returned invalid result")
-    return result
+    return _rpc_boolean(result, "Kakao held-row check")
 
 
 def _clear_stale_kakao_no_match_holds() -> None:
     """Reset held rows only after an approved guarded restart preflight."""
     db = CloudDatabase()
     result = db.rpc("oasis_clear_kakao_no_match_holds", {})
-    if isinstance(result, bool) or not isinstance(result, int):
-        raise RuntimeError("Kakao held-row reset returned invalid result")
+    _rpc_integer(result, "Kakao held-row reset")
+
+
+def _rpc_boolean(value: Any, operation: str) -> bool:
+    """Read scalar PostgREST RPC values across supported response shapes."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+        return value.strip().lower() == "true"
+    if isinstance(value, list) and len(value) == 1:
+        return _rpc_boolean(value[0], operation)
+    if isinstance(value, dict) and len(value) == 1:
+        return _rpc_boolean(next(iter(value.values())), operation)
+    raise RuntimeError(f"{operation} returned invalid result")
+
+
+def _rpc_integer(value: Any, operation: str) -> int:
+    """Validate a scalar integer result without coupling to REST response form."""
+    if isinstance(value, bool):
+        raise RuntimeError(f"{operation} returned invalid result")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    if isinstance(value, list) and len(value) == 1:
+        return _rpc_integer(value[0], operation)
+    if isinstance(value, dict) and len(value) == 1:
+        return _rpc_integer(next(iter(value.values())), operation)
+    raise RuntimeError(f"{operation} returned invalid result")
 
 
 def _release_kakao_no_match_holds(contact_keys: list[str]) -> None:
