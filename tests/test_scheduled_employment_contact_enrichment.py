@@ -953,31 +953,33 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
         eligible.assert_not_called()
 
     @patch.object(job, "_eligible_rows")
-    def test_orphaned_holds_trip_guard_before_preflight_and_queue(
+    def test_ready_guard_does_not_run_an_extra_hold_probe(
         self,
         eligible,
     ) -> None:
-        self.held_work.return_value = True
+        self.held_work.side_effect = RuntimeError("unavailable")
+        eligible.return_value = []
         preflight = Mock()
         with patch.multiple(
             job.kakao_provider_runtime,
             acquire_lease=Mock(return_value=True),
             release_lease=Mock(return_value=True),
+            get_daily_usage=Mock(
+                return_value={"request_count": 0, "blocked_until": ""}
+            ),
             test_connection_and_record=preflight,
         ):
+            preflight.return_value = {"ok": True, "category": "CONNECTED"}
             result = job.run_enrichment(
                 stage="phone",
                 phone_provider="kakao",
             )
 
-        self.assertEqual(result, job.EXIT_PROVIDER_GUARD)
-        self.guard_trip.assert_called_once()
-        self.assertEqual(
-            self.guard_trip.call_args.args[2],
-            job.kakao_provider_runtime.GUARD_REASON_ORPHANED_HOLDS,
-        )
-        preflight.assert_not_called()
-        eligible.assert_not_called()
+        self.assertEqual(result, 0)
+        self.held_work.assert_not_called()
+        self.guard_trip.assert_not_called()
+        preflight.assert_called_once()
+        eligible.assert_called()
 
     @patch.object(job, "_eligible_rows")
     @patch.object(job, "_clear_stale_kakao_no_match_holds")
@@ -1020,10 +1022,8 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
         eligible.assert_not_called()
 
     @patch.object(job, "_eligible_rows", return_value=[])
-    @patch.object(job, "_clear_stale_kakao_no_match_holds")
-    def test_approved_resume_resets_then_consumes_before_queue(
+    def test_approved_resume_consumes_before_queue(
         self,
-        clear_holds,
         eligible,
     ) -> None:
         events: list[str] = []
@@ -1033,8 +1033,6 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
             ),
             "guard_generation": 5,
         }
-        clear_holds.side_effect = lambda: events.append("reset")
-
         def consume(*_args, **_kwargs):
             events.append("consume")
             return True
@@ -1060,7 +1058,7 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
             )
 
         self.assertEqual(result, 0)
-        self.assertEqual(events, ["reset", "consume", "queue"])
+        self.assertEqual(events, ["consume", "queue"])
 
     @patch.object(job, "_release_kakao_no_match_holds")
     @patch.object(job.kakao_provider_runtime, "renew_lease", return_value=True)
