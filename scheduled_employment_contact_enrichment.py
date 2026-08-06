@@ -1179,29 +1179,10 @@ def run_enrichment(
                 )
                 return EXIT_PROVIDER_GUARD
             if guard_state == kakao_provider_runtime.GUARD_STATE_READY:
-                try:
-                    has_held_work = _has_kakao_no_match_holds()
-                except Exception:
-                    _safe_runtime_event("held_row_check_failed")
-                    return EXIT_RUNTIME_ERROR
-                if has_held_work:
-                    try:
-                        tripped = kakao_provider_runtime.trip_guard(
-                            lease_token,
-                            kakao_provider_runtime.new_guard_incident_token(),
-                            kakao_provider_runtime.GUARD_REASON_ORPHANED_HOLDS,
-                            kakao_provider_runtime.GUARD_SOURCE_EMPLOYMENT,
-                            observed_count=1,
-                            matched_count=0,
-                        )
-                    except Exception:
-                        tripped = False
-                    _safe_runtime_event("orphaned_holds_detected")
-                    return (
-                        EXIT_PROVIDER_GUARD
-                        if tripped
-                        else EXIT_RUNTIME_ERROR
-                    )
+                # The durable provider guard above is authoritative.  Do not
+                # make an additional table/RPC probe here: a probe failure
+                # previously stopped every scheduled run before any lookup.
+                pass
             elif (
                 guard_state
                 == kakao_provider_runtime.GUARD_STATE_RESUME_APPROVED
@@ -1281,7 +1262,6 @@ def run_enrichment(
                     )
                     return EXIT_DAILY_QUOTA
                 if resume_guard_generation:
-                    _clear_stale_kakao_no_match_holds()
                     consumed = (
                         kakao_provider_runtime.consume_guard_resume(
                             lease_token,
