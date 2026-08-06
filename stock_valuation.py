@@ -19,6 +19,7 @@ from cloud_sync import (
     load_registry_snapshot,
     load_stock_valuations,
 )
+from registered_policy_match import load_registered_customers
 from utils import get_user_cumulative_db_path, get_user_dirs
 
 
@@ -195,11 +196,10 @@ def _apply_customer_financial_data(
     Cretop financial cache.
     """
     defaults = _customer_defaults(row)
+    business_no = _normalize_business_no(defaults.get("사업자등록번호", ""))
 
     st.session_state["stock_company_name"] = str(defaults.get("법인명", "") or "")
-    st.session_state["stock_business_no"] = str(
-        defaults.get("사업자등록번호", "") or ""
-    )
+    st.session_state["stock_business_no"] = business_no
     st.session_state["stock_corporate_no"] = str(
         defaults.get("법인등록번호", "") or ""
     )
@@ -214,15 +214,19 @@ def _apply_customer_financial_data(
         defaults.get("총부채")
     )
 
-    business_no = _normalize_business_no(defaults.get("사업자등록번호", ""))
     cache = _load_financial_cache(user_id)
-    snapshot = cache.get(business_no, {}) if business_no else {}
-    if not snapshot and business_no:
-        snapshot = load_financial_snapshot(user_id, business_no)
+    # Supabase를 먼저 확인해, 과거에 저장된 빈/오래된 로컬 캐시가 최신
+    # 크레탑 재무자료를 가리지 않도록 합니다. 클라우드가 일시적으로
+    # unavailable하면 로컬 캐시로 안전하게 fallback합니다.
+    snapshot = load_financial_snapshot(user_id, business_no) if business_no else {}
+    if snapshot:
+        snapshot = _normalize_financial_snapshot(snapshot)
+        cache[business_no] = snapshot
+        _save_financial_cache(user_id, cache)
+    else:
+        snapshot = cache.get(business_no, {}) if business_no else {}
         if snapshot:
             snapshot = _normalize_financial_snapshot(snapshot)
-            cache[business_no] = snapshot
-            _save_financial_cache(user_id, cache)
 
     if snapshot:
         st.session_state["stock_company_name"] = str(
@@ -248,9 +252,22 @@ def _apply_customer_financial_data(
         ) or st.session_state["stock_total_liabilities"]
 
         history = snapshot.get("재무연도별", [])
+        def history_year(item: dict[str, Any]) -> float:
+            year = _safe_number(item.get("연도"))
+            return year if year is not None else float("-inf")
+
+        # 크레탑 보고서에는 최신 기준연도(예: 2026년)의 재무상태표는
+        # 있지만 손익계산서가 비어 있는 행이 포함될 수 있습니다. 그 행을
+        # 최근 3개년으로 잘못 선택하면 순손익 입력란이 공란으로 보이므로,
+        # 실제 당기순이익이 있는 연도만 주가평가 입력 대상으로 사용합니다.
         history = sorted(
-            [item for item in history if isinstance(item, dict)],
-            key=lambda item: item.get("연도", 0),
+            [
+                item
+                for item in history
+                if isinstance(item, dict)
+                and _safe_number(item.get("당기순이익")) is not None
+            ],
+            key=history_year,
             reverse=True,
         )[:3]
         if not history and snapshot.get("당기순이익") not in (None, ""):
@@ -356,6 +373,17 @@ def _read_customer_excel_cached(path_text: str, modified_time: float) -> pd.Data
 
 def _read_customers(user_id: str) -> pd.DataFrame:
     path = get_user_cumulative_db_path(user_id)
+
+    # 고객 등록/크레탑 업로드 결과는 Supabase의 고객 스냅샷을 우선합니다.
+    # 로컬 Excel만 읽으면 최근 등록된 사업자번호와 재무 필드가 누락될 수
+    # 있어 주가평가 화면에서 해당 기업을 선택해도 입력값이 공란으로 남습니다.
+    try:
+        cloud_df = load_registered_customers(path, user_id)
+    except Exception:
+        cloud_df = pd.DataFrame()
+    if not cloud_df.empty:
+        return cloud_df.dropna(how="all").copy()
+
     if not path.exists():
         return pd.DataFrame()
     try:
@@ -383,14 +411,24 @@ def _customer_defaults(row: pd.Series | None) -> dict[str, Any]:
 
     return {
         "법인명": get("업체명", "기업명"),
-        "사업자등록번호": get("사업자등록번호"),
+        "사업자등록번호": get(
+            "사업자등록번호",
+            "사업자번호",
+            "business_no",
+            "사업자등록번호(10자리)",
+        ),
         "법인등록번호": get("법인등록번호"),
         "본점소재지": get("사업장 소재지", "본점소재지", "주소"),
         "설립일": get("설립일", "설립년도"),
-        "총자산": get("자산총계", "총자산"),
-        "총부채": get("부채총계", "총부채"),
+        "총자산": get("자산총계", "총자산", "자산합계", "장부상총자산"),
+        "총부채": get("부채총계", "총부채", "부채합계", "장부상총부채"),
         "자본총계": get("자본총계"),
-        "최근당기순이익": get("당기순이익"),
+        "최근당기순이익": get(
+            "당기순이익",
+            "순이익",
+            "법인세차감후순이익",
+            "당기순손익",
+        ),
     }
 
 
