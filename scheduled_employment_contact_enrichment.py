@@ -338,55 +338,18 @@ def _kakao_provider_result(result: dict[str, Any]) -> dict[str, Any]:
 def _has_kakao_no_match_holds() -> bool:
     """Return whether a previous guarded run left retryable Kakao holds."""
     db = CloudDatabase()
-    response = requests.get(
-        db._url(TABLE_CONTACTS),
-        headers=db.headers,
-        params={
-            "select": "contact_key",
-            PHONE_PROVIDER_FIELD: "eq.kakao",
-            "phone_status": "eq.pending",
-            "phone_last_error": f"eq.{KAKAO_NO_MATCH_HELD}",
-            "limit": "1",
-        },
-        timeout=max(30, db.config.timeout),
-    )
-    if not response.ok:
-        raise RuntimeError(
-            "Kakao held-row check failed "
-            f"HTTP_{int(response.status_code)}"
-        )
-    rows = response.json() if response.text else []
-    return isinstance(rows, list) and bool(rows)
+    result = db.rpc("oasis_has_kakao_no_match_holds", {})
+    if not isinstance(result, bool):
+        raise RuntimeError("Kakao held-row check returned invalid result")
+    return result
 
 
 def _clear_stale_kakao_no_match_holds() -> None:
     """Reset held rows only after an approved guarded restart preflight."""
     db = CloudDatabase()
-    headers = dict(db.headers)
-    headers["Prefer"] = "return=minimal"
-    response = requests.patch(
-        db._url(TABLE_CONTACTS),
-        headers=headers,
-        params={
-            PHONE_PROVIDER_FIELD: "eq.kakao",
-            "phone_status": "eq.pending",
-            "phone_last_error": f"eq.{KAKAO_NO_MATCH_HELD}",
-        },
-        data=json.dumps(
-            {
-                "phone_last_error": "",
-                "last_error": "",
-                "updated_at": _iso(_now()),
-            },
-            ensure_ascii=False,
-        ),
-        timeout=max(30, db.config.timeout),
-    )
-    if not response.ok:
-        raise RuntimeError(
-            "Kakao held-row reset failed "
-            f"HTTP_{int(response.status_code)}"
-        )
+    result = db.rpc("oasis_clear_kakao_no_match_holds", {})
+    if isinstance(result, bool) or not isinstance(result, int):
+        raise RuntimeError("Kakao held-row reset returned invalid result")
 
 
 def _release_kakao_no_match_holds(contact_keys: list[str]) -> None:
