@@ -122,13 +122,25 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
         )
 
     @patch.object(job, "CloudDatabase")
-    def test_kakao_hold_check_rejects_invalid_rpc_response(
+    def test_kakao_hold_check_accepts_wrapped_rpc_response(
         self,
         cloud_database,
     ) -> None:
         self.held_work_patcher.stop()
         db = Mock()
-        db.rpc.return_value = {"has_holds": False}
+        db.rpc.return_value = {"oasis_has_kakao_no_match_holds": False}
+        cloud_database.return_value = db
+
+        self.assertFalse(job._has_kakao_no_match_holds())
+
+    @patch.object(job, "CloudDatabase")
+    def test_kakao_hold_check_rejects_ambiguous_rpc_response(
+        self,
+        cloud_database,
+    ) -> None:
+        self.held_work_patcher.stop()
+        db = Mock()
+        db.rpc.return_value = {"first": False, "second": False}
         cloud_database.return_value = db
 
         with self.assertRaisesRegex(RuntimeError, "invalid result"):
