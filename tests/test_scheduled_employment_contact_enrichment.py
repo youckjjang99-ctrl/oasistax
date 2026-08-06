@@ -89,6 +89,51 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
             f"neq.{job.KAKAO_NO_MATCH_HELD}",
         )
 
+    @patch.object(job, "CloudDatabase")
+    def test_kakao_hold_check_uses_service_role_rpc(
+        self,
+        cloud_database,
+    ) -> None:
+        self.held_work_patcher.stop()
+        db = Mock()
+        db.rpc.return_value = False
+        cloud_database.return_value = db
+
+        self.assertFalse(job._has_kakao_no_match_holds())
+        db.rpc.assert_called_once_with(
+            "oasis_has_kakao_no_match_holds",
+            {},
+        )
+
+    @patch.object(job, "CloudDatabase")
+    def test_kakao_hold_reset_uses_service_role_rpc(
+        self,
+        cloud_database,
+    ) -> None:
+        self.held_work_patcher.stop()
+        db = Mock()
+        db.rpc.return_value = 2
+        cloud_database.return_value = db
+
+        job._clear_stale_kakao_no_match_holds()
+        db.rpc.assert_called_once_with(
+            "oasis_clear_kakao_no_match_holds",
+            {},
+        )
+
+    @patch.object(job, "CloudDatabase")
+    def test_kakao_hold_check_rejects_invalid_rpc_response(
+        self,
+        cloud_database,
+    ) -> None:
+        self.held_work_patcher.stop()
+        db = Mock()
+        db.rpc.return_value = {"has_holds": False}
+        cloud_database.return_value = db
+
+        with self.assertRaisesRegex(RuntimeError, "invalid result"):
+            job._has_kakao_no_match_holds()
+
     @patch.object(job.time, "sleep")
     @patch.object(job.requests, "patch")
     @patch.object(job, "CloudDatabase")
