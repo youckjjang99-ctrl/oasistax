@@ -1890,7 +1890,7 @@ def _show_outreach_dialog(
                 "발송할 휴대폰 번호",
                 value=str(target.get("recipient") or ""),
                 max_chars=30,
-                placeholder="010-0000-0000",
+                placeholder="휴대폰 번호를 입력하세요.",
                 help=(
                     "이번 알림톡 발송에만 사용할 번호입니다. "
                     "저장된 업체 연락처는 변경하지 않습니다."
