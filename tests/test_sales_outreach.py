@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import unittest
+from datetime import datetime
 from unittest.mock import patch
 
 import requests
@@ -41,7 +42,10 @@ from sales_outreach import (
     SOLAPI_CLAIM_AUTH_TEMPLATE_ENV,
     claim_auth_alimtalk_templates,
     claim_auth_alimtalk_readiness,
+    claim_auth_alimtalk_template_preview,
     channel_readiness,
+    outreach_send_window,
+    render_claim_auth_alimtalk_preview,
     send_claim_auth_alimtalk,
     send_outreach,
     validate_claim_auth_alimtalk,
@@ -280,6 +284,82 @@ class SalesOutreachTests(unittest.TestCase):
             start["missing_env_names"],
         )
         self.assertNotIn("approved-resume-template", repr(resume))
+
+    def test_template_preview_is_loaded_and_rendered_without_identifiers(self):
+        class _Solapi:
+            def __init__(self):
+                self.template_ids = []
+
+            def get_template_preview(self, template_id):
+                self.template_ids.append(template_id)
+                return {
+                    "content": "#{고객명}님, https://#{인증링크}",
+                    "status": "APPROVED",
+                    "buttons": [
+                        {
+                            "name": "인증하기",
+                            "mobile_url": "https://#{인증링크}",
+                        }
+                    ],
+                }
+
+        client = _Solapi()
+        values = _solapi_claim_auth_env()
+        with patch.dict(os.environ, values, clear=True):
+            preview = claim_auth_alimtalk_template_preview(
+                "auth_start",
+                client=client,
+            )
+        rendered = render_claim_auth_alimtalk_preview(
+            preview,
+            "고객 이름",
+            "claim.example.test/c/token",
+        )
+
+        self.assertTrue(preview["ok"])
+        self.assertEqual(
+            client.template_ids,
+            [values[SOLAPI_CLAIM_AUTH_TEMPLATE_ENV]],
+        )
+        self.assertEqual(
+            rendered["content"],
+            "고객 이름님, https://claim.example.test/c/token",
+        )
+        self.assertEqual(
+            rendered["buttons"][0]["mobile_url"],
+            "https://claim.example.test/c/token",
+        )
+        self.assertNotIn(values[SOLAPI_CLAIM_AUTH_TEMPLATE_ENV], repr(preview))
+
+    def test_template_preview_keeps_placeholders_until_values_are_entered(self):
+        rendered = render_claim_auth_alimtalk_preview(
+            {
+                "content": "#{고객명} / #{인증링크}",
+                "buttons": [],
+            },
+            "",
+            "",
+        )
+
+        self.assertEqual(
+            rendered["content"],
+            "[고객이름 입력값] / [인증주소 입력값]",
+        )
+
+    def test_kakao_send_window_uses_seoul_business_hours(self):
+        blocked = outreach_send_window(
+            CHANNEL_KAKAO,
+            now=datetime(2026, 8, 10, 23, 57),
+        )
+        allowed = outreach_send_window(
+            CHANNEL_KAKAO,
+            now=datetime(2026, 8, 11, 11, 57),
+        )
+
+        self.assertFalse(blocked["allowed"])
+        self.assertEqual(blocked["code"], "NIGHT_SEND_BLOCKED")
+        self.assertIn("오전 8시", blocked["message"])
+        self.assertTrue(allowed["allowed"])
 
     def test_claim_auth_inputs_require_scheme_free_address(self):
         accepted = validate_claim_auth_alimtalk(

@@ -1794,6 +1794,16 @@ def _finish_outreach_dialog(level: str, message: str) -> None:
     st.rerun()
 
 
+@st.cache_data(ttl=300, max_entries=10, show_spinner=False)
+def _claim_auth_template_preview(template_code: str) -> dict:
+    """Cache only provider-approved, display-safe template metadata."""
+
+    return dict(
+        sales_outreach.claim_auth_alimtalk_template_preview(template_code)
+        or {}
+    )
+
+
 @st.dialog("영업 메시지 보내기")
 def _show_outreach_dialog(
     owner_user_id: str,
@@ -1846,6 +1856,9 @@ def _show_outreach_dialog(
         )
         or {}
     )
+    send_window = dict(
+        sales_outreach.outreach_send_window(channel) or {}
+    )
     st.markdown(f"**{channel_label} 작성**")
     st.caption(
         "수신처 "
@@ -1879,38 +1892,85 @@ def _show_outreach_dialog(
             setup_message += " 필요한 설정: " + ", ".join(missing)
         st.warning(setup_message)
 
-    with st.form(f"saved_prospect_outreach_form_v1040_{request_id}"):
-        subject = ""
-        body = ""
-        customer_name = ""
-        auth_link = ""
-        send_recipient = target.get("recipient")
-        if channel == "kakao":
-            send_recipient = st.text_input(
-                "발송할 휴대폰 번호",
-                value=str(target.get("recipient") or ""),
-                max_chars=30,
-                placeholder="휴대폰 번호를 입력하세요.",
-                help=(
-                    "이번 알림톡 발송에만 사용할 번호입니다. "
-                    "저장된 업체 연락처는 변경하지 않습니다."
-                ),
+    if not send_window.get("allowed"):
+        st.warning(
+            str(
+                send_window.get("message")
+                or "현재 시간에는 문자·카카오톡을 발송할 수 없습니다."
             )
-            customer_name = st.text_input(
-                "고객이름",
-                max_chars=50,
-                placeholder="알림톡에 표시할 고객이름을 입력해 주세요.",
+        )
+
+    subject = ""
+    body = ""
+    customer_name = ""
+    auth_link = ""
+    send_recipient = target.get("recipient")
+    if channel == "kakao":
+        send_recipient = st.text_input(
+            "발송할 휴대폰 번호",
+            value=str(target.get("recipient") or ""),
+            max_chars=30,
+            placeholder="휴대폰 번호를 입력하세요.",
+            help=(
+                "이번 알림톡 발송에만 사용할 번호입니다. "
+                "저장된 업체 연락처는 변경하지 않습니다."
+            ),
+            key=f"saved_prospect_alimtalk_recipient_{request_id}",
+        )
+        customer_name = st.text_input(
+            "고객이름",
+            max_chars=50,
+            placeholder="알림톡에 표시할 고객이름을 입력해 주세요.",
+            key=f"saved_prospect_alimtalk_name_{request_id}",
+        )
+        auth_link = st.text_input(
+            "인증링크",
+            max_chars=500,
+            placeholder="예: example.com/auth/abc123",
+            help="http:// 또는 https://는 입력하지 말고 주소만 입력하세요.",
+            key=f"saved_prospect_alimtalk_link_{request_id}",
+        )
+        st.caption(
+            "인증링크 입력칸에는 http:// 또는 https://를 제외한 주소만 입력해 주세요."
+        )
+        template_preview = _claim_auth_template_preview(
+            selected_template_code
+        )
+        st.markdown("**발송 예시**")
+        if template_preview.get("ok"):
+            rendered_preview = (
+                sales_outreach.render_claim_auth_alimtalk_preview(
+                    template_preview,
+                    customer_name,
+                    auth_link,
+                )
             )
-            auth_link = st.text_input(
-                "인증링크",
-                max_chars=500,
-                placeholder="예: example.com/auth/abc123",
-                help="http:// 또는 https://는 입력하지 말고 주소만 입력하세요.",
-            )
+            with st.container(border=True):
+                st.text(str(rendered_preview.get("content") or ""))
+                for button in rendered_preview.get("buttons") or []:
+                    button_name = str(button.get("name") or "").strip()
+                    mobile_url = str(
+                        button.get("mobile_url") or ""
+                    ).strip()
+                    if button_name:
+                        st.caption(
+                            "버튼 · "
+                            + button_name
+                            + (f" → {mobile_url}" if mobile_url else "")
+                        )
             st.caption(
-                "인증링크 입력칸에는 http:// 또는 https://를 제외한 주소만 입력해 주세요."
+                "고객이름과 인증링크를 입력하면 승인된 템플릿의 발송 예시에 반영됩니다."
             )
-        elif channel in {"email", "sms"}:
+        else:
+            st.warning(
+                str(
+                    template_preview.get("message")
+                    or "승인 템플릿 내용을 불러오지 못했습니다."
+                )
+            )
+
+    with st.form(f"saved_prospect_outreach_form_v1041_{request_id}"):
+        if channel in {"email", "sms"}:
             subject = st.text_input(
                 "제목" if channel == "email" else "제목 (선택)",
                 max_chars=200 if channel == "email" else 50,
@@ -1934,7 +1994,10 @@ def _show_outreach_dialog(
             "실제 발송",
             type="primary",
             use_container_width=True,
-            disabled=not bool(readiness.get("ready")),
+            disabled=(
+                not bool(readiness.get("ready"))
+                or not bool(send_window.get("allowed"))
+            ),
         )
         cancelled = cancel_col.form_submit_button(
             "취소",
@@ -1944,6 +2007,17 @@ def _show_outreach_dialog(
         st.session_state.pop(_OUTREACH_REQUEST_KEY, None)
         st.rerun()
     if not submitted:
+        return
+    current_send_window = dict(
+        sales_outreach.outreach_send_window(channel) or {}
+    )
+    if not current_send_window.get("allowed"):
+        st.error(
+            str(
+                current_send_window.get("message")
+                or "현재 시간에는 문자·카카오톡을 발송할 수 없습니다."
+            )
+        )
         return
     compliance_error = _outreach_compliance_error(
         channel,
@@ -2140,9 +2214,9 @@ def _show_outreach_dialog(
     if final_status == "provider_rejected":
         _finish_outreach_dialog(
             "error",
-            (
-                "외부 발송 서비스가 요청을 접수하지 않았습니다. 설정을 확인한 뒤 "
-                "목록에서 새 발송 요청을 만들어 주세요."
+            str(
+                result.get("message")
+                or "외부 발송 서비스가 요청을 접수하지 않았습니다. 설정을 확인한 뒤 목록에서 새 발송 요청을 만들어 주세요."
             ),
         )
         return

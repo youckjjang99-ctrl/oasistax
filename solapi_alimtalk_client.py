@@ -14,6 +14,7 @@ import requests
 
 SOLAPI_API_BASE_URL = "https://api.solapi.com"
 SOLAPI_SEND_DETAIL_PATH = "/messages/v4/send-many/detail"
+SOLAPI_TEMPLATE_LIST_PATH = "/kakao/v2/templates/"
 
 SOLAPI_API_KEY_ENV = "SOLAPI_API_KEY"
 SOLAPI_API_SECRET_ENV = "SOLAPI_API_SECRET"
@@ -466,3 +467,122 @@ class SolapiAlimtalkClient:
             group_id=group_id,
             message_id=message_id,
         )
+
+    def get_template_preview(self, template_id: str) -> dict[str, Any]:
+        """Return an approved template's display-safe content without IDs."""
+
+        clean_template_id = str(template_id or "").strip()
+        if not clean_template_id:
+            raise SolapiAlimtalkError(
+                "INVALID_REQUEST",
+                "알림톡 템플릿 설정이 누락되었습니다.",
+            )
+        headers = {
+            "Authorization": build_hmac_authorization(
+                self.config.api_key,
+                self.config.api_secret,
+            ),
+            "Accept": "application/json",
+        }
+        try:
+            response = requests.get(
+                self.config.base_url + SOLAPI_TEMPLATE_LIST_PATH,
+                headers=headers,
+                params={
+                    "templateId": clean_template_id,
+                    "channelId": self.config.pf_id,
+                    "limit": 1,
+                },
+                timeout=self.config.timeout_seconds,
+            )
+        except requests.Timeout:
+            raise SolapiAlimtalkError(
+                "TIMEOUT",
+                "SOLAPI 템플릿 조회 시간이 초과되었습니다.",
+            ) from None
+        except requests.RequestException:
+            raise SolapiAlimtalkError(
+                "NETWORK_ERROR",
+                "SOLAPI 템플릿을 조회하지 못했습니다.",
+            ) from None
+        if not response.ok:
+            raise SolapiAlimtalkError(
+                "HTTP_ERROR",
+                "SOLAPI 템플릿 조회 요청이 실패했습니다.",
+                http_status=int(response.status_code),
+            )
+        try:
+            payload = response.json()
+        except ValueError:
+            raise SolapiAlimtalkError(
+                "INVALID_RESPONSE",
+                "SOLAPI 템플릿 응답을 확인할 수 없습니다.",
+                http_status=int(response.status_code),
+            ) from None
+        if not isinstance(payload, Mapping):
+            raise SolapiAlimtalkError(
+                "INVALID_RESPONSE",
+                "SOLAPI 템플릿 응답 형식이 올바르지 않습니다.",
+                http_status=int(response.status_code),
+            )
+        rows = payload.get("templateList")
+        if not isinstance(rows, list) or not rows:
+            raise SolapiAlimtalkError(
+                "TEMPLATE_NOT_FOUND",
+                "등록된 알림톡 템플릿을 찾지 못했습니다.",
+                http_status=int(response.status_code),
+            )
+        row = next(
+            (
+                item
+                for item in rows
+                if isinstance(item, Mapping)
+                and str(item.get("templateId") or "").strip()
+                == clean_template_id
+            ),
+            None,
+        )
+        if not isinstance(row, Mapping):
+            raise SolapiAlimtalkError(
+                "TEMPLATE_NOT_FOUND",
+                "등록된 알림톡 템플릿을 찾지 못했습니다.",
+                http_status=int(response.status_code),
+            )
+        content = str(row.get("content") or "").strip()
+        if not content or len(content) > 4_000:
+            raise SolapiAlimtalkError(
+                "INVALID_RESPONSE",
+                "알림톡 템플릿 본문을 확인할 수 없습니다.",
+                http_status=int(response.status_code),
+            )
+        status = str(row.get("status") or "").strip().upper()
+        if status not in {"APPROVED", "PENDING", "INSPECTING", "REJECTED"}:
+            status = "UNKNOWN"
+        buttons: list[dict[str, str]] = []
+        raw_buttons = row.get("buttons")
+        if isinstance(raw_buttons, list):
+            for raw_button in raw_buttons[:5]:
+                if not isinstance(raw_button, Mapping):
+                    continue
+                name = str(
+                    raw_button.get("buttonName")
+                    or raw_button.get("name")
+                    or ""
+                ).strip()[:100]
+                mobile_url = str(
+                    raw_button.get("linkMo")
+                    or raw_button.get("linkMobile")
+                    or ""
+                ).strip()[:1_000]
+                if name:
+                    buttons.append(
+                        {
+                            "name": name,
+                            "mobile_url": mobile_url,
+                        }
+                    )
+        return {
+            "content": content,
+            "status": status,
+            "buttons": buttons,
+        }

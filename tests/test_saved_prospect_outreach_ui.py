@@ -498,6 +498,16 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
         self.assertIn("발송번호 별도 지정", source)
         self.assertIn("validate_claim_auth_alimtalk", source)
         self.assertIn("send_claim_auth_alimtalk", source)
+        self.assertIn("_claim_auth_template_preview", source)
+        self.assertIn(
+            "claim_auth_alimtalk_template_preview",
+            inspect.getsource(prospect._claim_auth_template_preview),
+        )
+        self.assertIn("render_claim_auth_alimtalk_preview", source)
+        self.assertIn('st.markdown("**발송 예시**")', source)
+        self.assertIn("outreach_send_window", source)
+        self.assertIn('not bool(send_window.get("allowed"))', source)
+        self.assertIn('result.get("message")', source)
 
     def test_resolver_rejects_a_stale_or_unowned_assignment(self):
         request = {
