@@ -150,13 +150,17 @@ def test_selected_company_auto_loads_financial_and_registry(monkeypatch):
     assert restored[0][0:2] == ("member", "123-45-67890")
 
 
-def test_stock_valuation_top_keeps_only_registry_registration():
+def test_stock_valuation_hides_registry_upload_but_restores_saved_data():
     render_source = _function_source("render_stock_valuation_page")
     registry_source = _function_source("_render_registry_upload")
+    registration_source = _function_source("render_registry_upload_for_customer")
+    context_source = _function_source("_load_stock_customer_context")
 
     assert "기존 고객에서 불러오기" not in render_source
     assert "기존 고객DB에서 재무정보 불러오기" not in render_source
     assert "크레탑 PDF에서 재무정보 불러오기" not in render_source
+    assert "_render_registry_upload" not in render_source
+    assert "_load_stock_customer_context" in render_source
     assert "등록된 등기정보 불러오기" not in registry_source
     assert "등기사항증명서 업로드" in registry_source
     assert "등기자료 분석·등록" in registry_source
@@ -164,12 +168,13 @@ def test_stock_valuation_top_keeps_only_registry_registration():
     assert "기존 정보와 비교" not in registry_source
     assert "_restore_registry_for_business" in registry_source
     assert "_apply_registry_data" in registry_source
+    assert "_render_registry_upload" in registration_source
+    assert "_restore_registry_for_business" in context_source
 
-    upload_at = render_source.index("_render_registry_upload")
     form_at = render_source.index("with st.form")
     history_at = render_source.index("_render_stock_history(user_id)")
     legal_at = render_source.index("평가 로직과 법령 적용 안내")
-    assert upload_at < form_at < legal_at < history_at
+    assert form_at < legal_at < history_at
 
 
 def test_enterprise_center_passes_selected_company_context():
