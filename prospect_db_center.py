@@ -3923,14 +3923,14 @@ def _render_contact_results(
     st.markdown("#### 업체 메모")
     if selected_memo:
         st.text_area(
-            "③ 저장된 영업후보에서 저장한 메모",
+            "② 저장된 영업후보에서 저장한 메모",
             value=selected_memo,
             height=100,
             disabled=True,
             key=f"contact_results_memo_v1070_{selected_assignment_id}",
         )
     else:
-        st.caption("③ 저장된 영업후보에 저장된 업체 메모가 없습니다.")
+        st.caption("② 저장된 영업후보에 저장된 업체 메모가 없습니다.")
 
     st.markdown("#### 업체 활동 이력")
     st.caption(
@@ -4152,7 +4152,7 @@ def _render_return_db_admin(current_user_id: str) -> None:
             getattr(st, level, st.info)(message)
 
     st.caption(
-        "영업담당자가 ④ 연락결과 기록에서 반납한 업체를 검토합니다. "
+        "영업담당자가 ③ 연락결과 기록에서 반납한 업체를 검토합니다. "
         "검토 전에는 다른 담당자가 다시 배정받을 수 없습니다."
     )
     assignment_result = sales_assignments.list_admin_assignments(
@@ -4302,46 +4302,45 @@ def render_prospect_db_center(
     )
     _show_pending_prospect_save_notices()
     workflow_steps = [
-        "① 조건 설정",
-        "② 검색 결과",
-        "③ 저장된 영업후보",
-        "④ 연락결과 기록",
+        "① DB신청",
+        "② 저장된 영업후보",
+        "③ 연락결과 기록",
     ]
     if is_admin_user:
-        workflow_steps.append("⑤ 반납DB 관리")
+        workflow_steps.append("④ 반납DB 관리")
     if st.session_state.get(
-        "prospect_workflow_step_v1020"
+        "prospect_workflow_step_v1081"
     ) not in workflow_steps:
-        st.session_state["prospect_workflow_step_v1020"] = "① 조건 설정"
+        st.session_state["prospect_workflow_step_v1081"] = "① DB신청"
     workflow_step = st.pills(
         "DB발굴 작업 단계",
         workflow_steps,
-        key="prospect_workflow_step_v1020",
+        key="prospect_workflow_step_v1081",
         label_visibility="collapsed",
     )
-    workflow_step = workflow_step or "① 조건 설정"
-    if workflow_step == "③ 저장된 영업후보":
+    workflow_step = workflow_step or "① DB신청"
+    if workflow_step == "② 저장된 영업후보":
         _render_clean_saved_prospects(
             owner_user_id,
             can_view_mobile=can_view_mobile,
             is_admin_user=is_admin_user,
         )
         return
-    if workflow_step == "④ 연락결과 기록":
+    if workflow_step == "③ 연락결과 기록":
         _render_contact_results(
             owner_user_id,
             can_view_mobile=can_view_mobile,
         )
         return
-    if workflow_step == "⑤ 반납DB 관리":
+    if workflow_step == "④ 반납DB 관리":
         _render_return_db_admin(owner_user_id)
         return
-    if workflow_step == "① 조건 설정":
+    if workflow_step == "① DB신청":
         _render_search_history(owner_user_id)
 
     with st.expander(
         "조회 조건",
-        expanded=workflow_step == "① 조건 설정",
+        expanded=True,
     ):
         discovery_type_name = st.radio(
             "발굴 유형",
@@ -4747,6 +4746,14 @@ def render_prospect_db_center(
                     progress=_progress,
                     exclude_saved_prospects=False,
                 )
+        result["query_snapshot"] = {
+            "region_name": region_name,
+            "district_name": district_name,
+            "business_type_name": business_type_name,
+            "minimum_employees": int(minimum_employees),
+            "maximum_employees": int(maximum_employees),
+            "contact_labels": list(selected_contact_labels or []),
+        }
         result = _sanitize_search_result(result, can_view_mobile)
         if result.get("ok"):
             result = _filter_assignment_search_result(
@@ -4819,17 +4826,9 @@ def render_prospect_db_center(
             result.get("next_page") or int(end_page) + 1
         )
         st.success(
-            "조회가 완료되었습니다. 조건 설정 화면은 그대로 유지됩니다. "
-            "결과는 ‘② 검색 결과’를 눌러 확인해주세요."
+            "조회가 완료되었습니다. 아래 검색 결과에서 확인해주세요."
         )
 
-    if workflow_step != "② 검색 결과":
-        st.info(
-            "조건을 선택해 조회하면 결과가 ‘② 검색 결과’ 단계에 "
-            "표시됩니다. 저장한 업체는 ‘③ 저장된 영업후보’에서 "
-            "확인하고 ‘④ 연락결과 기록’에서 후속조치를 관리할 수 있습니다."
-        )
-        return
     result = _sanitize_search_result(
         st.session_state.get(result_state_key) or {},
         can_view_mobile,
@@ -4841,8 +4840,8 @@ def render_prospect_db_center(
     st.session_state[result_state_key] = result
     if not result:
         st.info(
-            "아직 표시할 검색 결과가 없습니다. ‘① 조건 설정’에서 "
-            "조회 조건을 선택하고 검색을 실행해 주세요."
+            "조회 조건을 선택하고 검색을 실행하면 결과가 이 화면 아래에 "
+            "표시됩니다."
         )
         return
     if result:
@@ -4868,7 +4867,9 @@ def render_prospect_db_center(
                     )
                 )
             return
+        st.markdown("### 최근 조회 결과")
         stats = result.get("stats") or {}
+        query_snapshot = result.get("query_snapshot") or {}
         signal_count = stats.get(
             (
                 "recent_candidates"
@@ -4908,20 +4909,46 @@ def render_prospect_db_center(
         )
         if stats.get("source_mode") == "precomputed":
             metric_cols[4].metric("조회 방식", "사전 계산")
+            result_region_name = str(
+                query_snapshot.get("region_name") or region_name
+            )
+            result_district_name = str(
+                query_snapshot.get("district_name") or district_name
+            )
+            result_minimum_employees = int(
+                query_snapshot.get("minimum_employees")
+                or minimum_employees
+            )
+            result_maximum_employees = int(
+                query_snapshot.get("maximum_employees")
+                or maximum_employees
+            )
+            result_contact_labels = list(
+                query_snapshot.get(
+                    "contact_labels",
+                    selected_contact_labels or [],
+                )
+                or []
+            )
+            result_business_type_name = str(
+                query_snapshot.get("business_type_name")
+                or business_type_name
+            )
             search_range_text = " · ".join(
                 (
                     (
-                        f"{region_name} {district_name}"
-                        if district_name != ALL_DISTRICTS
-                        else f"{region_name} 전체"
+                        f"{result_region_name} {result_district_name}"
+                        if result_district_name != ALL_DISTRICTS
+                        else f"{result_region_name} 전체"
                     ),
                     (
-                        f"고용 {int(minimum_employees):,}"
-                        f"~{int(maximum_employees):,}명"
+                        f"고용 {result_minimum_employees:,}"
+                        f"~{result_maximum_employees:,}명"
                     ),
+                    f"사업자 {result_business_type_name}",
                     (
                         "연락처 "
-                        + "·".join(selected_contact_labels or ["전체"])
+                        + "·".join(result_contact_labels or ["전체"])
                     ),
                 )
             )
@@ -4986,8 +5013,8 @@ def render_prospect_db_center(
         if own_excluded:
             st.info(
                 f"이미 내 영업DB에 저장된 업체 {own_excluded:,}건은 "
-                "신규 결과에서 제외했습니다. ③ 저장된 영업후보에서 "
-                "업체를 확인하고 ④ 연락결과 기록에서 이력을 관리할 수 있습니다."
+                "신규 결과에서 제외했습니다. ② 저장된 영업후보에서 "
+                "업체를 확인하고 ③ 연락결과 기록에서 이력을 관리할 수 있습니다."
             )
         if result.get("assignment_view_warning") and is_admin_user:
             st.caption(

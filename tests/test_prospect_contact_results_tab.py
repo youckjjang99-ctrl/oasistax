@@ -6,28 +6,28 @@ import prospect_db_center as prospect
 
 
 class ProspectContactResultsTabTests(unittest.TestCase):
-    def test_navigation_exposes_admin_only_return_review_as_fifth_step(self):
+    def test_navigation_unifies_search_in_db_request_and_keeps_admin_review(self):
         source = inspect.getsource(prospect.render_prospect_db_center)
         labels = (
-            "① 조건 설정",
-            "② 검색 결과",
-            "③ 저장된 영업후보",
-            "④ 연락결과 기록",
-            "⑤ 반납DB 관리",
+            "① DB신청",
+            "② 저장된 영업후보",
+            "③ 연락결과 기록",
+            "④ 반납DB 관리",
         )
 
         positions = [source.index(f'"{label}"') for label in labels]
         self.assertEqual(positions, sorted(positions))
+        self.assertNotIn("검색 결과\"", source)
         self.assertIn(
-            'if workflow_step == "④ 연락결과 기록":',
+            'if workflow_step == "③ 연락결과 기록":',
             source,
         )
         self.assertIn("_render_contact_results(", source)
         self.assertIn("can_view_mobile=can_view_mobile", source)
         self.assertIn("if is_admin_user:", source)
-        self.assertIn('workflow_steps.append("⑤ 반납DB 관리")', source)
+        self.assertIn('workflow_steps.append("④ 반납DB 관리")', source)
         self.assertIn(
-            'if workflow_step == "⑤ 반납DB 관리":',
+            'if workflow_step == "④ 반납DB 관리":',
             source,
         )
         self.assertIn("_render_return_db_admin(owner_user_id)", source)
@@ -70,7 +70,7 @@ class ProspectContactResultsTabTests(unittest.TestCase):
             "다음 연락예정일",
             "상담내용",
             "업체 메모",
-            "③ 저장된 영업후보에서 저장한 메모",
+            "② 저장된 영업후보에서 저장한 메모",
             "연락결과 저장",
             "내 연락이력",
             "자동 발송 이력",
