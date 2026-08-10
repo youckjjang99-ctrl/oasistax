@@ -221,6 +221,18 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
         for column in prospect.OUTREACH_COLUMN_CHANNELS:
             self.assertTrue(pd.isna(compact.loc[0, column]))
 
+    def test_rejected_assignment_status_stays_blocked(self):
+        frame = self._frame()
+        frame.loc[0, "_assignment_status"] = "rejected"
+
+        compact = prospect._saved_prospect_table_frame(
+            frame,
+            can_view_mobile=True,
+        )
+
+        for column in prospect.OUTREACH_COLUMN_CHANNELS:
+            self.assertTrue(pd.isna(compact.loc[0, column]))
+
     def test_rejected_contact_is_never_selected(self):
         candidate = {
             "id": "prospect-1",
@@ -469,6 +481,17 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
         self.assertNotIn("file_uploader", source)
         self.assertNotIn("recording", source.lower())
         self.assertNotIn("evidence", source.lower())
+
+    def test_kakao_composer_uses_fixed_solapi_claim_auth_template(self):
+        source = inspect.getsource(prospect._show_outreach_dialog)
+
+        self.assertIn("claim_auth_alimtalk_readiness", source)
+        self.assertIn("경정청구 자료수집 인증안내", source)
+        self.assertIn('"고객이름"', source)
+        self.assertIn('"인증링크"', source)
+        self.assertIn("http:// 또는 https://는 입력하지 말고", source)
+        self.assertIn("validate_claim_auth_alimtalk", source)
+        self.assertIn("send_claim_auth_alimtalk", source)
 
     def test_resolver_rejects_a_stale_or_unowned_assignment(self):
         request = {

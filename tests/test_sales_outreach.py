@@ -37,9 +37,19 @@ from sales_outreach import (
     SMSKOREA_SENDER_ENV,
     SMSKOREA_TOKEN_URL,
     SMSKOREA_USER_ID_ENV,
+    SOLAPI_CLAIM_AUTH_TEMPLATE_ENV,
+    claim_auth_alimtalk_readiness,
     channel_readiness,
+    send_claim_auth_alimtalk,
     send_outreach,
+    validate_claim_auth_alimtalk,
     validate_message,
+)
+from solapi_alimtalk_client import (
+    SOLAPI_API_KEY_ENV,
+    SOLAPI_API_SECRET_ENV,
+    SOLAPI_KAKAO_CHANNEL_ID_ENV,
+    SolapiAlimtalkError,
 )
 
 
@@ -137,6 +147,20 @@ def _kakao_env() -> dict[str, str]:
     }
 
 
+def _solapi_claim_auth_env() -> dict[str, str]:
+    return {
+        OUTREACH_ENABLED_ENV: "true",
+        OUTREACH_COMPLIANCE_CONFIRMED_ENV: "true",
+        LEGACY_CONTACT_PHONE_HASH_KEY_ENV: (
+            "private-hash-key-with-at-least-32-characters"
+        ),
+        SOLAPI_API_KEY_ENV: "private-solapi-key",
+        SOLAPI_API_SECRET_ENV: "private-solapi-secret",
+        SOLAPI_KAKAO_CHANNEL_ID_ENV: "private-solapi-channel",
+        SOLAPI_CLAIM_AUTH_TEMPLATE_ENV: "approved-claim-auth-template",
+    }
+
+
 def _marketing_sms(value: str) -> str:
     return value
 
@@ -208,6 +232,105 @@ class SalesOutreachTests(unittest.TestCase):
         for value in values.values():
             if value != "true":
                 self.assertNotIn(value, readiness_text)
+
+    def test_claim_auth_readiness_uses_solapi_not_legacy_kakao_provider(self):
+        values = _solapi_claim_auth_env()
+        with patch.dict(os.environ, values, clear=True):
+            readiness = claim_auth_alimtalk_readiness()
+
+        self.assertTrue(readiness["ready"])
+        self.assertEqual(readiness["provider"], "solapi")
+        self.assertNotIn(
+            KAKAO_BIZ_CLIENT_ID_ENV,
+            readiness["required_env_names"],
+        )
+        readiness_text = repr(readiness)
+        for value in values.values():
+            if value != "true":
+                self.assertNotIn(value, readiness_text)
+
+    def test_claim_auth_inputs_require_scheme_free_address(self):
+        accepted = validate_claim_auth_alimtalk(
+            _MOBILE,
+            "고객 이름",
+            "claim.example.test/c/token?step=1",
+        )
+        http_rejected = validate_claim_auth_alimtalk(
+            _MOBILE,
+            "고객 이름",
+            "http://claim.example.test/c/token",
+        )
+        https_rejected = validate_claim_auth_alimtalk(
+            _MOBILE,
+            "고객 이름",
+            "https://claim.example.test/c/token",
+        )
+
+        self.assertTrue(accepted["ok"])
+        self.assertEqual(http_rejected["code"], "AUTH_LINK_INVALID")
+        self.assertEqual(https_rejected["code"], "AUTH_LINK_INVALID")
+        self.assertNotIn("claim.example.test", repr(http_rejected))
+
+    def test_claim_auth_send_uses_fixed_template_and_exact_variables(self):
+        class _Solapi:
+            def __init__(self):
+                self.calls = []
+
+            def send_alimtalk(self, to, template_id, **kwargs):
+                self.calls.append((to, template_id, kwargs))
+
+        client = _Solapi()
+        values = _solapi_claim_auth_env()
+        with patch.dict(os.environ, values, clear=True):
+            result = send_claim_auth_alimtalk(
+                _FORMATTED_MOBILE,
+                "고객 이름",
+                "claim.example.test/c/token",
+                "claim-auth-request-1",
+                client=client,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["code"], "ACCEPTED")
+        self.assertEqual(
+            client.calls,
+            [
+                (
+                    _FORMATTED_MOBILE,
+                    values[SOLAPI_CLAIM_AUTH_TEMPLATE_ENV],
+                    {
+                        "variables": {
+                            "#{고객명}": "고객 이름",
+                            "#{인증링크}": "claim.example.test/c/token",
+                        },
+                        "disable_sms": True,
+                    },
+                )
+            ],
+        )
+        self.assert_safe_result(result)
+
+    def test_claim_auth_timeout_is_delivery_unknown_and_redacted(self):
+        class _TimeoutSolapi:
+            def send_alimtalk(self, *_args, **_kwargs):
+                raise SolapiAlimtalkError(
+                    "TIMEOUT",
+                    "private provider detail",
+                )
+
+        with patch.dict(os.environ, _solapi_claim_auth_env(), clear=True):
+            result = send_claim_auth_alimtalk(
+                _MOBILE,
+                "고객 이름",
+                "claim.example.test/c/token",
+                "claim-auth-request-2",
+                client=_TimeoutSolapi(),
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "DELIVERY_UNKNOWN")
+        self.assertNotIn("private", repr(result))
+        self.assert_safe_result(result)
 
     def test_compliance_confirmation_is_required_before_network(self):
         values = _email_env()
