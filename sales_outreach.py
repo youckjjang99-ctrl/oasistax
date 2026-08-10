@@ -16,9 +16,16 @@ import os
 import re
 from datetime import datetime
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import requests
+from solapi_alimtalk_client import (
+    SolapiAlimtalkClient,
+    SolapiAlimtalkConfig,
+    SolapiAlimtalkError,
+    environment_readiness as solapi_environment_readiness,
+)
 
 
 CHANNEL_EMAIL = "email"
@@ -35,6 +42,8 @@ OUTREACH_SENDER_EMAIL_ENV = "OUTREACH_SENDER_EMAIL"
 OUTREACH_SENDER_PHONE_ENV = "OUTREACH_SENDER_PHONE"
 OUTREACH_SENDER_ADDRESS_ENV = "OUTREACH_SENDER_ADDRESS"
 LEGACY_CONTACT_PHONE_HASH_KEY_ENV = "OASIS_KAKAO_GUIDANCE_PHONE_HASH_KEY"
+SOLAPI_CLAIM_AUTH_TEMPLATE_ENV = "SOLAPI_TEMPLATE_AUTH_START_ID"
+SOLAPI_CLAIM_AUTH_TEMPLATE_LABEL = "경정청구 자료수집 인증안내"
 
 SMSKOREA_USER_ID_ENV = "SMSKOREA_USER_ID"
 SMSKOREA_SEC_API_KEY_ENV = "SMSKOREA_SEC_API_KEY"
@@ -70,6 +79,9 @@ _EMAIL_PATTERN = re.compile(
 )
 _PHONE_ALLOWED_PATTERN = re.compile(r"^[+0-9() .-]+$")
 _SAFE_IDEMPOTENCY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
+_AUTH_LINK_HOST_LABEL_PATTERN = re.compile(
+    r"^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)$"
+)
 
 _CHANNEL_ENV_NAMES = {
     CHANNEL_EMAIL: (
@@ -296,6 +308,68 @@ def channel_readiness(channel: str) -> dict[str, Any]:
     }
 
 
+def claim_auth_alimtalk_readiness() -> dict[str, Any]:
+    """Return redacted readiness for the fixed Solapi auth template."""
+
+    source = os.environ
+    provider = solapi_environment_readiness(
+        source,
+        required_template_env_names=(SOLAPI_CLAIM_AUTH_TEMPLATE_ENV,),
+    )
+    missing = list(provider.get("missing_env_names") or [])
+    code = "READY"
+    message = "Solapi 알림톡 발송 설정이 준비되었습니다."
+
+    if len(
+        str(source.get(LEGACY_CONTACT_PHONE_HASH_KEY_ENV, "") or "").strip()
+    ) < 32:
+        if LEGACY_CONTACT_PHONE_HASH_KEY_ENV not in missing:
+            missing.append(LEGACY_CONTACT_PHONE_HASH_KEY_ENV)
+        code = "OUTREACH_HMAC_KEY_REQUIRED"
+        message = "발송 중복방지 보안키 설정이 필요합니다."
+
+    send_enabled = _enabled(source.get(OUTREACH_ENABLED_ENV, ""))
+    if not send_enabled:
+        if OUTREACH_ENABLED_ENV not in missing:
+            missing.append(OUTREACH_ENABLED_ENV)
+        if code == "READY":
+            code = "OUTREACH_DISABLED"
+            message = "외부 발송 기능이 비활성화되어 있습니다."
+
+    compliance_confirmed = _enabled(
+        source.get(OUTREACH_COMPLIANCE_CONFIRMED_ENV, "")
+    )
+    if not compliance_confirmed:
+        if OUTREACH_COMPLIANCE_CONFIRMED_ENV not in missing:
+            missing.append(OUTREACH_COMPLIANCE_CONFIRMED_ENV)
+        if code == "READY":
+            code = "COMPLIANCE_CONFIRMATION_REQUIRED"
+            message = "수신동의·수신거부 운영 준비 확인이 필요합니다."
+
+    if missing and code == "READY":
+        code = "CONFIGURATION_MISSING"
+        message = "Solapi 알림톡 환경 설정을 확인해 주세요."
+
+    ready = not missing
+    required = [
+        OUTREACH_ENABLED_ENV,
+        OUTREACH_COMPLIANCE_CONFIRMED_ENV,
+        LEGACY_CONTACT_PHONE_HASH_KEY_ENV,
+        *list(provider.get("required_env_names") or []),
+    ]
+    return {
+        "channel": CHANNEL_KAKAO,
+        "provider": "solapi",
+        "ready": ready,
+        "send_enabled": send_enabled,
+        "external_send_allowed": ready,
+        "required_env_names": list(dict.fromkeys(required)),
+        "missing_env_names": list(dict.fromkeys(missing)),
+        "code": code if not ready else "READY",
+        "message": message if not ready else "Solapi 알림톡 발송 설정이 준비되었습니다.",
+    }
+
+
 def _normalize_local_mobile(recipient: str) -> str | None:
     raw = str(recipient or "").strip()
     if not raw or not _PHONE_ALLOWED_PATTERN.fullmatch(raw):
@@ -315,6 +389,80 @@ def _normalize_kakao_mobile(recipient: str) -> str | None:
     if local is None:
         return None
     return "82" + local[1:]
+
+
+def _normalize_claim_auth_link(value: Any) -> str | None:
+    """Validate the scheme-free value required by the approved template."""
+
+    clean = str(value or "").strip()
+    if (
+        not clean
+        or len(clean) > 500
+        or "://" in clean
+        or clean.startswith("//")
+        or any(character.isspace() for character in clean)
+    ):
+        return None
+    parsed = urlsplit("https://" + clean)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    hostname = str(parsed.hostname).rstrip(".")
+    labels = hostname.split(".")
+    if (
+        len(labels) < 2
+        or any(
+            not label
+            or len(label) > 63
+            or not _AUTH_LINK_HOST_LABEL_PATTERN.fullmatch(label)
+            for label in labels
+        )
+    ):
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is not None and not 1 <= port <= 65535:
+        return None
+    return clean
+
+
+def validate_claim_auth_alimtalk(
+    recipient: Any,
+    customer_name: Any,
+    auth_link: Any,
+) -> dict[str, Any]:
+    """Validate the fixed template inputs without echoing personal data."""
+
+    if _normalize_local_mobile(str(recipient or "")) is None:
+        return _status(
+            False,
+            "INVALID_RECIPIENT",
+            "유효한 휴대전화 번호를 확인해 주세요.",
+        )
+    clean_name = str(customer_name or "").strip()
+    if (
+        not clean_name
+        or len(clean_name) > 50
+        or any(ord(character) < 32 for character in clean_name)
+    ):
+        return _status(
+            False,
+            "CUSTOMER_NAME_REQUIRED",
+            "고객이름을 50자 이내로 입력해 주세요.",
+        )
+    if _normalize_claim_auth_link(auth_link) is None:
+        return _status(
+            False,
+            "AUTH_LINK_INVALID",
+            "http:// 또는 https://를 제외하고 인증 주소만 입력해 주세요.",
+        )
+    return _status(True, "VALID", "알림톡 입력값을 확인했습니다.")
 
 
 def _validate_email(recipient: str) -> bool:
@@ -869,6 +1017,106 @@ def _send_kakao(
     )
 
 
+def send_claim_auth_alimtalk(
+    recipient: Any,
+    customer_name: Any,
+    auth_link: Any,
+    idempotency_key: Any,
+    *,
+    client: SolapiAlimtalkClient | None = None,
+) -> dict[str, Any]:
+    """Send the approved claim-auth Alimtalk after the durable DB claim."""
+
+    readiness = claim_auth_alimtalk_readiness()
+    if not readiness["external_send_allowed"]:
+        return _status(
+            False,
+            str(readiness.get("code") or "CONFIGURATION_NOT_READY"),
+            str(
+                readiness.get("message")
+                or "Solapi 알림톡 발송 설정을 확인해 주세요."
+            ),
+        )
+    validation = validate_claim_auth_alimtalk(
+        recipient,
+        customer_name,
+        auth_link,
+    )
+    if not validation["ok"]:
+        return validation
+    if not _valid_idempotency_key(str(idempotency_key or "")):
+        return _status(
+            False,
+            "IDEMPOTENCY_KEY_REQUIRED",
+            "중복 발송 방지 키를 확인해 주세요.",
+        )
+    if not _within_standard_send_hours():
+        return _status(
+            False,
+            "NIGHT_SEND_BLOCKED",
+            "카카오톡 발송은 오전 8시부터 오후 9시 전까지만 가능합니다.",
+        )
+
+    clean_link = _normalize_claim_auth_link(auth_link)
+    if clean_link is None:
+        return _status(
+            False,
+            "AUTH_LINK_INVALID",
+            "http:// 또는 https://를 제외하고 인증 주소만 입력해 주세요.",
+        )
+    source = os.environ
+    provider_call_started = False
+    try:
+        provider = client or SolapiAlimtalkClient(
+            SolapiAlimtalkConfig.from_env(source)
+        )
+        provider_call_started = True
+        provider.send_alimtalk(
+            str(recipient or ""),
+            str(source.get(SOLAPI_CLAIM_AUTH_TEMPLATE_ENV, "") or ""),
+            variables={
+                "#{고객명}": str(customer_name or "").strip(),
+                "#{인증링크}": clean_link,
+            },
+            disable_sms=True,
+        )
+    except SolapiAlimtalkError as exc:
+        ambiguous = provider_call_started and (
+            exc.code in {"TIMEOUT", "NETWORK_ERROR", "INVALID_RESPONSE"}
+            or (
+                exc.code == "HTTP_ERROR"
+                and (exc.http_status is None or exc.http_status >= 500)
+            )
+        )
+        if ambiguous:
+            return _status(
+                False,
+                "DELIVERY_UNKNOWN",
+                "Solapi 접수 여부를 확인할 수 없습니다. 발송내역을 확인해 주세요.",
+            )
+        return _status(
+            False,
+            re.sub(r"[^A-Z0-9_-]", "_", str(exc.code or ""))[:80]
+            or "PROVIDER_REJECTED",
+            "Solapi가 알림톡 발송 요청을 접수하지 않았습니다.",
+        )
+    except Exception:
+        return _status(
+            False,
+            "DELIVERY_UNKNOWN" if provider_call_started else "PROVIDER_REJECTED",
+            (
+                "Solapi 접수 여부를 확인할 수 없습니다. 발송내역을 확인해 주세요."
+                if provider_call_started
+                else "Solapi 알림톡 발송 설정을 확인해 주세요."
+            ),
+        )
+    return _status(
+        True,
+        "ACCEPTED",
+        "Solapi 알림톡 발송 요청이 접수되었습니다.",
+    )
+
+
 def send_outreach(
     channel: str,
     recipient: str,
@@ -964,7 +1212,12 @@ __all__ = [
     "CHANNEL_EMAIL",
     "CHANNEL_SMS",
     "CHANNEL_KAKAO",
+    "SOLAPI_CLAIM_AUTH_TEMPLATE_ENV",
+    "SOLAPI_CLAIM_AUTH_TEMPLATE_LABEL",
+    "claim_auth_alimtalk_readiness",
     "channel_readiness",
+    "send_claim_auth_alimtalk",
     "validate_message",
+    "validate_claim_auth_alimtalk",
     "send_outreach",
 ]

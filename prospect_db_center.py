@@ -1811,7 +1811,14 @@ def _show_outreach_dialog(
     if not target.get("ok"):
         st.error(target.get("message") or "발송 대상을 확인하지 못했습니다.")
         return
-    readiness = dict(sales_outreach.channel_readiness(channel) or {})
+    readiness = dict(
+        (
+            sales_outreach.claim_auth_alimtalk_readiness()
+            if channel == "kakao"
+            else sales_outreach.channel_readiness(channel)
+        )
+        or {}
+    )
     st.markdown(f"**{channel_label} 작성**")
     st.caption(
         "수신처 "
@@ -1820,8 +1827,8 @@ def _show_outreach_dialog(
     )
     if channel == "kakao":
         st.info(
-            "카카오 친구톡은 계약된 비즈메시지 발신 프로필의 채널 친구에게만 "
-            "발송됩니다. 미친구·수신거부 대상에는 발송되지 않습니다."
+            "Solapi 알림톡 템플릿 ‘경정청구 자료수집 인증안내’로 발송합니다. "
+            "고객이름과 인증링크만 입력할 수 있으며 문자 대체발송은 하지 않습니다."
         )
     elif channel == "sms":
         st.info(
@@ -1851,20 +1858,39 @@ def _show_outreach_dialog(
     )[:24] or "request"
     with st.form(f"saved_prospect_outreach_form_v1040_{request_id}"):
         subject = ""
-        if channel in {"email", "sms"}:
+        body = ""
+        customer_name = ""
+        auth_link = ""
+        if channel == "kakao":
+            customer_name = st.text_input(
+                "고객이름",
+                max_chars=50,
+                placeholder="알림톡에 표시할 고객이름을 입력해 주세요.",
+            )
+            auth_link = st.text_input(
+                "인증링크",
+                max_chars=500,
+                placeholder="예: example.com/auth/abc123",
+                help="http:// 또는 https://는 입력하지 말고 주소만 입력하세요.",
+            )
+            st.caption(
+                "인증링크 입력칸에는 http:// 또는 https://를 제외한 주소만 입력해 주세요."
+            )
+        elif channel in {"email", "sms"}:
             subject = st.text_input(
                 "제목" if channel == "email" else "제목 (선택)",
                 max_chars=200 if channel == "email" else 50,
             )
-        body = st.text_area(
-            "내용",
-            height=260,
-            max_chars={"email": 10_000, "sms": 2_000, "kakao": 1_000}.get(
-                channel,
-                2_000,
-            ),
-            placeholder="담당자가 보낼 내용을 직접 입력해 주세요.",
-        )
+        if channel != "kakao":
+            body = st.text_area(
+                "내용",
+                height=260,
+                max_chars={"email": 10_000, "sms": 2_000}.get(
+                    channel,
+                    2_000,
+                ),
+                placeholder="담당자가 보낼 내용을 직접 입력해 주세요.",
+            )
         confirmed = st.checkbox(
             "이 대상의 광고 수신동의와 현재 수신거부 상태를 확인했습니다.",
             value=False,
@@ -1895,11 +1921,19 @@ def _show_outreach_dialog(
         st.error(compliance_error)
         return
     validation = dict(
-        sales_outreach.validate_message(
-            channel,
-            target.get("recipient"),
-            subject,
-            body,
+        (
+            sales_outreach.validate_claim_auth_alimtalk(
+                target.get("recipient"),
+                customer_name,
+                auth_link,
+            )
+            if channel == "kakao"
+            else sales_outreach.validate_message(
+                channel,
+                target.get("recipient"),
+                subject,
+                body,
+            )
         )
         or {}
     )
@@ -1928,10 +1962,20 @@ def _show_outreach_dialog(
         )
         return
     try:
+        fingerprint_subject = (
+            sales_outreach.SOLAPI_CLAIM_AUTH_TEMPLATE_LABEL
+            if channel == "kakao"
+            else subject
+        )
+        fingerprint_body = (
+            f"{len(customer_name)}:{customer_name}\n{auth_link}"
+            if channel == "kakao"
+            else body
+        )
         content_hmac = sales_outreach_repository.message_fingerprint(
             channel,
-            subject,
-            body,
+            fingerprint_subject,
+            fingerprint_body,
         )
         recipient_hmac = sales_outreach_repository.recipient_fingerprint(
             channel,
@@ -1994,12 +2038,21 @@ def _show_outreach_dialog(
 
     try:
         result = dict(
-            sales_outreach.send_outreach(
-                channel,
-                latest.get("recipient"),
-                subject,
-                body,
-                request_id,
+            (
+                sales_outreach.send_claim_auth_alimtalk(
+                    latest.get("recipient"),
+                    customer_name,
+                    auth_link,
+                    request_id,
+                )
+                if channel == "kakao"
+                else sales_outreach.send_outreach(
+                    channel,
+                    latest.get("recipient"),
+                    subject,
+                    body,
+                    request_id,
+                )
             )
             or {}
         )
@@ -2068,7 +2121,11 @@ def _show_outreach_dialog(
             latest.get("company_uid"),
             contact_method,
             contact_result,
-            notes=f"OASIS에서 {channel_label} 발송 접수",
+            notes=(
+                "OASIS에서 카카오톡 경정청구 자료수집 인증안내 발송 접수"
+                if channel == "kakao"
+                else f"OASIS에서 {channel_label} 발송 접수"
+            ),
             session_id=_assignment_session_id(),
         )
         if crm_result.get("ok"):
