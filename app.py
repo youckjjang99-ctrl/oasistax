@@ -667,7 +667,7 @@ def _navigate_to_main_menu(target: str) -> None:
         "홈": "주요업무",
         "업무함": "주요업무",
         "DB발굴": "주요업무",
-        "기업등록": "주요업무",
+        "기업정보등록": "주요업무",
         "기업 컨설팅": "주요업무",
         "경정청구": "주요업무",
         "AI 코파일럿": "주요업무",
@@ -808,7 +808,7 @@ def render_home_page(user_id, user_name=""):
         use_container_width=True,
         key="home_open_registration_v1020",
         on_click=_navigate_to_main_menu,
-        args=("기업등록",),
+        args=("기업정보등록",),
     )
     quick_cols[2].button(
         "기업 컨설팅 열기",
@@ -1860,7 +1860,7 @@ with st.sidebar:
             "홈": "홈",
             "업무함": "업무함",
             "DB발굴": "DB발굴",
-            "기업등록": "기업등록",
+            "기업정보등록": "기업등록",
             "기업 컨설팅": "기업관리센터",
             "경정청구": "경정청구",
             "AI 코파일럿": "AI 코파일럿",
@@ -1896,9 +1896,9 @@ with st.sidebar:
         "active_main_menu_v1020",
         st.session_state.get("active_main_menu_v311"),
     )
-    if current_sidebar_value == "크레탑 자동등록":
-        st.session_state["active_main_menu_v1020"] = "기업등록"
-        current_sidebar_value = "기업등록"
+    if current_sidebar_value in {"크레탑 자동등록", "기업등록"}:
+        st.session_state["active_main_menu_v1020"] = "기업정보등록"
+        current_sidebar_value = "기업정보등록"
     if current_sidebar_value == "영업후보DB":
         st.session_state["active_main_menu_v1020"] = "DB발굴"
         current_sidebar_value = "DB발굴"
@@ -1932,7 +1932,7 @@ with st.sidebar:
         "홈": "홈",
         "업무함": "업무함",
         "DB발굴": "DB발굴",
-        "기업등록": "기업등록",
+        "기업정보등록": "기업정보등록",
         "기업 컨설팅": "기업 컨설팅",
         "경정청구": "경정청구",
         "AI 코파일럿": "AI 코파일럿",
@@ -2673,18 +2673,39 @@ elif active_tab == "주가평가":
 elif active_tab == "기업등록":
     from cretop_runner import run_cretop_worker
     from stock_valuation import save_cretop_financial_snapshot
+    from enterprise_documents import render_enterprise_information_assets
+
+    st.markdown("## 기업정보등록")
+    st.caption(
+        "기업 기본정보와 상담·등기·인사·정관·연구개발·세무자료를 "
+        "한 기업에 연결해 등록합니다."
+    )
 
     registration_type = st.radio(
-        "등록할 사업자 유형",
-        ["법인사업자 - 크레탑 PDF", "개인사업자 - 종합소득세 신고서"],
+        "등록할 기업정보 유형",
+        [
+            "법인사업자 - 크레탑 PDF",
+            "개인사업자 - 종합소득세 신고서",
+            "기존 기업 - 첨부자료 통합등록",
+        ],
         horizontal=True,
         key="enterprise_registration_type",
     )
+    if registration_type.startswith("기존 기업"):
+        render_enterprise_information_assets(
+            CURRENT_USER_ID,
+            CURRENT_USER_NAME,
+        )
+        st.stop()
     if registration_type.startswith("개인사업자"):
         render_personal_business_registration(
             CURRENT_USER_ID,
             CURRENT_USER_NAME,
             USER_UPLOAD_DIR,
+        )
+        render_enterprise_information_assets(
+            CURRENT_USER_ID,
+            CURRENT_USER_NAME,
         )
         st.stop()
 
@@ -2867,6 +2888,36 @@ elif active_tab == "기업등록":
                     extracted_data,
                     source="cretop",
                 )
+                try:
+                    from enterprise_documents import (
+                        register_existing_enterprise_document,
+                    )
+
+                    register_existing_enterprise_document(
+                        pdf_save_path,
+                        user_id=CURRENT_USER_ID,
+                        business_no=extracted_data.get(
+                            "사업자등록번호",
+                            "",
+                        ),
+                        company_name=extracted_data.get("업체명", ""),
+                        document_type="cretop_report",
+                        analysis_summary="크레탑 기업종합보고서 분석을 완료했습니다.",
+                        extracted_fields={
+                            key: extracted_data.get(key, "")
+                            for key in (
+                                "매출액",
+                                "영업이익",
+                                "당기순이익",
+                                "자산총계",
+                                "부채총계",
+                                "자본총계",
+                            )
+                        },
+                    )
+                except Exception:
+                    # 기존 고객등록과 재무 스냅샷은 첨부 연결 오류와 무관하게 유지합니다.
+                    pass
                 if is_dup:
                     sync_customer_snapshot(
                         CURRENT_USER_ID,
@@ -3188,6 +3239,11 @@ elif active_tab == "기업등록":
                             st.success(
                                 "기존 고객의 정책자금 매칭설정은 정상 저장했습니다."
                             )
+
+    render_enterprise_information_assets(
+        CURRENT_USER_ID,
+        CURRENT_USER_NAME,
+    )
 
 elif active_tab == "실행이력":
     history_df = read_run_history(CURRENT_USER_ID)

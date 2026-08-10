@@ -505,6 +505,22 @@ def render_enterprise_management_center(
     crm_widget_suffix = f"{user_id}:{customer_key}"
 
     financial = _financial_snapshot(user_id, business_no)
+    try:
+        from enterprise_documents import load_enterprise_document_context
+
+        document_context = load_enterprise_document_context(
+            user_id,
+            business_no,
+            company_name,
+        )
+    except Exception:
+        document_context = {}
+    # 세무조정계산서 추출값은 기존 크레탑/고객DB 값이 비어 있을 때만
+    # 보완값으로 사용합니다. 기존 확정값은 절대 덮어쓰지 않습니다.
+    financial = _merge_snapshot_data(
+        document_context.get("financial_fields", {}),
+        financial,
+    )
     crm_record = get_customer_record(
         user_id,
         customer_key,
@@ -768,6 +784,38 @@ def render_enterprise_management_center(
                 hide_index=True,
                 use_container_width=True,
             )
+
+        try:
+            from enterprise_documents import (
+                DOCUMENT_TYPES,
+                UPLOAD_DOCUMENT_TYPES,
+                load_enterprise_source_overview,
+            )
+
+            source_overview = load_enterprise_source_overview(
+                user_id,
+                business_no,
+                company_name,
+            )
+            st.markdown("#### 연결된 기업자료")
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "자료": DOCUMENT_TYPES[item],
+                        "상태": (
+                            "반영됨"
+                            if source_overview[item]["available"]
+                            else "미등록"
+                        ),
+                        "연결 건수": source_overview[item]["count"],
+                    }
+                    for item in UPLOAD_DOCUMENT_TYPES
+                ]),
+                hide_index=True,
+                use_container_width=True,
+            )
+        except Exception:
+            st.caption("연결된 기업자료 현황을 불러오지 못했습니다.")
 
     elif selected_section == "CRM":
         from cloud_sync import sync_crm_record
@@ -1113,6 +1161,7 @@ def render_enterprise_management_center(
             user_id=user_id,
             business_no=business_no,
             company_name=company_name,
+            customer_id=str(selected_row.get("_customer_id", "") or ""),
         )
 
     elif selected_section == "기업히스토리":
@@ -1159,6 +1208,7 @@ def render_enterprise_management_center(
             business_no=business_no,
             company_name=company_name,
             company_address=company_address,
+            customer_id=str(selected_row.get("_customer_id", "") or ""),
         )
 
     elif selected_section == "가지급금 계산기":

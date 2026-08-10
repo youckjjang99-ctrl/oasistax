@@ -1123,6 +1123,25 @@ def _render_registry_upload(
                         share_key = f"stock_shares_{index}"
                         if not st.session_state.get(share_key):
                             st.session_state[share_key] = issued
+                try:
+                    from enterprise_documents import register_existing_enterprise_document
+
+                    register_existing_enterprise_document(
+                        registry_path,
+                        user_id=user_id,
+                        business_no=saved_registry_business_no,
+                        company_name=current_company_name,
+                        document_type="corporate_registry",
+                        customer_id=str(
+                            selected_row.get("_customer_id", "") or ""
+                        ),
+                        analysis_summary="법인 등기사항증명서 분석을 완료했습니다.",
+                        extracted_fields=dict(registry_data or {}),
+                    )
+                except Exception:
+                    # 등기 분석 결과와 기존 캐시는 유지하고 첨부자료 연결만
+                    # 다음 등록 시 다시 시도할 수 있도록 합니다.
+                    pass
                 st.success(
                     "등기자료를 현재 기업과 연결해 저장했습니다. "
                     "기존 당기순이익과 재무 입력값은 유지됩니다."
@@ -1252,6 +1271,22 @@ def _render_stock_history(user_id: str) -> None:
             _apply_loaded_record(record)
             st.success("저장된 평가자료를 불러왔습니다.")
             st.rerun()
+
+
+def render_registry_upload_for_customer(
+    user_id: str,
+    business_no: Any,
+    company_name: Any = "",
+) -> None:
+    """Render the existing registry workflow for one registered customer."""
+    customers = _read_customers(user_id)
+    selected_row = _load_stock_customer_context(
+        user_id,
+        customers,
+        selected_business_no=business_no,
+        selected_company_name=company_name,
+    )
+    _render_registry_upload(user_id, selected_row)
 
 
 def render_stock_valuation_page(
