@@ -820,7 +820,6 @@ def render_enterprise_management_center(
     elif selected_section == "상담일지":
         from cloud_sync import sync_crm_record
         from consultation_journal import (
-            render_audio_consultation_journal,
             render_saved_consultation_journals,
         )
 
@@ -973,9 +972,8 @@ def render_enterprise_management_center(
                         business_no,
                         updated_crm,
                     )
-                    # The save button already caused Streamlit's normal rerun.
-                    # Keep the fresh record available to the audio section below
-                    # instead of starting a second full-page rerun.
+                    # Keep the current render synchronized without forcing
+                    # a second full-page rerun after saving CRM changes.
                     crm_record = updated_crm
                     crm_profile = profile
                     st.success(
@@ -983,21 +981,6 @@ def render_enterprise_management_center(
                     )
                 else:
                     st.error(message)
-
-            st.divider()
-            render_audio_consultation_journal(
-                user_id=user_id,
-                customer_key=customer_key,
-                company_name=company_name,
-                business_no=business_no,
-                consultant_name=(
-                    crm_profile.get("assigned_manager")
-                    or user_name
-                    or ""
-                ),
-                current_crm=crm_record,
-            )
-
 
         else:
             render_saved_consultation_journals(
