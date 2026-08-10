@@ -157,6 +157,8 @@ def test_menu_and_requested_document_labels_are_present():
     module_source = Path("enterprise_documents.py").read_text(encoding="utf-8")
 
     assert '"기업정보등록": "기업등록"' in app_source
+    assert "기존 기업 - 첨부자료 통합등록" not in app_source
+    assert 'registration_type.startswith("기존 기업")' not in app_source
     for label in [
         "녹음파일",
         "법인등기사항증명서",

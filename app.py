@@ -2686,17 +2686,10 @@ elif active_tab == "기업등록":
         [
             "법인사업자 - 크레탑 PDF",
             "개인사업자 - 종합소득세 신고서",
-            "기존 기업 - 첨부자료 통합등록",
         ],
         horizontal=True,
         key="enterprise_registration_type",
     )
-    if registration_type.startswith("기존 기업"):
-        render_enterprise_information_assets(
-            CURRENT_USER_ID,
-            CURRENT_USER_NAME,
-        )
-        st.stop()
     if registration_type.startswith("개인사업자"):
         render_personal_business_registration(
             CURRENT_USER_ID,
