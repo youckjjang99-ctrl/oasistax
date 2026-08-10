@@ -298,6 +298,77 @@ class SolapiAlimtalkClientTests(unittest.TestCase):
         self.assertNotIn("".join(("010", "1234", "5678")), str(raised.exception))
         self.assertNotIn("one-time-private-token", str(raised.exception))
 
+    @patch("solapi_alimtalk_client.requests.get")
+    def test_get_template_preview_returns_content_without_identifiers(
+        self,
+        get,
+    ) -> None:
+        get.return_value = _Response(
+            {
+                "templateList": [
+                    {
+                        "templateId": "private-template-id",
+                        "channelId": "private-channel-id",
+                        "content": "#{고객명}님, https://#{인증링크}",
+                        "status": "APPROVED",
+                        "buttons": [
+                            {
+                                "buttonName": "인증하기",
+                                "linkMo": "https://#{인증링크}",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+
+        preview = _client().get_template_preview("private-template-id")
+
+        self.assertEqual(
+            preview,
+            {
+                "content": "#{고객명}님, https://#{인증링크}",
+                "status": "APPROVED",
+                "buttons": [
+                    {
+                        "name": "인증하기",
+                        "mobile_url": "https://#{인증링크}",
+                    }
+                ],
+            },
+        )
+        self.assertNotIn("private-template-id", repr(preview))
+        self.assertNotIn("private-channel-id", repr(preview))
+        request = get.call_args
+        self.assertEqual(
+            request.args[0],
+            "https://api.solapi.com/kakao/v2/templates/",
+        )
+        self.assertEqual(request.kwargs["params"]["limit"], 1)
+        self.assertTrue(
+            request.kwargs["headers"]["Authorization"].startswith(
+                "HMAC-SHA256 apiKey=test-api-key, "
+            )
+        )
+
+    @patch("solapi_alimtalk_client.requests.get")
+    def test_get_template_preview_failure_is_redacted(self, get) -> None:
+        get.return_value = _Response(
+            {"private": "provider detail"},
+            ok=False,
+            status_code=403,
+            text="private-api-secret private-template-id",
+        )
+
+        with self.assertRaises(SolapiAlimtalkError) as raised:
+            _client(api_secret="private-api-secret").get_template_preview(
+                "private-template-id"
+            )
+
+        self.assertEqual(raised.exception.code, "HTTP_ERROR")
+        self.assertNotIn("private-api-secret", str(raised.exception))
+        self.assertNotIn("private-template-id", str(raised.exception))
+
     def test_environment_readiness_reports_names_not_values(self) -> None:
         template_env = "SOLAPI_TEMPLATE_AUTH_RESUME_ID"
         missing = environment_readiness(

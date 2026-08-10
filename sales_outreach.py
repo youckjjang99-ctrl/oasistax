@@ -433,6 +433,127 @@ def claim_auth_alimtalk_readiness(
     }
 
 
+def claim_auth_alimtalk_template_preview(
+    template_code: Any = SOLAPI_ALIMTALK_DEFAULT_TEMPLATE_CODE,
+    *,
+    client: SolapiAlimtalkClient | None = None,
+) -> dict[str, Any]:
+    """Load display-safe content for one approved Solapi template."""
+
+    template = _claim_auth_template_spec(template_code)
+    if template is None:
+        return {
+            "ok": False,
+            "code": "TEMPLATE_NOT_ALLOWED",
+            "message": "선택할 수 없는 알림톡 템플릿입니다.",
+            "label": "",
+            "content": "",
+            "status": "",
+            "buttons": [],
+        }
+    source = os.environ
+    provider_readiness = solapi_environment_readiness(
+        source,
+        required_template_env_names=(template["env_name"],),
+    )
+    if not provider_readiness.get("ready"):
+        return {
+            "ok": False,
+            "code": "CONFIGURATION_MISSING",
+            "message": "승인 템플릿 내용을 불러오기 위한 설정이 필요합니다.",
+            "label": template["label"],
+            "content": "",
+            "status": "",
+            "buttons": [],
+        }
+    try:
+        provider = client or SolapiAlimtalkClient(
+            SolapiAlimtalkConfig.from_env(source)
+        )
+        preview = provider.get_template_preview(
+            str(source.get(template["env_name"], "") or "")
+        )
+    except SolapiAlimtalkError as exc:
+        return {
+            "ok": False,
+            "code": re.sub(
+                r"[^A-Z0-9_-]",
+                "_",
+                str(exc.code or "TEMPLATE_LOOKUP_FAILED").upper(),
+            )[:80],
+            "message": "승인 템플릿 내용을 불러오지 못했습니다.",
+            "label": template["label"],
+            "content": "",
+            "status": "",
+            "buttons": [],
+        }
+    except Exception:
+        return {
+            "ok": False,
+            "code": "TEMPLATE_LOOKUP_FAILED",
+            "message": "승인 템플릿 내용을 불러오지 못했습니다.",
+            "label": template["label"],
+            "content": "",
+            "status": "",
+            "buttons": [],
+        }
+    return {
+        "ok": True,
+        "code": "READY",
+        "message": "승인 템플릿 내용을 불러왔습니다.",
+        "label": template["label"],
+        "content": str(preview.get("content") or ""),
+        "status": str(preview.get("status") or ""),
+        "buttons": [
+            {
+                "name": str(button.get("name") or ""),
+                "mobile_url": str(button.get("mobile_url") or ""),
+            }
+            for button in preview.get("buttons") or []
+            if isinstance(button, Mapping)
+        ],
+    }
+
+
+def render_claim_auth_alimtalk_preview(
+    preview: Mapping[str, Any],
+    customer_name: Any,
+    auth_link: Any,
+) -> dict[str, Any]:
+    """Apply the two approved variables to display-only template content."""
+
+    def clean_value(value: Any, fallback: str, limit: int) -> str:
+        clean = "".join(
+            character
+            for character in str(value or "").strip()
+            if ord(character) >= 32 or character in {"\n", "\t"}
+        )[:limit]
+        return clean or fallback
+
+    values = {
+        "#{고객명}": clean_value(customer_name, "[고객이름 입력값]", 50),
+        "#{인증링크}": clean_value(auth_link, "[인증주소 입력값]", 500),
+    }
+
+    def apply_values(value: Any) -> str:
+        rendered = str(value or "")
+        for placeholder, replacement in values.items():
+            rendered = rendered.replace(placeholder, replacement)
+        return rendered
+
+    return {
+        "content": apply_values(preview.get("content")),
+        "buttons": [
+            {
+                "name": apply_values(button.get("name")),
+                "mobile_url": apply_values(button.get("mobile_url")),
+            }
+            for button in preview.get("buttons") or []
+            if isinstance(button, Mapping)
+        ],
+    }
+
+
 def _normalize_local_mobile(recipient: str) -> str | None:
     raw = str(recipient or "").strip()
     if not raw or not _PHONE_ALLOWED_PATTERN.fullmatch(raw):
@@ -747,9 +868,40 @@ def _valid_idempotency_key(value: str) -> bool:
     return bool(_SAFE_IDEMPOTENCY_PATTERN.fullmatch(str(value or "").strip()))
 
 
+def outreach_send_window(
+    channel: Any,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Return the public send-window status in Asia/Seoul."""
+
+    clean_channel = str(channel or "").strip().lower()
+    if clean_channel not in {CHANNEL_SMS, CHANNEL_KAKAO}:
+        return {
+            "allowed": True,
+            "code": "READY",
+            "message": "현재 발송할 수 있습니다.",
+        }
+    seoul = ZoneInfo("Asia/Seoul")
+    current = now or datetime.now(seoul)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=seoul)
+    else:
+        current = current.astimezone(seoul)
+    allowed = 8 <= current.hour < 21
+    return {
+        "allowed": allowed,
+        "code": "READY" if allowed else "NIGHT_SEND_BLOCKED",
+        "message": (
+            "현재 발송할 수 있습니다."
+            if allowed
+            else "문자·카카오톡 영업 발송은 오전 8시부터 오후 9시 전까지만 가능합니다."
+        ),
+    }
+
+
 def _within_standard_send_hours() -> bool:
-    hour = datetime.now(ZoneInfo("Asia/Seoul")).hour
-    return 8 <= hour < 21
+    return bool(outreach_send_window(CHANNEL_KAKAO).get("allowed"))
 
 
 def _response_json(response: Any) -> dict[str, Any] | None:
@@ -1299,7 +1451,10 @@ __all__ = [
     "SOLAPI_CLAIM_AUTH_TEMPLATE_LABEL",
     "claim_auth_alimtalk_templates",
     "claim_auth_alimtalk_readiness",
+    "claim_auth_alimtalk_template_preview",
     "channel_readiness",
+    "outreach_send_window",
+    "render_claim_auth_alimtalk_preview",
     "send_claim_auth_alimtalk",
     "validate_message",
     "validate_claim_auth_alimtalk",
