@@ -16,7 +16,12 @@ import streamlit as st
 from consulting_report import render_ai_consulting_report_page
 from tax_diagnosis import render_tax_diagnosis_page
 from consultation_journal import load_company_consultation_context
-from cloud_sync import load_financial_snapshot, load_stock_valuations
+from cloud_sync import (
+    load_financial_snapshot,
+    load_registry_snapshot,
+    load_stock_valuations,
+)
+from enterprise_documents import load_enterprise_document_context
 from matching_preferences import get_matching_preferences
 from consulting_priority_engine import build_priority_recommendations
 from data_safety_storage import (
@@ -838,6 +843,51 @@ def _load_integrated_company_context(
     if not isinstance(financial, dict):
         financial = {}
 
+    try:
+        registry = load_registry_snapshot(
+            user_id,
+            normalized_no,
+            company_name=company_name,
+        )
+    except Exception:
+        registry = {}
+    try:
+        from employee_status import get_latest_employee_status
+
+        employee_status = get_latest_employee_status(
+            user_id,
+            normalized_no,
+            company_name,
+        )
+    except Exception:
+        employee_status = {}
+    try:
+        from articles_review import get_latest_articles_review
+
+        articles_review = get_latest_articles_review(
+            user_id,
+            normalized_no,
+            company_name,
+        )
+    except Exception:
+        articles_review = {}
+    try:
+        enterprise_documents = load_enterprise_document_context(
+            user_id,
+            normalized_no,
+            company_name,
+        )
+    except Exception:
+        enterprise_documents = {}
+    for key, value in dict(
+        enterprise_documents.get("financial_fields", {}) or {}
+    ).items():
+        current = financial.get(key)
+        if current is None or str(current).strip().lower() in {
+            "", "-", "none", "nan", "nat", "<na>"
+        }:
+            financial[key] = value
+
     journal_text_parts: list[str] = []
     transcript_count = 0
     for journal in journals:
@@ -883,14 +933,40 @@ def _load_integrated_company_context(
             _clean(inputs.get("valuation_type", "")),
         ])
 
+    registered_source_tags: list[str] = []
+    if registry:
+        registered_source_tags.append("법인등기 등록됨")
+    if employee_status:
+        registered_source_tags.append("4대보험 가입자명부 등록됨")
+    if articles_review:
+        registered_source_tags.append("정관 등록됨")
+    document_types = {
+        str(item.get("document_type", ""))
+        for item in (enterprise_documents.get("records", []) or [])
+        if isinstance(item, dict)
+    }
+    if "rnd_certificate" in document_types:
+        registered_source_tags.append("연구개발부서 인정서 등록됨")
+    if "tax_adjustment" in document_types:
+        registered_source_tags.append("세무조정계산서 등록됨")
     combined_text = " ".join(
-        part for part in [*stock_text_parts, *journal_text_parts] if part
+        part
+        for part in [
+            *stock_text_parts,
+            *journal_text_parts,
+            *registered_source_tags,
+        ]
+        if part
     )
 
     return {
         "stock_records": stock_records,
         "latest_stock": latest_stock,
         "financial": financial,
+        "registry": registry,
+        "employee_status": employee_status,
+        "articles_review": articles_review,
+        "enterprise_documents": enterprise_documents,
         "journals": journals,
         "transcript_count": transcript_count,
         "combined_text": combined_text,
@@ -1281,15 +1357,39 @@ def render_copilot_page(
     latest_stock = integrated_context.get("latest_stock", {})
     if not isinstance(latest_stock, dict):
         latest_stock = {}
+    financial = integrated_context.get("financial", {}) or {}
+    registry = integrated_context.get("registry", {}) or {}
+    employee_status = integrated_context.get("employee_status", {}) or {}
+    articles_review = integrated_context.get("articles_review", {}) or {}
+    enterprise_documents = integrated_context.get("enterprise_documents", {}) or {}
 
     st.markdown("### AI 분석 반영자료")
     source_columns = st.columns(4, gap="medium")
     source_columns[0].metric("고객 기본정보", "반영")
-    source_columns[1].metric("주가평가", f"{len(stock_records)}건")
-    source_columns[2].metric("상담일지", f"{len(journals)}건")
-    source_columns[3].metric("녹취내용", f"{transcript_count}건")
+    source_columns[1].metric("재무·크레탑", "반영" if financial else "미등록")
+    source_columns[2].metric("법인등기", "반영" if registry else "미등록")
+    source_columns[3].metric("4대보험 명부", "반영" if employee_status else "미등록")
+    source_columns = st.columns(4, gap="medium")
+    source_columns[0].metric("정관", "반영" if articles_review else "미등록")
+    source_columns[1].metric(
+        "추가 기업자료",
+        f"{len(enterprise_documents.get('records', []) or [])}건",
+    )
+    source_columns[2].metric("주가평가", f"{len(stock_records)}건")
+    source_columns[3].metric(
+        "상담·녹취",
+        f"{len(journals)}건 / {transcript_count}건",
+    )
 
-    if not stock_records and not journals:
+    if not any([
+        stock_records,
+        journals,
+        financial,
+        registry,
+        employee_status,
+        articles_review,
+        enterprise_documents.get("records", []),
+    ]):
         st.warning(
             "이 기업의 사업자등록번호 또는 법인명이 저장자료와 연결되지 않았습니다. "
             "기업컨설팅에서 동일 기업을 선택해 주가평가·상담일지를 저장했는지 확인해주세요."
@@ -1331,6 +1431,22 @@ def render_copilot_page(
                     )
                     if summary:
                         st.caption(summary[:1000])
+
+            connected_records = enterprise_documents.get("records", []) or []
+            if connected_records:
+                st.markdown("#### 기업정보등록 첨부자료")
+                st.dataframe(
+                    pd.DataFrame([
+                        {
+                            "자료": item.get("document_label", ""),
+                            "등록일": str(item.get("uploaded_at", ""))[:19],
+                            "분석": item.get("analysis_summary", ""),
+                        }
+                        for item in connected_records[:20]
+                    ]),
+                    hide_index=True,
+                    use_container_width=True,
+                )
 
     saved_policy_items = preferences.get("저장정책자금", []) or []
     saved_policy_items = [

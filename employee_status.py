@@ -2006,6 +2006,7 @@ def render_employee_status(
     business_no: str,
     company_name: str,
     company_address: str = "",
+    customer_id: str = "",
 ) -> None:
     st.markdown("#### 직원현황")
     st.caption(
@@ -2172,6 +2173,30 @@ def render_employee_status(
                     if isinstance(workplace, dict)
                 )
             )
+            try:
+                from enterprise_documents import register_enterprise_document_bytes
+
+                for uploaded in uploaded_files:
+                    register_enterprise_document_bytes(
+                        user_id,
+                        business_no,
+                        company_name,
+                        "employee_roster",
+                        uploaded.name,
+                        uploaded.getvalue(),
+                        customer_id=customer_id,
+                        analysis_summary=(
+                            f"4대보험 가입자명부에서 직원 {len(deduped_rows)}명을 "
+                            "분석했습니다."
+                        ),
+                        extracted_fields={
+                            "employee_count": len(deduped_rows),
+                            "expected_count": expected_count,
+                        },
+                    )
+            except Exception:
+                # 검토표와 기존 직원현황 저장 흐름은 첨부 연결 오류와 무관하게 유지합니다.
+                pass
             st.session_state[state_key] = {
                 "rows": deduped_rows,
                 "expected_count": expected_count,

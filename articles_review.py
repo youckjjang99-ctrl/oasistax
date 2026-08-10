@@ -374,6 +374,7 @@ def render_articles_review(
     user_id: str,
     business_no: str,
     company_name: str,
+    customer_id: str = "",
 ) -> None:
     st.markdown("#### 정관 AI 검토")
     st.caption(
@@ -445,6 +446,29 @@ def render_articles_review(
                     uploaded.name,
                     analysis,
                 )
+                try:
+                    from enterprise_documents import register_enterprise_document_bytes
+
+                    register_enterprise_document_bytes(
+                        user_id,
+                        business_no,
+                        company_name,
+                        "articles",
+                        uploaded.name,
+                        uploaded.getvalue(),
+                        customer_id=customer_id,
+                        analysis_summary="정관 AI 검토를 완료했습니다.",
+                        extracted_fields={
+                            "score": analysis.get("score", 0),
+                            "priority_count": len(
+                                analysis.get("priority_items", []) or []
+                            ),
+                            "extraction_method": extraction.get("method", ""),
+                        },
+                    )
+                except Exception:
+                    # 정관 분석 결과는 이미 안전하게 저장됐으므로 유지합니다.
+                    pass
                 progress.progress(
                     1.0,
                     text="정관 분석 완료",

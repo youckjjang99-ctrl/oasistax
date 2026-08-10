@@ -233,6 +233,8 @@ def save_customer_event(
     occurred_at: str = "",
     source: str = "consultation",
     *,
+    history_type: str = "상담",
+    extra_data: dict[str, Any] | None = None,
     return_status: bool = False,
 ) -> dict[str, Any]:
     user_id = require_owner_context(user_id)
@@ -254,11 +256,13 @@ def save_customer_event(
             )
     captured_at = occurred_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     event_data = {
-        "히스토리유형": "상담",
+        "히스토리유형": str(history_type or "상담"),
         "이벤트ID": event_id,
         "상담제목": event_title,
         "상담내용": event_detail,
     }
+    if isinstance(extra_data, dict):
+        event_data.update(extra_data)
     snapshot = {
         "captured_at": captured_at,
         "source": source,
