@@ -1099,19 +1099,11 @@ def render_enterprise_management_center(
     elif selected_section == "주가평가·등기":
         from stock_valuation import render_stock_valuation_page
 
-        selected_stock_label = (
-            f"{company_name} · {business_no}"
-            if business_no
-            else company_name
-        )
-        if selected_stock_label:
-            st.session_state["stock_customer_selector"] = (
-                selected_stock_label
-            )
-
         render_stock_valuation_page(
             user_id=user_id,
             user_name=user_name,
+            selected_business_no=business_no,
+            selected_company_name=company_name,
         )
 
     elif selected_section == "정관검토":
