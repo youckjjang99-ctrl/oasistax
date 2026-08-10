@@ -375,21 +375,23 @@ def render_articles_review(
     business_no: str,
     company_name: str,
     customer_id: str = "",
+    allow_upload: bool = True,
 ) -> None:
     st.markdown("#### 정관 AI 검토")
-    st.caption(
-        "텍스트 PDF는 즉시 분석하고, 스캔 PDF는 한글 OCR을 자동 실행합니다. "
-        "절세·퇴직·유족보상·가업승계·투자유치 관점에서 보완사항을 확인합니다."
-    )
-
-    uploaded = st.file_uploader(
-        "정관 파일 업로드",
-        type=[
-            "pdf", "hwp", "docx", "txt",
-            "png", "jpg", "jpeg", "webp", "tif", "tiff",
-        ],
-        key=f"articles_upload_{business_no or company_name}",
-    )
+    uploaded = None
+    if allow_upload:
+        st.caption(
+            "텍스트 PDF는 즉시 분석하고, 스캔 PDF는 한글 OCR을 자동 실행합니다. "
+            "절세·퇴직·유족보상·가업승계·투자유치 관점에서 보완사항을 확인합니다."
+        )
+        uploaded = st.file_uploader(
+            "정관 파일 업로드",
+            type=[
+                "pdf", "hwp", "docx", "txt",
+                "png", "jpg", "jpeg", "webp", "tif", "tiff",
+            ],
+            key=f"articles_upload_{business_no or company_name}",
+        )
 
     if uploaded is not None and st.button(
         "정관 분석 실행",
@@ -487,7 +489,11 @@ def render_articles_review(
         company_name,
     )
     if not review:
-        st.info("저장된 정관검토 결과가 없습니다.")
+        st.info(
+            "저장된 정관검토 결과가 없습니다."
+            if allow_upload
+            else "기업정보등록에서 정관 등록 시 분석됩니다."
+        )
         return
 
     c1, c2, c3 = st.columns(3)

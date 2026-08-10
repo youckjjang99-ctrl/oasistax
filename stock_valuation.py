@@ -809,18 +809,6 @@ def _restore_stock_financial_inputs(values: dict[str, Any]) -> None:
             st.session_state[key] = value
 
 
-def _compare_values(label: str, left: Any, right: Any) -> dict[str, Any]:
-    left_text = str(left or "").strip()
-    right_text = str(right or "").strip()
-    same = bool(left_text and right_text and left_text == right_text)
-    return {
-        "항목": label,
-        "기존값": left_text,
-        "등기값": right_text,
-        "일치": "일치" if same else ("차이" if left_text and right_text else "확인"),
-    }
-
-
 def _apply_loaded_record(record: dict[str, Any]) -> None:
     st.session_state["stock_loaded_record_id"] = record.get("record_id", "")
     st.session_state["stock_company_name"] = record.get("company_name", "")
@@ -1152,67 +1140,6 @@ def _render_registry_upload(
                     "못했습니다. 기업컨설팅에서 업체를 다시 선택해주세요."
                 )
             st.rerun()
-
-    registry_data = st.session_state.get("stock_last_registry_data", {})
-    if registry_data:
-        st.markdown("#### 등기자료 추출값")
-        registry_preview = pd.DataFrame(
-            [
-                ["법인명", registry_data.get("법인명", "")],
-                ["법인등록번호", registry_data.get("법인등록번호", "")],
-                ["본점소재지", registry_data.get("본점소재지", "")],
-                ["법인설립일", registry_data.get("법인설립일", "")],
-                ["자본금", _format_number(registry_data.get("자본금"))],
-                [
-                    "발행할 주식 총수",
-                    _format_number(registry_data.get("발행할주식총수")),
-                ],
-                [
-                    "발행주식 총수",
-                    _format_number(registry_data.get("발행주식총수")),
-                ],
-                [
-                    "1주의 금액",
-                    _format_number(registry_data.get("1주당액면가액")),
-                ],
-            ],
-            columns=["항목", "추출값"],
-        )
-        st.dataframe(
-            registry_preview,
-            hide_index=True,
-            use_container_width=True,
-        )
-
-        compare_rows = [
-            _compare_values(
-                "법인명",
-                st.session_state.get("stock_company_name", ""),
-                registry_data.get("법인명", ""),
-            ),
-            _compare_values(
-                "법인등록번호",
-                st.session_state.get("stock_corporate_no", ""),
-                registry_data.get("법인등록번호", ""),
-            ),
-            _compare_values(
-                "본점소재지",
-                st.session_state.get("stock_address", ""),
-                registry_data.get("본점소재지", ""),
-            ),
-            _compare_values(
-                "설립일",
-                st.session_state.get("stock_establishment", ""),
-                registry_data.get("법인설립일", ""),
-            ),
-        ]
-        st.markdown("#### 기존 정보와 비교")
-        st.dataframe(
-            pd.DataFrame(compare_rows),
-            hide_index=True,
-            use_container_width=True,
-        )
-
 
 def _render_stock_history(user_id: str) -> None:
     st.divider()

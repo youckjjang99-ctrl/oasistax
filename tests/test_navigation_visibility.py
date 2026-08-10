@@ -42,9 +42,9 @@ class NavigationVisibilityTests(unittest.TestCase):
         source = (ROOT / "enterprise_center.py").read_text(encoding="utf-8")
         expected_labels = [
             "기업정보",
-            "CRM",
+            "상담일지",
             "정책자금",
-            "주가평가·등기",
+            "주가평가",
             "정관검토",
             "기업히스토리",
             "직원현황",
@@ -64,9 +64,9 @@ class NavigationVisibilityTests(unittest.TestCase):
         self.assertIn("crm_section = st.segmented_control(", source)
         self.assertIn('if selected_section == "기업정보":', source)
         for label in [
-            "CRM",
+            "상담일지",
             "정책자금",
-            "주가평가·등기",
+            "주가평가",
             "정관검토",
             "기업히스토리",
             "직원현황",

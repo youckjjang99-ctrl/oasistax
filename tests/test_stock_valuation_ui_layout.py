@@ -160,6 +160,10 @@ def test_stock_valuation_top_keeps_only_registry_registration():
     assert "등록된 등기정보 불러오기" not in registry_source
     assert "등기사항증명서 업로드" in registry_source
     assert "등기자료 분석·등록" in registry_source
+    assert "등기자료 추출값" not in registry_source
+    assert "기존 정보와 비교" not in registry_source
+    assert "_restore_registry_for_business" in registry_source
+    assert "_apply_registry_data" in registry_source
 
     upload_at = render_source.index("_render_registry_upload")
     form_at = render_source.index("with st.form")
@@ -170,10 +174,24 @@ def test_stock_valuation_top_keeps_only_registry_registration():
 
 def test_enterprise_center_passes_selected_company_context():
     source = (ROOT / "enterprise_center.py").read_text(encoding="utf-8")
-    route_start = source.index('elif selected_section == "주가평가·등기":')
+    route_start = source.index('elif selected_section == "주가평가":')
     route_end = source.index('elif selected_section == "정관검토":')
     route = source[route_start:route_end]
 
     assert "stock_customer_selector" not in route
     assert "selected_business_no=business_no" in route
     assert "selected_company_name=company_name" in route
+
+
+def test_enterprise_center_uses_read_only_document_tabs():
+    source = (ROOT / "enterprise_center.py").read_text(encoding="utf-8")
+
+    articles_start = source.index('elif selected_section == "정관검토":')
+    articles_end = source.index('elif selected_section == "기업히스토리":')
+    articles_route = source[articles_start:articles_end]
+    assert "allow_upload=False" in articles_route
+
+    employee_start = source.index('elif selected_section == "직원현황":')
+    employee_end = source.index('elif selected_section == "가지급금 계산기":')
+    employee_route = source[employee_start:employee_end]
+    assert "allow_upload=False" in employee_route
