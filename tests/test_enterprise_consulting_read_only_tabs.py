@@ -31,3 +31,19 @@ def test_employee_status_supports_read_only_mode_and_guides_registration():
         'else "기업정보등록에서 4대보험 가입자명부 등록 시 분석됩니다."'
         in source
     )
+
+
+def test_consulting_journal_hides_duplicate_audio_upload_but_keeps_history():
+    center_source = (ROOT / "enterprise_center.py").read_text(encoding="utf-8")
+    journal_start = center_source.index('elif selected_section == "상담일지":')
+    journal_end = center_source.index('elif selected_section == "정책자금":')
+    journal_route = center_source[journal_start:journal_end]
+
+    assert "render_audio_consultation_journal" not in journal_route
+    assert "render_saved_consultation_journals" in journal_route
+    assert "녹음파일 상담일지 보기" in journal_route
+
+    registration_source = (ROOT / "enterprise_documents.py").read_text(
+        encoding="utf-8"
+    )
+    assert "render_audio_consultation_journal" in registration_source
