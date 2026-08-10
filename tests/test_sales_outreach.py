@@ -37,7 +37,9 @@ from sales_outreach import (
     SMSKOREA_SENDER_ENV,
     SMSKOREA_TOKEN_URL,
     SMSKOREA_USER_ID_ENV,
+    SOLAPI_ALIMTALK_DEFAULT_TEMPLATE_CODE,
     SOLAPI_CLAIM_AUTH_TEMPLATE_ENV,
+    claim_auth_alimtalk_templates,
     claim_auth_alimtalk_readiness,
     channel_readiness,
     send_claim_auth_alimtalk,
@@ -249,6 +251,36 @@ class SalesOutreachTests(unittest.TestCase):
             if value != "true":
                 self.assertNotIn(value, readiness_text)
 
+    def test_alimtalk_template_options_are_allowlisted_and_redacted(self):
+        templates = claim_auth_alimtalk_templates()
+
+        self.assertEqual(
+            [item["code"] for item in templates],
+            ["auth_start", "auth_resume", "next_auth", "complete", "failed"],
+        )
+        self.assertEqual(
+            templates[0]["code"],
+            SOLAPI_ALIMTALK_DEFAULT_TEMPLATE_CODE,
+        )
+        self.assertNotIn("KA01", repr(templates))
+
+    def test_selected_template_readiness_requires_only_its_template_id(self):
+        values = _solapi_claim_auth_env()
+        values.pop(SOLAPI_CLAIM_AUTH_TEMPLATE_ENV)
+        values["SOLAPI_TEMPLATE_AUTH_RESUME_ID"] = "approved-resume-template"
+
+        with patch.dict(os.environ, values, clear=True):
+            resume = claim_auth_alimtalk_readiness("auth_resume")
+            start = claim_auth_alimtalk_readiness("auth_start")
+
+        self.assertTrue(resume["ready"])
+        self.assertFalse(start["ready"])
+        self.assertIn(
+            SOLAPI_CLAIM_AUTH_TEMPLATE_ENV,
+            start["missing_env_names"],
+        )
+        self.assertNotIn("approved-resume-template", repr(resume))
+
     def test_claim_auth_inputs_require_scheme_free_address(self):
         accepted = validate_claim_auth_alimtalk(
             _MOBILE,
@@ -308,6 +340,58 @@ class SalesOutreachTests(unittest.TestCase):
                 )
             ],
         )
+        self.assert_safe_result(result)
+
+    def test_claim_auth_send_uses_selected_allowlisted_template(self):
+        class _Solapi:
+            def __init__(self):
+                self.calls = []
+
+            def send_alimtalk(self, to, template_id, **kwargs):
+                self.calls.append((to, template_id, kwargs))
+
+        client = _Solapi()
+        values = _solapi_claim_auth_env()
+        values["SOLAPI_TEMPLATE_AUTH_RESUME_ID"] = "approved-resume-template"
+        with patch.dict(os.environ, values, clear=True):
+            result = send_claim_auth_alimtalk(
+                _FORMATTED_MOBILE,
+                "고객 이름",
+                "claim.example.test/c/token",
+                "claim-auth-request-selected",
+                template_code="auth_resume",
+                client=client,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(client.calls[0][1], "approved-resume-template")
+        self.assertNotEqual(
+            client.calls[0][1],
+            values[SOLAPI_CLAIM_AUTH_TEMPLATE_ENV],
+        )
+
+    def test_unknown_alimtalk_template_is_rejected_before_provider_call(self):
+        class _Solapi:
+            def __init__(self):
+                self.calls = []
+
+            def send_alimtalk(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+
+        client = _Solapi()
+        with patch.dict(os.environ, _solapi_claim_auth_env(), clear=True):
+            result = send_claim_auth_alimtalk(
+                _MOBILE,
+                "고객 이름",
+                "claim.example.test/c/token",
+                "claim-auth-request-unknown",
+                template_code="user-supplied-template",
+                client=client,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "TEMPLATE_NOT_ALLOWED")
+        self.assertEqual(client.calls, [])
         self.assert_safe_result(result)
 
     def test_claim_auth_timeout_is_delivery_unknown_and_redacted(self):

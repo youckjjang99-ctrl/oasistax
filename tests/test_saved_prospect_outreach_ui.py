@@ -482,14 +482,20 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
         self.assertNotIn("recording", source.lower())
         self.assertNotIn("evidence", source.lower())
 
-    def test_kakao_composer_uses_fixed_solapi_claim_auth_template(self):
+    def test_kakao_composer_selects_allowlisted_template_and_send_number(self):
         source = inspect.getsource(prospect._show_outreach_dialog)
 
         self.assertIn("claim_auth_alimtalk_readiness", source)
-        self.assertIn("경정청구 자료수집 인증안내", source)
+        self.assertIn("claim_auth_alimtalk_templates", source)
+        self.assertIn('"알림톡 템플릿"', source)
+        self.assertIn('"발송할 휴대폰 번호"', source)
+        self.assertIn("저장된 업체 연락처는 변경하지 않습니다", source)
         self.assertIn('"고객이름"', source)
         self.assertIn('"인증링크"', source)
         self.assertIn("http:// 또는 https://는 입력하지 말고", source)
+        self.assertIn("final_recipient", source)
+        self.assertIn("template_code=selected_template_code", source)
+        self.assertIn("발송번호 별도 지정", source)
         self.assertIn("validate_claim_auth_alimtalk", source)
         self.assertIn("send_claim_auth_alimtalk", source)
 
