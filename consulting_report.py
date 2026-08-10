@@ -160,9 +160,27 @@ def _clean(value: Any) -> str:
     if value is None:
         return ""
     text = str(value).strip()
-    if text.lower() in {"", "nan", "none", "nat"}:
+    if text.lower() in {"", "-", "nan", "none", "nat", "<na>"}:
         return ""
     return text
+
+
+def _merge_snapshot_data(
+    local: dict[str, Any] | None,
+    cloud: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge reusable company data, preferring non-empty cloud fields."""
+    merged = dict(local or {})
+    for key, value in dict(cloud or {}).items():
+        if isinstance(value, str):
+            usable = bool(_clean(value))
+        elif isinstance(value, (list, tuple, set, dict)):
+            usable = bool(value)
+        else:
+            usable = value is not None
+        if usable:
+            merged[key] = value
+    return merged
 
 
 def _number(value: Any) -> float | None:
@@ -270,14 +288,15 @@ def _financial_snapshot(
 
     normalized = _normalize_business_no(business_no)
     local = cache.get(normalized, {}) or {}
-    if local:
-        return local
 
     try:
         cloud = load_financial_snapshot(user_id, normalized)
     except Exception:
         cloud = {}
-    return cloud if isinstance(cloud, dict) else {}
+    return _merge_snapshot_data(
+        local if isinstance(local, dict) else {},
+        cloud if isinstance(cloud, dict) else {},
+    )
 
 
 def _registry_snapshot(
@@ -294,14 +313,15 @@ def _registry_snapshot(
 
     normalized = _normalize_business_no(business_no)
     local = cache.get(normalized, {}) or {}
-    if local:
-        return local
 
     try:
         cloud = load_registry_snapshot(user_id, normalized)
     except Exception:
         cloud = {}
-    return cloud if isinstance(cloud, dict) else {}
+    return _merge_snapshot_data(
+        local if isinstance(local, dict) else {},
+        cloud if isinstance(cloud, dict) else {},
+    )
 
 
 def _as_list(value: Any) -> list[str]:
@@ -1276,7 +1296,8 @@ def render_ai_consulting_report_page(
 
     if customer is None:
         customers = load_registered_customers(
-            get_user_cumulative_db_path(user_id)
+            get_user_cumulative_db_path(user_id),
+            owner_user_id=user_id,
         )
         if customers.empty:
             st.info(

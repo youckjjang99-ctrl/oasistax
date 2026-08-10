@@ -29,6 +29,66 @@ from sync_outbox import (
 )
 
 
+def _business_no_variants(value: Any) -> list[str]:
+    raw = str(value or "").strip()
+    normalized = normalize_business_no(raw)
+    digits = "".join(character for character in raw if character.isdigit())
+    return list(
+        dict.fromkeys(
+            candidate
+            for candidate in (normalized, digits, raw)
+            if candidate
+        )
+    )
+
+
+def _usable_snapshot_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in {
+            "", "-", "nan", "none", "nat", "<na>"
+        }
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
+
+
+def _merge_snapshot_data(
+    existing: dict[str, Any] | None,
+    incoming: dict[str, Any] | None,
+) -> dict[str, Any]:
+    merged = dict(existing or {})
+    for key, value in dict(incoming or {}).items():
+        if _usable_snapshot_value(value):
+            merged[key] = value
+    return merged
+
+
+def _select_snapshot_row(
+    table: str,
+    owner_user_id: str,
+    business_no: Any,
+    columns: str,
+) -> dict[str, Any]:
+    if not cloud_is_configured():
+        return {}
+    database = CloudDatabase()
+    for candidate in _business_no_variants(business_no):
+        rows = database.select(
+            table,
+            filters={
+                "owner_user_id": owner_user_id,
+                "business_no": candidate,
+            },
+            columns=columns,
+            limit=1,
+        )
+        if rows:
+            return rows[0] if isinstance(rows[0], dict) else {}
+    return {}
+
+
 def _queue_path(user_id: str) -> Path:
     return get_user_dirs(user_id)["base"] / "cloud_sync_queue.json"
 
@@ -524,14 +584,35 @@ def sync_financial_snapshot(
     if not business_no:
         return False, "사업자등록번호가 없어 재무 동기화를 건너뛰었습니다."
 
+    data = dict(financial_data or {})
+    storage_business_no = business_no
+    if cloud_is_configured():
+        try:
+            existing_row = _select_snapshot_row(
+                TABLE_FINANCIALS,
+                user_id,
+                business_no,
+                "business_no,financial_data",
+            )
+        except Exception:
+            existing_row = {}
+        if existing_row:
+            storage_business_no = str(
+                existing_row.get("business_no") or business_no
+            )
+            existing_data = existing_row.get("financial_data", {})
+            if isinstance(existing_data, dict):
+                data = _merge_snapshot_data(existing_data, data)
+    data["사업자등록번호"] = business_no
+
     return _safe_upsert(
         user_id,
         "financial",
         TABLE_FINANCIALS,
         [{
             "owner_user_id": user_id,
-            "business_no": business_no,
-            "financial_data": dict(financial_data or {}),
+            "business_no": storage_business_no,
+            "financial_data": data,
         }],
         "owner_user_id,business_no",
     )
@@ -546,14 +627,35 @@ def sync_registry_snapshot(
     if not business_no:
         return False, "사업자등록번호가 없어 등기 동기화를 건너뛰었습니다."
 
+    data = dict(registry_data or {})
+    storage_business_no = business_no
+    if cloud_is_configured():
+        try:
+            existing_row = _select_snapshot_row(
+                TABLE_REGISTRY,
+                user_id,
+                business_no,
+                "business_no,registry_data",
+            )
+        except Exception:
+            existing_row = {}
+        if existing_row:
+            storage_business_no = str(
+                existing_row.get("business_no") or business_no
+            )
+            existing_data = existing_row.get("registry_data", {})
+            if isinstance(existing_data, dict):
+                data = _merge_snapshot_data(existing_data, data)
+    data["사업자등록번호"] = business_no
+
     return _safe_upsert(
         user_id,
         "registry",
         TABLE_REGISTRY,
         [{
             "owner_user_id": user_id,
-            "business_no": business_no,
-            "registry_data": dict(registry_data or {}),
+            "business_no": storage_business_no,
+            "registry_data": data,
         }],
         "owner_user_id,business_no",
     )
@@ -568,15 +670,15 @@ def load_financial_snapshot(
     if not business_no or not cloud_is_configured():
         return {}
     try:
-        rows = CloudDatabase().select(
+        row = _select_snapshot_row(
             TABLE_FINANCIALS,
-            filters={"owner_user_id": user_id, "business_no": business_no},
-            columns="financial_data",
-            limit=1,
+            user_id,
+            business_no,
+            "financial_data",
         )
-        if not rows:
+        if not row:
             return {}
-        data = rows[0].get("financial_data", {})
+        data = row.get("financial_data", {})
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
@@ -591,15 +693,15 @@ def load_registry_snapshot(
     if not business_no or not cloud_is_configured():
         return {}
     try:
-        rows = CloudDatabase().select(
+        row = _select_snapshot_row(
             TABLE_REGISTRY,
-            filters={"owner_user_id": user_id, "business_no": business_no},
-            columns="registry_data",
-            limit=1,
+            user_id,
+            business_no,
+            "registry_data",
         )
-        if not rows:
+        if not row:
             return {}
-        data = rows[0].get("registry_data", {})
+        data = row.get("registry_data", {})
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
