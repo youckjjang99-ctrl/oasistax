@@ -32,6 +32,10 @@ RPC_SAVE_USER_NOTE = "oasis_save_user_prospect_note"
 RPC_RECORD_COMPANY_VIEWS = "oasis_record_company_views"
 RPC_ADMIN_SET_USER_LIMIT = "oasis_admin_set_sales_user_limit"
 RPC_LIST_ADMIN_AUDIT = "oasis_list_company_assignment_audit"
+RPC_SUBMIT_MOBILE_DB_REQUEST = "oasis_submit_mobile_db_request"
+RPC_LIST_USER_MOBILE_DB_REQUESTS = "oasis_list_user_mobile_db_requests"
+RPC_LIST_ADMIN_MOBILE_DB_REQUESTS = "oasis_list_admin_mobile_db_requests"
+RPC_ADMIN_UPDATE_MOBILE_DB_REQUEST = "oasis_admin_update_mobile_db_request"
 
 
 _UID_PATTERN = re.compile(
@@ -245,6 +249,20 @@ _ADMIN_ASSIGNMENT_FIELDS = _USER_ASSIGNMENT_FIELDS | {
     "target_user_id",
     "max_uncontacted",
     "total_count",
+}
+_MOBILE_DB_REQUEST_FIELDS = {
+    "request_id",
+    "requested_user_id",
+    "requested_user_name",
+    "region",
+    "district",
+    "business_type",
+    "requested_count",
+    "allocated_count",
+    "status",
+    "decision_reason",
+    "requested_at",
+    "decided_at",
 }
 
 
@@ -1772,6 +1790,183 @@ def admin_set_user_limit(
     )
 
 
+def submit_mobile_db_request(
+    current_user_id: str,
+    region: Any,
+    district: Any = "",
+    business_type: Any = "all",
+    *,
+    session_id: str = "",
+    db: CloudDatabase | None = None,
+) -> dict[str, Any]:
+    raw, error = _rpc(
+        RPC_SUBMIT_MOBILE_DB_REQUEST,
+        {
+            "p_current_user_id": _user_id(current_user_id),
+            "p_region": _bounded(region, 100),
+            "p_district": _bounded(district, 100),
+            "p_business_type": _bounded(business_type, 20).lower() or "all",
+            "p_session_id": _bounded(session_id, 200) or None,
+        },
+        db=db,
+    )
+    if error:
+        return error
+    return _mobile_request_mutation_result(
+        raw,
+        success_message="핸드폰 DB 배정 신청을 접수했습니다.",
+    )
+
+
+def list_user_mobile_db_requests(
+    current_user_id: str,
+    *,
+    limit: int = 20,
+    db: CloudDatabase | None = None,
+) -> dict[str, Any]:
+    raw, error = _rpc(
+        RPC_LIST_USER_MOBILE_DB_REQUESTS,
+        {
+            "p_current_user_id": _user_id(current_user_id),
+            "p_limit": max(1, min(int(limit), 100)),
+        },
+        db=db,
+    )
+    if error:
+        return {**error, "requests": []}
+    requests = [
+        {
+            key: value
+            for key, value in row.items()
+            if key in _MOBILE_DB_REQUEST_FIELDS
+        }
+        for row in _rows(raw)
+    ]
+    return {
+        "ok": True,
+        "code": "OK",
+        "message": "핸드폰 DB 신청내역을 불러왔습니다.",
+        "assignment": {},
+        "requests": requests,
+        "warning": "",
+        "fallback_required": False,
+    }
+
+
+def _mobile_request_mutation_result(
+    raw: Any,
+    *,
+    success_message: str,
+) -> dict[str, Any]:
+    row = _first_row(raw)
+    if row is None:
+        return _mutation_result(raw, success_message=success_message)
+    success_value = row.get("success", row.get("ok"))
+    ok = success_value is True or _text(success_value).lower() in {
+        "true",
+        "t",
+        "1",
+    }
+    code = _safe_code(row.get("code"), "OK" if ok else "REQUEST_FAILED")
+    request = {
+        key: value
+        for key, value in row.items()
+        if key in _MOBILE_DB_REQUEST_FIELDS
+    }
+    return {
+        "ok": ok,
+        "code": code,
+        "message": _safe_message(
+            code,
+            success_message=_text(row.get("message")) or success_message,
+            ok=ok,
+        ),
+        "assignment": {},
+        "request": request,
+        "warning": (
+            ""
+            if ok
+            else _FAILURE_MESSAGES.get(code, "요청을 처리하지 못했습니다.")
+        ),
+        "fallback_required": False,
+    }
+
+
+def list_admin_mobile_db_requests(
+    current_user_id: str,
+    *,
+    statuses: Sequence[str] | None = None,
+    limit: int = 200,
+    db: CloudDatabase | None = None,
+) -> dict[str, Any]:
+    raw, error = _rpc(
+        RPC_LIST_ADMIN_MOBILE_DB_REQUESTS,
+        {
+            "p_current_user_id": _user_id(current_user_id),
+            "p_statuses": [
+                _text(status).lower()
+                for status in (statuses or [])
+                if _text(status)
+            ],
+            "p_limit": max(1, min(int(limit), 1000)),
+        },
+        db=db,
+    )
+    if error:
+        return {**error, "requests": []}
+    requests = [
+        {
+            key: value
+            for key, value in row.items()
+            if key in _MOBILE_DB_REQUEST_FIELDS
+        }
+        for row in _rows(raw)
+    ]
+    return {
+        "ok": True,
+        "code": "OK",
+        "message": "핸드폰 DB 신청현황을 불러왔습니다.",
+        "assignment": {},
+        "requests": requests,
+        "warning": "",
+        "fallback_required": False,
+    }
+
+
+def admin_update_mobile_db_request(
+    current_user_id: str,
+    request_id: Any,
+    action: Any,
+    *,
+    allocated_count: int = 0,
+    reason: Any = "",
+    session_id: str = "",
+    db: CloudDatabase | None = None,
+) -> dict[str, Any]:
+    try:
+        safe_count = max(0, min(int(allocated_count), 100))
+    except (TypeError, ValueError):
+        safe_count = 0
+    raw, error = _rpc(
+        RPC_ADMIN_UPDATE_MOBILE_DB_REQUEST,
+        {
+            "p_current_user_id": _user_id(current_user_id),
+            "p_request_id": _text(request_id),
+            "p_action": _bounded(action, 20).lower(),
+            "p_allocated_count": safe_count,
+            "p_reason": _bounded(reason, 500),
+            "p_session_id": _bounded(session_id, 200) or None,
+        },
+        db=db,
+    )
+    if error:
+        return error
+    return _mobile_request_mutation_result(
+        raw,
+        success_message="핸드폰 DB 신청을 처리했습니다.",
+    )
+
+
 __all__ = [
     "CompanyIdentityError",
     "admin_change_assignee",
@@ -1779,6 +1974,7 @@ __all__ = [
     "admin_release_assignment",
     "admin_reactivate",
     "admin_set_user_limit",
+    "admin_update_mobile_db_request",
     "assignment_feature_ready",
     "assignment_status_label",
     "build_company_uid",
@@ -1790,13 +1986,16 @@ __all__ = [
     "list_admin_assignments",
     "list_admin_assignment_metrics",
     "list_admin_assignment_audit",
+    "list_admin_mobile_db_requests",
     "list_blocked_company_uids",
     "list_company_contacts",
     "list_user_assignments",
+    "list_user_mobile_db_requests",
     "record_contact",
     "record_company_views",
     "resolve_candidate_company_uids",
     "release_assignment",
     "release_expired_assignments",
     "save_user_note",
+    "submit_mobile_db_request",
 ]

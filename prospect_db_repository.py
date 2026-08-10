@@ -1074,6 +1074,21 @@ def _database_row(
     source_data["industry_category"] = str(
         prospect.get("업종분류") or ""
     )
+    source_data["discovery_type"] = str(
+        prospect.get("발굴유형") or source_data.get("discovery_type") or "unknown"
+    )
+    source_data["allocation_channel"] = str(
+        prospect.get("배정경로")
+        or source_data.get("allocation_channel")
+        or "legacy"
+    )
+    mobile_request_id = str(
+        prospect.get("핸드폰DB신청ID")
+        or source_data.get("mobile_request_id")
+        or ""
+    ).strip()
+    if mobile_request_id:
+        source_data["mobile_request_id"] = mobile_request_id
     source_data["employment_growth"] = {
         "basis": str(prospect.get("고용증가기준") or ""),
         "status": str(prospect.get("고용자료상태") or ""),

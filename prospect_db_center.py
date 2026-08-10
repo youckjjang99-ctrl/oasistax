@@ -135,6 +135,12 @@ DISCOVERY_TYPE_OPTIONS = {
 DISCOVERY_TYPE_LABELS = {
     value: label for label, value in DISCOVERY_TYPE_OPTIONS.items()
 }
+DISCOVERY_TYPE_LABELS.update(
+    {
+        "growth_recent": "신규·고용증가기업",
+        "unknown": "분류 확인 중",
+    }
+)
 PROSPECT_RESULT_PAGE_SIZE_OPTIONS = (25, 50, 100)
 _PROSPECT_SAVE_FLASH_KEY = "_prospect_save_flash_v989"
 _PROSPECT_SAVE_APPROVAL_KEY = "_prospect_save_approval_v1042"
@@ -146,6 +152,7 @@ _CONTACT_RESULTS_SELECTION_KEY = "contact_results_assignment_v1050"
 _CONTACT_RESULTS_RESET_SELECTION_KEY = "_contact_results_reset_selection_v1050"
 _RETURN_DB_ADMIN_FLASH_KEY = "_return_db_admin_flash_v1070"
 _RETURN_DB_ADMIN_SELECTION_KEY = "return_db_admin_assignment_v1070"
+_MOBILE_DB_ADMIN_SELECTION_KEY = "mobile_db_admin_request_v1090"
 OUTREACH_ALLOWED_ASSIGNMENT_STATUSES = frozenset(
     {"assigned", "pending_contact", "contacted", "consulting", "follow_up"}
 )
@@ -153,6 +160,7 @@ SAVED_PROSPECT_VISIBLE_COLUMNS = (
     "업체명",
     "사업자번호",
     "사업자유형",
+    "발굴유형",
     "연락처",
     "이메일",
     "인스타",
@@ -163,6 +171,13 @@ SAVED_PROSPECT_VISIBLE_COLUMNS = (
     "문자보내기",
     "카카오톡보내기",
 )
+MOBILE_DB_REQUEST_STATUS_LABELS = {
+    "pending": "배정 대기",
+    "partially_approved": "일부 배정",
+    "approved": "배정 완료",
+    "rejected": "신청 반려",
+    "cancelled": "신청 취소",
+}
 OUTREACH_COLUMN_CHANNELS = {
     "이메일보내기": "email",
     "문자보내기": "sms",
@@ -944,6 +959,21 @@ def _saved_sales_analysis(row: dict) -> dict:
     return analysis if isinstance(analysis, dict) else {}
 
 
+def _row_can_view_mobile(row: dict, can_view_mobile: bool) -> bool:
+    """Allow mobile visibility only for explicitly mobile-allocated rows."""
+
+    source_data = (
+        row.get("source_data")
+        if isinstance(row.get("source_data"), dict)
+        else {}
+    )
+    return bool(
+        can_view_mobile
+        or str(source_data.get("allocation_channel") or "").lower()
+        == "mobile"
+    )
+
+
 def _saved_candidate_frame(
     rows: list[dict],
     contacts: list[dict],
@@ -962,13 +992,7 @@ def _saved_candidate_frame(
             continue
         if str(contact.get("verification_status") or "").lower() == "rejected":
             continue
-        if (
-            contact.get("contact_type") == "phone"
-            and (
-                can_view_mobile
-                or not is_mobile_phone(contact.get("contact_value", ""))
-            )
-        ):
+        if contact.get("contact_type") == "phone":
             phones_by_id.setdefault(prospect_id, []).append(contact)
         if (
             contact.get("contact_type") == "email"
@@ -997,8 +1021,14 @@ def _saved_candidate_frame(
             if isinstance(source_data.get("employment_growth"), dict)
             else {}
         )
+        row_can_view_mobile = _row_can_view_mobile(row, can_view_mobile)
         selected_growth = employment.get("selected_growth")
-        phone_candidates = phones_by_id.get(prospect_id, [])
+        phone_candidates = [
+            contact
+            for contact in phones_by_id.get(prospect_id, [])
+            if row_can_view_mobile
+            or not is_mobile_phone(contact.get("contact_value", ""))
+        ]
         phone_candidates.sort(
             key=lambda item: (
                 is_mobile_phone(item.get("contact_value", "")),
@@ -1013,7 +1043,7 @@ def _saved_candidate_frame(
             else ""
         )
         canonical_mobile_available = bool(
-            can_view_mobile and is_mobile_phone(saved_phone)
+            row_can_view_mobile and is_mobile_phone(saved_phone)
         )
         phone_record = phone_candidates[0] if phone_candidates else {}
         email_record = email_by_id.get(prospect_id, {})
@@ -1024,12 +1054,12 @@ def _saved_candidate_frame(
         analysis_phone = str(analysis.get("phone") or "")
         if canonical_contacts_only:
             analysis_phone = ""
-        if not can_view_mobile and is_mobile_phone(analysis_phone):
+        if not row_can_view_mobile and is_mobile_phone(analysis_phone):
             analysis_phone = ""
         preferred_phone = (
             saved_phone
             if (
-                can_view_mobile
+                row_can_view_mobile
                 and is_mobile_phone(saved_phone)
             )
             or not is_mobile_phone(analysis_phone)
@@ -1038,7 +1068,7 @@ def _saved_candidate_frame(
         preferred_phone = normalize_phone(preferred_phone)
         mobile_phone = (
             preferred_phone
-            if can_view_mobile and is_mobile_phone(preferred_phone)
+            if row_can_view_mobile and is_mobile_phone(preferred_phone)
             else ""
         )
         landline_phone = (
@@ -1063,6 +1093,10 @@ def _saved_candidate_frame(
                     )
                 )
                 or _business_type_label(row.get("company_name")),
+                "발굴유형": DISCOVERY_TYPE_LABELS.get(
+                    str(source_data.get("discovery_type") or "unknown"),
+                    "분류 확인 중",
+                ),
                 "대표전화": preferred_phone,
                 "휴대전화": mobile_phone,
                 "일반전화": landline_phone,
@@ -1139,6 +1173,7 @@ def _saved_candidate_frame(
                 ),
                 "_do_not_contact": prospect_id in do_not_contact_ids,
                 "_canonical_mobile_available": canonical_mobile_available,
+                "_can_view_mobile": row_can_view_mobile,
                 "_canonical_email_available": canonical_email_available,
                 "_canonical_mobile_contact_id": str(
                     phone_record.get("id") or ""
@@ -1166,6 +1201,9 @@ def _saved_prospect_table_frame(
 
     records: list[dict] = []
     for row in frame.to_dict("records"):
+        row_can_view_mobile = bool(
+            can_view_mobile or row.get("_can_view_mobile")
+        )
         blocked = (
             bool(row.get("_do_not_contact"))
             or str(row.get("_assignment_status") or "").strip().lower()
@@ -1185,6 +1223,7 @@ def _saved_prospect_table_frame(
                 "업체명": str(row.get("업체명") or ""),
                 "사업자번호": str(row.get("사업자번호") or ""),
                 "사업자유형": str(row.get("사업자유형") or ""),
+                "발굴유형": str(row.get("발굴유형") or "분류 확인 중"),
                 "연락처": normalize_phone(row.get("대표전화") or ""),
                 "이메일": email,
                 "인스타": instagram,
@@ -1200,7 +1239,7 @@ def _saved_prospect_table_frame(
                 ),
                 "문자보내기": (
                     "💬"
-                    if can_view_mobile
+                    if row_can_view_mobile
                     and is_mobile_phone(mobile)
                     and bool(row.get("_canonical_mobile_available"))
                     and not blocked
@@ -1208,7 +1247,7 @@ def _saved_prospect_table_frame(
                 ),
                 "카카오톡보내기": (
                     "🟡"
-                    if can_view_mobile
+                    if row_can_view_mobile
                     and is_mobile_phone(mobile)
                     and bool(row.get("_canonical_mobile_available"))
                     and not blocked
@@ -1228,6 +1267,9 @@ def _outreach_action_rows(
 
     result: list[dict] = []
     for row in frame.to_dict("records"):
+        row_can_view_mobile = bool(
+            can_view_mobile or row.get("_can_view_mobile")
+        )
         available: list[str] = []
         sendable_assignment = bool(
             str(row.get("_assignment_id") or "").strip()
@@ -1244,7 +1286,7 @@ def _outreach_action_rows(
             available.append("email")
         mobile = normalize_phone(row.get("휴대전화") or "")
         if (
-            can_view_mobile
+            row_can_view_mobile
             and is_mobile_phone(mobile)
             and bool(row.get("_canonical_mobile_available"))
             and not bool(row.get("_do_not_contact"))
@@ -1430,10 +1472,14 @@ def _resolve_outreach_target(
             [prospect_id],
             owner_user_id,
         )
+        effective_mobile_visibility = _row_can_view_mobile(
+            matching,
+            can_view_mobile,
+        )
         current = _saved_candidate_frame(
             [matching],
             contacts,
-            can_view_mobile=can_view_mobile,
+            can_view_mobile=effective_mobile_visibility,
             canonical_contacts_only=True,
         )
         if current.empty:
@@ -3732,6 +3778,11 @@ def _assignment_contact_phone(
         if isinstance(source_data.get("sales_intelligence_v971"), dict)
         else {}
     )
+    effective_mobile_visibility = bool(
+        can_view_mobile
+        or str(source_data.get("allocation_channel") or "").lower()
+        == "mobile"
+    )
     mobile_candidates = (
         assignment.get("mobile_phone"),
         source_data.get("mobile_phone"),
@@ -3745,14 +3796,14 @@ def _assignment_contact_phone(
     )
     candidates = (
         (*mobile_candidates, *general_candidates)
-        if can_view_mobile
+        if effective_mobile_visibility
         else general_candidates
     )
     for candidate in candidates:
         normalized = normalize_phone(candidate)
         if not normalized:
             continue
-        if not can_view_mobile and is_mobile_phone(normalized):
+        if not effective_mobile_visibility and is_mobile_phone(normalized):
             continue
         return normalized
     return ""
@@ -3858,8 +3909,17 @@ def _render_contact_results(
             row,
             can_view_mobile=can_view_mobile,
         )
+        source_data = (
+            row.get("source_data")
+            if isinstance(row.get("source_data"), dict)
+            else {}
+        )
+        discovery_label = DISCOVERY_TYPE_LABELS.get(
+            str(source_data.get("discovery_type") or "unknown"),
+            "분류 확인 중",
+        )
         assignment_labels[assignment_id] = (
-            f"{company_name} · {progress_label} · "
+            f"{company_name} · {discovery_label} · {progress_label} · "
             f"{contact_phone or '연락처 없음'} · {assignment_id[-8:]}"
         )
     if not assignments_by_id:
@@ -4290,6 +4350,446 @@ def _render_return_db_admin(current_user_id: str) -> None:
         )
 
 
+def _merge_discovery_type(current: str, incoming: str) -> str:
+    values = {str(current or ""), str(incoming or "")} - {"", "unknown"}
+    if "growth_recent" in values or {"growth", "recent_opening"} <= values:
+        return "growth_recent"
+    if "growth" in values:
+        return "growth"
+    if "recent_opening" in values:
+        return "recent_opening"
+    if "other" in values:
+        return "other"
+    return "unknown"
+
+
+def _candidate_phone(item: dict, channel: str) -> str:
+    key = "휴대전화" if channel == "mobile" else "일반전화"
+    phone = normalize_phone(item.get(key) or "")
+    if channel == "mobile":
+        return phone if is_mobile_phone(phone) else ""
+    if not phone or is_mobile_phone(phone):
+        return ""
+    # 핸드폰 번호가 있는 업체는 희소 DB로 남겨 일반번호 자동배정에서 제외한다.
+    mobile = normalize_phone(item.get("휴대전화") or "")
+    return "" if is_mobile_phone(mobile) else phone
+
+
+def _collect_allocation_candidates(
+    region_name: str,
+    district_name: str,
+    business_type: str,
+    channel: str,
+    *,
+    pool_size: int = 500,
+) -> tuple[list[dict], list[str]]:
+    """Collect, classify and randomly order assignment candidates."""
+
+    district = "" if district_name == ALL_DISTRICTS else district_name
+    contact_channel = (
+        "mobile_phone" if channel == "mobile" else "landline_phone"
+    )
+    common = {
+        "target_count": max(30, min(500, int(pool_size))),
+        "minimum_employees": 1,
+        "maximum_employees": 10000,
+        "business_type": business_type,
+        "industry_categories": [],
+        "contact_channels": [contact_channel],
+        "district_name": district,
+        "exclude_saved_prospects": False,
+    }
+    searches = (
+        (
+            "growth",
+            lambda: collect_contactable_growth_companies(
+                REGION_CODES[region_name],
+                minimum_growth=1,
+                growth_only=True,
+                growth_basis="combined",
+                data_source="combined",
+                **common,
+            ),
+        ),
+        (
+            "recent_opening",
+            lambda: collect_recent_opening_companies(
+                REGION_CODES[region_name],
+                recent_months=6,
+                include_comwel_annual=True,
+                **common,
+            ),
+        ),
+        (
+            "other",
+            lambda: collect_other_companies(
+                REGION_CODES[region_name],
+                **common,
+            ),
+        ),
+    )
+    by_uid: dict[str, dict] = {}
+    warnings: list[str] = []
+    for discovery_type, search in searches:
+        result = search()
+        if not result.get("ok"):
+            warnings.append(
+                str(result.get("message") or f"{discovery_type} 조회 실패")
+            )
+            continue
+        for original in result.get("items") or []:
+            item = dict(original)
+            phone = _candidate_phone(item, channel)
+            if not phone:
+                continue
+            if channel == "mobile":
+                item["휴대전화"] = phone
+            else:
+                item["일반전화"] = phone
+            item["대표전화"] = phone
+            item["전화유형"] = (
+                "휴대전화" if channel == "mobile" else "일반전화"
+            )
+            item["사업자유형"] = business_type
+            try:
+                company_uid = sales_assignments.build_company_uid(item)
+            except ValueError:
+                continue
+            if company_uid in by_uid:
+                existing = by_uid[company_uid]
+                existing["발굴유형"] = _merge_discovery_type(
+                    str(existing.get("발굴유형") or ""),
+                    discovery_type,
+                )
+                continue
+            item["company_uid"] = company_uid
+            item["발굴유형"] = discovery_type
+            item["배정경로"] = channel
+            by_uid[company_uid] = item
+    candidates = list(by_uid.values())
+    secrets.SystemRandom().shuffle(candidates)
+    # The canonical identity resolver deliberately accepts at most 1,000 rows.
+    return candidates[:1000], warnings
+
+
+def _available_allocation_candidates(
+    candidates: list[dict],
+    user_id: str,
+) -> tuple[list[dict], str]:
+    availability = sales_assignments.filter_company_availability(
+        candidates,
+        user_id,
+        is_admin_user=False,
+    )
+    if not availability.get("ready"):
+        return [], str(
+            availability.get("warning")
+            or "전사 중복 여부를 확인하지 못했습니다."
+        )
+    available = list(availability.get("items") or [])
+    secrets.SystemRandom().shuffle(available)
+    return available, str(availability.get("warning") or "")
+
+
+def _render_db_request_home(owner_user_id: str) -> None:
+    st.markdown("### DB 신청")
+    st.caption(
+        "지역과 사업자 유형만 선택해 주세요. 일반번호 DB는 무작위로 즉시 "
+        "배정되고, 핸드폰 DB는 관리자가 신청 순서와 보유 현황을 검토해 배정합니다."
+    )
+    filter_col1, filter_col2, filter_col3 = st.columns(3)
+    region_name = filter_col1.selectbox(
+        "도·광역시",
+        province_options()[1:],
+        key="simple_db_region_v1090",
+    )
+    district_name = filter_col2.selectbox(
+        district_label(region_name),
+        district_options(region_name),
+        key=f"simple_db_district_v1090_{region_name}",
+    )
+    business_type_name = filter_col3.selectbox(
+        "사업자 유형",
+        list(BUSINESS_TYPE_OPTIONS.keys()),
+        key="simple_db_business_type_v1090",
+    )
+    business_type = BUSINESS_TYPE_OPTIONS[business_type_name]
+
+    landline_col, mobile_col = st.columns(2)
+    with landline_col:
+        st.markdown("#### 일반번호 DB")
+        st.write("조건에 맞는 일반번호 업체를 무작위로 최대 30개 즉시 배정합니다.")
+        landline_clicked = st.button(
+            "일반번호 DB 30개 받기",
+            type="primary",
+            use_container_width=True,
+            key="allocate_landline_db_v1090",
+        )
+    with mobile_col:
+        st.markdown("#### 핸드폰 DB")
+        st.write("희소 DB 보호를 위해 신청 후 관리자가 검토하여 배정합니다.")
+        mobile_clicked = st.button(
+            "핸드폰 DB 배정 신청",
+            use_container_width=True,
+            key="request_mobile_db_v1090",
+        )
+
+    if landline_clicked:
+        try:
+            with st.spinner("중복 업체를 제외하고 일반번호 DB를 무작위 배정 중입니다."):
+                candidates, warnings = _collect_allocation_candidates(
+                    region_name,
+                    district_name,
+                    business_type,
+                    "landline",
+                )
+                available, availability_warning = _available_allocation_candidates(
+                    candidates,
+                    owner_user_id,
+                )
+                selected = available[:MEMBER_PROSPECT_TARGET_COUNT]
+                if not selected:
+                    st.warning(
+                        availability_warning
+                        or "선택 조건에 지금 배정 가능한 일반번호 DB가 없습니다."
+                    )
+                else:
+                    save_result = save_assigned_prospects(
+                        selected,
+                        owner_user_id,
+                        session_id=_assignment_session_id(),
+                        promote_review_contacts=True,
+                    )
+                    saved_count = int(save_result.get("saved_count") or 0)
+                    if saved_count:
+                        extra = ""
+                        if saved_count < MEMBER_PROSPECT_TARGET_COUNT:
+                            extra = " 현재 보유 한도와 전사 중복을 반영한 수량입니다."
+                        st.success(
+                            f"일반번호 DB {saved_count}개를 내 영업후보에 배정했습니다."
+                            + extra
+                        )
+                    else:
+                        st.error(
+                            save_result.get("message")
+                            or "일반번호 DB를 배정하지 못했습니다."
+                        )
+                if warnings:
+                    st.caption("일부 유형 조회는 제외하고 확보 가능한 DB로 처리했습니다.")
+        except Exception as exc:
+            st.error(safe_public_error(exc, "일반번호 DB를 배정하지 못했습니다."))
+
+    if mobile_clicked:
+        request_result = sales_assignments.submit_mobile_db_request(
+            owner_user_id,
+            region_name,
+            "" if district_name == ALL_DISTRICTS else district_name,
+            business_type,
+            session_id=_assignment_session_id(),
+        )
+        if request_result.get("ok"):
+            st.success(
+                request_result.get("message")
+                or "핸드폰 DB 배정 신청을 접수했습니다."
+            )
+        else:
+            st.error(
+                request_result.get("message")
+                or "핸드폰 DB 신청을 접수하지 못했습니다."
+            )
+
+    history_result = sales_assignments.list_user_mobile_db_requests(
+        owner_user_id,
+        limit=10,
+    )
+    if history_result.get("ok") and history_result.get("requests"):
+        with st.expander("내 핸드폰 DB 신청내역", expanded=True):
+            history_frame = pd.DataFrame(
+                [
+                    {
+                        "신청일": str(row.get("requested_at") or "")
+                        .replace("T", " ")[:16],
+                        "지역": " ".join(
+                            value
+                            for value in (
+                                str(row.get("region") or ""),
+                                str(row.get("district") or ""),
+                            )
+                            if value
+                        ),
+                        "사업자유형": BUSINESS_TYPE_LABELS.get(
+                            str(row.get("business_type") or "all"), "전체"
+                        ),
+                        "신청": int(row.get("requested_count") or 0),
+                        "배정": int(row.get("allocated_count") or 0),
+                        "상태": MOBILE_DB_REQUEST_STATUS_LABELS.get(
+                            str(row.get("status") or ""), "확인 중"
+                        ),
+                    }
+                    for row in history_result.get("requests") or []
+                ]
+            )
+            st.dataframe(history_frame, use_container_width=True, hide_index=True)
+
+
+def _render_mobile_db_admin(current_user_id: str) -> None:
+    from auth import is_admin
+
+    st.markdown("### 핸드폰 DB 관리")
+    if not is_admin(current_user_id):
+        st.error("관리자만 핸드폰 DB 신청을 관리할 수 있습니다.")
+        return
+    result = sales_assignments.list_admin_mobile_db_requests(
+        current_user_id,
+        statuses=["pending", "partially_approved"],
+        limit=500,
+    )
+    if not result.get("ok"):
+        st.error(result.get("message") or "핸드폰 DB 신청을 불러오지 못했습니다.")
+        return
+    requests = list(result.get("requests") or [])
+    if not requests:
+        st.success("처리할 핸드폰 DB 신청이 없습니다.")
+        return
+    st.metric("배정 대기 신청", f"{len(requests):,}건")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "신청자": str(row.get("requested_user_name") or "담당자 미확인"),
+                    "지역": " ".join(
+                        value
+                        for value in (
+                            str(row.get("region") or ""),
+                            str(row.get("district") or ""),
+                        )
+                        if value
+                    ),
+                    "사업자유형": BUSINESS_TYPE_LABELS.get(
+                        str(row.get("business_type") or "all"), "전체"
+                    ),
+                    "배정현황": (
+                        f"{int(row.get('allocated_count') or 0)} / "
+                        f"{int(row.get('requested_count') or 0)}"
+                    ),
+                    "신청일": str(row.get("requested_at") or "")
+                    .replace("T", " ")[:16],
+                }
+                for row in requests
+            ]
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+    by_id = {str(row.get("request_id") or ""): row for row in requests}
+    selected_id = st.selectbox(
+        "처리할 신청",
+        list(by_id),
+        format_func=lambda value: (
+            f"{by_id[value].get('requested_user_name') or '담당자 미확인'} · "
+            f"{by_id[value].get('region') or ''}"
+        ),
+        key=_MOBILE_DB_ADMIN_SELECTION_KEY,
+    )
+    selected = by_id[selected_id]
+    remaining = max(
+        0,
+        int(selected.get("requested_count") or 0)
+        - int(selected.get("allocated_count") or 0),
+    )
+    allocation_count = st.number_input(
+        "이번 배정 수량",
+        min_value=1,
+        max_value=max(1, remaining),
+        value=min(30, max(1, remaining)),
+        step=1,
+        disabled=remaining < 1,
+        key=f"mobile_db_allocation_count_v1090_{selected_id}",
+    )
+    reason = st.text_input(
+        "관리 메모 (반려 시 필수)",
+        max_chars=500,
+        key=f"mobile_db_admin_reason_v1090_{selected_id}",
+    )
+    allocate_col, reject_col = st.columns(2)
+    allocate_clicked = allocate_col.button(
+        "핸드폰 DB 배정",
+        type="primary",
+        use_container_width=True,
+        disabled=remaining < 1,
+        key=f"allocate_mobile_db_v1090_{selected_id}",
+    )
+    reject_clicked = reject_col.button(
+        "신청 반려",
+        use_container_width=True,
+        disabled=int(selected.get("allocated_count") or 0) > 0,
+        key=f"reject_mobile_db_v1090_{selected_id}",
+    )
+    if reject_clicked:
+        if not reason.strip():
+            st.error("반려 사유를 입력해 주세요.")
+            return
+        update = sales_assignments.admin_update_mobile_db_request(
+            current_user_id,
+            selected_id,
+            "reject",
+            reason=reason,
+            session_id=_assignment_session_id(),
+        )
+        if update.get("ok"):
+            st.success("핸드폰 DB 신청을 반려했습니다.")
+            return
+        st.error(update.get("message") or "신청을 반려하지 못했습니다.")
+        return
+    if not allocate_clicked:
+        return
+    try:
+        with st.spinner("중복 업체를 제외하고 핸드폰 DB를 배정 중입니다."):
+            candidates, _warnings = _collect_allocation_candidates(
+                str(selected.get("region") or ""),
+                str(selected.get("district") or ALL_DISTRICTS) or ALL_DISTRICTS,
+                str(selected.get("business_type") or "all"),
+                "mobile",
+            )
+            for candidate in candidates:
+                candidate["핸드폰DB신청ID"] = selected_id
+            available, warning = _available_allocation_candidates(
+                candidates,
+                str(selected.get("requested_user_id") or ""),
+            )
+            targets = available[: int(allocation_count)]
+            if not targets:
+                st.warning(warning or "조건에 맞는 배정 가능 핸드폰 DB가 없습니다.")
+                return
+            save_result = save_assigned_prospects(
+                targets,
+                str(selected.get("requested_user_id") or ""),
+                session_id=_assignment_session_id(),
+                promote_review_contacts=True,
+            )
+            allocated = int(save_result.get("claimed_count") or 0)
+            if allocated < 1:
+                st.error(save_result.get("message") or "핸드폰 DB를 배정하지 못했습니다.")
+                return
+            update = sales_assignments.admin_update_mobile_db_request(
+                current_user_id,
+                selected_id,
+                "allocate",
+                allocated_count=allocated,
+                reason=reason,
+                session_id=_assignment_session_id(),
+            )
+            if not update.get("ok"):
+                st.error(
+                    "업체 배정은 완료됐지만 신청 수량 기록을 갱신하지 못했습니다. "
+                    "추가 배정을 중단하고 관리자에게 확인해 주세요."
+                )
+                return
+            st.success(f"핸드폰 DB {allocated}개를 배정했습니다.")
+    except Exception as exc:
+        st.error(safe_public_error(exc, "핸드폰 DB를 배정하지 못했습니다."))
+
+
 def render_prospect_db_center(
     owner_user_id: str = "",
     *,
@@ -4308,6 +4808,7 @@ def render_prospect_db_center(
     ]
     if is_admin_user:
         workflow_steps.append("④ 반납DB 관리")
+        workflow_steps.append("⑤ 핸드폰DB 관리")
     if st.session_state.get(
         "prospect_workflow_step_v1081"
     ) not in workflow_steps:
@@ -4335,8 +4836,12 @@ def render_prospect_db_center(
     if workflow_step == "④ 반납DB 관리":
         _render_return_db_admin(owner_user_id)
         return
+    if workflow_step == "⑤ 핸드폰DB 관리":
+        _render_mobile_db_admin(owner_user_id)
+        return
     if workflow_step == "① DB신청":
-        _render_search_history(owner_user_id)
+        _render_db_request_home(owner_user_id)
+        return
 
     with st.expander(
         "조회 조건",
