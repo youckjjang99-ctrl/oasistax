@@ -54,6 +54,7 @@ def _is_blank_customer_value(value: Any) -> bool:
         pass
     return str(value).strip().lower() in {
         "",
+        "-",
         "nan",
         "none",
         "nat",

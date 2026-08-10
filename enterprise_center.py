@@ -9,6 +9,11 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+from cloud_sync import (
+    load_financial_snapshot,
+    load_registry_snapshot,
+    load_stock_valuations,
+)
 from crm import (
     ACTION_OPTIONS,
     STATUS_OPTIONS,
@@ -38,7 +43,7 @@ def _clean(value: Any) -> str:
     if value is None:
         return ""
     text = str(value).strip()
-    if text.lower() in {"", "nan", "none", "nat"}:
+    if text.lower() in {"", "-", "nan", "none", "nat", "<na>"}:
         return ""
     return text
 
@@ -76,6 +81,30 @@ def _load_json(path: Path, default: Any) -> Any:
         return default
 
 
+def _has_data_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in {
+            "", "-", "nan", "none", "nat", "<na>"
+        }
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
+
+
+def _merge_snapshot_data(
+    local: dict[str, Any] | None,
+    cloud: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Prefer usable cloud fields while retaining local-only values."""
+    merged = dict(local or {})
+    for key, value in dict(cloud or {}).items():
+        if _has_data_value(value):
+            merged[key] = value
+    return merged
+
+
 def _financial_snapshot(
     user_id: str,
     business_no: str,
@@ -86,8 +115,14 @@ def _financial_snapshot(
         {},
     )
     if not isinstance(cache, dict):
-        return {}
-    return cache.get(_normalize_business_no(business_no), {}) or {}
+        cache = {}
+    normalized = _normalize_business_no(business_no)
+    local = cache.get(normalized, {}) or {}
+    try:
+        cloud = load_financial_snapshot(user_id, normalized)
+    except Exception:
+        cloud = {}
+    return _merge_snapshot_data(local, cloud)
 
 
 def _registry_snapshot(
@@ -100,9 +135,14 @@ def _registry_snapshot(
         {},
     )
     if not isinstance(cache, dict):
-        return {}
+        cache = {}
     normalized = _normalize_business_no(business_no)
-    return cache.get(normalized, {}) or {}
+    local = cache.get(normalized, {}) or {}
+    try:
+        cloud = load_registry_snapshot(user_id, normalized)
+    except Exception:
+        cloud = {}
+    return _merge_snapshot_data(local, cloud)
 
 
 def _stock_record(
@@ -115,7 +155,14 @@ def _stock_record(
         [],
     )
     if not isinstance(records, list):
-        return {}
+        records = []
+
+    try:
+        cloud_records = load_stock_valuations(user_id)
+    except Exception:
+        cloud_records = []
+    if isinstance(cloud_records, list):
+        records = [*cloud_records, *records]
 
     normalized = _normalize_business_no(business_no)
     matching = [
