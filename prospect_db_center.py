@@ -3570,6 +3570,7 @@ def _render_clean_saved_prospects(
         compact_frame,
         use_container_width=True,
         hide_index=True,
+        column_order=list(SAVED_PROSPECT_VISIBLE_COLUMNS),
         column_config={
             "이메일보내기": st.column_config.ButtonColumn(
                 "이메일보내기",
@@ -3596,7 +3597,7 @@ def _render_clean_saved_prospects(
                 args=(kakao_click_key, "kakao", action_rows),
             ),
         },
-        key="saved_prospect_compact_table_v1040",
+        key="saved_prospect_compact_table_v1041",
     )
 
     pending_request = st.session_state.get(_OUTREACH_REQUEST_KEY)

@@ -509,6 +509,15 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
         self.assertIn('not bool(send_window.get("allowed"))', source)
         self.assertIn('result.get("message")', source)
 
+    def test_saved_prospect_table_forces_stable_column_order(self):
+        source = inspect.getsource(prospect._render_clean_saved_prospects)
+
+        self.assertIn(
+            "column_order=list(SAVED_PROSPECT_VISIBLE_COLUMNS)",
+            source,
+        )
+        self.assertIn('key="saved_prospect_compact_table_v1041"', source)
+
     def test_resolver_rejects_a_stale_or_unowned_assignment(self):
         request = {
             "channel": "email",
