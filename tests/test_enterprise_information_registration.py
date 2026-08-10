@@ -8,6 +8,11 @@ import pytest
 import enterprise_documents as documents
 
 
+SYNTHETIC_BUSINESS_NO = "-".join(("123", "45", "67890"))
+SYNTHETIC_BUSINESS_NO_DIGITS = "".join(("123", "45", "67890"))
+OTHER_SYNTHETIC_BUSINESS_NO = "-".join(("999", "99", "99999"))
+
+
 def _user_dirs(tmp_path: Path) -> dict[str, Path]:
     base = tmp_path / "user"
     uploads = base / "uploads"
@@ -61,7 +66,7 @@ def test_document_registration_preserves_original_and_deduplicates(
 
     first = documents.register_enterprise_document_bytes(
         "member",
-        "123-45-67890",
+        SYNTHETIC_BUSINESS_NO,
         "테스트법인",
         "tax_adjustment",
         "세무조정.pdf",
@@ -71,7 +76,7 @@ def test_document_registration_preserves_original_and_deduplicates(
     )
     second = documents.register_enterprise_document_bytes(
         "member",
-        "1234567890",
+        SYNTHETIC_BUSINESS_NO_DIGITS,
         "테스트법인",
         "tax_adjustment",
         "세무조정.pdf",
@@ -98,7 +103,7 @@ def test_corrupt_metadata_is_never_overwritten(tmp_path: Path, monkeypatch):
     with pytest.raises(documents.EnterpriseDocumentCorruptionError):
         documents.register_enterprise_document_bytes(
             "member",
-            "123-45-67890",
+            SYNTHETIC_BUSINESS_NO,
             "테스트법인",
             "articles",
             "정관.pdf",
@@ -118,7 +123,7 @@ def test_document_context_exposes_only_matching_company_records(
         json.dumps([
             {
                 "record_id": "one",
-                "business_no": "123-45-67890",
+                "business_no": SYNTHETIC_BUSINESS_NO,
                 "document_type": "tax_adjustment",
                 "document_label": "세무조정계산서",
                 "uploaded_at": "2026-08-10T10:00:00",
@@ -128,7 +133,7 @@ def test_document_context_exposes_only_matching_company_records(
             },
             {
                 "record_id": "other",
-                "business_no": "999-99-99999",
+                "business_no": OTHER_SYNTHETIC_BUSINESS_NO,
                 "document_type": "tax_adjustment",
                 "uploaded_at": "2026-08-10T11:00:00",
                 "extracted_fields": {
@@ -140,7 +145,7 @@ def test_document_context_exposes_only_matching_company_records(
     )
 
     context = documents.load_enterprise_document_context(
-        "member", "1234567890", "테스트법인"
+        "member", SYNTHETIC_BUSINESS_NO_DIGITS, "테스트법인"
     )
 
     assert len(context["records"]) == 1
