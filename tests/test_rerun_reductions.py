@@ -37,16 +37,21 @@ class RerunReductionTests(unittest.TestCase):
         self.assertIn('st.session_state["sales_analysis_results_v971"]', analysis_block)
         self.assertNotIn("st.rerun()", analysis_block)
 
-    def test_prospect_search_completion_does_not_trigger_second_full_rerun(self):
+    def test_prospect_search_completion_keeps_condition_step(self):
         source = _function_source(
             "prospect_db_center.py",
             "render_prospect_db_center",
         )
-        marker = 'st.session_state["_prospect_workflow_step_pending_v1020"]'
+        marker = "st.session_state[result_page_key] = 1"
         start = source.index(marker)
         end = source.index('if workflow_step != "② 검색 결과":', start)
         completion_block = source[start:end]
-        self.assertIn('workflow_step = "② 검색 결과"', completion_block)
+        self.assertNotIn(
+            '_prospect_workflow_step_pending_v1020',
+            source,
+        )
+        self.assertNotIn('workflow_step = "② 검색 결과"', completion_block)
+        self.assertIn("조건 설정 화면은 그대로 유지됩니다", completion_block)
         self.assertNotIn("st.rerun()", completion_block)
 
     def test_customer_crm_mutations_do_not_start_a_second_full_rerun(self):

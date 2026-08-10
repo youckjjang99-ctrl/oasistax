@@ -710,7 +710,12 @@ def _restore_registry_for_business(
 
     cache = _load_registry_cache(user_id)
     local = cache.get(key, {})
-    cloud = load_registry_snapshot(user_id, key)
+    cloud = load_registry_snapshot(
+        user_id,
+        key,
+        company_name,
+        corporate_no,
+    )
     data = dict(local or {})
     for field, value in dict(cloud or {}).items():
         if value not in (None, "", [], {}):
@@ -1095,8 +1100,9 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
                 st.rerun()
             else:
                 st.warning(
-                    "해당 사업자등록번호로 저장된 등기정보를 찾지 못했습니다. "
-                    f"조회번호: {current_business_no or '-'}"
+                    "저장된 등기정보를 찾지 못했습니다. 과거 업로드가 "
+                    "클라우드에 남아 있지 않은 경우 등기자료를 한 번 다시 "
+                    "분석해주세요. 이후에는 고객과 자동 연결됩니다."
                 )
 
         if registry_pdf is not None and st.button(

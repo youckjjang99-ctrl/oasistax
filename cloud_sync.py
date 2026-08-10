@@ -42,6 +42,71 @@ def _business_no_variants(value: Any) -> list[str]:
     )
 
 
+def _registry_corporate_digits(value: Any) -> str:
+    return re.sub(r"[^0-9]", "", str(value or ""))
+
+
+def _registry_company_key(value: Any) -> str:
+    return re.sub(
+        r"[^0-9a-z가-힣]",
+        "",
+        str(value or "").strip().lower(),
+    )
+
+
+def _select_registry_row_by_identity(
+    owner_user_id: str,
+    *,
+    company_name: Any = "",
+    corporate_no: Any = "",
+) -> dict[str, Any]:
+    """Find one legacy registry row using strong owner-scoped identity.
+
+    Older releases sometimes stored the corporate registration number as the
+    table key instead of the business number.  Prefer the corporate number and
+    use a normalized company name only when it identifies exactly one row.
+    Ambiguous matches deliberately fail closed.
+    """
+    target_corporate = _registry_corporate_digits(corporate_no)
+    target_company = _registry_company_key(company_name)
+    if not target_corporate and not target_company:
+        return {}
+
+    rows = CloudDatabase().select_all(
+        TABLE_REGISTRY,
+        filters={"owner_user_id": owner_user_id},
+        columns="business_no,registry_data",
+        order="updated_at.desc",
+        max_rows=5000,
+    )
+    corporate_matches: list[dict[str, Any]] = []
+    company_matches: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        data = row.get("registry_data", {})
+        if not isinstance(data, dict):
+            continue
+        row_corporate = _registry_corporate_digits(
+            data.get("법인등록번호")
+        )
+        row_company = _registry_company_key(
+            data.get("법인명") or data.get("업체명")
+        )
+        if (
+            target_corporate
+            and row_corporate
+            and target_corporate == row_corporate
+        ):
+            corporate_matches.append(row)
+        if target_company and row_company and target_company == row_company:
+            company_matches.append(row)
+
+    if target_corporate:
+        return corporate_matches[0] if len(corporate_matches) == 1 else {}
+    return company_matches[0] if len(company_matches) == 1 else {}
+
+
 def _usable_snapshot_value(value: Any) -> bool:
     if value is None:
         return False
@@ -687,8 +752,11 @@ def load_financial_snapshot(
 def load_registry_snapshot(
     user_id: str,
     business_no: Any,
+    company_name: Any = "",
+    corporate_no: Any = "",
 ) -> dict[str, Any]:
-    # Supabase에 저장된 최신 법인 등기 스냅샷을 읽습니다.
+    # Supabase에 저장된 최신 법인 등기 스냅샷을 읽습니다. 과거 버전에서
+    # 다른 식별자로 저장된 행도 같은 소유자 안에서 안전하게 복구합니다.
     business_no = normalize_business_no(business_no)
     if not business_no or not cloud_is_configured():
         return {}
@@ -699,6 +767,12 @@ def load_registry_snapshot(
             business_no,
             "registry_data",
         )
+        if not row:
+            row = _select_registry_row_by_identity(
+                user_id,
+                company_name=company_name,
+                corporate_no=corporate_no,
+            )
         if not row:
             return {}
         data = row.get("registry_data", {})

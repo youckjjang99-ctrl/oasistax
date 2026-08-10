@@ -77,3 +77,52 @@ def test_restore_legacy_registry_rekeys_and_syncs(monkeypatch, tmp_path):
     saved = json.loads(cache_path.read_text(encoding="utf-8"))
     assert "123-45-67890" in saved
 
+
+def test_restore_registry_passes_customer_identity_to_cloud(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+    monkeypatch.setattr(
+        stock,
+        "get_user_dirs",
+        lambda user_id: {"base": tmp_path},
+    )
+
+    def load_snapshot(user_id, business_no, company_name, corporate_no):
+        captured.update(
+            {
+                "user_id": user_id,
+                "business_no": business_no,
+                "company_name": company_name,
+                "corporate_no": corporate_no,
+            }
+        )
+        return {"법인명": company_name, "발행주식총수": 10_000}
+
+    monkeypatch.setattr(stock, "load_registry_snapshot", load_snapshot)
+    monkeypatch.setattr(stock, "_apply_registry_data", lambda data: None)
+    monkeypatch.setattr(
+        stock,
+        "sync_registry_snapshot",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("cloud snapshot must not be re-synced")
+        ),
+    )
+    stock.st.session_state.clear()
+
+    restored = stock._restore_registry_for_business(
+        "member",
+        "1234567890",
+        company_name="테스트 주식회사",
+        corporate_no="110111-1234567",
+    )
+
+    assert restored["발행주식총수"] == 10_000
+    assert captured == {
+        "user_id": "member",
+        "business_no": "123-45-67890",
+        "company_name": "테스트 주식회사",
+        "corporate_no": "110111-1234567",
+    }
+
