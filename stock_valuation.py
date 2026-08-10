@@ -710,7 +710,12 @@ def _restore_registry_for_business(
 
     cache = _load_registry_cache(user_id)
     local = cache.get(key, {})
-    cloud = load_registry_snapshot(user_id, key)
+    cloud = load_registry_snapshot(
+        user_id,
+        key,
+        company_name,
+        corporate_no,
+    )
     data = dict(local or {})
     for field, value in dict(cloud or {}).items():
         if value not in (None, "", [], {}):
@@ -877,7 +882,385 @@ def _apply_loaded_record(record: dict[str, Any]) -> None:
         st.session_state[f"stock_{key}"] = _format_number(record.get(key))
 
 
-def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
+def _find_stock_customer_row(
+    customers: pd.DataFrame,
+    *,
+    business_no: Any = "",
+    company_name: Any = "",
+) -> pd.Series | None:
+    """Resolve exactly one registered customer for the valuation context."""
+    if not isinstance(customers, pd.DataFrame) or customers.empty:
+        return None
+
+    target_business = _normalize_business_no(business_no)
+    if target_business:
+        business_matches = [
+            row
+            for _, row in customers.iterrows()
+            if _normalize_business_no(row.get("사업자등록번호", ""))
+            == target_business
+        ]
+        if len(business_matches) == 1:
+            return business_matches[0]
+        if len(business_matches) > 1:
+            return None
+
+    target_company = _normalize_company_name(company_name)
+    if not target_company:
+        return None
+    company_matches = [
+        row
+        for _, row in customers.iterrows()
+        if _normalize_company_name(
+            row.get("업체명") or row.get("기업명")
+        )
+        == target_company
+    ]
+    return company_matches[0] if len(company_matches) == 1 else None
+
+
+def _clear_stock_customer_state() -> None:
+    """Clear values that must never carry over to another company."""
+    keys = [
+        "stock_company_name",
+        "stock_business_no",
+        "stock_corporate_no",
+        "stock_address",
+        "stock_establishment",
+        "stock_current_shares",
+        "stock_par_value",
+        "stock_capital",
+        "stock_authorized_shares",
+        "stock_share_classes",
+        "stock_total_assets",
+        "stock_total_liabilities",
+        "stock_asset_additions",
+        "stock_asset_deductions",
+        "stock_liability_additions",
+        "stock_liability_deductions",
+        "stock_goodwill",
+        "stock_other_adjustments",
+        "stock_last_registry_data",
+        "stock_registry_restored_key",
+        "stock_last_result",
+        "stock_last_inputs",
+        "stock_loaded_record_id",
+    ]
+    for index in range(1, 4):
+        keys.extend(
+            [
+                f"stock_year_{index}",
+                f"stock_net_income_{index}",
+                f"stock_shares_{index}",
+            ]
+        )
+    for key in keys:
+        st.session_state.pop(key, None)
+
+
+def _load_stock_customer_context(
+    user_id: str,
+    customers: pd.DataFrame,
+    *,
+    selected_business_no: Any = "",
+    selected_company_name: Any = "",
+) -> pd.Series | None:
+    explicit_business = _normalize_business_no(selected_business_no)
+    explicit_company = str(selected_company_name or "").strip()
+    state_business = _normalize_business_no(
+        st.session_state.get("stock_business_no", "")
+    )
+    state_company = str(
+        st.session_state.get("stock_company_name", "") or ""
+    ).strip()
+    selected_row = _find_stock_customer_row(
+        customers,
+        business_no=explicit_business or state_business,
+        company_name=explicit_company or state_company,
+    )
+    if selected_row is None:
+        return None
+
+    resolved_business = _normalize_business_no(
+        selected_row.get("사업자등록번호", "")
+    )
+    customer_revision = str(
+        selected_row.get("_cloud_updated_at", "") or ""
+    )
+    customer_id = str(selected_row.get("_customer_id", "") or "")
+    context_key = f"{resolved_business}:{customer_id}:{customer_revision}"
+    if st.session_state.get("stock_customer_context_key") != context_key:
+        loaded_record_matches = bool(
+            st.session_state.get("stock_loaded_record_id")
+            and _normalize_business_no(
+                st.session_state.get("stock_business_no", "")
+            )
+            == resolved_business
+        )
+        if not loaded_record_matches:
+            _clear_stock_customer_state()
+        st.session_state["stock_customer_context_key"] = context_key
+        if loaded_record_matches:
+            st.session_state["stock_auto_loaded_customer_key"] = context_key
+
+    if st.session_state.get("stock_auto_loaded_customer_key") != context_key:
+        loaded, _ = _apply_customer_financial_data(user_id, selected_row)
+        if loaded:
+            business_no = st.session_state.get("stock_business_no", "")
+            _restore_registry_for_business(
+                user_id,
+                business_no,
+                company_name=st.session_state.get("stock_company_name", ""),
+                corporate_no=st.session_state.get("stock_corporate_no", ""),
+            )
+            st.session_state["stock_registry_restored_key"] = (
+                _normalize_business_no(business_no)
+            )
+            st.session_state["stock_auto_loaded_customer_key"] = context_key
+    return selected_row
+
+
+def _render_registry_upload(
+    user_id: str,
+    selected_row: pd.Series | None,
+) -> None:
+    st.markdown("### 등기사항증명서 업로드")
+    current_business_no = _normalize_business_no(
+        st.session_state.get("stock_business_no", "")
+    )
+    current_company_name = str(
+        st.session_state.get("stock_company_name", "") or ""
+    ).strip()
+    has_customer_context = bool(
+        selected_row is not None and current_business_no
+    )
+    if has_customer_context:
+        st.caption(
+            f"현재 평가기업: {current_company_name or '선택된 등록 고객'} · "
+            "등록된 크레탑·등기정보는 자동으로 불러옵니다."
+        )
+    else:
+        st.info(
+            "기업컨설팅에서 업체를 먼저 선택해주세요. "
+            "업체가 확인되어야 등기자료를 안전하게 연결할 수 있습니다."
+        )
+
+    restore_key = current_business_no if has_customer_context else ""
+    if (
+        restore_key
+        and st.session_state.get("stock_registry_restored_key")
+        != restore_key
+    ):
+        restored = _restore_registry_for_business(
+            user_id,
+            restore_key,
+            company_name=current_company_name,
+            corporate_no=st.session_state.get("stock_corporate_no", ""),
+        )
+        st.session_state["stock_registry_restored_key"] = restore_key
+        if restored:
+            st.session_state["stock_last_registry_data"] = restored
+
+    registry_pdf = st.file_uploader(
+        "법인 등기사항증명서 PDF",
+        type=["pdf"],
+        key="stock_registry_pdf",
+        disabled=not has_customer_context,
+    )
+    st.caption(
+        "법인명, 법인등록번호, 본점소재지, 설립일, 자본금, "
+        "발행주식총수, 1주의 금액 등을 자동 추출합니다."
+    )
+
+    if registry_pdf is not None and st.button(
+        "등기자료 분석·등록",
+        key="stock_analyze_registry",
+        use_container_width=True,
+        disabled=not has_customer_context,
+    ):
+        dirs = get_user_dirs(user_id)
+        registry_path = (
+            dirs["uploads"]
+            / f"등기자료_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        )
+        registry_pdf.seek(0)
+        with open(registry_path, "wb") as output:
+            output.write(registry_pdf.read())
+
+        from registry_runner import run_registry_worker
+
+        with st.spinner("등기자료에서 자본금과 주식정보를 찾고 있습니다..."):
+            registry_data, registry_error = run_registry_worker(
+                registry_path,
+                timeout=90,
+            )
+
+        if registry_error:
+            st.error(registry_error)
+        else:
+            preserved_financial_inputs = _capture_stock_financial_inputs()
+            _apply_registry_data(registry_data)
+            _restore_stock_financial_inputs(preserved_financial_inputs)
+            saved_registry_business_no = _save_registry_cache(
+                user_id,
+                current_business_no,
+                registry_data,
+            )
+            if saved_registry_business_no:
+                registry_data = {
+                    **dict(registry_data),
+                    "사업자등록번호": saved_registry_business_no,
+                }
+                st.session_state["stock_last_registry_data"] = registry_data
+                st.session_state["stock_registry_restored_key"] = (
+                    saved_registry_business_no
+                )
+                issued = _format_number(
+                    registry_data.get("발행주식총수")
+                )
+                if issued:
+                    for index in range(1, 4):
+                        share_key = f"stock_shares_{index}"
+                        if not st.session_state.get(share_key):
+                            st.session_state[share_key] = issued
+                st.success(
+                    "등기자료를 현재 기업과 연결해 저장했습니다. "
+                    "기존 당기순이익과 재무 입력값은 유지됩니다."
+                )
+            else:
+                st.warning(
+                    "등기자료는 분석했지만 현재 기업과 안전하게 연결하지 "
+                    "못했습니다. 기업컨설팅에서 업체를 다시 선택해주세요."
+                )
+            st.rerun()
+
+    registry_data = st.session_state.get("stock_last_registry_data", {})
+    if registry_data:
+        st.markdown("#### 등기자료 추출값")
+        registry_preview = pd.DataFrame(
+            [
+                ["법인명", registry_data.get("법인명", "")],
+                ["법인등록번호", registry_data.get("법인등록번호", "")],
+                ["본점소재지", registry_data.get("본점소재지", "")],
+                ["법인설립일", registry_data.get("법인설립일", "")],
+                ["자본금", _format_number(registry_data.get("자본금"))],
+                [
+                    "발행할 주식 총수",
+                    _format_number(registry_data.get("발행할주식총수")),
+                ],
+                [
+                    "발행주식 총수",
+                    _format_number(registry_data.get("발행주식총수")),
+                ],
+                [
+                    "1주의 금액",
+                    _format_number(registry_data.get("1주당액면가액")),
+                ],
+            ],
+            columns=["항목", "추출값"],
+        )
+        st.dataframe(
+            registry_preview,
+            hide_index=True,
+            use_container_width=True,
+        )
+
+        compare_rows = [
+            _compare_values(
+                "법인명",
+                st.session_state.get("stock_company_name", ""),
+                registry_data.get("법인명", ""),
+            ),
+            _compare_values(
+                "법인등록번호",
+                st.session_state.get("stock_corporate_no", ""),
+                registry_data.get("법인등록번호", ""),
+            ),
+            _compare_values(
+                "본점소재지",
+                st.session_state.get("stock_address", ""),
+                registry_data.get("본점소재지", ""),
+            ),
+            _compare_values(
+                "설립일",
+                st.session_state.get("stock_establishment", ""),
+                registry_data.get("법인설립일", ""),
+            ),
+        ]
+        st.markdown("#### 기존 정보와 비교")
+        st.dataframe(
+            pd.DataFrame(compare_rows),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+
+def _render_stock_history(user_id: str) -> None:
+    st.divider()
+    st.markdown("### 주가평가 히스토리")
+    records = _load_records(user_id)
+    with st.expander("저장된 주가평가 불러오기·수정", expanded=False):
+        if not records:
+            st.info(
+                "저장된 주가평가 자료가 없습니다. 평가자료를 저장하면 "
+                "이 메뉴에서 다시 불러올 수 있습니다."
+            )
+            return
+
+        st.caption(
+            f"저장된 평가자료 {len(records)}건 · 로컬 및 Supabase 통합 조회"
+        )
+        options = ["선택 안 함"] + [
+            _record_label(record) for record in records
+        ]
+        selected_record_label = st.selectbox(
+            "저장 기록",
+            options,
+            key="stock_saved_record_selector",
+        )
+        if selected_record_label == "선택 안 함":
+            return
+
+        record = records[options.index(selected_record_label) - 1]
+        preview_result = record.get("result", {})
+        if isinstance(preview_result, dict):
+            final_value = _safe_number(
+                preview_result.get("final_value_per_share")
+            )
+            total_value = _safe_number(
+                preview_result.get("total_equity_value")
+            )
+            if final_value is not None or total_value is not None:
+                p1, p2 = st.columns(2)
+                p1.metric(
+                    "저장된 1주당 평가액",
+                    f"{final_value:,.0f}원"
+                    if final_value is not None
+                    else "-",
+                )
+                p2.metric(
+                    "저장된 전체 주식가치",
+                    f"{total_value:,.0f}원"
+                    if total_value is not None
+                    else "-",
+                )
+        if st.button(
+            "선택 평가 불러오기",
+            key="stock_load_record",
+            use_container_width=True,
+        ):
+            _apply_loaded_record(record)
+            st.success("저장된 평가자료를 불러왔습니다.")
+            st.rerun()
+
+
+def render_stock_valuation_page(
+    user_id: str,
+    user_name: str = "",
+    *,
+    selected_business_no: Any = "",
+    selected_company_name: Any = "",
+) -> None:
     st.markdown("## 주가평가")
     st.caption(
         "비상장주식 보충적 평가를 위한 상담용 계산 화면입니다. "
@@ -890,349 +1273,13 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
     )
 
     customers = _read_customers(user_id)
-    selected_row = None
-
-    if not customers.empty and "업체명" in customers.columns:
-        labels = ["직접 입력"]
-        row_map: dict[str, int] = {}
-
-        for idx, row in customers.iterrows():
-            name = str(row.get("업체명", "") or "").strip()
-            business_no = _normalize_business_no(row.get("사업자등록번호", ""))
-            label = f"{name} · {business_no}" if business_no else name
-            if not label:
-                continue
-            labels.append(label)
-            row_map[label] = idx
-
-        selected_label = st.selectbox(
-            "기존 고객에서 불러오기",
-            labels,
-            key="stock_customer_selector",
-        )
-
-        if selected_label != "직접 입력":
-            selected_row = customers.loc[row_map[selected_label]]
-            customer_revision = str(
-                selected_row.get("_cloud_updated_at", "") or ""
-            )
-            selector_key = (
-                f"{selected_label}:{row_map[selected_label]}:{customer_revision}"
-            )
-            st.session_state["stock_last_customer_key"] = selector_key
-
-            if st.session_state.get("stock_auto_loaded_customer_key") != selector_key:
-                loaded, _ = _apply_customer_financial_data(
-                    user_id,
-                    selected_row,
-                )
-                if loaded:
-                    _restore_registry_for_business(
-                        user_id,
-                        st.session_state.get("stock_business_no", ""),
-                        company_name=st.session_state.get(
-                            "stock_company_name", ""
-                        ),
-                        corporate_no=st.session_state.get(
-                            "stock_corporate_no", ""
-                        ),
-                    )
-                    st.session_state["stock_auto_loaded_customer_key"] = (
-                        selector_key
-                    )
-
-            if st.button(
-                "기존 고객DB에서 재무정보 불러오기",
-                key="stock_load_customer_financials",
-                use_container_width=True,
-            ):
-                loaded, message = _apply_customer_financial_data(
-                    user_id,
-                    selected_row,
-                )
-                if loaded:
-                    _restore_registry_for_business(
-                        user_id,
-                        st.session_state.get("stock_business_no", ""),
-                        company_name=st.session_state.get(
-                            "stock_company_name", ""
-                        ),
-                        corporate_no=st.session_state.get(
-                            "stock_corporate_no", ""
-                        ),
-                    )
-                    st.session_state["stock_auto_loaded_customer_key"] = (
-                        selector_key
-                    )
-                    st.success(message)
-                    st.rerun()
-                else:
-                    st.error(message)
-        else:
-            st.session_state.pop("stock_auto_loaded_customer_key", None)
-
-    with st.expander("크레탑 PDF에서 재무정보 불러오기", expanded=False):
-        uploaded_pdf = st.file_uploader(
-            "크레탑 PDF",
-            type=["pdf"],
-            key="stock_cretop_pdf",
-        )
-        if uploaded_pdf is not None and st.button(
-            "크레탑 재무정보 분석",
-            key="stock_analyze_pdf",
-            use_container_width=True,
-        ):
-            dirs = get_user_dirs(user_id)
-            pdf_path = (
-                dirs["uploads"]
-                / f"주가평가_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-            )
-            uploaded_pdf.seek(0)
-            with open(pdf_path, "wb") as output:
-                output.write(uploaded_pdf.read())
-
-            from cretop_runner import run_cretop_worker
-
-            with st.spinner("크레탑 보고서에서 최근 3개년 재무정보를 찾고 있습니다..."):
-                data, error, logs = run_cretop_worker(
-                    pdf_path,
-                    mode="full",
-                    timeout=180,
-                )
-
-            if error:
-                st.error(error)
-            else:
-                data = _normalize_financial_snapshot(data)
-                save_cretop_financial_snapshot(user_id, data)
-                st.session_state["stock_company_name"] = data.get("업체명", "")
-                st.session_state["stock_business_no"] = data.get(
-                    "사업자등록번호", ""
-                )
-                st.session_state["stock_corporate_no"] = data.get(
-                    "법인등록번호", ""
-                )
-                st.session_state["stock_address"] = data.get(
-                    "사업장 소재지", ""
-                )
-                st.session_state["stock_establishment"] = data.get(
-                    "설립일", ""
-                )
-                history = data.get("재무연도별", [])
-                history = sorted(
-                    [row for row in history if isinstance(row, dict)],
-                    key=lambda row: row.get("연도", 0),
-                    reverse=True,
-                )
-                latest_financial = history[0] if history else {}
-                st.session_state["stock_total_assets"] = _format_number(
-                    data.get("자산총계") or latest_financial.get("자산총계")
-                )
-                st.session_state["stock_total_liabilities"] = _format_number(
-                    data.get("부채총계") or latest_financial.get("부채총계")
-                )
-
-                history = data.get("재무연도별", [])
-                history = sorted(
-                    history,
-                    key=lambda row: row.get("연도", 0),
-                    reverse=True,
-                )[:3]
-                for index, row in enumerate(history, start=1):
-                    st.session_state[f"stock_year_{index}"] = str(row.get("연도", "") or "")
-                    st.session_state[f"stock_net_income_{index}"] = _format_number(
-                        row.get("당기순이익")
-                    )
-
-                st.success(
-                    "크레탑 값을 불러왔습니다. 발행주식수와 세법상 조정사항을 확인해주세요."
-                )
-                st.rerun()
-
-    with st.expander("법인 등기자료에서 주식정보 불러오기", expanded=False):
-        registry_pdf = st.file_uploader(
-            "법인 등기사항증명서 PDF",
-            type=["pdf"],
-            key="stock_registry_pdf",
-        )
-        st.caption(
-            "법인명, 법인등록번호, 본점소재지, 설립일, 자본금, "
-            "발행주식총수, 1주의 금액 등을 자동 추출합니다."
-        )
-
-        current_business_no = _normalize_business_no(
-            st.session_state.get("stock_business_no", "")
-        )
-        if not current_business_no and selected_row is not None:
-            current_business_no = _normalize_business_no(
-                selected_row.get("사업자등록번호", "")
-            )
-
-        if st.button(
-            "등록된 등기정보 불러오기",
-            key="stock_load_saved_registry",
-            use_container_width=True,
-            disabled=not bool(current_business_no),
-        ):
-            registry_data = _restore_registry_for_business(
-                user_id,
-                current_business_no,
-                company_name=st.session_state.get("stock_company_name", ""),
-                corporate_no=st.session_state.get("stock_corporate_no", ""),
-            )
-            if registry_data:
-                preserved_financial_inputs = _capture_stock_financial_inputs()
-                _apply_registry_data(registry_data)
-                _restore_stock_financial_inputs(preserved_financial_inputs)
-                st.session_state["stock_last_registry_data"] = registry_data
-                st.session_state["stock_registry_restored_key"] = (
-                    current_business_no
-                )
-                st.success(
-                    "등록된 등기정보를 불러왔습니다. "
-                    "기존 재무·당기순이익 입력값은 유지됩니다."
-                )
-                st.rerun()
-            else:
-                st.warning(
-                    "해당 사업자등록번호로 저장된 등기정보를 찾지 못했습니다. "
-                    f"조회번호: {current_business_no or '-'}"
-                )
-
-        if registry_pdf is not None and st.button(
-            "등기자료 분석",
-            key="stock_analyze_registry",
-            use_container_width=True,
-        ):
-            dirs = get_user_dirs(user_id)
-            registry_path = (
-                dirs["uploads"]
-                / f"등기자료_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-            )
-            registry_pdf.seek(0)
-            with open(registry_path, "wb") as output:
-                output.write(registry_pdf.read())
-
-            from registry_runner import run_registry_worker
-
-            with st.spinner("등기자료에서 자본금과 주식정보를 찾고 있습니다..."):
-                registry_data, registry_error = run_registry_worker(
-                    registry_path,
-                    timeout=90,
-                )
-
-            if registry_error:
-                st.error(registry_error)
-            else:
-                preserved_financial_inputs = _capture_stock_financial_inputs()
-                _apply_registry_data(registry_data)
-                _restore_stock_financial_inputs(preserved_financial_inputs)
-                saved_registry_business_no = _save_registry_cache(
-                    user_id,
-                    st.session_state.get("stock_business_no", ""),
-                    registry_data,
-                )
-                st.session_state["stock_last_registry_data"] = registry_data
-                issued = _format_number(registry_data.get("발행주식총수"))
-                if issued:
-                    for index in range(1, 4):
-                        share_key = f"stock_shares_{index}"
-                        if not st.session_state.get(share_key):
-                            st.session_state[share_key] = issued
-                if saved_registry_business_no:
-                    st.success(
-                        "등기자료를 고객과 연결해 저장했습니다. "
-                        "기존 당기순이익과 재무 입력값은 유지됩니다."
-                    )
-                else:
-                    st.warning(
-                        "등기자료는 분석했지만 연결할 고객의 사업자등록번호를 "
-                        "확정하지 못했습니다. 기존 고객을 먼저 선택해주세요."
-                    )
-                st.rerun()
-
-        registry_data = st.session_state.get("stock_last_registry_data", {})
-        current_business_no = st.session_state.get("stock_business_no", "")
-        restore_key = _normalize_business_no(current_business_no)
-        if restore_key and st.session_state.get("stock_registry_restored_key") != restore_key:
-            restored = _restore_registry_for_business(
-                user_id,
-                restore_key,
-                company_name=st.session_state.get("stock_company_name", ""),
-                corporate_no=st.session_state.get("stock_corporate_no", ""),
-            )
-            st.session_state["stock_registry_restored_key"] = restore_key
-            if restored:
-                registry_data = restored
-        if registry_data:
-            st.markdown("#### 등기자료 추출값")
-            registry_preview = pd.DataFrame([
-                ["법인명", registry_data.get("법인명", "")],
-                ["법인등록번호", registry_data.get("법인등록번호", "")],
-                ["본점소재지", registry_data.get("본점소재지", "")],
-                ["법인설립일", registry_data.get("법인설립일", "")],
-                ["자본금", _format_number(registry_data.get("자본금"))],
-                ["발행할 주식 총수", _format_number(registry_data.get("발행할주식총수"))],
-                ["발행주식 총수", _format_number(registry_data.get("발행주식총수"))],
-                ["1주의 금액", _format_number(registry_data.get("1주당액면가액"))],
-            ], columns=["항목", "추출값"])
-            st.dataframe(
-                registry_preview,
-                hide_index=True,
-                use_container_width=True,
-            )
-
-            compare_rows = [
-                _compare_values(
-                    "법인명",
-                    st.session_state.get("stock_company_name", ""),
-                    registry_data.get("법인명", ""),
-                ),
-                _compare_values(
-                    "법인등록번호",
-                    st.session_state.get("stock_corporate_no", ""),
-                    registry_data.get("법인등록번호", ""),
-                ),
-                _compare_values(
-                    "본점소재지",
-                    st.session_state.get("stock_address", ""),
-                    registry_data.get("본점소재지", ""),
-                ),
-                _compare_values(
-                    "설립일",
-                    st.session_state.get("stock_establishment", ""),
-                    registry_data.get("법인설립일", ""),
-                ),
-            ]
-            st.markdown("#### 기존 정보와 비교")
-            st.dataframe(
-                pd.DataFrame(compare_rows),
-                hide_index=True,
-                use_container_width=True,
-            )
-
-    records = _load_records(user_id)
-    with st.expander("저장된 주가평가 불러오기·수정", expanded=False):
-        if not records:
-            st.info("저장된 주가평가 자료가 없습니다. 평가자료를 저장하면 이 메뉴에서 다시 불러올 수 있습니다.")
-        else:
-            st.caption(f"저장된 평가자료 {len(records)}건 · 로컬 및 Supabase 통합 조회")
-            options = ["선택 안 함"] + [_record_label(record) for record in records]
-            selected_record_label = st.selectbox("저장 기록", options, key="stock_saved_record_selector")
-            if selected_record_label != "선택 안 함":
-                record = records[options.index(selected_record_label) - 1]
-                preview_result = record.get("result", {})
-                if isinstance(preview_result, dict):
-                    final_value = _safe_number(preview_result.get("final_value_per_share"))
-                    total_value = _safe_number(preview_result.get("total_equity_value"))
-                    if final_value is not None or total_value is not None:
-                        p1, p2 = st.columns(2)
-                        p1.metric("저장된 1주당 평가액", f"{final_value:,.0f}원" if final_value is not None else "-")
-                        p2.metric("저장된 전체 주식가치", f"{total_value:,.0f}원" if total_value is not None else "-")
-                if st.button("선택 평가 불러오기", key="stock_load_record", use_container_width=True):
-                    _apply_loaded_record(record)
-                    st.success("저장된 평가자료를 불러왔습니다.")
-                    st.rerun()
+    selected_row = _load_stock_customer_context(
+        user_id,
+        customers,
+        selected_business_no=selected_business_no,
+        selected_company_name=selected_company_name,
+    )
+    _render_registry_upload(user_id, selected_row)
 
     with st.form(
         "stock_valuation_input_form_v855",
@@ -1720,3 +1767,5 @@ def render_stock_valuation_page(user_id: str, user_name: str = "") -> None:
 개별 검토해야 합니다.
 """
         )
+
+    _render_stock_history(user_id)

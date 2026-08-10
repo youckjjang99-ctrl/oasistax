@@ -4127,14 +4127,6 @@ def render_prospect_db_center(
     ]
     if is_admin_user:
         workflow_steps.append("⑤ 반납DB 관리")
-    pending_workflow_step = st.session_state.pop(
-        "_prospect_workflow_step_pending_v1020",
-        None,
-    )
-    if pending_workflow_step in workflow_steps:
-        st.session_state["prospect_workflow_step_v1020"] = (
-            pending_workflow_step
-        )
     if st.session_state.get(
         "prospect_workflow_step_v1020"
     ) not in workflow_steps:
@@ -4644,13 +4636,10 @@ def render_prospect_db_center(
         st.session_state[page_state_key] = int(
             result.get("next_page") or int(end_page) + 1
         )
-        st.session_state["_prospect_workflow_step_pending_v1020"] = (
-            "② 검색 결과"
+        st.success(
+            "조회가 완료되었습니다. 조건 설정 화면은 그대로 유지됩니다. "
+            "결과는 ‘② 검색 결과’를 눌러 확인해주세요."
         )
-        # Render the completed result immediately in this run. The pending
-        # value synchronizes the selector on the next natural interaction,
-        # avoiding a second full-app repaint at the end of a long search.
-        workflow_step = "② 검색 결과"
 
     if workflow_step != "② 검색 결과":
         st.info(
