@@ -50,7 +50,7 @@ class ProspectContactResultsTabTests(unittest.TestCase):
 
         for retained_marker in (
             "저장된 영업후보 엑셀 다운로드",
-            "saved_prospect_compact_table_v1040",
+            "saved_prospect_compact_table_v1041",
             "_show_outreach_dialog(",
             "업체 메모 관리",
         ):
