@@ -1235,13 +1235,12 @@ def render_stock_valuation_page(
     )
 
     customers = _read_customers(user_id)
-    selected_row = _load_stock_customer_context(
+    _load_stock_customer_context(
         user_id,
         customers,
         selected_business_no=selected_business_no,
         selected_company_name=selected_company_name,
     )
-    _render_registry_upload(user_id, selected_row)
 
     with st.form(
         "stock_valuation_input_form_v855",
