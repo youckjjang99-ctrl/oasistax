@@ -1811,9 +1811,36 @@ def _show_outreach_dialog(
     if not target.get("ok"):
         st.error(target.get("message") or "발송 대상을 확인하지 못했습니다.")
         return
+    request_id = re.sub(
+        r"[^A-Za-z0-9]",
+        "",
+        str(request.get("request_id") or ""),
+    )[:24] or "request"
+    selected_template_code = (
+        sales_outreach.SOLAPI_ALIMTALK_DEFAULT_TEMPLATE_CODE
+    )
+    selected_template_label = sales_outreach.SOLAPI_CLAIM_AUTH_TEMPLATE_LABEL
+    if channel == "kakao":
+        template_options = sales_outreach.claim_auth_alimtalk_templates()
+        template_labels = {
+            str(item.get("code") or ""): str(item.get("label") or "")
+            for item in template_options
+        }
+        selected_template_code = st.selectbox(
+            "알림톡 템플릿",
+            options=list(template_labels),
+            format_func=lambda code: template_labels.get(code, code),
+            key=f"saved_prospect_alimtalk_template_{request_id}",
+        )
+        selected_template_label = template_labels.get(
+            selected_template_code,
+            sales_outreach.SOLAPI_CLAIM_AUTH_TEMPLATE_LABEL,
+        )
     readiness = dict(
         (
-            sales_outreach.claim_auth_alimtalk_readiness()
+            sales_outreach.claim_auth_alimtalk_readiness(
+                selected_template_code
+            )
             if channel == "kakao"
             else sales_outreach.channel_readiness(channel)
         )
@@ -1827,8 +1854,9 @@ def _show_outreach_dialog(
     )
     if channel == "kakao":
         st.info(
-            "Solapi 알림톡 템플릿 ‘경정청구 자료수집 인증안내’로 발송합니다. "
-            "고객이름과 인증링크만 입력할 수 있으며 문자 대체발송은 하지 않습니다."
+            f"Solapi 승인 템플릿 ‘{selected_template_label}’로 발송합니다. "
+            "발송할 휴대폰 번호·고객이름·인증링크를 확인할 수 있으며 "
+            "문자 대체발송은 하지 않습니다."
         )
     elif channel == "sms":
         st.info(
@@ -1851,17 +1879,23 @@ def _show_outreach_dialog(
             setup_message += " 필요한 설정: " + ", ".join(missing)
         st.warning(setup_message)
 
-    request_id = re.sub(
-        r"[^A-Za-z0-9]",
-        "",
-        str(request.get("request_id") or ""),
-    )[:24] or "request"
     with st.form(f"saved_prospect_outreach_form_v1040_{request_id}"):
         subject = ""
         body = ""
         customer_name = ""
         auth_link = ""
+        send_recipient = target.get("recipient")
         if channel == "kakao":
+            send_recipient = st.text_input(
+                "발송할 휴대폰 번호",
+                value=str(target.get("recipient") or ""),
+                max_chars=30,
+                placeholder="010-0000-0000",
+                help=(
+                    "이번 알림톡 발송에만 사용할 번호입니다. "
+                    "저장된 업체 연락처는 변경하지 않습니다."
+                ),
+            )
             customer_name = st.text_input(
                 "고객이름",
                 max_chars=50,
@@ -1923,9 +1957,10 @@ def _show_outreach_dialog(
     validation = dict(
         (
             sales_outreach.validate_claim_auth_alimtalk(
-                target.get("recipient"),
+                send_recipient,
                 customer_name,
                 auth_link,
+                template_code=selected_template_code,
             )
             if channel == "kakao"
             else sales_outreach.validate_message(
@@ -1954,6 +1989,9 @@ def _show_outreach_dialog(
     ):
         st.error("발송 직전 대상 상태가 변경되어 안전하게 중단했습니다. 목록에서 다시 선택해 주세요.")
         return
+    final_recipient = (
+        send_recipient if channel == "kakao" else latest.get("recipient")
+    )
     request_id = str(request.get("request_id") or "")
     if not _claim_outreach_attempt(st.session_state, request_id):
         st.error(
@@ -1963,12 +2001,15 @@ def _show_outreach_dialog(
         return
     try:
         fingerprint_subject = (
-            sales_outreach.SOLAPI_CLAIM_AUTH_TEMPLATE_LABEL
+            selected_template_label
             if channel == "kakao"
             else subject
         )
         fingerprint_body = (
-            f"{len(customer_name)}:{customer_name}\n{auth_link}"
+            (
+                f"{selected_template_code}\n"
+                f"{len(customer_name)}:{customer_name}\n{auth_link}"
+            )
             if channel == "kakao"
             else body
         )
@@ -1979,10 +2020,10 @@ def _show_outreach_dialog(
         )
         recipient_hmac = sales_outreach_repository.recipient_fingerprint(
             channel,
-            latest.get("recipient"),
+            final_recipient,
         )
         recipient_phone_hash = (
-            legacy_phone_contact_hash(str(latest.get("recipient") or ""))
+            legacy_phone_contact_hash(str(final_recipient or ""))
             if channel in {"sms", "kakao"}
             else ""
         )
@@ -2040,15 +2081,16 @@ def _show_outreach_dialog(
         result = dict(
             (
                 sales_outreach.send_claim_auth_alimtalk(
-                    latest.get("recipient"),
+                    final_recipient,
                     customer_name,
                     auth_link,
                     request_id,
+                    template_code=selected_template_code,
                 )
                 if channel == "kakao"
                 else sales_outreach.send_outreach(
                     channel,
-                    latest.get("recipient"),
+                    final_recipient,
                     subject,
                     body,
                     request_id,
@@ -2122,7 +2164,15 @@ def _show_outreach_dialog(
             contact_method,
             contact_result,
             notes=(
-                "OASIS에서 카카오톡 경정청구 자료수집 인증안내 발송 접수"
+                (
+                    f"OASIS에서 카카오톡 {selected_template_label} 발송 접수"
+                    + (
+                        " (발송번호 별도 지정)"
+                        if str(final_recipient or "").strip()
+                        != str(latest.get("recipient") or "").strip()
+                        else ""
+                    )
+                )
                 if channel == "kakao"
                 else f"OASIS에서 {channel_label} 발송 접수"
             ),

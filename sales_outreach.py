@@ -44,6 +44,29 @@ OUTREACH_SENDER_ADDRESS_ENV = "OUTREACH_SENDER_ADDRESS"
 LEGACY_CONTACT_PHONE_HASH_KEY_ENV = "OASIS_KAKAO_GUIDANCE_PHONE_HASH_KEY"
 SOLAPI_CLAIM_AUTH_TEMPLATE_ENV = "SOLAPI_TEMPLATE_AUTH_START_ID"
 SOLAPI_CLAIM_AUTH_TEMPLATE_LABEL = "경정청구 자료수집 인증안내"
+SOLAPI_ALIMTALK_DEFAULT_TEMPLATE_CODE = "auth_start"
+SOLAPI_ALIMTALK_TEMPLATE_SPECS = {
+    SOLAPI_ALIMTALK_DEFAULT_TEMPLATE_CODE: {
+        "label": SOLAPI_CLAIM_AUTH_TEMPLATE_LABEL,
+        "env_name": SOLAPI_CLAIM_AUTH_TEMPLATE_ENV,
+    },
+    "auth_resume": {
+        "label": "경정청구 자료수집 재안내",
+        "env_name": "SOLAPI_TEMPLATE_AUTH_RESUME_ID",
+    },
+    "next_auth": {
+        "label": "경정청구 추가 인증 안내",
+        "env_name": "SOLAPI_TEMPLATE_NEXT_AUTH_ID",
+    },
+    "complete": {
+        "label": "경정청구 자료수집 완료 안내",
+        "env_name": "SOLAPI_TEMPLATE_COMPLETE_ID",
+    },
+    "failed": {
+        "label": "경정청구 자료수집 확인 필요 안내",
+        "env_name": "SOLAPI_TEMPLATE_FAILED_ID",
+    },
+}
 
 SMSKOREA_USER_ID_ENV = "SMSKOREA_USER_ID"
 SMSKOREA_SEC_API_KEY_ENV = "SMSKOREA_SEC_API_KEY"
@@ -308,13 +331,53 @@ def channel_readiness(channel: str) -> dict[str, Any]:
     }
 
 
-def claim_auth_alimtalk_readiness() -> dict[str, Any]:
-    """Return redacted readiness for the fixed Solapi auth template."""
+def claim_auth_alimtalk_templates() -> tuple[dict[str, str], ...]:
+    """Return the approved template allowlist without provider identifiers."""
+
+    return tuple(
+        {
+            "code": code,
+            "label": str(spec["label"]),
+            "env_name": str(spec["env_name"]),
+        }
+        for code, spec in SOLAPI_ALIMTALK_TEMPLATE_SPECS.items()
+    )
+
+
+def _claim_auth_template_spec(template_code: Any) -> dict[str, str] | None:
+    clean_code = str(template_code or "").strip().lower()
+    spec = SOLAPI_ALIMTALK_TEMPLATE_SPECS.get(clean_code)
+    if not isinstance(spec, Mapping):
+        return None
+    return {
+        "code": clean_code,
+        "label": str(spec.get("label") or "").strip(),
+        "env_name": str(spec.get("env_name") or "").strip(),
+    }
+
+
+def claim_auth_alimtalk_readiness(
+    template_code: Any = SOLAPI_ALIMTALK_DEFAULT_TEMPLATE_CODE,
+) -> dict[str, Any]:
+    """Return redacted readiness for one allowlisted Solapi template."""
 
     source = os.environ
+    template = _claim_auth_template_spec(template_code)
+    if template is None:
+        return {
+            "channel": CHANNEL_KAKAO,
+            "provider": "solapi",
+            "ready": False,
+            "send_enabled": _enabled(source.get(OUTREACH_ENABLED_ENV, "")),
+            "external_send_allowed": False,
+            "required_env_names": [],
+            "missing_env_names": [],
+            "code": "TEMPLATE_NOT_ALLOWED",
+            "message": "선택할 수 없는 알림톡 템플릿입니다.",
+        }
     provider = solapi_environment_readiness(
         source,
-        required_template_env_names=(SOLAPI_CLAIM_AUTH_TEMPLATE_ENV,),
+        required_template_env_names=(template["env_name"],),
     )
     missing = list(provider.get("missing_env_names") or [])
     code = "READY"
@@ -436,8 +499,17 @@ def validate_claim_auth_alimtalk(
     recipient: Any,
     customer_name: Any,
     auth_link: Any,
+    *,
+    template_code: Any = SOLAPI_ALIMTALK_DEFAULT_TEMPLATE_CODE,
 ) -> dict[str, Any]:
-    """Validate the fixed template inputs without echoing personal data."""
+    """Validate allowlisted template inputs without echoing personal data."""
+
+    if _claim_auth_template_spec(template_code) is None:
+        return _status(
+            False,
+            "TEMPLATE_NOT_ALLOWED",
+            "선택할 수 없는 알림톡 템플릿입니다.",
+        )
 
     if _normalize_local_mobile(str(recipient or "")) is None:
         return _status(
@@ -1023,11 +1095,19 @@ def send_claim_auth_alimtalk(
     auth_link: Any,
     idempotency_key: Any,
     *,
+    template_code: Any = SOLAPI_ALIMTALK_DEFAULT_TEMPLATE_CODE,
     client: SolapiAlimtalkClient | None = None,
 ) -> dict[str, Any]:
-    """Send the approved claim-auth Alimtalk after the durable DB claim."""
+    """Send one approved Alimtalk template after the durable DB claim."""
 
-    readiness = claim_auth_alimtalk_readiness()
+    template = _claim_auth_template_spec(template_code)
+    if template is None:
+        return _status(
+            False,
+            "TEMPLATE_NOT_ALLOWED",
+            "선택할 수 없는 알림톡 템플릿입니다.",
+        )
+    readiness = claim_auth_alimtalk_readiness(template["code"])
     if not readiness["external_send_allowed"]:
         return _status(
             False,
@@ -1041,6 +1121,7 @@ def send_claim_auth_alimtalk(
         recipient,
         customer_name,
         auth_link,
+        template_code=template["code"],
     )
     if not validation["ok"]:
         return validation
@@ -1073,7 +1154,7 @@ def send_claim_auth_alimtalk(
         provider_call_started = True
         provider.send_alimtalk(
             str(recipient or ""),
-            str(source.get(SOLAPI_CLAIM_AUTH_TEMPLATE_ENV, "") or ""),
+            str(source.get(template["env_name"], "") or ""),
             variables={
                 "#{고객명}": str(customer_name or "").strip(),
                 "#{인증링크}": clean_link,
@@ -1212,8 +1293,11 @@ __all__ = [
     "CHANNEL_EMAIL",
     "CHANNEL_SMS",
     "CHANNEL_KAKAO",
+    "SOLAPI_ALIMTALK_DEFAULT_TEMPLATE_CODE",
+    "SOLAPI_ALIMTALK_TEMPLATE_SPECS",
     "SOLAPI_CLAIM_AUTH_TEMPLATE_ENV",
     "SOLAPI_CLAIM_AUTH_TEMPLATE_LABEL",
+    "claim_auth_alimtalk_templates",
     "claim_auth_alimtalk_readiness",
     "channel_readiness",
     "send_claim_auth_alimtalk",
