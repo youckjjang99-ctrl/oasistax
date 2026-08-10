@@ -410,7 +410,7 @@ def render_enterprise_management_center(
     user_name: str = "",
 ) -> None:
     st.caption(
-        "고객 한 곳을 선택해 기업정보·CRM·정책자금 설정·주가평가·"
+        "고객 한 곳을 선택해 기업정보·상담일지·정책자금 설정·주가평가·"
         "기업 히스토리를 한 화면에서 관리합니다."
     )
 
@@ -603,9 +603,9 @@ def render_enterprise_management_center(
 
     section_options = [
         "기업정보",
-        "CRM",
+        "상담일지",
         "정책자금",
-        "주가평가·등기",
+        "주가평가",
         "정관검토",
         "기업히스토리",
         "직원현황",
@@ -616,7 +616,7 @@ def render_enterprise_management_center(
         section_options,
         default="기업정보",
         selection_mode="single",
-        key="enterprise_section_v1030",
+        key="enterprise_section_v1031",
         label_visibility="collapsed",
     )
     selected_section = selected_section or "기업정보"
@@ -817,7 +817,7 @@ def render_enterprise_management_center(
         except Exception:
             st.caption("연결된 기업자료 현황을 불러오지 못했습니다.")
 
-    elif selected_section == "CRM":
+    elif selected_section == "상담일지":
         from cloud_sync import sync_crm_record
         from consultation_journal import (
             render_audio_consultation_journal,
@@ -1144,7 +1144,7 @@ def render_enterprise_management_center(
             current_policy_preferences,
         )
 
-    elif selected_section == "주가평가·등기":
+    elif selected_section == "주가평가":
         from stock_valuation import render_stock_valuation_page
 
         render_stock_valuation_page(
@@ -1162,6 +1162,7 @@ def render_enterprise_management_center(
             business_no=business_no,
             company_name=company_name,
             customer_id=str(selected_row.get("_customer_id", "") or ""),
+            allow_upload=False,
         )
 
     elif selected_section == "기업히스토리":
@@ -1209,6 +1210,7 @@ def render_enterprise_management_center(
             company_name=company_name,
             company_address=company_address,
             customer_id=str(selected_row.get("_customer_id", "") or ""),
+            allow_upload=False,
         )
 
     elif selected_section == "가지급금 계산기":

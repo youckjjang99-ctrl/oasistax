@@ -2007,35 +2007,39 @@ def render_employee_status(
     company_name: str,
     company_address: str = "",
     customer_id: str = "",
+    allow_upload: bool = True,
 ) -> None:
     st.markdown("#### 직원현황")
-    st.caption(
-        "가입자명부 이미지는 AI 비전으로 표 전체를 분석한 뒤, "
-        "편집 가능한 검수표에서 확인한 내용만 저장합니다. "
-        "주민등록번호 뒷자리는 AI에 출력하도록 요청하지 않으며 저장하지 않습니다. "
-        "암호 1111인 근로자 고용정보 Excel은 메모리에서 자동으로 열어 분석합니다."
-    )
-    st.info(
-        "JPG·JPEG·PNG 이미지는 OpenAI API로 전송되어 분석됩니다. "
-        "검수 완료 버튼을 누르기 전에는 직원현황과 Supabase에 저장되지 않습니다."
-    )
+    if allow_upload:
+        st.caption(
+            "가입자명부 이미지는 AI 비전으로 표 전체를 분석한 뒤, "
+            "편집 가능한 검수표에서 확인한 내용만 저장합니다. "
+            "주민등록번호 뒷자리는 AI에 출력하도록 요청하지 않으며 저장하지 않습니다. "
+            "암호 1111인 근로자 고용정보 Excel은 메모리에서 자동으로 열어 분석합니다."
+        )
+        st.info(
+            "JPG·JPEG·PNG 이미지는 OpenAI API로 전송되어 분석됩니다. "
+            "검수 완료 버튼을 누르기 전에는 직원현황과 Supabase에 저장되지 않습니다."
+        )
 
     state_key = (
         f"employee_roster_review_"
         f"{_company_key(business_no, company_name)}"
     )
 
-    uploaded_files = st.file_uploader(
-        "4대보험 가입자명부 업로드",
-        type=["xlsx", "xls", "csv", "pdf", "jpg", "jpeg", "png"],
-        accept_multiple_files=True,
-        key=f"employee_roster_upload_{business_no or company_name}",
-        help=(
-            "가입내역 페이지와 안내 페이지를 함께 올려도 됩니다. "
-            "AI가 직원 행이 없는 안내 페이지는 제외합니다. "
-            "암호화된 근로자 고용정보 현황(.xls/.xlsx)도 그대로 선택할 수 있습니다."
-        ),
-    )
+    uploaded_files = []
+    if allow_upload:
+        uploaded_files = st.file_uploader(
+            "4대보험 가입자명부 업로드",
+            type=["xlsx", "xls", "csv", "pdf", "jpg", "jpeg", "png"],
+            accept_multiple_files=True,
+            key=f"employee_roster_upload_{business_no or company_name}",
+            help=(
+                "가입내역 페이지와 안내 페이지를 함께 올려도 됩니다. "
+                "AI가 직원 행이 없는 안내 페이지는 제외합니다. "
+                "암호화된 근로자 고용정보 현황(.xls/.xlsx)도 그대로 선택할 수 있습니다."
+            ),
+        )
 
     if uploaded_files and st.button(
         "AI 비전 분석 후 검수표 만들기",
@@ -2216,7 +2220,7 @@ def render_employee_status(
                 "아래 표를 확인·수정한 뒤 저장하세요."
             )
 
-    pending = st.session_state.get(state_key)
+    pending = st.session_state.get(state_key) if allow_upload else None
     if isinstance(pending, dict) and pending.get("rows"):
         st.markdown("##### AI 분석 결과 검수")
         expected_count = int(pending.get("expected_count", 0) or 0)
@@ -2410,7 +2414,11 @@ def render_employee_status(
         company_name,
     )
     if not latest:
-        st.info("저장된 직원현황이 없습니다.")
+        st.info(
+            "저장된 직원현황이 없습니다."
+            if allow_upload
+            else "기업정보등록에서 4대보험 가입자명부 등록 시 분석됩니다."
+        )
         return
 
     summary = latest.get("summary", {}) or {}
