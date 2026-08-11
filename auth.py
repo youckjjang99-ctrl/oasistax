@@ -20,7 +20,7 @@ from performance_cache import cache_generation, invalidate_cache
 ROOT_DIR = Path(__file__).parent
 DATA_DIR = ROOT_DIR / "data"
 USERS_FILE = DATA_DIR / "users.json"
-MIN_PASSWORD_LENGTH = 12
+MIN_PASSWORD_LENGTH = 9
 MAX_LOGIN_FAILURES = 5
 LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
 LOGIN_LOCK_SECONDS = 15 * 60
@@ -29,6 +29,10 @@ _LOGIN_ATTEMPTS_LOCK = threading.Lock()
 _DEFAULT_ADMIN_ENSURED = False
 _DEFAULT_ADMIN_LOCK = threading.Lock()
 AUTH_RECHECK_SECONDS = 10.0
+AUTH_OUTAGE_GRACE_SECONDS = 5 * 60.0
+SESSION_CURRENT = "current"
+SESSION_SUPERSEDED = "superseded"
+SESSION_UNAVAILABLE = "unavailable"
 PERSISTENT_LOGIN_COOKIE = "oasis_login_v1"
 PERSISTENT_LOGIN_SECONDS = 30 * 24 * 60 * 60
 SIGNED_OUT_QUERY_PARAM = "_oasis_signed_out"
@@ -252,6 +256,27 @@ def save_users(users):
     invalidate_cache("auth_users", "all")
 
 
+def _save_single_user(user_id: str, user: dict) -> None:
+    """Persist one account without rewriting another account's password row."""
+    safe_id = _safe_user_id(user_id)
+    if not safe_id or not isinstance(user, dict):
+        raise ValueError("invalid user record")
+    normalized = dict(user)
+    normalized["user_id"] = safe_id
+
+    if cloud_is_configured():
+        CloudDatabase().upsert(
+            TABLE_USERS,
+            [_user_to_cloud_row(safe_id, normalized)],
+            "user_id",
+        )
+
+    local_users = _load_local_users()
+    local_users[safe_id] = normalized
+    _save_local_users(local_users)
+    invalidate_cache("auth_users", "all")
+
+
 @st.cache_data(
     ttl=15,
     max_entries=8,
@@ -383,7 +408,7 @@ def create_user(user_id, password, name):
         "approved_by": "",
     }
     try:
-        save_users(users)
+        _save_single_user(user_id, users[user_id])
     except Exception as exc:
         return False, (
             "회원정보를 Supabase에 저장하지 못했습니다. "
@@ -425,11 +450,11 @@ def _load_authoritative_user_for_login(user_id: str):
     return _load_local_users().get(safe_id), ""
 
 
-def _load_current_user_access(user_id: str) -> dict:
-    """Load only fields needed for an already authenticated session."""
+def _load_current_user_access_status(user_id: str) -> tuple[dict, str]:
+    """Load current access data and distinguish absence from a DB outage."""
     safe_id = _safe_user_id(user_id)
     if not safe_id:
-        return {}
+        return {}, "not_found"
     if cloud_is_configured():
         try:
             rows = CloudDatabase().select(
@@ -439,9 +464,18 @@ def _load_current_user_access(user_id: str) -> dict:
                 limit=1,
             )
         except Exception:
-            return {}
-        return _cloud_row_to_user(rows[0]) if rows else {}
-    return _load_local_users().get(safe_id, {})
+            return {}, SESSION_UNAVAILABLE
+        if not rows:
+            return {}, "not_found"
+        return _cloud_row_to_user(rows[0]), "ok"
+    user = _load_local_users().get(safe_id, {})
+    return (user, "ok") if user else ({}, "not_found")
+
+
+def _load_current_user_access(user_id: str) -> dict:
+    """Load only fields needed for an already authenticated session."""
+    user, _status = _load_current_user_access_status(user_id)
+    return user
 
 
 def authenticate_user(user_id, password):
@@ -574,7 +608,7 @@ def approve_user(user_id, approved_by=""):
     users[user_id]["approved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     users[user_id]["approved_by"] = approved_by or "admin"
     try:
-        save_users(users)
+        _save_single_user(user_id, users[user_id])
     except Exception as exc:
         return False, (
             "회원 승인정보를 Supabase에 저장하지 못했습니다. "
@@ -597,7 +631,7 @@ def reject_user(user_id, approved_by=""):
     users[user_id]["approved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     users[user_id]["approved_by"] = approved_by or "admin"
     try:
-        save_users(users)
+        _save_single_user(user_id, users[user_id])
     except Exception as exc:
         return False, (
             "회원 거절정보를 Supabase에 저장하지 못했습니다. "
@@ -629,9 +663,9 @@ def _register_login_session(user_id: str) -> str:
     return token
 
 
-def _session_is_current(user_id: str, token: str) -> bool:
+def _session_validation_status(user_id: str, token: str) -> str:
     if not user_id or not token or not cloud_is_configured():
-        return True
+        return SESSION_CURRENT
     try:
         rows = CloudDatabase().select(
             TABLE_LOGIN_SESSIONS,
@@ -640,10 +674,23 @@ def _session_is_current(user_id: str, token: str) -> bool:
             limit=1,
         )
         if not rows:
-            return False
-        return str(rows[0].get("session_token", "")) == str(token)
+            return SESSION_SUPERSEDED
+        if str(rows[0].get("session_token", "")) == str(token):
+            return SESSION_CURRENT
+        return SESSION_SUPERSEDED
     except Exception:
-        return False
+        return SESSION_UNAVAILABLE
+
+
+def _session_is_current(user_id: str, token: str) -> bool:
+    """Strict validation used when restoring a browser cookie."""
+    return _session_validation_status(user_id, token) == SESSION_CURRENT
+
+
+def _auth_outage_grace_active(last_verified_at: float, now: float) -> bool:
+    return bool(last_verified_at) and (
+        0 <= now - float(last_verified_at) <= AUTH_OUTAGE_GRACE_SECONDS
+    )
 
 
 def _persistent_login_cipher() -> Fernet | None:
@@ -880,7 +927,7 @@ def change_password(
     )
     users[user_id] = user
     try:
-        save_users(users)
+        _save_single_user(user_id, user)
     except Exception as exc:
         return False, (
             "변경된 비밀번호를 Supabase에 저장하지 못했습니다. "
@@ -904,7 +951,7 @@ def render_password_change(user_id: str) -> None:
             new_password = st.text_input(
                 "새 비밀번호",
                 type="password",
-                placeholder="12자리 이상 · 문자와 숫자 포함",
+                placeholder="9자리 이상 · 문자와 숫자 포함",
                 key="password_change_new_v740",
             )
             new_password_confirm = st.text_input(
@@ -1011,14 +1058,48 @@ def check_login():
             _sync_persistent_login_cookie(current_user_id, session_token)
             return True
 
-        if not _session_is_current(current_user_id, session_token):
+        session_status = _session_validation_status(
+            current_user_id,
+            session_token,
+        )
+        if session_status == SESSION_UNAVAILABLE:
+            if _auth_outage_grace_active(last_verified_at, now):
+                st.warning(
+                    "로그인 확인 서버 연결이 잠시 지연되고 있습니다. "
+                    "확인된 기존 로그인은 안전하게 유지합니다."
+                )
+                return True
+            _clear_persistent_login_cookie()
+            _clear_local_login_state()
+            st.warning(
+                "로그인 확인 서버에 연결하지 못해 세션을 안전하게 종료했습니다. "
+                "잠시 후 다시 로그인해주세요."
+            )
+            return False
+        if session_status == SESSION_SUPERSEDED:
             _clear_persistent_login_cookie()
             _clear_local_login_state()
             st.warning(
                 "동일 계정으로 새 로그인이 확인되어 현재 기기에서 자동 로그아웃되었습니다."
             )
             return False
-        current_user = _load_current_user_access(current_user_id)
+        current_user, access_status = _load_current_user_access_status(
+            current_user_id
+        )
+        if access_status == SESSION_UNAVAILABLE:
+            if _auth_outage_grace_active(last_verified_at, now):
+                st.warning(
+                    "계정 확인 서버 연결이 잠시 지연되고 있습니다. "
+                    "확인된 기존 로그인은 안전하게 유지합니다."
+                )
+                return True
+            _clear_persistent_login_cookie()
+            _clear_local_login_state()
+            st.warning(
+                "계정 확인 서버에 연결하지 못해 세션을 안전하게 종료했습니다. "
+                "잠시 후 다시 로그인해주세요."
+            )
+            return False
         if str(current_user.get("status", "")).strip() != "approved":
             _clear_persistent_login_cookie()
             _clear_local_login_state()
@@ -1082,6 +1163,16 @@ def login_form(logo_html_func):
                 st.session_state.login_session_token = _register_login_session(
                     user.get("user_id", "")
                 )
+                login_verification_key = hashlib.sha256(
+                    (
+                        f"{st.session_state.current_user_id}\0"
+                        f"{st.session_state.login_session_token}"
+                    ).encode("utf-8")
+                ).hexdigest()
+                st.session_state["_auth_last_verified_key"] = (
+                    login_verification_key
+                )
+                st.session_state["_auth_last_verified_at"] = time.monotonic()
                 st.session_state.latest_result_file = None
                 st.session_state.latest_upload_file = None
                 st.rerun()
@@ -1103,7 +1194,7 @@ def login_form(logo_html_func):
             new_pw = st.text_input(
                 "비밀번호",
                 type="password",
-                placeholder="12자리 이상 · 문자와 숫자 포함",
+                placeholder="9자리 이상 · 문자와 숫자 포함",
                 key="signup_user_pw",
             )
             new_pw2 = st.text_input(
