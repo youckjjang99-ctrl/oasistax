@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
@@ -26,6 +27,16 @@ TABLE_BACKUP_RUNS = "oasis_backup_runs"
 TABLE_RESTORE_DRILLS = "oasis_restore_drills"
 TABLE_CUSTOMER_ARCHIVE_EVENTS = "oasis_customer_archive_events"
 PRIVATE_CUSTOMER_ASSET_BUCKET = "oasis-customer-assets"
+_HTTP_CLIENT_LOCAL = threading.local()
+
+
+def _http_client() -> requests.Session:
+    """Return a per-thread client so HTTPS connections can be reused safely."""
+    client = getattr(_HTTP_CLIENT_LOCAL, "client", None)
+    if client is None:
+        client = requests.Session()
+        _HTTP_CLIENT_LOCAL.client = client
+    return client
 
 
 def _invalidate_written_rows(
@@ -110,7 +121,7 @@ class CloudDatabase:
 
     def health_check(self) -> tuple[bool, str]:
         try:
-            response = requests.get(
+            response = _http_client().get(
                 self._url(TABLE_CUSTOMERS),
                 headers=self.headers,
                 params={"select": "id", "limit": "1"},
@@ -136,7 +147,7 @@ class CloudDatabase:
 
         headers = dict(self.headers)
         headers["Prefer"] = "resolution=merge-duplicates,return=representation"
-        response = requests.post(
+        response = _http_client().post(
             self._url(table),
             headers=headers,
             params={"on_conflict": on_conflict},
@@ -155,7 +166,7 @@ class CloudDatabase:
     def insert(self, table: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not rows:
             return []
-        response = requests.post(
+        response = _http_client().post(
             self._url(table),
             headers=self.headers,
             data=json.dumps(rows, ensure_ascii=False, default=str),
@@ -179,7 +190,7 @@ class CloudDatabase:
         if not filters or not values:
             raise ValueError("수정 대상과 값을 확인해주세요.")
         params = {key: f"eq.{value}" for key, value in filters.items()}
-        response = requests.patch(
+        response = _http_client().patch(
             self._url(table),
             headers=self.headers,
             params=params,
@@ -204,7 +215,7 @@ class CloudDatabase:
         safe_name = re.sub(r"[^a-zA-Z0-9_]", "", str(function_name or ""))
         if not safe_name or safe_name != function_name:
             raise ValueError("올바르지 않은 RPC 함수명입니다.")
-        response = requests.post(
+        response = _http_client().post(
             f"{self.config.url}/rest/v1/rpc/{safe_name}",
             headers=self.headers,
             data=json.dumps(parameters, ensure_ascii=False, default=str),
@@ -240,7 +251,7 @@ class CloudDatabase:
             "x-upsert": "false",
         }
         encoded_path = quote(clean_path, safe="/")
-        response = requests.post(
+        response = _http_client().post(
             (
                 f"{self.config.url}/storage/v1/object/"
                 f"{safe_bucket}/{encoded_path}"
@@ -259,7 +270,7 @@ class CloudDatabase:
         clean_path = str(path or "").strip().lstrip("/")
         if not safe_bucket or not clean_path:
             return
-        requests.delete(
+        _http_client().delete(
             f"{self.config.url}/storage/v1/object/{safe_bucket}",
             headers=self.headers,
             data=json.dumps({"prefixes": [clean_path]}),
@@ -284,7 +295,7 @@ class CloudDatabase:
         }
         if download_name:
             payload["download"] = str(download_name)
-        response = requests.post(
+        response = _http_client().post(
             (
                 f"{self.config.url}/storage/v1/object/sign/"
                 f"{safe_bucket}/{encoded_path}"
@@ -334,7 +345,7 @@ class CloudDatabase:
         if offset is not None:
             params["offset"] = str(max(0, int(offset)))
 
-        response = requests.get(
+        response = _http_client().get(
             self._url(table),
             headers=self.headers,
             params=params,
@@ -387,7 +398,7 @@ class CloudDatabase:
         if owner_user_id:
             params["owner_user_id"] = f"eq.{owner_user_id}"
 
-        response = requests.get(
+        response = _http_client().get(
             self._url(table),
             headers=headers,
             params=params,

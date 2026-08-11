@@ -4751,6 +4751,7 @@ def _render_return_db_admin(current_user_id: str) -> None:
     )
 
     if action_result.get("ok"):
+        _load_assignable_db_inventory_dashboard.clear()
         processed_count = int(action_result.get("processed_count") or 0)
         st.session_state[_RETURN_DB_ADMIN_FLASH_KEY] = {
             "level": "success",
@@ -5042,6 +5043,12 @@ def _available_allocation_candidates(
     return available, str(availability.get("warning") or "")
 
 
+@st.cache_data(
+    show_spinner=False,
+    ttl=60,
+    max_entries=64,
+    scope="session",
+)
 def _load_assignable_db_inventory_dashboard(owner_user_id: str) -> dict:
     ready, ready_message = _assignment_feature_status()
     if not ready:
@@ -5051,6 +5058,19 @@ def _load_assignable_db_inventory_dashboard(owner_user_id: str) -> dict:
             "metrics": {},
         }
     return sales_assignments.get_assignable_db_inventory_dashboard(owner_user_id)
+
+
+@st.cache_data(
+    show_spinner=False,
+    ttl=30,
+    max_entries=64,
+    scope="session",
+)
+def _load_user_mobile_db_requests(owner_user_id: str) -> dict:
+    return sales_assignments.list_user_mobile_db_requests(
+        owner_user_id,
+        limit=10,
+    )
 
 
 def _render_db_request_status_dashboard(metrics: dict) -> None:
@@ -5354,6 +5374,7 @@ def _render_db_request_home(owner_user_id: str) -> None:
                     )
                     saved_count = int(save_result.get("saved_count") or 0)
                     if saved_count:
+                        _load_assignable_db_inventory_dashboard.clear()
                         extra = ""
                         if saved_count < MEMBER_PROSPECT_TARGET_COUNT:
                             extra = " 현재 보유 한도와 전사 중복을 반영한 수량입니다."
@@ -5386,6 +5407,7 @@ def _render_db_request_home(owner_user_id: str) -> None:
             session_id=_assignment_session_id(),
         )
         if request_result.get("ok"):
+            _load_user_mobile_db_requests.clear()
             request_panel.success(
                 request_result.get("message")
                 or "핸드폰 DB 배정 신청을 접수했습니다."
@@ -5396,10 +5418,7 @@ def _render_db_request_home(owner_user_id: str) -> None:
                 or "핸드폰 DB 신청을 접수하지 못했습니다."
             )
 
-    history_result = sales_assignments.list_user_mobile_db_requests(
-        owner_user_id,
-        limit=10,
-    )
+    history_result = _load_user_mobile_db_requests(owner_user_id)
     if history_result.get("ok") and history_result.get("requests"):
         with st.expander("내 핸드폰 DB 신청내역", expanded=True):
             history_frame = pd.DataFrame(
@@ -5605,6 +5624,8 @@ def _render_mobile_db_admin(current_user_id: str) -> None:
                     "추가 배정을 중단하고 관리자에게 확인해 주세요."
                 )
                 return
+            _load_assignable_db_inventory_dashboard.clear()
+            _load_user_mobile_db_requests.clear()
             st.success(f"핸드폰 DB {allocated}개를 배정했습니다.")
     except Exception as exc:
         st.error(safe_public_error(exc, "핸드폰 DB를 배정하지 못했습니다."))

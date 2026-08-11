@@ -7,6 +7,7 @@ import re
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -28,7 +29,14 @@ _LOGIN_ATTEMPTS: dict[str, dict[str, float | int]] = {}
 _LOGIN_ATTEMPTS_LOCK = threading.Lock()
 _DEFAULT_ADMIN_ENSURED = False
 _DEFAULT_ADMIN_LOCK = threading.Lock()
-AUTH_RECHECK_SECONDS = 10.0
+_AUTH_VALIDATION_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="oasis-auth",
+)
+# A session check is still repeated regularly so a newer login can supersede an
+# older browser.  Thirty seconds avoids placing two remote reads in the hot path
+# of ordinary Streamlit clicks while keeping the hand-off delay short.
+AUTH_RECHECK_SECONDS = 30.0
 AUTH_OUTAGE_GRACE_SECONDS = 5 * 60.0
 SESSION_CURRENT = "current"
 SESSION_SUPERSEDED = "superseded"
@@ -687,6 +695,36 @@ def _session_is_current(user_id: str, token: str) -> bool:
     return _session_validation_status(user_id, token) == SESSION_CURRENT
 
 
+def _validate_current_session_and_access(
+    user_id: str,
+    token: str,
+) -> tuple[str, dict, str]:
+    """Validate session ownership and account access in one latency window.
+
+    The two checks remain independent and preserve their existing fail-closed
+    semantics.  When Supabase is configured they run concurrently, so a normal
+    Streamlit rerun waits for one network round trip instead of two sequential
+    round trips.
+    """
+    if not cloud_is_configured():
+        session_status = _session_validation_status(user_id, token)
+        user, access_status = _load_current_user_access_status(user_id)
+        return session_status, user, access_status
+
+    session_future = _AUTH_VALIDATION_EXECUTOR.submit(
+        _session_validation_status,
+        user_id,
+        token,
+    )
+    access_future = _AUTH_VALIDATION_EXECUTOR.submit(
+        _load_current_user_access_status,
+        user_id,
+    )
+    session_status = session_future.result()
+    user, access_status = access_future.result()
+    return session_status, user, access_status
+
+
 def _auth_outage_grace_active(last_verified_at: float, now: float) -> bool:
     return bool(last_verified_at) and (
         0 <= now - float(last_verified_at) <= AUTH_OUTAGE_GRACE_SECONDS
@@ -1058,9 +1096,11 @@ def check_login():
             _sync_persistent_login_cookie(current_user_id, session_token)
             return True
 
-        session_status = _session_validation_status(
-            current_user_id,
-            session_token,
+        session_status, current_user, access_status = (
+            _validate_current_session_and_access(
+                current_user_id,
+                session_token,
+            )
         )
         if session_status == SESSION_UNAVAILABLE:
             if _auth_outage_grace_active(last_verified_at, now):
@@ -1083,9 +1123,6 @@ def check_login():
                 "동일 계정으로 새 로그인이 확인되어 현재 기기에서 자동 로그아웃되었습니다."
             )
             return False
-        current_user, access_status = _load_current_user_access_status(
-            current_user_id
-        )
         if access_status == SESSION_UNAVAILABLE:
             if _auth_outage_grace_active(last_verified_at, now):
                 st.warning(

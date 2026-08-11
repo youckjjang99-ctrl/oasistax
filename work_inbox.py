@@ -13,6 +13,8 @@ SEOUL = ZoneInfo("Asia/Seoul")
 _AUTOMATED_PAGE_SIZE = 500
 _SALES_PAGE_SIZE = 1000
 _MAX_PAGE_COUNT = 100
+_WORK_INBOX_CACHE_KEY = "_work_inbox_cache_v1"
+_WORK_INBOX_CACHE_SECONDS = 30.0
 _STATUS_LABELS = {
     "scheduled": "예정",
     "pending": "대기",
@@ -406,6 +408,47 @@ def build_work_inbox(
     }
 
 
+def invalidate_work_inbox_cache(user_id: str = "") -> None:
+    """Discard the short-lived per-browser work inbox snapshot."""
+    import streamlit as st
+
+    cached = st.session_state.get(_WORK_INBOX_CACHE_KEY)
+    if not isinstance(cached, Mapping):
+        return
+    if user_id and str(cached.get("user_id") or "") != str(user_id or ""):
+        return
+    st.session_state.pop(_WORK_INBOX_CACHE_KEY, None)
+
+
+def get_cached_work_inbox(
+    user_id: str,
+    *,
+    crm_restore_ok: bool | None = None,
+) -> dict[str, Any]:
+    """Reuse home counts briefly instead of repeating several RPCs per click."""
+    import streamlit as st
+
+    now = datetime.now(SEOUL).timestamp()
+    cached = st.session_state.get(_WORK_INBOX_CACHE_KEY)
+    if (
+        isinstance(cached, Mapping)
+        and str(cached.get("user_id") or "") == str(user_id or "")
+        and cached.get("crm_restore_ok") is crm_restore_ok
+        and 0 <= now - float(cached.get("cached_at") or 0) < _WORK_INBOX_CACHE_SECONDS
+        and isinstance(cached.get("value"), Mapping)
+    ):
+        return dict(cached["value"])
+
+    value = build_work_inbox(user_id, crm_restore_ok=crm_restore_ok)
+    st.session_state[_WORK_INBOX_CACHE_KEY] = {
+        "user_id": str(user_id or ""),
+        "crm_restore_ok": crm_restore_ok,
+        "cached_at": now,
+        "value": value,
+    }
+    return value
+
+
 def _format_due(value: Any) -> str:
     parsed = _parse_due(value)
     return parsed.strftime("%Y-%m-%d %H:%M") if parsed else "일정 확인 필요"
@@ -454,7 +497,7 @@ def render_work_inbox_page(
     resolved_inbox = (
         dict(inbox)
         if inbox is not None
-        else build_work_inbox(user_id, crm_restore_ok=crm_restore_ok)
+        else get_cached_work_inbox(user_id, crm_restore_ok=crm_restore_ok)
     )
     for warning in resolved_inbox.get("warnings", []):
         st.warning(str(warning))
@@ -501,6 +544,7 @@ def render_work_inbox_page(
                 result = work_task_repository.start_work_task(
                     user_id, task_id, task_version
                 )
+                invalidate_work_inbox_cache(user_id)
                 st.session_state["_work_inbox_flash_v912"] = result
                 st.rerun()
             if action_columns[1].button(
@@ -511,6 +555,7 @@ def render_work_inbox_page(
                 result = work_task_repository.complete_work_task(
                     user_id, task_id, task_version
                 )
+                invalidate_work_inbox_cache(user_id)
                 st.session_state["_work_inbox_flash_v912"] = result
                 st.rerun()
             if action_columns[2].button(
@@ -524,6 +569,7 @@ def render_work_inbox_page(
                     task_version,
                     _defer_until_tomorrow(),
                 )
+                invalidate_work_inbox_cache(user_id)
                 st.session_state["_work_inbox_flash_v912"] = result
                 st.rerun()
             action_columns[3].button(
@@ -569,4 +615,9 @@ def render_work_inbox_page(
         st.info("오늘부터 향후 일정에 등록된 CRM·영업 후속업무가 없습니다.")
 
 
-__all__ = ["build_work_inbox", "render_work_inbox_page"]
+__all__ = [
+    "build_work_inbox",
+    "get_cached_work_inbox",
+    "invalidate_work_inbox_cache",
+    "render_work_inbox_page",
+]

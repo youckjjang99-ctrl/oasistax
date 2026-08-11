@@ -521,11 +521,11 @@ def test_app_integrates_work_inbox_into_home():
     assert '"업무함": "업무함"' not in source
     assert 'elif active_tab == "업무함":' not in source
     assert source.count(
-        "from work_inbox import build_work_inbox, render_work_inbox_page"
+        "from work_inbox import get_cached_work_inbox, render_work_inbox_page"
     ) == 1
     home = source[source.index("def render_home_page(") :]
     home = home[: home.index("\ndef ", 1)]
-    assert "build_work_inbox(" in home
+    assert "get_cached_work_inbox(" in home
     assert "render_work_inbox_page(" in home
     assert "navigate=_navigate_to_main_menu" in home
     assert "inbox=inbox" in home

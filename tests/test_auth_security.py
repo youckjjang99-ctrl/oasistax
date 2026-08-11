@@ -1,3 +1,4 @@
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -68,6 +69,33 @@ class AuthSecurityTests(unittest.TestCase):
             )
         )
         self.assertFalse(auth._auth_outage_grace_active(0, now))
+
+    def test_session_and_access_checks_share_one_network_latency_window(self):
+        barrier = threading.Barrier(2)
+
+        def validate_session(_user_id, _token):
+            barrier.wait(timeout=1)
+            return auth.SESSION_CURRENT
+
+        def load_access(_user_id):
+            barrier.wait(timeout=1)
+            return {"status": "approved", "role": "member"}, "ok"
+
+        with (
+            patch("auth.cloud_is_configured", return_value=True),
+            patch("auth._session_validation_status", side_effect=validate_session),
+            patch("auth._load_current_user_access_status", side_effect=load_access),
+        ):
+            session_status, user, access_status = (
+                auth._validate_current_session_and_access("owner", "token")
+            )
+
+        self.assertEqual(session_status, auth.SESSION_CURRENT)
+        self.assertEqual(access_status, "ok")
+        self.assertEqual(user["status"], "approved")
+
+    def test_authentication_recheck_does_not_run_on_every_click(self):
+        self.assertGreaterEqual(auth.AUTH_RECHECK_SECONDS, 30.0)
 
     def test_active_session_is_not_logged_out_by_transient_session_check_error(self):
         state = _SessionState(

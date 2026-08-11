@@ -88,6 +88,22 @@ HISTORY_DIR = BASE_DIR / "history"
 # 임시 운영 스위치: 신청 데이터와 처리 기능은 보존하고 사이드바 메뉴만 숨긴다.
 SHOW_CLAIM_SALES_APPLICATION_MENU = False
 
+
+def _get_user_dirs_once(user_id: str) -> dict:
+    """Create a user's workspace folders once per browser session."""
+    cache_key = "_user_dirs_cache_v1"
+    cached = st.session_state.get(cache_key)
+    if (
+        isinstance(cached, dict)
+        and str(cached.get("user_id") or "") == str(user_id or "")
+        and isinstance(cached.get("dirs"), dict)
+    ):
+        return cached["dirs"]
+    dirs = get_user_dirs(user_id)
+    st.session_state[cache_key] = {"user_id": str(user_id or ""), "dirs": dirs}
+    return dirs
+
+
 for _folder in [TEMPLATE_DIR, UPLOAD_DIR, RESULT_DIR, HISTORY_DIR]:
     _folder.mkdir(exist_ok=True)
 
@@ -808,11 +824,11 @@ def _render_queued_sidebar_collapse() -> None:
 
 
 def render_home_page(user_id, user_name="", *, crm_restore_ok=None):
-    from work_inbox import build_work_inbox, render_work_inbox_page
+    from work_inbox import get_cached_work_inbox, render_work_inbox_page
 
     customer_df, _ = read_current_user_customer_df(user_id)
     customer_count = len(customer_df)
-    inbox = build_work_inbox(user_id, crm_restore_ok=crm_restore_ok)
+    inbox = get_cached_work_inbox(user_id, crm_restore_ok=crm_restore_ok)
     summary = dict(inbox.get("summary") or {})
     today_count = int(summary.get("today_count", 0) or 0)
     overdue_count = int(summary.get("overdue_count", 0) or 0)
@@ -1836,7 +1852,7 @@ CURRENT_USER_CAN_VIEW_MOBILE = can_view_mobile_numbers(CURRENT_USER_ID)
 SAFE_CURRENT_USER_NAME = html.escape(
     str(CURRENT_USER_NAME or CURRENT_USER_ID)
 )
-USER_DIRS = get_user_dirs(CURRENT_USER_ID)
+USER_DIRS = _get_user_dirs_once(CURRENT_USER_ID)
 USER_UPLOAD_DIR = USER_DIRS["uploads"]
 USER_RESULT_DIR = USER_DIRS["results"]
 
