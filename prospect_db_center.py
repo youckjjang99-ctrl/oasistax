@@ -196,7 +196,7 @@ SAVED_PROSPECT_VISIBLE_COLUMNS = (
 )
 MOBILE_DB_REQUEST_STATUS_LABELS = {
     "pending": "배정 대기",
-    "partially_approved": "일부 배정",
+    "partially_approved": "배정 완료",
     "approved": "배정 완료",
     "rejected": "신청 반려",
     "cancelled": "신청 취소",
@@ -5240,7 +5240,7 @@ def _render_mobile_db_admin(current_user_id: str) -> None:
         return
     result = sales_assignments.list_admin_mobile_db_requests(
         current_user_id,
-        statuses=["pending", "partially_approved"],
+        statuses=["pending"],
         limit=500,
     )
     if not result.get("ok"):

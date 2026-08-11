@@ -277,6 +277,12 @@ class ProspectContactResultsTabTests(unittest.TestCase):
         self.assertIn("enter_to_submit=False", source)
         self.assertNotIn("on_change=", source)
 
+    def test_mobile_db_admin_only_lists_unprocessed_requests(self):
+        source = inspect.getsource(prospect._render_mobile_db_admin)
+
+        self.assertIn('statuses=["pending"]', source)
+        self.assertNotIn('statuses=["pending", "partially_approved"]', source)
+
     def test_contact_save_success_forces_fresh_assignment_and_history_queries(self):
         source = inspect.getsource(prospect._render_contact_results)
         record_at = source.index("sales_assignments.record_contact(")
