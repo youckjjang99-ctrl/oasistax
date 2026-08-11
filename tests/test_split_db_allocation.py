@@ -312,7 +312,7 @@ class MobileRequestMigrationTests(unittest.TestCase):
             root
             / "supabase"
             / "migrations"
-            / "20260811035921_restore_db_request_employee_filter.sql"
+            / "20260811041435_restore_db_request_employee_filter.sql"
         ).read_text(encoding="utf-8").lower()
 
         self.assertIn("minimum_employees integer not null default 1", sql)
