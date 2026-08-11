@@ -166,6 +166,7 @@ _RETURN_DB_ADMIN_SELECTION_KEY = "_return_db_admin_selection_v1160"
 _RETURN_DB_ADMIN_EDITOR_GENERATION_KEY = (
     "_return_db_admin_editor_generation_v1160"
 )
+_RETURN_DB_ADMIN_ROW_SIGNATURE_KEY = "_return_db_admin_row_signature_v1170"
 _MOBILE_DB_ADMIN_SELECTION_KEY = "mobile_db_admin_request_v1090"
 _SAVED_DB_DASHBOARD_FILTER_KEY = "saved_db_dashboard_filter_v1100"
 _SAVED_DB_DASHBOARD_PAGE_KEY = "saved_db_dashboard_page_v1100"
@@ -4660,6 +4661,29 @@ def _render_return_db_admin(current_user_id: str) -> None:
         str(row.get("company_uid") or "").strip() for row in review_rows
     ]
     available_review_uids = {uid for uid in review_uids if uid}
+    if len(available_review_uids) != len(review_uids):
+        st.error("반납 DB 목록의 업체 식별정보를 확인할 수 없습니다.")
+        return
+    editor_generation = int(
+        st.session_state.get(_RETURN_DB_ADMIN_EDITOR_GENERATION_KEY, 0) or 0
+    )
+    previous_row_signature = tuple(
+        str(uid)
+        for uid in st.session_state.get(
+            _RETURN_DB_ADMIN_ROW_SIGNATURE_KEY,
+            [],
+        )
+    )
+    current_row_signature = tuple(review_uids)
+    if previous_row_signature != current_row_signature:
+        st.session_state[_RETURN_DB_ADMIN_SELECTION_KEY] = []
+        editor_generation += 1
+        st.session_state[_RETURN_DB_ADMIN_EDITOR_GENERATION_KEY] = (
+            editor_generation
+        )
+        st.session_state[_RETURN_DB_ADMIN_ROW_SIGNATURE_KEY] = list(
+            current_row_signature
+        )
     selected_uid_set = {
         str(uid)
         for uid in st.session_state.get(_RETURN_DB_ADMIN_SELECTION_KEY, [])
@@ -4671,7 +4695,7 @@ def _render_return_db_admin(current_user_id: str) -> None:
     review_frame = pd.DataFrame(
         [
             {
-                "선택": review_uids[index] in selected_uid_set,
+                "선택": False,
                 "업체명": str(row.get("company_name") or "업체명 미확인"),
                 "반납 담당자": str(row.get("_returned_by_name") or ""),
                 "반납사유": str(row.get("_return_reason") or ""),
@@ -4679,11 +4703,12 @@ def _render_return_db_admin(current_user_id: str) -> None:
                 .replace("T", " ")[:19],
                 "현재상태": "관리자 검토 대기",
             }
-            for index, row in enumerate(review_rows)
+            for row in review_rows
         ]
     )
-    editor_generation = int(
-        st.session_state.get(_RETURN_DB_ADMIN_EDITOR_GENERATION_KEY, 0) or 0
+    review_frame.index = pd.Index(
+        review_uids,
+        name="company_uid",
     )
     editor_key = f"{_RETURN_DB_ADMIN_TABLE_KEY}_{editor_generation}"
     st.data_editor(
@@ -4715,7 +4740,7 @@ def _render_return_db_admin(current_user_id: str) -> None:
             editor_key,
             _RETURN_DB_ADMIN_SELECTION_KEY,
             review_uids,
-            set(selected_uid_set),
+            set(),
         ),
     )
     selected_uid_set = {

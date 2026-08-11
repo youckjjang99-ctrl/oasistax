@@ -101,6 +101,36 @@ class PartialRenderingPerformanceTests(unittest.TestCase):
             ["other-page", "row-b"],
         )
 
+    def test_editor_callback_accumulates_multiple_checked_rows(self):
+        session_state = {
+            "selection": [],
+            "editor": {"edited_rows": {"0": {"선택": True}}},
+        }
+
+        with patch.object(prospect.st, "session_state", session_state):
+            prospect._sync_result_editor_selection(
+                "editor",
+                "selection",
+                ["row-a", "row-b"],
+                set(),
+            )
+            self.assertEqual(session_state["selection"], ["row-a"])
+
+            session_state["editor"] = {
+                "edited_rows": {
+                    "0": {"선택": True},
+                    "1": {"선택": True},
+                }
+            }
+            prospect._sync_result_editor_selection(
+                "editor",
+                "selection",
+                ["row-a", "row-b"],
+                set(),
+            )
+
+        self.assertEqual(session_state["selection"], ["row-a", "row-b"])
+
     def test_select_all_callback_selects_and_clears_every_result(self):
         session_state = {
             "select-all": True,
