@@ -34,6 +34,7 @@ RPC_ADMIN_REVIEW_RETURNED_BATCH = "oasis_admin_review_returned_companies_batch"
 RPC_SAVE_USER_NOTE = "oasis_save_user_prospect_note"
 RPC_RECORD_COMPANY_VIEWS = "oasis_record_company_views"
 RPC_ADMIN_SET_USER_LIMIT = "oasis_admin_set_sales_user_limit"
+RPC_GET_USER_LIMITS = "oasis_get_sales_user_limits"
 RPC_LIST_ADMIN_AUDIT = "oasis_list_company_assignment_audit"
 RPC_SUBMIT_MOBILE_DB_REQUEST = "oasis_submit_mobile_db_request"
 RPC_LIST_USER_MOBILE_DB_REQUESTS = "oasis_list_user_mobile_db_requests"
@@ -146,21 +147,12 @@ _FAILURE_MESSAGES = {
         "다른 담당자가 먼저 배정받은 업체입니다. "
         "검색 결과를 새로고침합니다."
     ),
-    "MAX_UNCONTACTED_REACHED": (
-        "일반전화 30개와 핸드폰번호 DB 30개를 합쳐 "
-        "최대 60개까지 보유할 수 있습니다."
-    ),
-    "LIMIT_REACHED": (
-        "일반전화 30개와 핸드폰번호 DB 30개를 합쳐 "
-        "최대 60개까지 보유할 수 있습니다."
-    ),
-    "UNCONTACTED_LIMIT_REACHED": (
-        "일반전화 30개와 핸드폰번호 DB 30개를 합쳐 "
-        "최대 60개까지 보유할 수 있습니다."
-    ),
-    "TOTAL_DB_LIMIT_REACHED": "배정 DB는 총 60개까지 보유할 수 있습니다.",
-    "LANDLINE_LIMIT_REACHED": "일반전화 DB는 최대 30개까지 보유할 수 있습니다.",
-    "MOBILE_LIMIT_REACHED": "핸드폰번호 DB는 최대 30개까지 보유할 수 있습니다.",
+    "MAX_UNCONTACTED_REACHED": "관리자가 설정한 미접촉 배정 한도에 도달했습니다.",
+    "LIMIT_REACHED": "관리자가 설정한 미접촉 배정 한도에 도달했습니다.",
+    "UNCONTACTED_LIMIT_REACHED": "관리자가 설정한 미접촉 배정 한도에 도달했습니다.",
+    "TOTAL_DB_LIMIT_REACHED": "관리자가 설정한 전체 DB 보유 한도에 도달했습니다.",
+    "LANDLINE_LIMIT_REACHED": "관리자가 설정한 일반전화 DB 한도에 도달했습니다.",
+    "MOBILE_LIMIT_REACHED": "관리자가 설정한 핸드폰번호 DB 한도에 도달했습니다.",
     "RETURN_REASON_REQUIRED": "반납사유를 입력해 주세요.",
     "MIGRATION_CONFLICT": (
         "기존 저장자료의 담당자가 서로 달라 관리자의 담당자 지정이 "
@@ -1928,10 +1920,59 @@ def admin_review_returned_batch(
     }
 
 
+def get_user_limits(
+    admin_user_id: str,
+    target_user_id: str,
+    *,
+    db: CloudDatabase | None = None,
+) -> dict[str, Any]:
+    raw, error = _rpc(
+        RPC_GET_USER_LIMITS,
+        {
+            "p_current_user_id": _user_id(admin_user_id),
+            "p_target_user_id": _user_id(target_user_id),
+        },
+        db=db,
+    )
+    if error:
+        return {**error, "limits": {}}
+    row = _first_row(raw)
+    if row is None:
+        return {
+            "ok": False,
+            "code": "MALFORMED_RESPONSE",
+            "message": _FAILURE_MESSAGES["MALFORMED_RESPONSE"],
+            "limits": {},
+        }
+    try:
+        limits = {
+            "max_uncontacted": int(row.get("max_uncontacted") or 0),
+            "max_landline_db": int(row.get("max_landline_db") or 0),
+            "max_mobile_db": int(row.get("max_mobile_db") or 0),
+        }
+    except (TypeError, ValueError):
+        limits = {}
+    if not limits or any(value < 1 or value > 1000 for value in limits.values()):
+        return {
+            "ok": False,
+            "code": "MALFORMED_RESPONSE",
+            "message": _FAILURE_MESSAGES["MALFORMED_RESPONSE"],
+            "limits": {},
+        }
+    return {
+        "ok": True,
+        "code": "OK",
+        "message": "사용자별 DB 한도를 불러왔습니다.",
+        "limits": limits,
+    }
+
+
 def admin_set_user_limit(
     admin_user_id: str,
     target_user_id: str,
     max_uncontacted: int,
+    max_landline_db: int,
+    max_mobile_db: int,
     reason: Any,
     session_id: str = "",
     *,
@@ -1939,13 +1980,20 @@ def admin_set_user_limit(
 ) -> dict[str, Any]:
     try:
         safe_limit = int(max_uncontacted)
+        safe_landline_limit = int(max_landline_db)
+        safe_mobile_limit = int(max_mobile_db)
     except (TypeError, ValueError):
         safe_limit = -1
-    if safe_limit < 1 or safe_limit > 1000:
+        safe_landline_limit = -1
+        safe_mobile_limit = -1
+    if any(
+        value < 1 or value > 1000
+        for value in (safe_limit, safe_landline_limit, safe_mobile_limit)
+    ):
         return {
             "ok": False,
             "code": "INVALID_INPUT",
-            "message": "미접촉 배정 한도는 1~1000 사이로 입력해 주세요.",
+            "message": "각 DB 한도는 1~1000 사이로 입력해 주세요.",
             "assignment": {},
         }
     raw, error = _rpc(
@@ -1954,6 +2002,8 @@ def admin_set_user_limit(
             "p_admin_user_id": _user_id(admin_user_id),
             "p_target_user_id": _user_id(target_user_id),
             "p_max_uncontacted": safe_limit,
+            "p_max_landline_db": safe_landline_limit,
+            "p_max_mobile_db": safe_mobile_limit,
             "p_reason": _bounded(reason, 500),
             "p_session_id": _bounded(session_id, 200),
         },
@@ -1966,20 +2016,22 @@ def admin_set_user_limit(
             "ok": raw,
             "code": "UPDATED" if raw else "REQUEST_FAILED",
             "message": (
-                "영업사원의 미접촉 배정 한도를 변경했습니다."
+                "영업사원의 DB 한도를 변경했습니다."
                 if raw
-                else "미접촉 배정 한도를 변경하지 못했습니다."
+                else "DB 한도를 변경하지 못했습니다."
             ),
             "assignment": {
                 "target_user_id": _user_id(target_user_id),
                 "max_uncontacted": safe_limit,
+                "max_landline_db": safe_landline_limit,
+                "max_mobile_db": safe_mobile_limit,
             },
-            "warning": "" if raw else "미접촉 배정 한도를 변경하지 못했습니다.",
+            "warning": "" if raw else "DB 한도를 변경하지 못했습니다.",
             "fallback_required": False,
         }
     return _mutation_result(
         raw,
-        success_message="영업사원의 미접촉 배정 한도를 변경했습니다.",
+        success_message="영업사원의 DB 한도를 변경했습니다.",
         admin=True,
     )
 
@@ -2197,6 +2249,7 @@ __all__ = [
     "claim_companies",
     "claim_company",
     "filter_company_availability",
+    "get_user_limits",
     "get_user_db_dashboard",
     "list_admin_assignments",
     "list_admin_assignment_metrics",

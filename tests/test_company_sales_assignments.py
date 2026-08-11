@@ -18,6 +18,7 @@ from company_sales_assignment import (
     build_company_uid,
     claim_company,
     filter_company_availability,
+    get_user_limits,
     get_user_db_dashboard,
     list_admin_assignment_audit,
     list_admin_assignment_metrics,
@@ -920,18 +921,24 @@ class AssignmentRpcTests(unittest.TestCase):
             "admin",
             "sales-a",
             40,
+            50,
+            80,
             "분기 한도 조정",
             session_id="session-1",
             db=database,
         )
         self.assertTrue(result["ok"])
         self.assertEqual(result["assignment"]["max_uncontacted"], 40)
+        self.assertEqual(result["assignment"]["max_landline_db"], 50)
+        self.assertEqual(result["assignment"]["max_mobile_db"], 80)
         self.assertEqual(
             database.calls[0][1],
             {
                 "p_admin_user_id": "admin",
                 "p_target_user_id": "sales-a",
                 "p_max_uncontacted": 40,
+                "p_max_landline_db": 50,
+                "p_max_mobile_db": 80,
                 "p_reason": "분기 한도 조정",
                 "p_session_id": "session-1",
             },
@@ -939,10 +946,44 @@ class AssignmentRpcTests(unittest.TestCase):
 
         invalid_database = _FakeDatabase()
         invalid = admin_set_user_limit(
-            "admin", "sales-a", 0, "invalid", db=invalid_database
+            "admin", "sales-a", 40, 0, 80, "invalid", db=invalid_database
         )
         self.assertEqual(invalid["code"], "INVALID_INPUT")
         self.assertEqual(invalid_database.calls, [])
+
+    def test_admin_gets_current_user_channel_limits(self):
+        database = _FakeDatabase(
+            {
+                "oasis_get_sales_user_limits": [
+                    {
+                        "max_uncontacted": 100,
+                        "max_landline_db": 40,
+                        "max_mobile_db": 90,
+                    }
+                ]
+            }
+        )
+        result = get_user_limits("admin", "sales-a", db=database)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            result["limits"],
+            {
+                "max_uncontacted": 100,
+                "max_landline_db": 40,
+                "max_mobile_db": 90,
+            },
+        )
+        self.assertEqual(
+            database.calls[0],
+            (
+                "oasis_get_sales_user_limits",
+                {
+                    "p_current_user_id": "admin",
+                    "p_target_user_id": "sales-a",
+                },
+            ),
+        )
 
     def test_admin_audit_payload_and_field_allowlist(self):
         database = _FakeDatabase(

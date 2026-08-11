@@ -5360,7 +5360,19 @@ def _render_mobile_db_admin(current_user_id: str) -> None:
             )
             allocated = int(save_result.get("claimed_count") or 0)
             if allocated < 1:
-                st.error(save_result.get("message") or "핸드폰 DB를 배정하지 못했습니다.")
+                first_failure = next(
+                    (
+                        row
+                        for row in list(save_result.get("results") or [])
+                        if not row.get("ok")
+                    ),
+                    {},
+                )
+                st.error(
+                    first_failure.get("message")
+                    or save_result.get("message")
+                    or "핸드폰 DB를 배정하지 못했습니다."
+                )
                 return
             update = sales_assignments.admin_update_mobile_db_request(
                 current_user_id,
@@ -6898,19 +6910,47 @@ def render_company_assignment_admin(current_user_id: str = "") -> None:
                 else:
                     st.error(action_result.get("message"))
 
-    st.markdown("### 영업사원별 미접촉 배정 한도")
+    st.markdown("### 영업사원별 DB 배정 한도")
     if user_labels:
-        with st.form("assignment_user_limit_form_v989"):
-            limit_user_label = st.selectbox(
-                "영업사원",
-                list(user_labels),
-            )
-            max_uncontacted = st.number_input(
-                "미접촉 임시배정 최대 건수",
+        limit_user_label = st.selectbox(
+            "영업사원",
+            list(user_labels),
+            key="assignment_limit_user_v1191",
+        )
+        limit_user_id = user_labels[limit_user_label]
+        current_limits = sales_assignments.get_user_limits(
+            current_user_id,
+            limit_user_id,
+        )
+        if not current_limits.get("ok"):
+            st.error(current_limits.get("message") or "DB 한도를 불러오지 못했습니다.")
+            return
+        limit_values = dict(current_limits.get("limits") or {})
+        with st.form(f"assignment_user_limit_form_v1191_{limit_user_id}"):
+            uncontacted_col, landline_col, mobile_col = st.columns(3)
+            max_uncontacted = uncontacted_col.number_input(
+                "미접촉 배정 한도",
                 min_value=1,
                 max_value=1000,
-                value=30,
+                value=int(limit_values.get("max_uncontacted") or 60),
                 step=1,
+            )
+            max_landline_db = landline_col.number_input(
+                "일반전화 DB 한도",
+                min_value=1,
+                max_value=1000,
+                value=int(limit_values.get("max_landline_db") or 30),
+                step=1,
+            )
+            max_mobile_db = mobile_col.number_input(
+                "핸드폰 DB 한도",
+                min_value=1,
+                max_value=1000,
+                value=int(limit_values.get("max_mobile_db") or 30),
+                step=1,
+            )
+            st.caption(
+                "전체 활성 DB 한도는 일반전화 DB 한도와 핸드폰 DB 한도의 합계입니다."
             )
             limit_reason = st.text_input(
                 "한도 변경 사유",
@@ -6926,8 +6966,10 @@ def render_company_assignment_admin(current_user_id: str = "") -> None:
             else:
                 limit_result = sales_assignments.admin_set_user_limit(
                     current_user_id,
-                    user_labels[limit_user_label],
+                    limit_user_id,
                     int(max_uncontacted),
+                    int(max_landline_db),
+                    int(max_mobile_db),
                     limit_reason,
                     _assignment_session_id(),
                 )
