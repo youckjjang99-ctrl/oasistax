@@ -162,6 +162,10 @@ _SAVED_PROSPECT_RESET_SELECTION_KEY = (
 )
 _RETURN_DB_ADMIN_FLASH_KEY = "_return_db_admin_flash_v1070"
 _RETURN_DB_ADMIN_TABLE_KEY = "return_db_admin_table_v1150"
+_RETURN_DB_ADMIN_SELECTION_KEY = "_return_db_admin_selection_v1160"
+_RETURN_DB_ADMIN_EDITOR_GENERATION_KEY = (
+    "_return_db_admin_editor_generation_v1160"
+)
 _MOBILE_DB_ADMIN_SELECTION_KEY = "mobile_db_admin_request_v1090"
 _SAVED_DB_DASHBOARD_FILTER_KEY = "saved_db_dashboard_filter_v1100"
 _SAVED_DB_DASHBOARD_PAGE_KEY = "saved_db_dashboard_page_v1100"
@@ -4646,14 +4650,27 @@ def _render_return_db_admin(current_user_id: str) -> None:
         audit_rows,
     )
     if not review_rows:
+        st.session_state[_RETURN_DB_ADMIN_SELECTION_KEY] = []
         st.success("관리자가 검토할 반납 DB가 없습니다.")
         return
 
     st.metric("검토 대기", f"{len(review_rows):,}건")
+    review_uids = [
+        str(row.get("company_uid") or "").strip() for row in review_rows
+    ]
+    available_review_uids = {uid for uid in review_uids if uid}
+    selected_uid_set = {
+        str(uid)
+        for uid in st.session_state.get(_RETURN_DB_ADMIN_SELECTION_KEY, [])
+        if str(uid) in available_review_uids
+    }
+    st.session_state[_RETURN_DB_ADMIN_SELECTION_KEY] = sorted(
+        selected_uid_set
+    )
     review_frame = pd.DataFrame(
         [
             {
-                "선택": False,
+                "선택": review_uids[index] in selected_uid_set,
                 "업체명": str(row.get("company_name") or "업체명 미확인"),
                 "반납 담당자": str(row.get("_returned_by_name") or ""),
                 "반납사유": str(row.get("_return_reason") or ""),
@@ -4661,10 +4678,14 @@ def _render_return_db_admin(current_user_id: str) -> None:
                 .replace("T", " ")[:19],
                 "현재상태": "관리자 검토 대기",
             }
-            for row in review_rows
+            for index, row in enumerate(review_rows)
         ]
     )
-    edited_review_frame = st.data_editor(
+    editor_generation = int(
+        st.session_state.get(_RETURN_DB_ADMIN_EDITOR_GENERATION_KEY, 0) or 0
+    )
+    editor_key = f"{_RETURN_DB_ADMIN_TABLE_KEY}_{editor_generation}"
+    st.data_editor(
         review_frame,
         use_container_width=True,
         hide_index=True,
@@ -4687,16 +4708,25 @@ def _render_return_db_admin(current_user_id: str) -> None:
             "반납일시",
             "현재상태",
         ],
-        key=_RETURN_DB_ADMIN_TABLE_KEY,
+        key=editor_key,
+        on_change=_sync_result_editor_selection,
+        args=(
+            editor_key,
+            _RETURN_DB_ADMIN_SELECTION_KEY,
+            review_uids,
+            set(selected_uid_set),
+        ),
     )
-    selected_indexes = [
-        index
-        for index, selected in enumerate(
-            edited_review_frame["선택"].fillna(False).tolist()
-        )
-        if bool(selected) and index < len(review_rows)
+    selected_uid_set = {
+        str(uid)
+        for uid in st.session_state.get(_RETURN_DB_ADMIN_SELECTION_KEY, [])
+        if str(uid) in available_review_uids
+    }
+    selected_returns = [
+        row
+        for uid, row in zip(review_uids, review_rows)
+        if uid in selected_uid_set
     ]
-    selected_returns = [review_rows[index] for index in selected_indexes]
     st.caption(f"선택한 반납 DB: {len(selected_returns):,}개")
 
     with st.form("return_db_admin_review_form_v1150"):
@@ -4760,7 +4790,10 @@ def _render_return_db_admin(current_user_id: str) -> None:
                 f"{review_action} 처리했습니다."
             ),
         }
-        st.session_state.pop(_RETURN_DB_ADMIN_TABLE_KEY, None)
+        st.session_state[_RETURN_DB_ADMIN_SELECTION_KEY] = []
+        st.session_state[_RETURN_DB_ADMIN_EDITOR_GENERATION_KEY] = (
+            editor_generation + 1
+        )
         st.rerun()
     else:
         st.error(
