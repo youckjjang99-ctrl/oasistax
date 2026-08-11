@@ -106,9 +106,9 @@ def _valid_resident_number(value: str) -> bool:
         datetime.strptime(f"{century + int(digits[:2]):04d}{digits[2:6]}", "%Y%m%d")
     except ValueError:
         return False
-    weights = (2, 3, 4, 5, 6, 7, 8, 9, 2, 3, 4, 5)
-    check_digit = (11 - sum(int(n) * w for n, w in zip(digits[:12], weights))) % 10
-    return check_digit == int(digits[-1])
+    # 2020-10 이후 신규·변경 번호는 성별 뒤 6자리가 임의번호이므로
+    # 종전의 지역·순번·검증번호 규칙을 강제하면 정상 번호도 거절된다.
+    return True
 
 
 def validate_application(values: dict[str, Any]) -> dict[str, str]:
@@ -119,6 +119,7 @@ def validate_application(values: dict[str, Any]) -> dict[str, str]:
             "birth_date",
             "contact",
             "email",
+            "bank_name",
             "account_number",
             "desired_title",
             "desired_admin_id",
@@ -130,6 +131,7 @@ def validate_application(values: dict[str, Any]) -> dict[str, str]:
         "birth_date": "주민등록번호",
         "contact": "연락처",
         "email": "이메일",
+        "bank_name": "은행명",
         "account_number": "계좌번호",
         "desired_title": "희망 직함",
         "desired_admin_id": "관리자 페이지 희망 ID",
@@ -151,6 +153,11 @@ def validate_application(values: dict[str, Any]) -> dict[str, str]:
     if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", clean["email"]):
         raise ClaimSalesApplicationError("이메일 형식을 확인해주세요.")
 
+    if not 2 <= len(clean["bank_name"]) <= 40 or re.search(
+        r"[\x00-\x1f\x7f]",
+        clean["bank_name"],
+    ):
+        raise ClaimSalesApplicationError("은행명을 정확히 입력해주세요.")
     account_digits = _digits(clean["account_number"])
     if not 6 <= len(account_digits) <= 20:
         raise ClaimSalesApplicationError("계좌번호를 정확히 입력해주세요.")
@@ -436,7 +443,7 @@ def render_claim_sales_application(
         "경정청구 영업 활동에 필요한 신청정보를 작성해 제출해주세요."
     )
     st.info(
-        "주민등록번호와 계좌번호는 직원등록·4대보험·세무 신고를 위한 "
+        "주민등록번호와 계좌정보는 직원등록·4대보험·세무 신고를 위한 "
         "목적으로만 수집하며, 원문을 별도 열에 남기지 않고 암호화해 저장합니다."
     )
 
@@ -469,10 +476,15 @@ def render_claim_sales_application(
             )
             email = st.text_input("이메일", max_chars=200)
         with right:
+            bank_name = st.text_input(
+                "은행명",
+                placeholder="예: 국민은행",
+                max_chars=40,
+            )
             account_number = st.text_input(
                 "계좌번호",
                 type="password",
-                placeholder="은행명 없이 계좌번호만 입력해주세요.",
+                placeholder="계좌번호를 입력해주세요.",
                 max_chars=30,
             )
             desired_title = st.text_input("희망 직함", max_chars=80)
@@ -488,7 +500,7 @@ def render_claim_sales_application(
             )
 
         consented = st.checkbox(
-            "직원등록이 확정되었으며, 4대보험·원천징수 등 법정 신고를 위한 "
+            "4대보험·원천징수 등 법정 신고를 위한 "
             "주민등록번호 및 개인정보의 수집·이용과 암호화 저장을 확인했습니다."
         )
         submitted = st.form_submit_button(
@@ -507,6 +519,7 @@ def render_claim_sales_application(
                 "birth_date": birth_date,
                 "contact": contact,
                 "email": email,
+                "bank_name": bank_name,
                 "account_number": account_number,
                 "desired_title": desired_title,
                 "desired_admin_id": desired_admin_id,

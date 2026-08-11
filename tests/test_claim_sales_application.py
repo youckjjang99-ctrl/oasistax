@@ -18,6 +18,7 @@ VALID = {
     "birth_date": "900101-1234567",
     "contact": "010-1234-5678",
     "email": "Sales@Example.com",
+    "bank_name": "국민은행",
     "account_number": "123-456-789012",
     "desired_title": "팀장",
     "desired_admin_id": "sales.hong",
@@ -78,10 +79,16 @@ class ClaimSalesApplicationTests(unittest.TestCase):
         self.assertEqual(clean["birth_date"], "9001011234567")
         self.assertEqual(clean["contact"], "01012345678")
         self.assertEqual(clean["email"], "sales@example.com")
+        self.assertEqual(clean["bank_name"], "국민은행")
         self.assertEqual(clean["account_number"], "123456789012")
 
-    def test_invalid_resident_number_is_rejected(self):
+    def test_structurally_valid_number_is_not_rejected_by_legacy_checksum(self):
         values = {**VALID, "birth_date": "900101-1234568"}
+        clean = validate_application(values)
+        self.assertEqual(clean["birth_date"], "9001011234568")
+
+    def test_invalid_resident_birth_date_is_rejected(self):
+        values = {**VALID, "birth_date": "901332-1234567"}
         with self.assertRaises(ClaimSalesApplicationError):
             validate_application(values)
 
@@ -99,11 +106,14 @@ class ClaimSalesApplicationTests(unittest.TestCase):
         stored = db.rows[0]
         self.assertNotIn("name", stored)
         self.assertNotIn("contact", stored)
+        self.assertNotIn("bank_name", stored)
         self.assertNotIn("account_number", stored)
         ciphertext = stored["secure_payload_ciphertext"]
         self.assertNotIn("홍길동", ciphertext)
         self.assertNotIn("01012345678", ciphertext)
+        self.assertNotIn("국민은행", ciphertext)
         self.assertEqual(cipher.decrypt(ciphertext)["name"], "홍길동")
+        self.assertEqual(cipher.decrypt(ciphertext)["bank_name"], "국민은행")
 
     def test_consent_is_required(self):
         repository = ClaimSalesApplicationRepository(
@@ -124,6 +134,7 @@ class ClaimSalesApplicationTests(unittest.TestCase):
             "주민등록번호",
             "연락처",
             "이메일",
+            "은행명",
             "계좌번호",
             "희망 직함",
             "관리자 페이지 희망 ID",
@@ -131,6 +142,7 @@ class ClaimSalesApplicationTests(unittest.TestCase):
             "영업신청 제출",
         ):
             self.assertIn(label, source)
+        self.assertNotIn("직원등록이 확정되었으며", source)
 
     def test_user_result_query_is_owner_scoped_and_excludes_ciphertext(self):
         db = FakeDatabase()
