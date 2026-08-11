@@ -96,9 +96,6 @@ class RerunReductionTests(unittest.TestCase):
             # Administrator return-review now refreshes only its fragment,
             # so it is excluded from full-app rerun counts.
             "prospect_db_center.py": 6,
-            # Auth refresh, two soft-delete dialog exits, and the existing
-            # dialog close.  These are user actions, not polling reruns.
-            "claim_correction_center.py": 4,
         }
         for file_name, expected in expected_counts.items():
             with self.subTest(file_name=file_name):

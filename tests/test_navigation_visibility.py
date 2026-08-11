@@ -17,7 +17,11 @@ class NavigationVisibilityTests(unittest.TestCase):
         self.assertNotIn("sidebar-nav-heading", source)
         self.assertNotIn("<small>1단계</small>", source)
         self.assertNotIn("<small>{html.escape(selected_group)}</small>", source)
-        self.assertIn('"경정청구": "경정청구"', source)
+        self.assertIn(
+            '"경정청구 영업신청": "경정청구 영업신청"',
+            source,
+        )
+        self.assertNotIn('elif active_tab == "경정청구":', source)
 
     def test_detail_menu_change_collapses_sidebar_once(self):
         source = (ROOT / "app.py").read_text(encoding="utf-8")

@@ -669,7 +669,7 @@ def _navigate_to_main_menu(target: str) -> None:
         "DB발굴": "주요업무",
         "기업정보등록": "주요업무",
         "기업 컨설팅": "주요업무",
-        "경정청구": "주요업무",
+        "경정청구 영업신청": "주요업무",
         "AI 코파일럿": "주요업무",
         "내 누적 고객DB": "고객관리",
         "실행이력": "고객관리",
@@ -1859,7 +1859,7 @@ with st.sidebar:
             "DB발굴": "DB발굴",
             "기업정보등록": "기업등록",
             "기업 컨설팅": "기업관리센터",
-            "경정청구": "경정청구",
+            "경정청구 영업신청": "경정청구 영업신청",
             "AI 코파일럿": "AI 코파일럿",
         },
         "고객관리": {
@@ -1906,6 +1906,9 @@ with st.sidebar:
     if current_sidebar_value == "영업후보DB":
         st.session_state["active_main_menu_v1020"] = "DB발굴"
         current_sidebar_value = "DB발굴"
+    if current_sidebar_value == "경정청구":
+        st.session_state["active_main_menu_v1020"] = "경정청구 영업신청"
+        current_sidebar_value = "경정청구 영업신청"
     if current_sidebar_value not in menu_label_map:
         current_sidebar_value = (
             query_menu if query_menu in menu_label_map else "홈"
@@ -1939,7 +1942,7 @@ with st.sidebar:
         "DB발굴": "DB발굴",
         "기업정보등록": "기업정보등록",
         "기업 컨설팅": "기업 컨설팅",
-        "경정청구": "경정청구",
+        "경정청구 영업신청": "경정청구 영업신청",
         "AI 코파일럿": "AI 코파일럿",
         "내 누적 고객DB": "내 고객DB",
         "실행이력": "실행이력",
@@ -2073,10 +2076,10 @@ elif active_tab == "기업관리센터":
         CURRENT_USER_NAME,
     )
 
-elif active_tab == "경정청구":
-    from claim_correction_center import render_claim_correction_center
+elif active_tab == "경정청구 영업신청":
+    from claim_sales_application import render_claim_sales_application
 
-    render_claim_correction_center(
+    render_claim_sales_application(
         CURRENT_USER_ID,
         CURRENT_USER_NAME,
     )

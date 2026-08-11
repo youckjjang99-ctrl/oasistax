@@ -224,12 +224,3 @@ def test_task_table_is_service_role_only_and_uses_fixed_safe_titles():
     assert "name" not in table_definition.lower()
     assert "business_no" not in table_definition.lower()
     assert "auth" not in table_definition.lower()
-
-
-def test_public_gateway_bootstrap_starts_durable_task_consumer():
-    source = (ROOT / "claim_remote_service.py").read_text(encoding="utf-8")
-
-    assert "OASIS_TASK_AUTOMATION_ENABLED" in source
-    assert "start_guidance_task_automation_worker" in source
-    assert "if task_automation_enabled:" in source
-    assert "if enabled and task_automation_enabled" not in source

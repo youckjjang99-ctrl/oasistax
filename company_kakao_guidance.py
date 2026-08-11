@@ -658,12 +658,11 @@ def request_guidance_send(
             "external_send_enabled": readiness["external_send_ready"],
         }
 
-    if invite_factory is None:
-        from claim_remote_service import create_prospect_self_input_invite
-        invite_factory = create_prospect_self_input_invite
-    if outbox_repository_factory is None:
-        from claim_remote_repository import ClaimRemoteRepository
-        outbox_repository_factory = ClaimRemoteRepository
+    if invite_factory is None or outbox_repository_factory is None:
+        raise CompanyKakaoGuidanceError(
+            "CLAIM_COLLECTION_RETIRED",
+            "기존 경정청구 자료수집 링크 발급 기능이 종료되었습니다.",
+        )
     try:
         invite = dict(invite_factory(
             owner_user_id=_text(current_user_id).lower(), requested_by=_text(requested_by)[:120] or _text(current_user_id).lower(),
