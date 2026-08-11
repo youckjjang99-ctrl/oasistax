@@ -64,9 +64,7 @@ def test_company_selection_shows_timeline_before_blank_entry_form() -> None:
         "sales_assignments.list_company_contacts(",
         timeline_at,
     )
-    form_at = source.index(
-        'with st.form("contact_results_record_form_v1050"'
-    )
+    form_at = source.index("with st.form(", query_at)
 
     assert timeline_at < query_at < form_at
     assert source.count("sales_assignments.list_company_contacts(") == 2

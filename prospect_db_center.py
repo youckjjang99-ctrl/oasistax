@@ -155,6 +155,11 @@ _OUTREACH_ATTEMPTS_KEY = "_saved_prospect_outreach_attempts_v1040"
 _CONTACT_RESULTS_FLASH_KEY = "_contact_results_flash_v1050"
 _CONTACT_RESULTS_SELECTION_KEY = "contact_results_assignment_table_v1120"
 _CONTACT_RESULTS_RESET_SELECTION_KEY = "_contact_results_reset_selection_v1050"
+_SAVED_PROSPECT_TABLE_KEY = "saved_prospect_compact_table_v1140"
+_ACTIVITY_DIALOG_REQUEST_KEY = "_saved_prospect_activity_request_v1140"
+_SAVED_PROSPECT_RESET_SELECTION_KEY = (
+    "_saved_prospect_reset_selection_v1140"
+)
 _RETURN_DB_ADMIN_FLASH_KEY = "_return_db_admin_flash_v1070"
 _RETURN_DB_ADMIN_SELECTION_KEY = "return_db_admin_assignment_v1070"
 _MOBILE_DB_ADMIN_SELECTION_KEY = "mobile_db_admin_request_v1090"
@@ -3471,6 +3476,8 @@ def _select_saved_db_dashboard_filter(filter_key: str) -> None:
     st.session_state[_SAVED_DB_DASHBOARD_FILTER_KEY] = selected
     st.session_state[_SAVED_DB_DASHBOARD_PAGE_KEY] = 0
     st.session_state.pop(_CONTACT_RESULTS_SELECTION_KEY, None)
+    st.session_state.pop(_SAVED_PROSPECT_TABLE_KEY, None)
+    st.session_state.pop(_ACTIVITY_DIALOG_REQUEST_KEY, None)
 
 
 def _set_saved_db_dashboard_page(page_index: int) -> None:
@@ -3479,6 +3486,8 @@ def _set_saved_db_dashboard_page(page_index: int) -> None:
         int(page_index),
     )
     st.session_state.pop(_CONTACT_RESULTS_SELECTION_KEY, None)
+    st.session_state.pop(_SAVED_PROSPECT_TABLE_KEY, None)
+    st.session_state.pop(_ACTIVITY_DIALOG_REQUEST_KEY, None)
 
 
 def _load_user_db_dashboard(owner_user_id: str) -> dict:
@@ -3610,6 +3619,66 @@ def _load_user_assignment_rows(owner_user_id: str) -> dict:
     }
 
 
+def _dismiss_company_activity_dialog() -> None:
+    """Close the activity dialog without losing dashboard filter state."""
+
+    st.session_state.pop(_ACTIVITY_DIALOG_REQUEST_KEY, None)
+    st.session_state.pop(_SAVED_PROSPECT_TABLE_KEY, None)
+
+
+@st.dialog(
+    "업체 활동 관리",
+    width="large",
+    on_dismiss=_dismiss_company_activity_dialog,
+)
+def _show_company_activity_dialog(
+    owner_user_id: str,
+    assignment: dict,
+    *,
+    can_view_mobile: bool,
+) -> None:
+    """Show one current-user assignment in a mobile-friendly modal."""
+
+    assignment_id = str(assignment.get("_assignment_id") or "")
+    company_name = str(
+        assignment.get("company_name") or "업체명 미확인"
+    )
+    source_data = (
+        assignment.get("source_data")
+        if isinstance(assignment.get("source_data"), dict)
+        else {}
+    )
+    company_type = DISCOVERY_TYPE_LABELS.get(
+        str(source_data.get("discovery_type") or "unknown"),
+        "분류 확인 중",
+    )
+    contact_status = sales_assignments.assignment_status_label(
+        str(assignment.get("status") or "")
+    )
+    phone = _assignment_contact_phone(
+        assignment,
+        can_view_mobile=can_view_mobile,
+    ) or "연락처 없음"
+
+    st.markdown(f"### {company_name}")
+    summary_columns = st.columns(3)
+    summary_columns[0].caption("기업유형")
+    summary_columns[0].write(company_type)
+    summary_columns[1].caption("연락현황")
+    summary_columns[1].write(contact_status)
+    summary_columns[2].caption("연락처")
+    summary_columns[2].write(phone)
+    st.divider()
+
+    _render_contact_results(
+        owner_user_id,
+        can_view_mobile=can_view_mobile,
+        embedded=True,
+        assignment_rows=[assignment],
+        selected_assignment_id=assignment_id,
+    )
+
+
 def _render_clean_saved_prospects(
     owner_user_id: str,
     can_view_mobile: bool = False,
@@ -3622,6 +3691,9 @@ def _render_clean_saved_prospects(
         "전사 배정 기능 적용 후에는 공개 연락처가 아직 없는 업체도 "
         "저장·배정 현황 확인을 위해 함께 표시합니다."
     )
+    if st.session_state.pop(_SAVED_PROSPECT_RESET_SELECTION_KEY, False):
+        st.session_state.pop(_SAVED_PROSPECT_TABLE_KEY, None)
+        st.session_state.pop(_ACTIVITY_DIALOG_REQUEST_KEY, None)
     _show_outreach_result_notice()
     assignment_mode = False
     selected_filter = _saved_db_dashboard_filter()
@@ -3788,8 +3860,9 @@ def _render_clean_saved_prospects(
         key="saved_prospect_excel_v984",
     )
     st.caption(
-        "오른쪽의 💬·🟡 버튼을 누르면 선택한 업체 1곳에 보낼 내용을 "
-        "직접 작성할 수 있습니다. 수신거부 또는 수신처가 없는 채널은 버튼이 표시되지 않습니다."
+        "업체 행을 클릭하면 활동이력·연락결과·DB 반납 화면이 팝업으로 열립니다. "
+        "오른쪽의 💬·🟡 버튼은 문자·카카오톡 보내기이며, 수신거부 또는 "
+        "수신처가 없는 채널은 표시되지 않습니다."
     )
     action_rows = _outreach_action_rows(
         frame,
@@ -3797,7 +3870,13 @@ def _render_clean_saved_prospects(
     )
     sms_click_key = "saved_prospect_sms_click_v1040"
     kakao_click_key = "saved_prospect_kakao_click_v1040"
-    st.dataframe(
+    table_options: dict = {}
+    if assignment_mode:
+        table_options = {
+            "on_select": "rerun",
+            "selection_mode": "single-row",
+        }
+    table_event = st.dataframe(
         compact_frame,
         use_container_width=True,
         hide_index=True,
@@ -3820,7 +3899,8 @@ def _render_clean_saved_prospects(
                 args=(kakao_click_key, "kakao", action_rows),
             ),
         },
-        key="saved_prospect_compact_table_v1041",
+        key=_SAVED_PROSPECT_TABLE_KEY,
+        **table_options,
     )
     if assignment_mode and total_count > _SAVED_DB_DASHBOARD_PAGE_SIZE:
         page_count = (
@@ -3857,19 +3937,40 @@ def _render_clean_saved_prospects(
             pending_request,
             can_view_mobile=can_view_mobile,
         )
+        return
 
-    with st.expander("업체 연락결과 관리", expanded=False):
-        if assignment_mode:
-            _render_contact_results(
+    if assignment_mode:
+        selected_indexes = list(table_event.selection.rows)
+        if selected_indexes:
+            selected_index = int(selected_indexes[0])
+            if 0 <= selected_index < len(frame):
+                selected_assignment_id = str(
+                    frame.iloc[selected_index].get("_assignment_id") or ""
+                )
+                if selected_assignment_id:
+                    st.session_state[_ACTIVITY_DIALOG_REQUEST_KEY] = (
+                        selected_assignment_id
+                    )
+
+        requested_assignment_id = str(
+            st.session_state.get(_ACTIVITY_DIALOG_REQUEST_KEY) or ""
+        )
+        assignment_by_id = {
+            str(row.get("_assignment_id") or ""): row
+            for row in rows
+            if str(row.get("_assignment_id") or "")
+        }
+        requested_assignment = assignment_by_id.get(
+            requested_assignment_id
+        )
+        if requested_assignment:
+            _show_company_activity_dialog(
                 owner_user_id,
+                requested_assignment,
                 can_view_mobile=can_view_mobile,
-                embedded=True,
-                assignment_rows=rows,
-                active_filter_label=selected_label,
             )
-            return
-
-        st.info("연락결과 관리는 활성 배정 업체에 적용됩니다.")
+        elif requested_assignment_id:
+            st.session_state.pop(_ACTIVITY_DIALOG_REQUEST_KEY, None)
 
 
 def _activity_datetime(value: object) -> datetime | None:
@@ -4060,6 +4161,7 @@ def _render_contact_results(
     embedded: bool = False,
     assignment_rows: list[dict] | None = None,
     active_filter_label: str = "",
+    selected_assignment_id: str = "",
 ) -> None:
     """Render contact management for the signed-in user's assignments only."""
 
@@ -4104,19 +4206,6 @@ def _render_contact_results(
             "아래 업체 목록에도 같은 조건이 적용됩니다."
         )
 
-    latest_contacts_result = sales_assignments.list_company_contacts(
-        owner_user_id,
-        limit=1000,
-    )
-    latest_contact_by_uid = _latest_contact_by_company(
-        list(latest_contacts_result.get("contacts") or [])
-    )
-    if not latest_contacts_result.get("ok"):
-        st.warning(
-            latest_contacts_result.get("message")
-            or "최신 연락현황을 불러오지 못해 배정상태로 표시합니다."
-        )
-
     assignments_by_id: dict[str, dict] = {}
     for row in rows:
         assignment_id = str(row.get("_assignment_id") or "")
@@ -4128,44 +4217,70 @@ def _render_contact_results(
         st.info("연락결과를 기록할 저장·배정 영업후보가 없습니다.")
         return
 
-    if st.session_state.pop(_CONTACT_RESULTS_RESET_SELECTION_KEY, False):
-        st.session_state.pop(_CONTACT_RESULTS_SELECTION_KEY, None)
-    selection_rows = _contact_assignment_selection_rows(
-        rows,
-        latest_contact_by_uid,
-        can_view_mobile=can_view_mobile,
-    )
-    st.markdown("##### 연락결과를 기록할 업체")
-    st.caption("업체 행을 선택하면 아래에 연락 이력과 입력 화면이 열립니다.")
-    selection_event = st.dataframe(
-        pd.DataFrame(selection_rows),
-        use_container_width=True,
-        hide_index=True,
-        column_order=["업체명", "기업유형", "연락현황", "연락처"],
-        column_config={
-            "업체명": st.column_config.TextColumn(width="large"),
-            "기업유형": st.column_config.TextColumn(width="medium"),
-            "연락현황": st.column_config.TextColumn(width="small"),
-            "연락처": st.column_config.TextColumn(width="medium"),
-        },
-        key=_CONTACT_RESULTS_SELECTION_KEY,
-        on_select="rerun",
-        selection_mode="single-row",
-        row_height=42,
-        height=min(430, max(160, 48 + (len(selection_rows) * 42))),
-    )
-    selected_indexes = list(selection_event.selection.rows)
-    if not selected_indexes:
-        st.info("목록에서 연락결과를 기록할 업체를 선택해 주세요.")
-        return
-    selected_index = int(selected_indexes[0])
-    if selected_index < 0 or selected_index >= len(selection_rows):
-        st.warning("선택한 업체를 확인하지 못했습니다. 다시 선택해 주세요.")
-        return
-    selected_assignment_id = str(
-        selection_rows[selected_index].get("_assignment_id") or ""
-    )
-    selected_assignment = assignments_by_id.get(selected_assignment_id, {})
+    selected_assignment_id = str(selected_assignment_id or "").strip()
+    if selected_assignment_id:
+        selected_assignment = assignments_by_id.get(
+            selected_assignment_id,
+            {},
+        )
+        if not selected_assignment:
+            st.warning("선택한 업체를 확인하지 못했습니다. 다시 선택해 주세요.")
+            return
+    else:
+        latest_contacts_result = sales_assignments.list_company_contacts(
+            owner_user_id,
+            limit=1000,
+        )
+        latest_contact_by_uid = _latest_contact_by_company(
+            list(latest_contacts_result.get("contacts") or [])
+        )
+        if not latest_contacts_result.get("ok"):
+            st.warning(
+                latest_contacts_result.get("message")
+                or "최신 연락현황을 불러오지 못해 배정상태로 표시합니다."
+            )
+
+        if st.session_state.pop(_CONTACT_RESULTS_RESET_SELECTION_KEY, False):
+            st.session_state.pop(_CONTACT_RESULTS_SELECTION_KEY, None)
+        selection_rows = _contact_assignment_selection_rows(
+            rows,
+            latest_contact_by_uid,
+            can_view_mobile=can_view_mobile,
+        )
+        st.markdown("##### 연락결과를 기록할 업체")
+        st.caption("업체 행을 선택하면 아래에 연락 이력과 입력 화면이 열립니다.")
+        selection_event = st.dataframe(
+            pd.DataFrame(selection_rows),
+            use_container_width=True,
+            hide_index=True,
+            column_order=["업체명", "기업유형", "연락현황", "연락처"],
+            column_config={
+                "업체명": st.column_config.TextColumn(width="large"),
+                "기업유형": st.column_config.TextColumn(width="medium"),
+                "연락현황": st.column_config.TextColumn(width="small"),
+                "연락처": st.column_config.TextColumn(width="medium"),
+            },
+            key=_CONTACT_RESULTS_SELECTION_KEY,
+            on_select="rerun",
+            selection_mode="single-row",
+            row_height=42,
+            height=min(430, max(160, 48 + (len(selection_rows) * 42))),
+        )
+        selected_indexes = list(selection_event.selection.rows)
+        if not selected_indexes:
+            st.info("목록에서 연락결과를 기록할 업체를 선택해 주세요.")
+            return
+        selected_index = int(selected_indexes[0])
+        if selected_index < 0 or selected_index >= len(selection_rows):
+            st.warning("선택한 업체를 확인하지 못했습니다. 다시 선택해 주세요.")
+            return
+        selected_assignment_id = str(
+            selection_rows[selected_index].get("_assignment_id") or ""
+        )
+        selected_assignment = assignments_by_id.get(
+            selected_assignment_id,
+            {},
+        )
     selected_company_uid = str(selected_assignment.get("company_uid") or "")
 
     st.markdown("#### 업체 활동 이력")
@@ -4206,33 +4321,36 @@ def _render_contact_results(
     schedule_next_contact = st.checkbox(
         "다음 연락예정일 지정",
         value=True,
-        key="contact_results_schedule_v1050",
+        key=f"contact_results_schedule_v1140_{selected_assignment_id}",
         help="기본으로 활성화됩니다. 필요하지 않으면 체크를 해제하세요.",
     )
     next_contact_date = st.date_input(
         "다음 연락예정일",
         disabled=not schedule_next_contact,
         help="‘재연락 요청’ 선택 시 반드시 지정합니다.",
-        key="contact_results_next_date_v1050",
+        key=f"contact_results_next_date_v1140_{selected_assignment_id}",
     )
 
-    with st.form("contact_results_record_form_v1050", clear_on_submit=True):
+    with st.form(
+        f"contact_results_record_form_v1140_{selected_assignment_id}",
+        clear_on_submit=True,
+    ):
         contact_col1, contact_col2 = st.columns(2)
         contact_method = contact_col1.selectbox(
             "연락방식",
             CONTACT_METHOD_OPTIONS,
-            key="contact_results_method_v1050",
+            key=f"contact_results_method_v1140_{selected_assignment_id}",
         )
         contact_result = contact_col2.selectbox(
             "연락결과",
             CONTACT_RESULT_OPTIONS,
-            key="contact_results_result_v1050",
+            key=f"contact_results_result_v1140_{selected_assignment_id}",
         )
         contact_notes = st.text_area(
             "상담내용",
             max_chars=10_000,
             placeholder="고객 반응과 후속조치 내용을 기록해 주세요.",
-            key="contact_results_notes_v1050",
+            key=f"contact_results_notes_v1140_{selected_assignment_id}",
         )
         contact_submitted = st.form_submit_button(
             "연락결과 저장",
@@ -4281,12 +4399,17 @@ def _render_contact_results(
         key=f"contact_results_return_reason_v1130_{selected_assignment_id}",
         disabled=not selected_company_uid,
     )
+    return_confirmed = st.checkbox(
+        "이 업체를 내 DB에서 반납하는 내용을 확인했습니다.",
+        key=f"contact_results_return_confirm_v1140_{selected_assignment_id}",
+        disabled=not selected_company_uid,
+    )
     return_submitted = st.button(
         "DB 반납하기",
         help="선택한 업체를 반납하고 내 활성 배정 목록에서 제외합니다.",
         key=f"contact_results_return_v1120_{selected_assignment_id}",
         use_container_width=True,
-        disabled=not selected_company_uid,
+        disabled=not selected_company_uid or not return_confirmed,
     )
     if return_submitted:
         return_result = None
@@ -4310,6 +4433,8 @@ def _render_contact_results(
                 ),
             }
             st.session_state[_CONTACT_RESULTS_RESET_SELECTION_KEY] = True
+            st.session_state.pop(_ACTIVITY_DIALOG_REQUEST_KEY, None)
+            st.session_state[_SAVED_PROSPECT_RESET_SELECTION_KEY] = True
             st.rerun()
         elif return_result:
             st.error(

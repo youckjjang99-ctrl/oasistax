@@ -512,7 +512,7 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
             "column_order=list(SAVED_PROSPECT_VISIBLE_COLUMNS)",
             source,
         )
-        self.assertIn('key="saved_prospect_compact_table_v1041"', source)
+        self.assertIn("key=_SAVED_PROSPECT_TABLE_KEY", source)
 
     def test_saved_db_dashboard_has_all_cards_and_server_side_filtering(self):
         cards = prospect.SAVED_DB_DASHBOARD_CARDS
@@ -548,6 +548,10 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
         self.assertIn("_SAVED_DB_DASHBOARD_PAGE_KEY", selector_source)
         self.assertIn("_CONTACT_RESULTS_SELECTION_KEY", selector_source)
         self.assertIn("_CONTACT_RESULTS_SELECTION_KEY", page_source)
+        self.assertIn("_SAVED_PROSPECT_TABLE_KEY", selector_source)
+        self.assertIn("_SAVED_PROSPECT_TABLE_KEY", page_source)
+        self.assertIn("_ACTIVITY_DIALOG_REQUEST_KEY", selector_source)
+        self.assertIn("_ACTIVITY_DIALOG_REQUEST_KEY", page_source)
         self.assertIn("_saved_db_dashboard_filter()", renderer_source)
         self.assertIn("현재 목록:", renderer_source)
         self.assertIn('"전체 보기"', renderer_source)

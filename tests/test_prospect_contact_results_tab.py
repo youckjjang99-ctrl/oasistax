@@ -30,21 +30,21 @@ class ProspectContactResultsTabTests(unittest.TestCase):
         )
         self.assertIn("_render_return_db_admin(owner_user_id)", source)
 
-    def test_saved_prospect_tab_renders_integrated_contact_management(self):
+    def test_saved_prospect_table_opens_integrated_activity_dialog(self):
         source = inspect.getsource(prospect._render_clean_saved_prospects)
 
         for retained_marker in (
             "저장된 영업후보 엑셀 다운로드",
-            "saved_prospect_compact_table_v1041",
+            "_SAVED_PROSPECT_TABLE_KEY",
             "_show_outreach_dialog(",
-            "업체 연락결과 관리",
-            "_render_contact_results(",
-            "embedded=True",
-            "assignment_rows=rows",
-            "active_filter_label=selected_label",
+            '"on_select": "rerun"',
+            '"selection_mode": "single-row"',
+            "_ACTIVITY_DIALOG_REQUEST_KEY",
+            "_show_company_activity_dialog(",
         ):
             with self.subTest(retained_marker=retained_marker):
                 self.assertIn(retained_marker, source)
+        self.assertNotIn('st.expander("업체 연락결과 관리"', source)
 
     def test_contact_results_tab_contains_the_complete_moved_area_once(self):
         source = inspect.getsource(prospect._render_contact_results)
@@ -76,18 +76,36 @@ class ProspectContactResultsTabTests(unittest.TestCase):
         self.assertNotIn("메모 저장", source)
         self.assertNotIn("_show_outreach_dialog(", source)
 
-    def test_dashboard_filter_rows_are_passed_to_contact_manager(self):
+    def test_dashboard_filter_rows_are_used_to_resolve_dialog_assignment(self):
         source = inspect.getsource(prospect._render_clean_saved_prospects)
 
         filter_load_at = source.index(
             "_load_user_dashboard_assignment_rows("
         )
-        manager_at = source.index("_render_contact_results(", filter_load_at)
+        resolver_at = source.index("assignment_by_id = {", filter_load_at)
+        dialog_at = source.index(
+            "_show_company_activity_dialog(",
+            resolver_at,
+        )
 
-        self.assertLess(filter_load_at, manager_at)
-        self.assertIn("selected_filter", source[filter_load_at:manager_at])
-        self.assertIn("assignment_rows=rows", source[manager_at:])
-        self.assertIn("active_filter_label=selected_label", source[manager_at:])
+        self.assertLess(filter_load_at, resolver_at)
+        self.assertLess(resolver_at, dialog_at)
+        self.assertIn("selected_filter", source[filter_load_at:resolver_at])
+        self.assertIn("for row in rows", source[resolver_at:dialog_at])
+
+    def test_activity_dialog_is_large_dismissible_and_uses_one_assignment(self):
+        source = inspect.getsource(prospect._show_company_activity_dialog)
+
+        for marker in (
+            '@st.dialog(',
+            '"업체 활동 관리"',
+            'width="large"',
+            "on_dismiss=_dismiss_company_activity_dialog",
+            "assignment_rows=[assignment]",
+            "selected_assignment_id=assignment_id",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, source)
 
     def test_company_selector_is_an_aligned_single_row_table(self):
         source = inspect.getsource(prospect._render_contact_results)
@@ -124,14 +142,23 @@ class ProspectContactResultsTabTests(unittest.TestCase):
 
         schedule_at = source.index("schedule_next_contact = st.checkbox(")
         date_at = source.index("next_contact_date = st.date_input(")
-        form_at = source.index(
-            'with st.form("contact_results_record_form_v1050"',
-        )
+        form_at = source.index("with st.form(")
 
         self.assertLess(schedule_at, date_at)
         self.assertLess(date_at, form_at)
         self.assertIn("value=True", source[schedule_at:date_at])
         self.assertIn("disabled=not schedule_next_contact", source)
+
+    def test_return_requires_explicit_confirmation_inside_activity_dialog(self):
+        source = inspect.getsource(prospect._render_contact_results)
+
+        self.assertIn("return_confirmed = st.checkbox(", source)
+        self.assertIn("이 업체를 내 DB에서 반납하는 내용을 확인했습니다.", source)
+        self.assertIn(
+            "disabled=not selected_company_uid or not return_confirmed",
+            source,
+        )
+        self.assertIn("_SAVED_PROSPECT_RESET_SELECTION_KEY", source)
 
     def test_assignment_loader_is_scoped_to_the_current_user(self):
         assignment = {
