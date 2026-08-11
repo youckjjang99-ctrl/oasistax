@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from html import unescape
 from io import BytesIO
 from pathlib import Path
 import re
@@ -11,6 +12,7 @@ import time
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import requests
 import streamlit as st
 from runtime_error_log import safe_public_error
 
@@ -66,6 +68,9 @@ from sales_intelligence import analyze_sales_candidate, merge_analysis
 
 BASE_DIR = Path(__file__).resolve().parent
 SEOUL_TIMEZONE = ZoneInfo("Asia/Seoul")
+KRX_LISTED_COMPANY_URL = (
+    "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download"
+)
 STOCK_COMPANY_MARKERS = ("주식회사", "(주)", "㈜", "（주）")
 EXCLUDED_LEGAL_MARKERS = (
     "농업회사법인",
@@ -4375,30 +4380,159 @@ def _candidate_phone(item: dict, channel: str) -> str:
     return "" if is_mobile_phone(mobile) else phone
 
 
+def _normalize_listed_company_name(value: object) -> str:
+    normalized = str(value or "").strip().upper()
+    for marker in STOCK_COMPANY_MARKERS:
+        normalized = normalized.replace(marker.upper(), "")
+    return re.sub(r"[^0-9A-Z가-힣]", "", normalized)
+
+
+@st.cache_data(ttl=21600, max_entries=1, show_spinner=False)
+def _krx_listed_company_names() -> frozenset[str]:
+    """Load the official KRX listed-company names for allocation filtering."""
+
+    response = requests.get(
+        KRX_LISTED_COMPANY_URL,
+        headers={"User-Agent": "OASIS-CRM/1.0"},
+        timeout=15,
+    )
+    response.raise_for_status()
+    document = response.content.decode("euc-kr", errors="replace")
+    first_cells = re.findall(
+        r"<tr\b[^>]*>\s*<td\b[^>]*>(.*?)</td>",
+        document,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    names = {
+        _normalize_listed_company_name(
+            unescape(re.sub(r"<[^>]+>", "", cell))
+        )
+        for cell in first_cells
+    }
+    names.discard("")
+    if len(names) < 1000:
+        raise RuntimeError("KRX 상장사 목록 응답이 완전하지 않습니다.")
+    return frozenset(names)
+
+
+def _candidate_employee_count(item: dict) -> int:
+    raw = (
+        item.get("가입자수")
+        or item.get("current_employee_count")
+        or item.get("employee_count")
+        or 0
+    )
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _candidate_is_listed_company(
+    item: dict,
+    listed_company_names: frozenset[str] = frozenset(),
+) -> bool:
+    """Exclude rows explicitly marked as KRX-listed by any source."""
+
+    sources = [item]
+    raw_source = item.get("원본데이터")
+    if isinstance(raw_source, dict):
+        sources.append(raw_source)
+
+    boolean_keys = (
+        "is_listed",
+        "listed",
+        "상장여부",
+        "상장기업여부",
+    )
+    market_keys = (
+        "listing_status",
+        "listing_market",
+        "market_type",
+        "stock_market",
+        "상장시장",
+        "시장구분",
+    )
+    stock_code_keys = (
+        "stock_code",
+        "ticker",
+        "종목코드",
+        "주식코드",
+    )
+    listed_markers = (
+        "KOSPI",
+        "KOSDAQ",
+        "KONEX",
+        "코스피",
+        "코스닥",
+        "코넥스",
+        "유가증권시장",
+    )
+    for source in sources:
+        for key in boolean_keys:
+            value = source.get(key)
+            if value is True or str(value or "").strip().lower() in {
+                "true",
+                "t",
+                "1",
+                "yes",
+                "y",
+                "상장",
+            }:
+                return True
+        for key in market_keys:
+            value = str(source.get(key) or "").strip().upper()
+            if any(marker.upper() in value for marker in listed_markers):
+                return True
+        for key in stock_code_keys:
+            code = re.sub(r"[^0-9A-Z]", "", str(source.get(key) or "").upper())
+            if code and code not in {"0", "000000"}:
+                return True
+    company_name = (
+        item.get("사업장명")
+        or item.get("company_name")
+        or item.get("업체명")
+    )
+    if _normalize_listed_company_name(company_name) in listed_company_names:
+        return True
+    return False
+
+
 def _collect_allocation_candidates(
     region_name: str,
     district_name: str,
     business_type: str,
     channel: str,
     *,
+    minimum_employees: int = 1,
+    maximum_employees: int = 300,
     pool_size: int = 500,
 ) -> tuple[list[dict], list[str]]:
     """Collect, classify and randomly order assignment candidates."""
 
+    minimum_count = max(1, int(minimum_employees))
+    maximum_count = max(minimum_count, int(maximum_employees))
     district = "" if district_name == ALL_DISTRICTS else district_name
     contact_channel = (
         "mobile_phone" if channel == "mobile" else "landline_phone"
     )
     common = {
         "target_count": max(30, min(500, int(pool_size))),
-        "minimum_employees": 1,
-        "maximum_employees": 10000,
+        "minimum_employees": minimum_count,
+        "maximum_employees": maximum_count,
         "business_type": business_type,
         "industry_categories": [],
         "contact_channels": [contact_channel],
         "district_name": district,
         "exclude_saved_prospects": False,
     }
+    try:
+        listed_company_names = _krx_listed_company_names()
+    except Exception:
+        return [], [
+            "한국거래소 상장사 목록을 확인하지 못해 안전하게 배정을 "
+            "중단했습니다. 잠시 후 다시 시도해 주세요."
+        ]
     searches = (
         (
             "growth",
@@ -4439,6 +4573,11 @@ def _collect_allocation_candidates(
             continue
         for original in result.get("items") or []:
             item = dict(original)
+            employee_count = _candidate_employee_count(item)
+            if not minimum_count <= employee_count <= maximum_count:
+                continue
+            if _candidate_is_listed_company(item, listed_company_names):
+                continue
             phone = _candidate_phone(item, channel)
             if not phone:
                 continue
@@ -4494,7 +4633,7 @@ def _available_allocation_candidates(
 def _render_db_request_home(owner_user_id: str) -> None:
     st.markdown("### DB 신청")
     st.caption(
-        "지역과 사업자 유형만 선택해 주세요. 일반번호 DB는 무작위로 즉시 "
+        "지역·사업자 유형·고용인원을 선택해 주세요. 일반번호 DB는 무작위로 즉시 "
         "배정되고, 핸드폰 DB는 관리자가 신청 순서와 보유 현황을 검토해 배정합니다."
     )
     filter_col1, filter_col2, filter_col3 = st.columns(3)
@@ -4515,6 +4654,31 @@ def _render_db_request_home(owner_user_id: str) -> None:
     )
     business_type = BUSINESS_TYPE_OPTIONS[business_type_name]
 
+    employee_col1, employee_col2 = st.columns(2)
+    minimum_employees = employee_col1.number_input(
+        "최소 고용인원",
+        min_value=1,
+        max_value=10000,
+        value=1,
+        step=1,
+        key="simple_db_minimum_employees_v1100",
+    )
+    maximum_employees = employee_col2.number_input(
+        "최대 고용인원",
+        min_value=1,
+        max_value=10000,
+        value=300,
+        step=1,
+        key="simple_db_maximum_employees_v1100",
+    )
+    invalid_employee_range = int(maximum_employees) < int(minimum_employees)
+    if invalid_employee_range:
+        st.error("최대 고용인원은 최소 고용인원보다 크거나 같아야 합니다.")
+    st.caption(
+        "한국거래소 상장사 목록과 상장시장·종목코드를 확인해 "
+        "상장기업은 랜덤배정 대상에서 제외합니다."
+    )
+
     landline_col, mobile_col = st.columns(2)
     with landline_col:
         st.markdown("#### 일반번호 DB")
@@ -4523,6 +4687,7 @@ def _render_db_request_home(owner_user_id: str) -> None:
             "일반번호 DB 30개 받기",
             type="primary",
             use_container_width=True,
+            disabled=invalid_employee_range,
             key="allocate_landline_db_v1090",
         )
     with mobile_col:
@@ -4531,6 +4696,7 @@ def _render_db_request_home(owner_user_id: str) -> None:
         mobile_clicked = st.button(
             "핸드폰 DB 배정 신청",
             use_container_width=True,
+            disabled=invalid_employee_range,
             key="request_mobile_db_v1090",
         )
 
@@ -4542,6 +4708,8 @@ def _render_db_request_home(owner_user_id: str) -> None:
                     district_name,
                     business_type,
                     "landline",
+                    minimum_employees=int(minimum_employees),
+                    maximum_employees=int(maximum_employees),
                 )
                 available, availability_warning = _available_allocation_candidates(
                     candidates,
@@ -4585,6 +4753,8 @@ def _render_db_request_home(owner_user_id: str) -> None:
             region_name,
             "" if district_name == ALL_DISTRICTS else district_name,
             business_type,
+            minimum_employees=int(minimum_employees),
+            maximum_employees=int(maximum_employees),
             session_id=_assignment_session_id(),
         )
         if request_result.get("ok"):
@@ -4619,6 +4789,10 @@ def _render_db_request_home(owner_user_id: str) -> None:
                         ),
                         "사업자유형": BUSINESS_TYPE_LABELS.get(
                             str(row.get("business_type") or "all"), "전체"
+                        ),
+                        "고용인원": (
+                            f"{int(row.get('minimum_employees') or 1):,}"
+                            f"~{int(row.get('maximum_employees') or 300):,}명"
                         ),
                         "신청": int(row.get("requested_count") or 0),
                         "배정": int(row.get("allocated_count") or 0),
@@ -4667,6 +4841,10 @@ def _render_mobile_db_admin(current_user_id: str) -> None:
                     ),
                     "사업자유형": BUSINESS_TYPE_LABELS.get(
                         str(row.get("business_type") or "all"), "전체"
+                    ),
+                    "고용인원": (
+                        f"{int(row.get('minimum_employees') or 1):,}"
+                        f"~{int(row.get('maximum_employees') or 300):,}명"
                     ),
                     "배정현황": (
                         f"{int(row.get('allocated_count') or 0)} / "
@@ -4750,6 +4928,8 @@ def _render_mobile_db_admin(current_user_id: str) -> None:
                 str(selected.get("district") or ALL_DISTRICTS) or ALL_DISTRICTS,
                 str(selected.get("business_type") or "all"),
                 "mobile",
+                minimum_employees=int(selected.get("minimum_employees") or 1),
+                maximum_employees=int(selected.get("maximum_employees") or 300),
             )
             for candidate in candidates:
                 candidate["핸드폰DB신청ID"] = selected_id

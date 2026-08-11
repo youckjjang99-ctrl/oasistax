@@ -257,6 +257,8 @@ _MOBILE_DB_REQUEST_FIELDS = {
     "region",
     "district",
     "business_type",
+    "minimum_employees",
+    "maximum_employees",
     "requested_count",
     "allocated_count",
     "status",
@@ -1796,9 +1798,26 @@ def submit_mobile_db_request(
     district: Any = "",
     business_type: Any = "all",
     *,
+    minimum_employees: int = 1,
+    maximum_employees: int = 300,
     session_id: str = "",
     db: CloudDatabase | None = None,
 ) -> dict[str, Any]:
+    try:
+        minimum_count = max(1, min(int(minimum_employees), 10000))
+        maximum_count = max(1, min(int(maximum_employees), 10000))
+    except (TypeError, ValueError):
+        minimum_count = 1
+        maximum_count = 300
+    if maximum_count < minimum_count:
+        return {
+            "ok": False,
+            "code": "INVALID_INPUT",
+            "message": "최대 고용인원은 최소 고용인원보다 크거나 같아야 합니다.",
+            "assignment": {},
+            "warning": "고용인원 범위를 확인해 주세요.",
+            "fallback_required": False,
+        }
     raw, error = _rpc(
         RPC_SUBMIT_MOBILE_DB_REQUEST,
         {
@@ -1806,6 +1825,8 @@ def submit_mobile_db_request(
             "p_region": _bounded(region, 100),
             "p_district": _bounded(district, 100),
             "p_business_type": _bounded(business_type, 20).lower() or "all",
+            "p_minimum_employees": minimum_count,
+            "p_maximum_employees": maximum_count,
             "p_session_id": _bounded(session_id, 200) or None,
         },
         db=db,
