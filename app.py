@@ -85,6 +85,9 @@ UPLOAD_DIR = BASE_DIR / "uploads"
 RESULT_DIR = BASE_DIR / "results"
 HISTORY_DIR = BASE_DIR / "history"
 
+# 임시 운영 스위치: 신청 데이터와 처리 기능은 보존하고 사이드바 메뉴만 숨긴다.
+SHOW_CLAIM_SALES_APPLICATION_MENU = False
+
 for _folder in [TEMPLATE_DIR, UPLOAD_DIR, RESULT_DIR, HISTORY_DIR]:
     _folder.mkdir(exist_ok=True)
 
@@ -1853,15 +1856,18 @@ with st.sidebar:
         </div>
         """, unsafe_allow_html=True)
 
+    primary_menu = {
+        "홈": "홈",
+        "DB발굴": "DB발굴",
+        "기업정보등록": "기업등록",
+        "기업 컨설팅": "기업관리센터",
+    }
+    if SHOW_CLAIM_SALES_APPLICATION_MENU:
+        primary_menu["경정청구 영업신청"] = "경정청구 영업신청"
+    primary_menu["AI 코파일럿"] = "AI 코파일럿"
+
     menu_groups = {
-        "주요업무": {
-            "홈": "홈",
-            "DB발굴": "DB발굴",
-            "기업정보등록": "기업등록",
-            "기업 컨설팅": "기업관리센터",
-            "경정청구 영업신청": "경정청구 영업신청",
-            "AI 코파일럿": "AI 코파일럿",
-        },
+        "주요업무": primary_menu,
         "고객관리": {
             "내 누적 고객DB": "내 누적 고객DB",
             "실행이력": "실행이력",

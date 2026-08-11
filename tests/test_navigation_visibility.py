@@ -17,8 +17,10 @@ class NavigationVisibilityTests(unittest.TestCase):
         self.assertNotIn("sidebar-nav-heading", source)
         self.assertNotIn("<small>1단계</small>", source)
         self.assertNotIn("<small>{html.escape(selected_group)}</small>", source)
+        self.assertIn("SHOW_CLAIM_SALES_APPLICATION_MENU = False", source)
+        self.assertIn("if SHOW_CLAIM_SALES_APPLICATION_MENU:", source)
         self.assertIn(
-            '"경정청구 영업신청": "경정청구 영업신청"',
+            'primary_menu["경정청구 영업신청"] = "경정청구 영업신청"',
             source,
         )
         self.assertNotIn('elif active_tab == "경정청구":', source)

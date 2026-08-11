@@ -60,7 +60,8 @@ class ClaimSalesApplicationTests(unittest.TestCase):
         source = (Path(__file__).resolve().parents[1] / "app.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn('"경정청구 영업신청": "경정청구 영업신청"', source)
+        self.assertIn("SHOW_CLAIM_SALES_APPLICATION_MENU = False", source)
+        self.assertIn("if SHOW_CLAIM_SALES_APPLICATION_MENU:", source)
         self.assertIn('elif active_tab == "경정청구 영업신청":', source)
         self.assertIn("render_claim_sales_application(", source)
         self.assertNotIn("render_claim_correction_center(", source)
