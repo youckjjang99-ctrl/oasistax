@@ -3882,7 +3882,19 @@ def _render_clean_saved_prospects(
             can_view_mobile=can_view_mobile,
         )
 
-    with st.expander("업체 메모 관리", expanded=False):
+    with st.expander("업체 메모·연락결과 관리", expanded=False):
+        if assignment_mode:
+            _render_contact_results(
+                owner_user_id,
+                can_view_mobile=can_view_mobile,
+                embedded=True,
+            )
+            return
+
+        st.caption(
+            "기존 저장 업체는 메모를 관리할 수 있습니다. 연락결과 기록은 "
+            "활성 배정 업체에 적용됩니다."
+        )
         memo_rows = {
             (
                 f"{row.get('업체명', '')} · "
@@ -4074,10 +4086,13 @@ def _render_contact_results(
     owner_user_id: str,
     *,
     can_view_mobile: bool = False,
+    embedded: bool = False,
 ) -> None:
     """Render contact management for the signed-in user's assignments only."""
 
-    st.markdown("### 연락결과 기록")
+    st.markdown(
+        "#### 업체 메모·연락결과" if embedded else "### 연락결과 기록"
+    )
     st.caption(
         "통화·이메일·문자·카카오톡·상담 결과를 저장하면 담당자가 "
         "확정되고 전사 중복연락 방지 상태가 함께 갱신됩니다."
@@ -4207,18 +4222,40 @@ def _render_contact_results(
                 or "업체를 반납하지 못했습니다."
             )
 
-    selected_memo = str(selected_assignment.get("memo") or "").strip()
     st.markdown("#### 업체 메모")
-    if selected_memo:
-        st.text_area(
-            "② 저장된 영업후보에서 저장한 메모",
-            value=selected_memo,
+    with st.form(
+        f"saved_prospect_integrated_memo_form_v1110_{selected_assignment_id}"
+    ):
+        memo_value = st.text_area(
+            "업체 메모",
+            value=str(selected_assignment.get("memo") or ""),
             height=100,
-            disabled=True,
-            key=f"contact_results_memo_v1070_{selected_assignment_id}",
+            max_chars=10_000,
+            placeholder="담당자·통화 결과·다음 조치 등을 기록해 주세요.",
+            key=f"saved_prospect_integrated_memo_v1110_{selected_assignment_id}",
         )
-    else:
-        st.caption("② 저장된 영업후보에 저장된 업체 메모가 없습니다.")
+        memo_submitted = st.form_submit_button(
+            "메모 저장",
+            use_container_width=True,
+        )
+    if memo_submitted:
+        memo_result = sales_assignments.save_user_note(
+            owner_user_id,
+            selected_company_uid,
+            memo_value,
+            company_id=str(selected_assignment.get("company_id") or ""),
+        )
+        if memo_result.get("ok"):
+            st.session_state[_CONTACT_RESULTS_FLASH_KEY] = {
+                "level": "success",
+                "message": "업체 메모를 저장했습니다.",
+            }
+            st.rerun()
+        else:
+            st.error(
+                memo_result.get("message")
+                or "업체 메모를 저장하지 못했습니다."
+            )
 
     st.markdown("#### 업체 활동 이력")
     st.caption(
@@ -4440,7 +4477,7 @@ def _render_return_db_admin(current_user_id: str) -> None:
             getattr(st, level, st.info)(message)
 
     st.caption(
-        "영업담당자가 ③ 연락결과 기록에서 반납한 업체를 검토합니다. "
+        "영업담당자가 ② 저장된 영업후보의 업체 관리에서 반납한 업체를 검토합니다. "
         "검토 전에는 다른 담당자가 다시 배정받을 수 없습니다."
     )
     assignment_result = sales_assignments.list_admin_assignments(
@@ -5207,14 +5244,19 @@ def render_prospect_db_center(
     workflow_steps = [
         "① DB신청",
         "② 저장된 영업후보",
-        "③ 연락결과 기록",
     ]
     if is_admin_user:
-        workflow_steps.append("④ 반납DB 관리")
-        workflow_steps.append("⑤ 핸드폰DB 관리")
-    if st.session_state.get(
-        "prospect_workflow_step_v1081"
-    ) not in workflow_steps:
+        workflow_steps.append("③ 반납DB 관리")
+        workflow_steps.append("④ 핸드폰DB 관리")
+    if (
+        st.session_state.get("prospect_workflow_step_v1081")
+        == "③ 연락결과 기록"
+    ):
+        st.session_state["prospect_workflow_step_v1081"] = "② 저장된 영업후보"
+    if (
+        st.session_state.get("prospect_workflow_step_v1081")
+        not in workflow_steps
+    ):
         st.session_state["prospect_workflow_step_v1081"] = "① DB신청"
     workflow_step = st.pills(
         "DB발굴 작업 단계",
@@ -5230,16 +5272,10 @@ def render_prospect_db_center(
             is_admin_user=is_admin_user,
         )
         return
-    if workflow_step == "③ 연락결과 기록":
-        _render_contact_results(
-            owner_user_id,
-            can_view_mobile=can_view_mobile,
-        )
-        return
-    if workflow_step == "④ 반납DB 관리":
+    if workflow_step == "③ 반납DB 관리":
         _render_return_db_admin(owner_user_id)
         return
-    if workflow_step == "⑤ 핸드폰DB 관리":
+    if workflow_step == "④ 핸드폰DB 관리":
         _render_mobile_db_admin(owner_user_id)
         return
     if workflow_step == "① DB신청":
@@ -5922,7 +5958,7 @@ def render_prospect_db_center(
             st.info(
                 f"이미 내 영업DB에 저장된 업체 {own_excluded:,}건은 "
                 "신규 결과에서 제외했습니다. ② 저장된 영업후보에서 "
-                "업체를 확인하고 ③ 연락결과 기록에서 이력을 관리할 수 있습니다."
+                "업체를 확인하고 메모·연락 이력을 함께 관리할 수 있습니다."
             )
         if result.get("assignment_view_warning") and is_admin_user:
             st.caption(

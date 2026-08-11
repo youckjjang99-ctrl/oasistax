@@ -6,53 +6,40 @@ import prospect_db_center as prospect
 
 
 class ProspectContactResultsTabTests(unittest.TestCase):
-    def test_navigation_unifies_search_in_db_request_and_keeps_admin_review(self):
+    def test_navigation_integrates_contact_results_and_keeps_admin_review(self):
         source = inspect.getsource(prospect.render_prospect_db_center)
         labels = (
             "① DB신청",
             "② 저장된 영업후보",
-            "③ 연락결과 기록",
-            "④ 반납DB 관리",
+            "③ 반납DB 관리",
+            "④ 핸드폰DB 관리",
         )
 
         positions = [source.index(f'"{label}"') for label in labels]
         self.assertEqual(positions, sorted(positions))
         self.assertNotIn("검색 결과\"", source)
-        self.assertIn(
-            'if workflow_step == "③ 연락결과 기록":',
-            source,
-        )
-        self.assertIn("_render_contact_results(", source)
-        self.assertIn("can_view_mobile=can_view_mobile", source)
+        self.assertNotIn('"③ 연락결과 기록",', source)
+        self.assertNotIn('if workflow_step == "③ 연락결과 기록":', source)
+        self.assertNotIn("_render_contact_results(", source)
         self.assertIn("if is_admin_user:", source)
-        self.assertIn('workflow_steps.append("④ 반납DB 관리")', source)
+        self.assertIn('workflow_steps.append("③ 반납DB 관리")', source)
+        self.assertIn('workflow_steps.append("④ 핸드폰DB 관리")', source)
         self.assertIn(
-            'if workflow_step == "④ 반납DB 관리":',
+            'if workflow_step == "③ 반납DB 관리":',
             source,
         )
         self.assertIn("_render_return_db_admin(owner_user_id)", source)
 
-    def test_saved_prospect_tab_no_longer_renders_contact_management(self):
+    def test_saved_prospect_tab_renders_integrated_contact_management(self):
         source = inspect.getsource(prospect._render_clean_saved_prospects)
-
-        for moved_marker in (
-            "연락결과를 기록할 업체",
-            "연락결과 저장",
-            "내 연락이력",
-            "자동 발송 이력",
-            "미접촉 임시 배정 해제",
-            "record_contact(",
-            "list_company_contacts(",
-            "release_assignment(",
-        ):
-            with self.subTest(moved_marker=moved_marker):
-                self.assertNotIn(moved_marker, source)
 
         for retained_marker in (
             "저장된 영업후보 엑셀 다운로드",
             "saved_prospect_compact_table_v1041",
             "_show_outreach_dialog(",
-            "업체 메모 관리",
+            "업체 메모·연락결과 관리",
+            "_render_contact_results(",
+            "embedded=True",
         ):
             with self.subTest(retained_marker=retained_marker):
                 self.assertIn(retained_marker, source)
@@ -70,21 +57,40 @@ class ProspectContactResultsTabTests(unittest.TestCase):
             "다음 연락예정일",
             "상담내용",
             "업체 메모",
-            "② 저장된 영업후보에서 저장한 메모",
+            "메모 저장",
             "연락결과 저장",
-            "내 연락이력",
             "자동 발송 이력",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, source)
 
-        self.assertEqual(source.count('st.markdown("### 연락결과 기록")'), 1)
+        self.assertEqual(source.count('"### 연락결과 기록"'), 1)
         self.assertIn("sales_assignments.record_contact(", source)
         self.assertIn("sales_assignments.list_company_contacts(", source)
         self.assertIn("sales_assignments.release_assignment(", source)
+        self.assertIn("sales_assignments.save_user_note(", source)
         self.assertIn('reason="contact_results_return"', source)
         self.assertIn('selected_assignment.get("memo")', source)
         self.assertNotIn("_show_outreach_dialog(", source)
+
+    def test_integrated_memo_uses_the_selected_assignment_and_user_scope(self):
+        source = inspect.getsource(prospect._render_contact_results)
+
+        memo_form_at = source.index("saved_prospect_integrated_memo_form_v1110")
+        save_note_at = source.index(
+            "sales_assignments.save_user_note(",
+            memo_form_at,
+        )
+        rerun_at = source.index("st.rerun()", save_note_at)
+
+        self.assertLess(memo_form_at, save_note_at)
+        self.assertLess(save_note_at, rerun_at)
+        self.assertIn("owner_user_id", source[save_note_at:rerun_at])
+        self.assertIn("selected_company_uid", source[save_note_at:rerun_at])
+        self.assertIn(
+            "selected_assignment_id",
+            source[memo_form_at:save_note_at],
+        )
 
     def test_return_button_is_adjacent_to_assignment_selector(self):
         source = inspect.getsource(prospect._render_contact_results)
