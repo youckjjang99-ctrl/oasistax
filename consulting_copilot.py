@@ -14,8 +14,11 @@ import pandas as pd
 import streamlit as st
 
 from consulting_report import render_ai_consulting_report_page
-from tax_diagnosis import render_tax_diagnosis_page
-from consultation_journal import load_company_consultation_context
+from auth import is_admin
+from consultation_journal import (
+    load_company_consultation_context,
+    save_consultation_journal,
+)
 from cloud_sync import (
     load_financial_snapshot,
     load_registry_snapshot,
@@ -23,6 +26,8 @@ from cloud_sync import (
 )
 from enterprise_documents import load_enterprise_document_context
 from matching_preferences import get_matching_preferences
+from crm import STATUS_OPTIONS, get_customer_record, make_customer_key
+from crm_enhancements import PIPELINE_OPTIONS
 from consulting_priority_engine import build_priority_recommendations
 from data_safety_storage import (
     feature_enabled,
@@ -1165,6 +1170,96 @@ def _save_checklist(
     )
 
 
+def _split_list_input(value: Any) -> list[str]:
+    """Convert a short multiline/comma-separated UI value into clean items."""
+    return list(
+        dict.fromkeys(
+            item.strip()
+            for item in re.split(r"[\n,]+", str(value or ""))
+            if item.strip()
+        )
+    )
+
+
+def _render_success_case_registration(
+    user_id: str,
+    business_key: str,
+    company_name: str,
+    customer: pd.Series,
+) -> None:
+    """Render the knowledge-base writer only for administrators."""
+    if not is_admin(user_id):
+        return
+
+    with st.expander("관리자용 성공사례 등록", expanded=False):
+        st.caption(
+            "검증된 사례만 등록해 이후 유사 기업의 상담 준비자료에 활용합니다."
+        )
+        s1, s2 = st.columns(2)
+        with s1:
+            case_industry = st.text_input(
+                "업종",
+                value=_clean(customer.get("업종명", "")),
+                key=f"case_industry_{business_key}",
+            )
+            consulting_topic = st.text_input(
+                "계약·성공 주제",
+                key=f"case_topic_{business_key}",
+            )
+            trigger_keywords = st.text_input(
+                "핵심 키워드",
+                placeholder="기계투자, 신규채용, 가지급금 등",
+                key=f"case_keywords_{business_key}",
+            )
+        with s2:
+            company_profile = st.text_area(
+                "기업 특성",
+                height=90,
+                key=f"case_profile_{business_key}",
+            )
+            success_factors = st.text_area(
+                "성공요인",
+                height=90,
+                key=f"case_factors_{business_key}",
+            )
+
+        result_summary = st.text_area(
+            "결과 요약",
+            height=90,
+            key=f"case_result_{business_key}",
+        )
+        best_questions = st.text_area(
+            "효과적이었던 질문·설명 순서",
+            height=90,
+            key=f"case_questions_{business_key}",
+        )
+
+        if st.button(
+            "성공사례 저장",
+            use_container_width=True,
+            key=f"save_success_case_{business_key}",
+        ):
+            storage_result = save_success_case(
+                user_id,
+                {
+                    "source_company_name": company_name,
+                    "industry": case_industry,
+                    "company_profile": company_profile,
+                    "consulting_topic": consulting_topic,
+                    "trigger_keywords": trigger_keywords,
+                    "success_factors": success_factors,
+                    "result_summary": result_summary,
+                    "best_questions": best_questions,
+                },
+                return_status=True,
+            )
+            _show_storage_result(storage_result)
+            st.success(
+                "내부 성공사례를 저장했습니다. 이후 유사 기업 추천에 사용됩니다."
+            )
+            st.rerun()
+
+
 def render_copilot_page(
     user_id: str,
     user_name: str,
@@ -1363,23 +1458,42 @@ def render_copilot_page(
     articles_review = integrated_context.get("articles_review", {}) or {}
     enterprise_documents = integrated_context.get("enterprise_documents", {}) or {}
 
-    st.markdown("### AI 분석 반영자료")
-    source_columns = st.columns(4, gap="medium")
-    source_columns[0].metric("고객 기본정보", "반영")
-    source_columns[1].metric("재무·크레탑", "반영" if financial else "미등록")
-    source_columns[2].metric("법인등기", "반영" if registry else "미등록")
-    source_columns[3].metric("4대보험 명부", "반영" if employee_status else "미등록")
-    source_columns = st.columns(4, gap="medium")
-    source_columns[0].metric("정관", "반영" if articles_review else "미등록")
-    source_columns[1].metric(
-        "추가 기업자료",
-        f"{len(enterprise_documents.get('records', []) or [])}건",
+    enterprise_record_count = len(
+        enterprise_documents.get("records", []) or []
     )
-    source_columns[2].metric("주가평가", f"{len(stock_records)}건")
-    source_columns[3].metric(
-        "상담·녹취",
-        f"{len(journals)}건 / {transcript_count}건",
-    )
+    source_status_rows = [
+        ("고객 기본정보", True),
+        ("재무·크레탑", bool(financial)),
+        ("법인등기", bool(registry)),
+        ("4대보험 명부", bool(employee_status)),
+        ("정관", bool(articles_review)),
+        ("추가 기업자료", enterprise_record_count > 0),
+        ("주가평가", bool(stock_records)),
+        ("상담·녹취", bool(journals or transcript_count)),
+    ]
+    ready_source_count = sum(ready for _label, ready in source_status_rows)
+    with st.container(border=True):
+        st.markdown("#### 상담 준비자료")
+        source_columns = st.columns(3, gap="medium")
+        source_columns[0].metric(
+            "AI 반영자료",
+            f"{ready_source_count}/{len(source_status_rows)}",
+        )
+        source_columns[1].metric(
+            "재무·등기",
+            "반영" if financial and registry else "보완 필요",
+        )
+        source_columns[2].metric(
+            "상담·첨부",
+            f"{len(journals) + transcript_count + enterprise_record_count}건",
+        )
+        missing_source_labels = [
+            label for label, ready in source_status_rows if not ready
+        ]
+        if missing_source_labels:
+            st.caption("미등록 자료: " + ", ".join(missing_source_labels))
+        else:
+            st.caption("등록된 주요 기업자료가 모두 AI 분석에 연결되어 있습니다.")
 
     if not any([
         stock_records,
@@ -1448,11 +1562,20 @@ def render_copilot_page(
                     use_container_width=True,
                 )
 
+    selected_stage = st.segmented_control(
+        "상담 단계",
+        ["① 상담 준비", "② 상담 진행", "③ 상담 마무리"],
+        default="① 상담 준비",
+        selection_mode="single",
+        key=f"copilot_stage_v2_{business_key}",
+        width="stretch",
+    )
+
     saved_policy_items = preferences.get("저장정책자금", []) or []
     saved_policy_items = [
         item for item in saved_policy_items if isinstance(item, dict)
     ]
-    if saved_policy_items:
+    if saved_policy_items and selected_stage == "① 상담 준비":
         st.markdown("### 저장된 정책자금 추천")
         st.caption(
             f"기업컨설팅에서 확정 저장한 추천 {len(saved_policy_items)}건 · "
@@ -1563,45 +1686,29 @@ def render_copilot_page(
                     )
                 )
 
-    (
-        tab_report,
-        tab_tax,
-        tab_playbook,
-        tab_memory,
-        tab_success,
-        tab_review,
-    ) = st.tabs(
-        [
-            "AI 상담보고서",
-            "AI 절세진단",
-            "상담 플레이북",
-            "기업 메모리",
-            "성공사례",
-            "미팅 종료점검",
-        ]
-    )
-
-    with tab_report:
+    if selected_stage == "① 상담 준비":
+        st.markdown("### 상담 준비")
         st.caption(
-            "선택한 기업의 고객DB·재무·등기·주가평가·매칭설정을 "
-            "한 번에 결합한 상담 사전진단입니다."
+            "핵심 우선순위와 관련 성공사례를 먼저 확인하고, 필요한 경우에만 "
+            "상세 AI 보고서를 펼쳐보세요."
         )
-        render_ai_consulting_report_page(
-            user_id,
-            user_name,
-            customer=customer,
-            embedded=True,
-            key_prefix=f"copilot_report_{business_key}",
+        show_detailed_report = st.toggle(
+            "상세 AI 상담보고서 보기",
+            value=False,
+            key=f"copilot_show_report_v2_{business_key}",
+            help="재무·절세·기업 건강진단의 상세 근거가 필요할 때만 실행합니다.",
         )
+        if show_detailed_report:
+            render_ai_consulting_report_page(
+                user_id,
+                user_name,
+                customer=customer,
+                embedded=True,
+                key_prefix=f"copilot_report_{business_key}",
+            )
 
-    with tab_tax:
-        render_tax_diagnosis_page(
-            user_id,
-            customer,
-            key_prefix=f"copilot_tax_{business_key}",
-        )
-
-    with tab_playbook:
+    if selected_stage == "② 상담 진행":
+        st.markdown("### 상담 진행")
         scenario_brief = build_scenario_brief(
             recommendations,
             memory,
@@ -1823,9 +1930,11 @@ def render_copilot_page(
             _show_storage_result(storage_result)
             st.success("상담 체크리스트를 저장했습니다.")
 
-    with tab_memory:
+    if selected_stage == "③ 상담 마무리":
+        st.markdown("### 상담 마무리")
         st.info(
-            "기업별 메모리는 다음 상담에서 우선 질문과 추천순서를 만드는 데 사용됩니다."
+            "상담 핵심내용과 다음 조치를 정리하면 기업 메모리와 상담일지에 "
+            "연결해 다음 상담에서 이어서 활용할 수 있습니다."
         )
 
         key_needs = st.text_area(
@@ -1927,7 +2036,7 @@ def render_copilot_page(
                 "기업 메모리를 저장했습니다. 다음 상담 추천에 반영됩니다."
             )
 
-    with tab_success:
+    if selected_stage == "① 상담 준비":
         st.markdown("#### 유사한 내부 성공사례")
         if similar_cases:
             for case in similar_cases:
@@ -1952,76 +2061,17 @@ def render_copilot_page(
                         f"**추천 질문:** {case.get('best_questions', '-')}"
                     )
         else:
-            st.info(
-                "등록된 성공사례가 없습니다. 아래에서 첫 사례를 등록해주세요."
-            )
+            st.info("이 기업과 유사한 내부 성공사례가 아직 없습니다.")
 
-        st.markdown("#### 성공사례 등록")
-        s1, s2 = st.columns(2)
-        with s1:
-            case_industry = st.text_input(
-                "업종",
-                value=_clean(customer.get("업종명", "")),
-                key=f"case_industry_{business_key}",
-            )
-            consulting_topic = st.text_input(
-                "계약·성공 주제",
-                key=f"case_topic_{business_key}",
-            )
-            trigger_keywords = st.text_input(
-                "핵심 키워드",
-                placeholder="기계투자, 신규채용, 가지급금 등",
-                key=f"case_keywords_{business_key}",
-            )
-        with s2:
-            company_profile = st.text_area(
-                "기업 특성",
-                height=90,
-                key=f"case_profile_{business_key}",
-            )
-            success_factors = st.text_area(
-                "성공요인",
-                height=90,
-                key=f"case_factors_{business_key}",
-            )
-
-        result_summary = st.text_area(
-            "결과 요약",
-            height=90,
-            key=f"case_result_{business_key}",
-        )
-        best_questions = st.text_area(
-            "효과적이었던 질문·설명 순서",
-            height=90,
-            key=f"case_questions_{business_key}",
+        _render_success_case_registration(
+            user_id,
+            business_key,
+            company_name,
+            customer,
         )
 
-        if st.button(
-            "성공사례 저장",
-            use_container_width=True,
-            key=f"save_success_case_{business_key}",
-        ):
-            storage_result = save_success_case(
-                user_id,
-                {
-                    "source_company_name": company_name,
-                    "industry": case_industry,
-                    "company_profile": company_profile,
-                    "consulting_topic": consulting_topic,
-                    "trigger_keywords": trigger_keywords,
-                    "success_factors": success_factors,
-                    "result_summary": result_summary,
-                    "best_questions": best_questions,
-                },
-                return_status=True,
-            )
-            _show_storage_result(storage_result)
-            st.success(
-                "내부 성공사례를 저장했습니다. 이후 유사 기업 추천에 사용됩니다."
-            )
-            st.rerun()
-
-    with tab_review:
+    if selected_stage == "③ 상담 마무리":
+        st.markdown("#### 상담 완료 점검")
         checklist = _load_checklist(
             user_id,
             business_key,
@@ -2078,9 +2128,143 @@ def render_copilot_page(
             f"- {item}"
             for item in missed[:7]
         )
-        st.text_area(
+        follow_up_text = st.text_area(
             "다음 상담 TODO",
             value=follow_up,
             height=180,
             key=f"copilot_followup_{business_key}",
         )
+
+        st.markdown("#### 상담일지 저장")
+        st.caption(
+            "저장하면 기업컨설팅 상담일지·CRM·기업히스토리에 함께 반영됩니다."
+        )
+        consultation_summary = st.text_area(
+            "상담 핵심요약",
+            value=_clean(consultant_notes or key_needs),
+            placeholder="대표의 주요 니즈, 검토한 내용, 합의사항을 간단히 정리하세요.",
+            height=130,
+            key=f"copilot_finish_summary_v2_{business_key}",
+        )
+        finish_columns = st.columns(2)
+        with finish_columns[0]:
+            next_actions_text = st.text_area(
+                "다음 액션",
+                value=_clean(follow_up_text or next_focus),
+                placeholder="자료 요청, 제안서 준비, 재연락 등",
+                height=110,
+                key=f"copilot_finish_actions_v2_{business_key}",
+            )
+            next_contact_date = st.text_input(
+                "다음 연락예정일",
+                placeholder="YYYY-MM-DD (선택)",
+                key=f"copilot_finish_date_v2_{business_key}",
+            )
+
+        customer_key = make_customer_key(company_name, business_no)
+        current_crm = get_customer_record(user_id, customer_key)
+        current_status = str(current_crm.get("status") or "상담중")
+        if current_status not in STATUS_OPTIONS:
+            current_status = "상담중"
+        current_pipeline = str(
+            current_crm.get("pipeline_stage") or "초기상담"
+        )
+        if current_pipeline not in PIPELINE_OPTIONS:
+            current_pipeline = "초기상담"
+
+        with finish_columns[1]:
+            crm_status = st.selectbox(
+                "CRM 상태",
+                STATUS_OPTIONS,
+                index=STATUS_OPTIONS.index(current_status),
+                key=f"copilot_finish_status_v2_{business_key}",
+            )
+            pipeline_stage = st.selectbox(
+                "상담 진행단계",
+                PIPELINE_OPTIONS,
+                index=PIPELINE_OPTIONS.index(current_pipeline),
+                key=f"copilot_finish_pipeline_v2_{business_key}",
+            )
+
+        if st.button(
+            "상담일지에 저장하고 마무리",
+            type="primary",
+            use_container_width=True,
+            key=f"copilot_finish_save_v2_{business_key}",
+        ):
+            if not consultation_summary.strip():
+                st.error("상담 핵심요약을 입력해 주세요.")
+            elif next_contact_date.strip() and not re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}",
+                next_contact_date.strip(),
+            ):
+                st.error("다음 연락예정일은 YYYY-MM-DD 형식으로 입력해 주세요.")
+            else:
+                action_items = _split_list_input(next_actions_text)
+                topic_items = recommendations[:3]
+                required_documents = list(
+                    dict.fromkeys(
+                        document
+                        for item in topic_items
+                        for document in (item.get("documents", []) or [])
+                        if document
+                    )
+                )
+                journal = {
+                    "consultation_title": "AI 코파일럿 상담",
+                    "summary": consultation_summary.strip(),
+                    "detected_topics": [
+                        {
+                            "topic": str(item.get("topic") or ""),
+                            "confidence": int(item.get("confidence") or 0),
+                            "evidence": ", ".join(item.get("evidence", []) or []),
+                            "recommended_review": str(item.get("status") or ""),
+                        }
+                        for item in topic_items
+                    ],
+                    "client_needs": _split_list_input(key_needs),
+                    "key_discussions": [
+                        str(item.get("topic") or "") for item in topic_items
+                    ],
+                    "recommended_solutions": [
+                        str(item.get("topic") or "") for item in topic_items
+                    ],
+                    "required_documents": required_documents,
+                    "client_promises": [],
+                    "consultant_tasks": action_items,
+                    "unresolved_questions": missed,
+                    "risks_and_checks": _split_list_input(resistance_topics),
+                    "next_actions": action_items,
+                    "next_contact_date": next_contact_date.strip(),
+                    "crm_status": crm_status,
+                    "pipeline_stage": pipeline_stage,
+                    "crm_memo": consultation_summary.strip(),
+                }
+                ok, message = save_consultation_journal(
+                    user_id,
+                    customer_key,
+                    company_name,
+                    business_no,
+                    user_name,
+                    journal,
+                    current_crm,
+                )
+                if ok:
+                    memory_result = save_company_memory(
+                        user_id,
+                        company_name,
+                        business_no,
+                        {
+                            "key_needs": key_needs,
+                            "decision_style": decision_style,
+                            "positive_topics": positive_topics,
+                            "resistance_topics": resistance_topics,
+                            "next_focus": next_actions_text,
+                            "consultant_notes": consultation_summary,
+                        },
+                        return_status=True,
+                    )
+                    _show_storage_result(memory_result)
+                    st.success(message)
+                else:
+                    st.error(message)
