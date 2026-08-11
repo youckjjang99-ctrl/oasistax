@@ -101,7 +101,7 @@ def test_request_screen_places_responsive_global_dashboard_above_request_form():
     renderer_source = inspect.getsource(prospect._render_db_request_status_dashboard)
 
     assert home_source.index("_render_db_request_status_dashboard") < home_source.index(
-        'st.markdown("### DB 신청")'
+        'request_panel.markdown("### DB 신청")'
     )
     for label in (
         "총 배정가능 DB",
@@ -113,6 +113,8 @@ def test_request_screen_places_responsive_global_dashboard_above_request_form():
         assert label in renderer_source
     assert "모든 조직에 공통으로 표시" in renderer_source
     assert "현재 나에게 활성 배정된 DB" not in renderer_source
+    assert "oasis-db-status-caption" in renderer_source
+    assert "font-weight: 500" in renderer_source
     assert "@media (max-width: 760px)" in renderer_source
     assert "grid-template-columns: 1fr" in renderer_source
 
@@ -141,3 +143,18 @@ def test_inventory_dashboard_html_is_not_emitted_as_a_markdown_code_block(
     assert '<section class="oasis-db-status-card"' in html
     assert "\n    <section" not in html
     assert kwargs["unsafe_allow_html"] is True
+
+
+def test_db_request_form_is_visually_grouped_and_high_contrast():
+    source = inspect.getsource(prospect._render_db_request_home)
+
+    assert 'st.container(border=True, key="db_request_panel")' in source
+    assert 'request_panel.markdown("### DB 신청")' in source
+    assert "request_panel.divider()" in source
+    assert source.count("with st.container(border=True):") >= 2
+    assert ".st-key-db_request_panel" in source
+    assert "border: 2px solid #a9bfdf" in source
+    assert "opacity: 1 !important" in source
+    assert "color: #52647d !important" in source
+    assert "textwrap.dedent(" in source
+    assert ").lstrip()" in source

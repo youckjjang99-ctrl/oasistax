@@ -5100,9 +5100,12 @@ def _render_db_request_status_dashboard(metrics: dict) -> None:
             )
         )
     st.markdown("### DB 현황")
-    st.caption(
+    st.markdown(
+        '<p class="oasis-db-status-caption">'
         "모든 조직에 공통으로 표시되는 현재 배정 가능 DB 재고입니다. 일반전화와 "
         "핸드폰번호를 모두 가진 업체는 두 전화번호 카드에 각각 포함됩니다."
+        "</p>",
+        unsafe_allow_html=True,
     )
     st.markdown(
         textwrap.dedent(
@@ -5113,6 +5116,13 @@ def _render_db_request_status_dashboard(metrics: dict) -> None:
             grid-template-columns: repeat(3, minmax(0, 1fr));
             gap: 0.8rem;
             margin: 0.35rem 0 1.4rem;
+        }
+        .oasis-db-status-caption {
+            color: #52647d;
+            font-size: 0.88rem;
+            font-weight: 500;
+            line-height: 1.55;
+            margin: 0.15rem 0 0.85rem;
         }
         .oasis-db-status-card {
             border: 1px solid #cbd8ee;
@@ -5189,12 +5199,43 @@ def _render_db_request_home(owner_user_id: str) -> None:
             dashboard_result.get("message")
             or "DB 현황을 불러오지 못했습니다. 잠시 후 다시 시도해 주세요."
         )
-    st.markdown("### DB 신청")
-    st.caption(
+    st.markdown(
+        textwrap.dedent(
+            """\
+            <style>
+        .st-key-db_request_panel {
+            border: 2px solid #a9bfdf !important;
+            border-radius: 16px !important;
+            background: #fbfdff !important;
+            box-shadow: 0 6px 18px rgba(28, 76, 142, 0.08);
+        }
+        .st-key-db_request_panel h3,
+        .st-key-db_request_panel h4 {
+            color: #102f57 !important;
+        }
+        .st-key-db_request_panel [data-testid="stCaptionContainer"] p {
+            color: #52647d !important;
+            opacity: 1 !important;
+        }
+        .st-key-db_request_panel label p {
+            color: #19385f !important;
+            font-weight: 700 !important;
+        }
+        .st-key-db_request_panel [data-testid="stMarkdownContainer"] > p {
+            color: #314968 !important;
+        }
+        </style>
+            """
+        ).lstrip(),
+        unsafe_allow_html=True,
+    )
+    request_panel = st.container(border=True, key="db_request_panel")
+    request_panel.markdown("### DB 신청")
+    request_panel.caption(
         "지역·사업자 유형·고용인원을 선택해 주세요. 일반번호 DB는 무작위로 즉시 "
         "배정되고, 핸드폰 DB는 관리자가 신청 순서와 보유 현황을 검토해 배정합니다."
     )
-    filter_col1, filter_col2, filter_col3 = st.columns(3)
+    filter_col1, filter_col2, filter_col3 = request_panel.columns(3)
     region_name = filter_col1.selectbox(
         "도·광역시",
         province_options()[1:],
@@ -5212,7 +5253,7 @@ def _render_db_request_home(owner_user_id: str) -> None:
     )
     business_type = BUSINESS_TYPE_OPTIONS[business_type_name]
 
-    employee_col1, employee_col2 = st.columns(2)
+    employee_col1, employee_col2 = request_panel.columns(2)
     minimum_employees = employee_col1.number_input(
         "최소 고용인원",
         min_value=1,
@@ -5231,36 +5272,41 @@ def _render_db_request_home(owner_user_id: str) -> None:
     )
     invalid_employee_range = int(maximum_employees) < int(minimum_employees)
     if invalid_employee_range:
-        st.error("최대 고용인원은 최소 고용인원보다 크거나 같아야 합니다.")
-    st.caption(
+        request_panel.error("최대 고용인원은 최소 고용인원보다 크거나 같아야 합니다.")
+    request_panel.caption(
         "한국거래소 상장사 목록과 상장시장·종목코드를 확인해 "
         "상장기업은 랜덤배정 대상에서 제외합니다."
     )
+    request_panel.divider()
 
-    landline_col, mobile_col = st.columns(2)
+    landline_col, mobile_col = request_panel.columns(2)
     with landline_col:
-        st.markdown("#### 일반번호 DB")
-        st.write("조건에 맞는 일반번호 업체를 무작위로 최대 30개 즉시 배정합니다.")
-        landline_clicked = st.button(
-            "일반번호 DB 30개 받기",
-            type="primary",
-            use_container_width=True,
-            disabled=invalid_employee_range,
-            key="allocate_landline_db_v1090",
-        )
+        with st.container(border=True):
+            st.markdown("#### 일반번호 DB")
+            st.write("조건에 맞는 일반번호 업체를 무작위로 최대 30개 즉시 배정합니다.")
+            landline_clicked = st.button(
+                "일반번호 DB 30개 받기",
+                type="primary",
+                use_container_width=True,
+                disabled=invalid_employee_range,
+                key="allocate_landline_db_v1090",
+            )
     with mobile_col:
-        st.markdown("#### 핸드폰 DB")
-        st.write("희소 DB 보호를 위해 신청 후 관리자가 검토하여 배정합니다.")
-        mobile_clicked = st.button(
-            "핸드폰 DB 배정 신청",
-            use_container_width=True,
-            disabled=invalid_employee_range,
-            key="request_mobile_db_v1090",
-        )
+        with st.container(border=True):
+            st.markdown("#### 핸드폰 DB")
+            st.write("희소 DB 보호를 위해 신청 후 관리자가 검토하여 배정합니다.")
+            mobile_clicked = st.button(
+                "핸드폰 DB 배정 신청",
+                use_container_width=True,
+                disabled=invalid_employee_range,
+                key="request_mobile_db_v1090",
+            )
 
     if landline_clicked:
         try:
-            with st.spinner("중복 업체를 제외하고 일반번호 DB를 무작위 배정 중입니다."):
+            with request_panel.spinner(
+                "중복 업체를 제외하고 일반번호 DB를 무작위 배정 중입니다."
+            ):
                 candidates, warnings = _collect_allocation_candidates(
                     region_name,
                     district_name,
@@ -5275,7 +5321,7 @@ def _render_db_request_home(owner_user_id: str) -> None:
                 )
                 selected = available[:MEMBER_PROSPECT_TARGET_COUNT]
                 if not selected:
-                    st.warning(
+                    request_panel.warning(
                         availability_warning
                         or "선택 조건에 지금 배정 가능한 일반번호 DB가 없습니다."
                     )
@@ -5291,19 +5337,23 @@ def _render_db_request_home(owner_user_id: str) -> None:
                         extra = ""
                         if saved_count < MEMBER_PROSPECT_TARGET_COUNT:
                             extra = " 현재 보유 한도와 전사 중복을 반영한 수량입니다."
-                        st.success(
+                        request_panel.success(
                             f"일반번호 DB {saved_count}개를 내 영업후보에 배정했습니다."
                             + extra
                         )
                     else:
-                        st.error(
+                        request_panel.error(
                             save_result.get("message")
                             or "일반번호 DB를 배정하지 못했습니다."
                         )
                 if warnings:
-                    st.caption("일부 유형 조회는 제외하고 확보 가능한 DB로 처리했습니다.")
+                    request_panel.caption(
+                        "일부 유형 조회는 제외하고 확보 가능한 DB로 처리했습니다."
+                    )
         except Exception as exc:
-            st.error(safe_public_error(exc, "일반번호 DB를 배정하지 못했습니다."))
+            request_panel.error(
+                safe_public_error(exc, "일반번호 DB를 배정하지 못했습니다.")
+            )
 
     if mobile_clicked:
         request_result = sales_assignments.submit_mobile_db_request(
@@ -5316,12 +5366,12 @@ def _render_db_request_home(owner_user_id: str) -> None:
             session_id=_assignment_session_id(),
         )
         if request_result.get("ok"):
-            st.success(
+            request_panel.success(
                 request_result.get("message")
                 or "핸드폰 DB 배정 신청을 접수했습니다."
             )
         else:
-            st.error(
+            request_panel.error(
                 request_result.get("message")
                 or "핸드폰 DB 신청을 접수하지 못했습니다."
             )
