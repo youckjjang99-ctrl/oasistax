@@ -158,6 +158,21 @@ _CONTACT_RESULTS_RESET_SELECTION_KEY = "_contact_results_reset_selection_v1050"
 _RETURN_DB_ADMIN_FLASH_KEY = "_return_db_admin_flash_v1070"
 _RETURN_DB_ADMIN_SELECTION_KEY = "return_db_admin_assignment_v1070"
 _MOBILE_DB_ADMIN_SELECTION_KEY = "mobile_db_admin_request_v1090"
+_SAVED_DB_DASHBOARD_FILTER_KEY = "saved_db_dashboard_filter_v1100"
+_SAVED_DB_DASHBOARD_PAGE_KEY = "saved_db_dashboard_page_v1100"
+_SAVED_DB_DASHBOARD_PAGE_SIZE = 100
+SAVED_DB_DASHBOARD_CARDS = (
+    ("all", "총 DB 수량", "total_db_count"),
+    ("landline", "일반전화 DB", "landline_db_count"),
+    ("mobile", "핸드폰번호 DB", "mobile_db_count"),
+    ("new", "신규 배정 DB", "new_db_count"),
+    ("in_progress", "연락중인 DB", "in_progress_db_count"),
+    ("completed", "연락완료 DB", "completed_db_count"),
+)
+SAVED_DB_DASHBOARD_FILTER_LABELS = {
+    filter_key: label
+    for filter_key, label, _metric_key in SAVED_DB_DASHBOARD_CARDS
+}
 OUTREACH_ALLOWED_ASSIGNMENT_STATUSES = frozenset(
     {"assigned", "pending_contact", "contacted", "consulting", "follow_up"}
 )
@@ -3456,6 +3471,118 @@ def _render_prospect_db_center_legacy(owner_user_id: str = "") -> None:
         )
 
 
+def _saved_db_dashboard_filter() -> str:
+    selected = str(
+        st.session_state.get(_SAVED_DB_DASHBOARD_FILTER_KEY) or "all"
+    ).strip().lower()
+    if selected not in SAVED_DB_DASHBOARD_FILTER_LABELS:
+        selected = "all"
+        st.session_state[_SAVED_DB_DASHBOARD_FILTER_KEY] = selected
+    return selected
+
+
+def _select_saved_db_dashboard_filter(filter_key: str) -> None:
+    selected = str(filter_key or "all").strip().lower()
+    if selected not in SAVED_DB_DASHBOARD_FILTER_LABELS:
+        selected = "all"
+    st.session_state[_SAVED_DB_DASHBOARD_FILTER_KEY] = selected
+    st.session_state[_SAVED_DB_DASHBOARD_PAGE_KEY] = 0
+
+
+def _set_saved_db_dashboard_page(page_index: int) -> None:
+    st.session_state[_SAVED_DB_DASHBOARD_PAGE_KEY] = max(
+        0,
+        int(page_index),
+    )
+
+
+def _load_user_db_dashboard(owner_user_id: str) -> dict:
+    ready, ready_message = _assignment_feature_status()
+    if not ready:
+        return {
+            "ok": False,
+            "message": ready_message,
+            "metrics": {},
+            "legacy_fallback": True,
+        }
+    _release_expired_assignments_if_due(owner_user_id)
+    return sales_assignments.get_user_db_dashboard(owner_user_id)
+
+
+def _load_user_dashboard_assignment_rows(
+    owner_user_id: str,
+    dashboard_filter: str,
+    *,
+    limit: int = _SAVED_DB_DASHBOARD_PAGE_SIZE,
+    offset: int = 0,
+) -> dict:
+    ready, ready_message = _assignment_feature_status()
+    if not ready:
+        return {
+            "ok": False,
+            "message": ready_message,
+            "rows": [],
+            "total_count": 0,
+        }
+    _release_expired_assignments_if_due(owner_user_id)
+    assignment_result = sales_assignments.list_user_db_assignments(
+        owner_user_id,
+        dashboard_filter=dashboard_filter,
+        limit=limit,
+        offset=offset,
+    )
+    if not assignment_result.get("ok"):
+        return {
+            "ok": False,
+            "message": str(
+                assignment_result.get("message")
+                or "내 영업후보를 불러오지 못했습니다."
+            ),
+            "rows": [],
+            "total_count": 0,
+        }
+    rows: list[dict] = []
+    for assignment in assignment_result.get("assignments") or []:
+        row = dict(assignment)
+        row["_assignment_id"] = (
+            row.get("assignment_id") or row.get("id") or ""
+        )
+        row["id"] = row.get("company_id") or row.get("id")
+        row["memo"] = row.get("own_memo") or row.get("memo") or ""
+        rows.append(row)
+    return {
+        "ok": True,
+        "message": "",
+        "rows": rows,
+        "total_count": int(assignment_result.get("total_count") or 0),
+    }
+
+
+def _render_saved_db_dashboard(metrics: dict, selected_filter: str) -> None:
+    st.markdown("#### 내 DB 현황")
+    st.caption(
+        "일반전화와 핸드폰번호를 모두 가진 업체는 두 카드에 함께 집계되므로 "
+        "전화번호 카드의 합계가 총 DB 수량과 다를 수 있습니다."
+    )
+    for row_start in (0, 3):
+        columns = st.columns(3)
+        for column, card in zip(
+            columns,
+            SAVED_DB_DASHBOARD_CARDS[row_start : row_start + 3],
+        ):
+            filter_key, label, metric_key = card
+            count = max(0, int(metrics.get(metric_key) or 0))
+            button_label = f"{label}\n\n{count:,}개"
+            column.button(
+                button_label,
+                key=f"saved_db_dashboard_card_{filter_key}_v1100",
+                type="primary" if selected_filter == filter_key else "secondary",
+                use_container_width=True,
+                on_click=_select_saved_db_dashboard_filter,
+                args=(filter_key,),
+            )
+
+
 def _load_user_assignment_rows(owner_user_id: str) -> dict:
     """Load only the current user's assignments through the existing RPC."""
 
@@ -3512,18 +3639,87 @@ def _render_clean_saved_prospects(
     )
     _show_outreach_result_notice()
     assignment_mode = False
+    selected_filter = _saved_db_dashboard_filter()
+    total_count = 0
+    page_index = 0
     try:
-        assignment_result = _load_user_assignment_rows(owner_user_id)
-        if assignment_result.get("ok"):
+        dashboard_result = _load_user_db_dashboard(owner_user_id)
+        if dashboard_result.get("ok"):
+            metrics = dict(dashboard_result.get("metrics") or {})
+            _render_saved_db_dashboard(metrics, selected_filter)
+            selected_label = SAVED_DB_DASHBOARD_FILTER_LABELS.get(
+                selected_filter,
+                "총 DB 수량",
+            )
+            filter_row, reset_row = st.columns([4, 1])
+            filter_row.info(f"현재 목록: {selected_label}")
+            if selected_filter != "all":
+                reset_row.button(
+                    "전체 보기",
+                    key="saved_db_dashboard_reset_v1100",
+                    use_container_width=True,
+                    on_click=_select_saved_db_dashboard_filter,
+                    args=("all",),
+                )
+            page_index = max(
+                0,
+                int(st.session_state.get(_SAVED_DB_DASHBOARD_PAGE_KEY, 0) or 0),
+            )
+            selected_metric_key = next(
+                metric_key
+                for filter_key, _label, metric_key in SAVED_DB_DASHBOARD_CARDS
+                if filter_key == selected_filter
+            )
+            selected_count = max(
+                0,
+                int(metrics.get(selected_metric_key) or 0),
+            )
+            last_page_index = max(
+                0,
+                (selected_count - 1) // _SAVED_DB_DASHBOARD_PAGE_SIZE,
+            )
+            page_index = min(page_index, last_page_index)
+            st.session_state[_SAVED_DB_DASHBOARD_PAGE_KEY] = page_index
+            assignment_result = _load_user_dashboard_assignment_rows(
+                owner_user_id,
+                selected_filter,
+                limit=_SAVED_DB_DASHBOARD_PAGE_SIZE,
+                offset=page_index * _SAVED_DB_DASHBOARD_PAGE_SIZE,
+            )
+        else:
+            if dashboard_result.get("legacy_fallback"):
+                rows = list_prospects(owner_user_id, limit=1000)
+                assignment_result = None
+            else:
+                assignment_result = {
+                    "ok": False,
+                    "message": dashboard_result.get("message"),
+                }
+        if assignment_result is None:
+            pass
+        elif assignment_result.get("ok"):
             rows = list(assignment_result.get("rows") or [])
+            total_count = int(assignment_result.get("total_count") or 0)
             assignment_mode = True
         else:
-            rows = list_prospects(owner_user_id, limit=1000)
+            st.error(
+                str(
+                    assignment_result.get("message")
+                    or "내 DB 현황을 안전하게 확인하지 못해 목록 조회를 중단했습니다."
+                )
+            )
+            return
     except Exception as exc:
         st.warning(safe_public_error(exc, "저장목록을 불러오지 못했습니다."))
         return
     if not rows:
-        st.info("내가 저장한 영업후보가 없습니다.")
+        if assignment_mode and selected_filter != "all":
+            st.info(
+                f"{SAVED_DB_DASHBOARD_FILTER_LABELS[selected_filter]} 조건에 "
+                "해당하는 업체가 없습니다."
+            )
+        else:
+            st.info("내가 저장한 영업후보가 없습니다.")
         return
 
     contacts: list[dict] = []
@@ -3650,6 +3846,33 @@ def _render_clean_saved_prospects(
         },
         key="saved_prospect_compact_table_v1041",
     )
+    if assignment_mode and total_count > _SAVED_DB_DASHBOARD_PAGE_SIZE:
+        page_count = (
+            total_count + _SAVED_DB_DASHBOARD_PAGE_SIZE - 1
+        ) // _SAVED_DB_DASHBOARD_PAGE_SIZE
+        previous_column, page_column, next_column = st.columns([1, 2, 1])
+        previous_column.button(
+            "이전 페이지",
+            key="saved_db_dashboard_previous_v1100",
+            disabled=page_index <= 0,
+            use_container_width=True,
+            on_click=_set_saved_db_dashboard_page,
+            args=(page_index - 1,),
+        )
+        page_column.markdown(
+            f"<div style='text-align:center;padding:0.5rem'>"
+            f"{page_index + 1:,} / {page_count:,} 페이지 · 총 {total_count:,}개"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        next_column.button(
+            "다음 페이지",
+            key="saved_db_dashboard_next_v1100",
+            disabled=page_index >= page_count - 1,
+            use_container_width=True,
+            on_click=_set_saved_db_dashboard_page,
+            args=(page_index + 1,),
+        )
 
     pending_request = st.session_state.get(_OUTREACH_REQUEST_KEY)
     if isinstance(pending_request, dict):

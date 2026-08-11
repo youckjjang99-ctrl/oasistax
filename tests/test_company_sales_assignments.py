@@ -17,12 +17,14 @@ from company_sales_assignment import (
     build_company_uid,
     claim_company,
     filter_company_availability,
+    get_user_db_dashboard,
     list_admin_assignment_audit,
     list_admin_assignment_metrics,
     list_admin_assignments,
     list_blocked_company_uids,
     list_company_contacts,
     list_user_assignments,
+    list_user_db_assignments,
     record_company_views,
     record_contact,
     resolve_candidate_company_uids,
@@ -471,6 +473,88 @@ class AssignmentRpcTests(unittest.TestCase):
         self.assertNotIn("other_user_memo", assignment)
         self.assertEqual(database.calls[0][1]["p_limit"], 1000)
         self.assertEqual(database.calls[0][1]["p_offset"], 0)
+
+    def test_user_db_dashboard_returns_count_only_allowlisted_metrics(self):
+        database = _FakeDatabase(
+            {
+                "oasis_get_user_db_dashboard": [
+                    {
+                        "total_db_count": 10,
+                        "landline_db_count": 7,
+                        "mobile_db_count": 4,
+                        "new_db_count": 3,
+                        "in_progress_db_count": 5,
+                        "completed_db_count": 2,
+                        "company_name": "노출되면 안 됨",
+                    }
+                ]
+            }
+        )
+
+        result = get_user_db_dashboard("Sales-A", db=database)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["metrics"]["total_db_count"], 10)
+        self.assertEqual(result["metrics"]["mobile_db_count"], 4)
+        self.assertNotIn("company_name", result["metrics"])
+        self.assertEqual(
+            database.calls[0],
+            (
+                "oasis_get_user_db_dashboard",
+                {"p_current_user_id": "sales-a"},
+            ),
+        )
+
+    def test_user_db_list_applies_server_filter_and_pagination(self):
+        database = _FakeDatabase(
+            {
+                "oasis_list_user_db_assignments": [
+                    {
+                        "assignment_id": "assignment-1",
+                        "company_id": "company-1",
+                        "company_uid": "business:1234567890",
+                        "company_name": "테스트 업체",
+                        "own_memo": "후속 연락",
+                        "total_count": 121,
+                        "assigned_user_id": "다른 사용자 노출 금지",
+                    }
+                ]
+            }
+        )
+
+        result = list_user_db_assignments(
+            "sales-a",
+            dashboard_filter="in_progress",
+            limit=100,
+            offset=100,
+            db=database,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["total_count"], 121)
+        self.assertEqual(result["assignments"][0]["memo"], "후속 연락")
+        self.assertNotIn("assigned_user_id", result["assignments"][0])
+        self.assertEqual(
+            database.calls[0][1],
+            {
+                "p_current_user_id": "sales-a",
+                "p_filter": "in_progress",
+                "p_limit": 100,
+                "p_offset": 100,
+            },
+        )
+
+    def test_user_db_list_rejects_unknown_client_filter(self):
+        database = _FakeDatabase({"oasis_list_user_db_assignments": []})
+
+        result = list_user_db_assignments(
+            "sales-a",
+            dashboard_filter="another-user",
+            db=database,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(database.calls[0][1]["p_filter"], "all")
 
     def test_contact_requires_next_date_for_follow_up_without_rpc(self):
         database = _FakeDatabase()

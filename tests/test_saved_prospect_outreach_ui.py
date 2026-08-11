@@ -518,6 +518,48 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
         )
         self.assertIn('key="saved_prospect_compact_table_v1041"', source)
 
+    def test_saved_db_dashboard_has_all_cards_and_server_side_filtering(self):
+        cards = prospect.SAVED_DB_DASHBOARD_CARDS
+        self.assertEqual(
+            [label for _key, label, _metric in cards],
+            [
+                "총 DB 수량",
+                "일반전화 DB",
+                "핸드폰번호 DB",
+                "신규 배정 DB",
+                "연락중인 DB",
+                "연락완료 DB",
+            ],
+        )
+        loader_source = inspect.getsource(
+            prospect._load_user_dashboard_assignment_rows
+        )
+        self.assertIn("list_user_db_assignments", loader_source)
+        self.assertIn("dashboard_filter=dashboard_filter", loader_source)
+        self.assertNotIn("list_user_assignments", loader_source)
+
+    def test_saved_db_filter_and_page_survive_regular_reruns(self):
+        selector_source = inspect.getsource(
+            prospect._select_saved_db_dashboard_filter
+        )
+        renderer_source = inspect.getsource(
+            prospect._render_clean_saved_prospects
+        )
+        self.assertIn("_SAVED_DB_DASHBOARD_FILTER_KEY", selector_source)
+        self.assertIn("_SAVED_DB_DASHBOARD_PAGE_KEY", selector_source)
+        self.assertIn("_saved_db_dashboard_filter()", renderer_source)
+        self.assertIn("현재 목록:", renderer_source)
+        self.assertIn('"전체 보기"', renderer_source)
+        self.assertIn("_set_saved_db_dashboard_page", renderer_source)
+        self.assertIn('dashboard_result.get("legacy_fallback")', renderer_source)
+        self.assertIn("list_prospects(", renderer_source)
+        self.assertIn("목록 조회를 중단했습니다", renderer_source)
+
+    def test_dashboard_refreshes_without_client_cache(self):
+        source = inspect.getsource(prospect._load_user_db_dashboard)
+        self.assertIn("get_user_db_dashboard", source)
+        self.assertNotIn("cache_data", source)
+
     def test_resolver_rejects_a_stale_or_unowned_assignment(self):
         request = {
             "channel": "email",

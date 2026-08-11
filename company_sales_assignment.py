@@ -17,6 +17,8 @@ RPC_CLAIM_SAVE_PROMOTE_CONTACTS = (
     "oasis_claim_save_and_promote_prospect_contacts"
 )
 RPC_LIST_USER = "oasis_list_user_company_assignments"
+RPC_GET_USER_DB_DASHBOARD = "oasis_get_user_db_dashboard"
+RPC_LIST_USER_DB_ASSIGNMENTS = "oasis_list_user_db_assignments"
 RPC_FILTER_BLOCKED = "oasis_filter_blocked_company_uids"
 RPC_RESOLVE_CANDIDATE_UIDS = "oasis_resolve_candidate_company_uids"
 RPC_RECORD_CONTACT = "oasis_record_company_sales_contact"
@@ -219,6 +221,23 @@ _USER_ASSIGNMENT_FIELDS = _ASSIGNMENT_FIELDS | {
     "priority_reasons",
     "data_created_ym",
     "source_data",
+    "total_count",
+}
+_USER_DB_DASHBOARD_FIELDS = {
+    "total_db_count",
+    "landline_db_count",
+    "mobile_db_count",
+    "new_db_count",
+    "in_progress_db_count",
+    "completed_db_count",
+}
+_USER_DB_FILTERS = {
+    "all",
+    "landline",
+    "mobile",
+    "new",
+    "in_progress",
+    "completed",
 }
 _ADMIN_ASSIGNMENT_FIELDS = _USER_ASSIGNMENT_FIELDS | {
     "assigned_user_id",
@@ -959,6 +978,99 @@ def list_user_assignments(
         "message": "내 영업DB를 불러왔습니다.",
         "assignment": {},
         "assignments": assignments,
+        "warning": "",
+        "fallback_required": False,
+    }
+
+
+def get_user_db_dashboard(
+    current_user_id: str,
+    *,
+    db: CloudDatabase | None = None,
+) -> dict[str, Any]:
+    """Return count-only metrics for one user's active assignments."""
+
+    raw, error = _rpc(
+        RPC_GET_USER_DB_DASHBOARD,
+        {"p_current_user_id": _user_id(current_user_id)},
+        db=db,
+    )
+    if error:
+        return {**error, "metrics": {}}
+    row = _first_row(raw)
+    if row is None:
+        return {
+            "ok": False,
+            "code": "MALFORMED_RESPONSE",
+            "message": _FAILURE_MESSAGES["MALFORMED_RESPONSE"],
+            "assignment": {},
+            "metrics": {},
+            "warning": _FAILURE_MESSAGES["MALFORMED_RESPONSE"],
+            "fallback_required": False,
+        }
+    metrics: dict[str, int] = {}
+    for field in _USER_DB_DASHBOARD_FIELDS:
+        try:
+            metrics[field] = max(0, int(row.get(field) or 0))
+        except (TypeError, ValueError):
+            metrics[field] = 0
+    return {
+        "ok": True,
+        "code": "OK",
+        "message": "내 DB 현황을 불러왔습니다.",
+        "assignment": {},
+        "metrics": metrics,
+        "warning": "",
+        "fallback_required": False,
+    }
+
+
+def list_user_db_assignments(
+    current_user_id: str,
+    *,
+    dashboard_filter: str = "all",
+    limit: int = 100,
+    offset: int = 0,
+    db: CloudDatabase | None = None,
+) -> dict[str, Any]:
+    """Return one server-filtered page of the user's active assignments."""
+
+    safe_filter = _text(dashboard_filter).lower() or "all"
+    if safe_filter not in _USER_DB_FILTERS:
+        safe_filter = "all"
+    raw, error = _rpc(
+        RPC_LIST_USER_DB_ASSIGNMENTS,
+        {
+            "p_current_user_id": _user_id(current_user_id),
+            "p_filter": safe_filter,
+            "p_limit": max(1, min(int(limit), 1000)),
+            "p_offset": max(0, int(offset)),
+        },
+        db=db,
+    )
+    if error:
+        return {**error, "assignments": [], "total_count": 0}
+    assignments = []
+    for row in _rows(raw):
+        assignment = {
+            key: value
+            for key, value in row.items()
+            if key in _USER_ASSIGNMENT_FIELDS
+        }
+        assignment["memo"] = _text(assignment.get("own_memo"))
+        assignments.append(assignment)
+    total_count = max(
+        (int(row.get("total_count") or 0) for row in assignments),
+        default=0,
+    )
+    return {
+        "ok": True,
+        "code": "OK",
+        "message": "내 DB 목록을 불러왔습니다.",
+        "assignment": {},
+        "assignments": assignments,
+        "total_count": total_count,
+        "filter": safe_filter,
         "warning": "",
         "fallback_required": False,
     }
@@ -2004,6 +2116,7 @@ __all__ = [
     "claim_companies",
     "claim_company",
     "filter_company_availability",
+    "get_user_db_dashboard",
     "list_admin_assignments",
     "list_admin_assignment_metrics",
     "list_admin_assignment_audit",
@@ -2011,6 +2124,7 @@ __all__ = [
     "list_blocked_company_uids",
     "list_company_contacts",
     "list_user_assignments",
+    "list_user_db_assignments",
     "list_user_mobile_db_requests",
     "record_contact",
     "record_company_views",
