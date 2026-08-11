@@ -429,6 +429,9 @@ def render_work_inbox_page(
     *,
     navigate: Callable[[str], None] | None = None,
     crm_restore_ok: bool | None = None,
+    inbox: Mapping[str, Any] | None = None,
+    show_header: bool = True,
+    show_metrics: bool = True,
 ) -> None:
     import streamlit as st
 
@@ -441,26 +444,38 @@ def render_work_inbox_page(
         else:
             st.error(message)
 
-    st.markdown("### 중앙 업무함")
-    st.caption(
-        "자동 생성 업무, 고객 CRM 예정일, DB발굴 재연락 일정을 한곳에서 확인합니다. "
-        "원본 고객·영업·수집 대기열은 변경하지 않습니다."
-    )
+    if show_header:
+        st.markdown("### 중앙 업무함")
+        st.caption(
+            "자동 생성 업무, 고객 CRM 예정일, DB발굴 재연락 일정을 한곳에서 확인합니다. "
+            "원본 고객·영업·수집 대기열은 변경하지 않습니다."
+        )
 
-    inbox = build_work_inbox(user_id, crm_restore_ok=crm_restore_ok)
-    for warning in inbox.get("warnings", []):
+    resolved_inbox = (
+        dict(inbox)
+        if inbox is not None
+        else build_work_inbox(user_id, crm_restore_ok=crm_restore_ok)
+    )
+    for warning in resolved_inbox.get("warnings", []):
         st.warning(str(warning))
 
-    summary = dict(inbox.get("summary") or {})
-    metric_columns = st.columns(4)
-    metric_columns[0].metric("기한 경과", f"{int(summary.get('overdue_count', 0)):,}건")
-    metric_columns[1].metric("오늘", f"{int(summary.get('today_count', 0)):,}건")
-    metric_columns[2].metric("향후 7일", f"{int(summary.get('week_count', 0)):,}건")
-    metric_columns[3].metric(
-        "진행 중", f"{int(summary.get('in_progress_count', 0)):,}건"
-    )
+    summary = dict(resolved_inbox.get("summary") or {})
+    if show_metrics:
+        metric_columns = st.columns(4)
+        metric_columns[0].metric(
+            "기한 경과", f"{int(summary.get('overdue_count', 0)):,}건"
+        )
+        metric_columns[1].metric(
+            "오늘", f"{int(summary.get('today_count', 0)):,}건"
+        )
+        metric_columns[2].metric(
+            "향후 7일", f"{int(summary.get('week_count', 0)):,}건"
+        )
+        metric_columns[3].metric(
+            "진행 중", f"{int(summary.get('in_progress_count', 0)):,}건"
+        )
 
-    items = list(inbox.get("items") or [])
+    items = list(resolved_inbox.get("items") or [])
     automated = [item for item in items if item.get("source") == "automated"]
     local_items = [item for item in items if item.get("source") != "automated"]
 

@@ -515,19 +515,21 @@ def test_render_changes_only_automated_tasks_and_navigates_for_source_rows():
     assert "upsert_customer_record(" not in source
 
 
-def test_app_exposes_lazy_loaded_work_inbox_route():
+def test_app_integrates_work_inbox_into_home():
     source = (ROOT / "app.py").read_text(encoding="utf-8")
 
-    assert '"업무함": "업무함"' in source
-    assert 'elif active_tab == "업무함":' in source
-    assert source.count("from work_inbox import render_work_inbox_page") == 1
-    route = source[source.index('elif active_tab == "업무함":') :]
-    route = route[: route.index("\nelif active_tab", 1)]
-    assert "from work_inbox import render_work_inbox_page" in route
-    assert "render_work_inbox_page(" in route
-    assert "CURRENT_USER_ID" in route
-    assert "CURRENT_USER_NAME" in route
-    assert "navigate=_navigate_to_main_menu" in route
-    assert "crm_restore_ok=crm_restore_ok" in route
-    assert 'if active_tab in {"홈", "업무함"}:' in source
+    assert '"업무함": "업무함"' not in source
+    assert 'elif active_tab == "업무함":' not in source
+    assert source.count(
+        "from work_inbox import build_work_inbox, render_work_inbox_page"
+    ) == 1
+    home = source[source.index("def render_home_page(") :]
+    home = home[: home.index("\ndef ", 1)]
+    assert "build_work_inbox(" in home
+    assert "render_work_inbox_page(" in home
+    assert "navigate=_navigate_to_main_menu" in home
+    assert "inbox=inbox" in home
+    assert "show_header=False" in home
+    assert "show_metrics=False" in home
+    assert 'if active_tab == "홈":' in source
     assert "restore_crm_from_cloud(CURRENT_USER_ID)" in source

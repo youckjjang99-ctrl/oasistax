@@ -46,7 +46,7 @@ from matching_preferences import (
 from crm import (
     STATUS_OPTIONS, ACTION_OPTIONS, make_customer_key, get_customer_record,
     upsert_customer_record, append_timeline_event, get_crm_summary,
-    get_due_action_summary, get_home_dashboard_summary
+    get_due_action_summary
 )
 
 from auth import (
@@ -769,13 +769,16 @@ def _render_queued_sidebar_collapse() -> None:
     )
 
 
-def render_home_page(user_id, user_name=""):
+def render_home_page(user_id, user_name="", *, crm_restore_ok=None):
+    from work_inbox import build_work_inbox, render_work_inbox_page
+
     customer_df, _ = read_current_user_customer_df(user_id)
     customer_count = len(customer_df)
-    crm_summary, due_summary = get_home_dashboard_summary(user_id)
-    today_count = len(due_summary.get("today", []))
-    overdue_count = len(due_summary.get("overdue", []))
-    week_count = len(due_summary.get("week", []))
+    inbox = build_work_inbox(user_id, crm_restore_ok=crm_restore_ok)
+    summary = dict(inbox.get("summary") or {})
+    today_count = int(summary.get("today_count", 0) or 0)
+    overdue_count = int(summary.get("overdue_count", 0) or 0)
+    week_count = int(summary.get("week_count", 0) or 0)
 
     st.markdown("""
     <div class="hero">
@@ -818,55 +821,15 @@ def render_home_page(user_id, user_name=""):
         args=("기업 컨설팅",),
     )
 
-    st.markdown("### 오늘의 후속관리")
-    due_items = [
-        {**item, "구분": "기한 경과"}
-        for item in due_summary.get("overdue", [])
-    ] + [
-        {**item, "구분": "오늘"}
-        for item in due_summary.get("today", [])
-    ] + [
-        {**item, "구분": "향후 7일"}
-        for item in due_summary.get("week", [])
-    ]
-    if due_items:
-        due_frame = pd.DataFrame(due_items)
-        display_columns = [
-            column
-            for column in [
-                "구분",
-                "company_name",
-                "next_action",
-                "next_date",
-                "status",
-            ]
-            if column in due_frame.columns
-        ]
-        due_frame = due_frame[display_columns].rename(
-            columns={
-                "company_name": "업체명",
-                "next_action": "다음 액션",
-                "next_date": "예정일",
-                "status": "고객 상태",
-            }
-        )
-        st.dataframe(
-            due_frame.head(12),
-            hide_index=True,
-            use_container_width=True,
-        )
-    else:
-        st.info(
-            f"{user_name or '담당자'}님의 오늘 예정 후속조치가 없습니다."
-        )
-
-    active_count = sum(
-        int(crm_summary.get(status, 0) or 0)
-        for status in ["상담중", "자료요청", "제안서 발송", "신청준비"]
-    )
-    st.caption(
-        f"현재 진행 중인 고객 {active_count:,}건 · "
-        "후속조치 예정일은 기업 컨설팅의 CRM에서 관리할 수 있습니다."
+    st.markdown("### 오늘 처리할 업무")
+    render_work_inbox_page(
+        user_id,
+        user_name,
+        navigate=_navigate_to_main_menu,
+        crm_restore_ok=crm_restore_ok,
+        inbox=inbox,
+        show_header=False,
+        show_metrics=False,
     )
 
 
@@ -1858,7 +1821,6 @@ with st.sidebar:
     menu_groups = {
         "주요업무": {
             "홈": "홈",
-            "업무함": "업무함",
             "DB발굴": "DB발굴",
             "기업정보등록": "기업등록",
             "기업 컨설팅": "기업관리센터",
@@ -1930,7 +1892,6 @@ with st.sidebar:
 
     menu_labels = {
         "홈": "홈",
-        "업무함": "업무함",
         "DB발굴": "DB발굴",
         "기업정보등록": "기업정보등록",
         "기업 컨설팅": "기업 컨설팅",
@@ -1994,7 +1955,7 @@ if active_tab in local_customer_routes:
         if "실패" not in restore_message:
             st.session_state[restore_session_key] = True
 
-if active_tab in {"홈", "업무함"}:
+if active_tab == "홈":
     crm_restore_session_key = f"cloud_crm_restore_{CURRENT_USER_ID}"
     crm_restore_attempt_key = f"{crm_restore_session_key}_attempted_at"
     last_attempt = float(
@@ -2042,11 +2003,6 @@ if active_tab == "홈":
     if crm_restore_notice.get("restored", 0) > 0:
         st.success(crm_restore_notice.get("message", ""))
 
-    render_home_page(CURRENT_USER_ID, CURRENT_USER_NAME)
-
-elif active_tab == "업무함":
-    from work_inbox import render_work_inbox_page
-
     crm_restore_notice = st.session_state.get(
         "cloud_crm_restore_result",
         {},
@@ -2058,10 +2014,9 @@ elif active_tab == "업무함":
         marker in crm_restore_message
         for marker in ("실패", "설정되지 않아", "사용자 ID가 없습니다")
     )
-    render_work_inbox_page(
+    render_home_page(
         CURRENT_USER_ID,
         CURRENT_USER_NAME,
-        navigate=_navigate_to_main_menu,
         crm_restore_ok=crm_restore_ok,
     )
 
