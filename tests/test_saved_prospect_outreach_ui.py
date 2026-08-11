@@ -64,11 +64,9 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
             compact.loc[0, "연락처"],
             _phone("010", "0000", "0000"),
         )
-        self.assertEqual(
-            compact.loc[0, "인스타"],
-            "https://example.invalid/sample",
-        )
-        self.assertEqual(compact.loc[0, "이메일보내기"], "📧")
+        self.assertNotIn("이메일", compact.columns)
+        self.assertNotIn("인스타", compact.columns)
+        self.assertNotIn("이메일보내기", compact.columns)
         self.assertEqual(compact.loc[0, "문자보내기"], "💬")
         self.assertEqual(compact.loc[0, "카카오톡보내기"], "🟡")
 
@@ -205,7 +203,6 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
             can_view_mobile=False,
         )
 
-        self.assertEqual(compact.loc[0, "이메일보내기"], "📧")
         self.assertTrue(pd.isna(compact.loc[0, "문자보내기"]))
         self.assertTrue(pd.isna(compact.loc[0, "카카오톡보내기"]))
 
@@ -277,7 +274,6 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
             ),
             can_view_mobile=True,
         )
-        self.assertTrue(pd.isna(compact.loc[0, "이메일보내기"]))
         self.assertTrue(pd.isna(compact.loc[0, "문자보내기"]))
 
     def test_resolver_honors_legacy_phone_hash_opt_out(self):

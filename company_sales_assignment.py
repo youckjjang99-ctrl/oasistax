@@ -146,20 +146,21 @@ _FAILURE_MESSAGES = {
         "검색 결과를 새로고침합니다."
     ),
     "MAX_UNCONTACTED_REACHED": (
-        "미접촉 배정 DB는 최대 30개까지 보유할 수 있습니다. "
-        "기존 DB의 연락결과를 기록하거나 배정을 해제한 후 "
-        "다시 시도해 주세요."
+        "일반전화 30개와 핸드폰번호 DB 30개를 합쳐 "
+        "최대 60개까지 보유할 수 있습니다."
     ),
     "LIMIT_REACHED": (
-        "미접촉 배정 DB는 최대 30개까지 보유할 수 있습니다. "
-        "기존 DB의 연락결과를 기록하거나 배정을 해제한 후 "
-        "다시 시도해 주세요."
+        "일반전화 30개와 핸드폰번호 DB 30개를 합쳐 "
+        "최대 60개까지 보유할 수 있습니다."
     ),
     "UNCONTACTED_LIMIT_REACHED": (
-        "미접촉 배정 DB는 최대 30개까지 보유할 수 있습니다. "
-        "기존 DB의 연락결과를 기록하거나 배정을 해제한 후 "
-        "다시 시도해 주세요."
+        "일반전화 30개와 핸드폰번호 DB 30개를 합쳐 "
+        "최대 60개까지 보유할 수 있습니다."
     ),
+    "TOTAL_DB_LIMIT_REACHED": "배정 DB는 총 60개까지 보유할 수 있습니다.",
+    "LANDLINE_LIMIT_REACHED": "일반전화 DB는 최대 30개까지 보유할 수 있습니다.",
+    "MOBILE_LIMIT_REACHED": "핸드폰번호 DB는 최대 30개까지 보유할 수 있습니다.",
+    "RETURN_REASON_REQUIRED": "반납사유를 입력해 주세요.",
     "MIGRATION_CONFLICT": (
         "기존 저장자료의 담당자가 서로 달라 관리자의 담당자 지정이 "
         "필요한 업체입니다."
@@ -1478,6 +1479,7 @@ def release_assignment(
     company_uid: Any,
     *,
     reason: Any,
+    return_reason: Any = "",
     session_id: str = "",
     db: CloudDatabase | None = None,
 ) -> dict[str, Any]:
@@ -1488,6 +1490,7 @@ def release_assignment(
             "p_company_uid": _company_uid(company_uid),
             "p_reason": _bounded(reason, 500),
             "p_session_id": _bounded(session_id, 200),
+            "p_return_reason": _bounded(return_reason, 500),
         },
         db=db,
     )

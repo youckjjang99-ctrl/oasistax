@@ -674,6 +674,7 @@ class AssignmentRpcTests(unittest.TestCase):
             "legacy-company-id",
             "business:1234567890",
             reason="직접 해제",
+            return_reason="영업 대상 아님",
             session_id="session-1",
             db=database,
         )
@@ -685,6 +686,7 @@ class AssignmentRpcTests(unittest.TestCase):
                 "p_company_uid": "business:1234567890",
                 "p_reason": "직접 해제",
                 "p_session_id": "session-1",
+                "p_return_reason": "영업 대상 아님",
             },
         )
 

@@ -69,6 +69,8 @@ class ProspectContactResultsTabTests(unittest.TestCase):
         self.assertIn("sales_assignments.list_company_contacts(", source)
         self.assertIn("sales_assignments.release_assignment(", source)
         self.assertIn('reason="contact_results_return"', source)
+        self.assertIn("return_reason=return_reason.strip()", source)
+        self.assertIn('"반납사유"', source)
         self.assertNotIn("sales_assignments.save_user_note(", source)
         self.assertNotIn("업체 메모", source)
         self.assertNotIn("메모 저장", source)
@@ -187,7 +189,10 @@ class ProspectContactResultsTabTests(unittest.TestCase):
             {
                 "company_uid": "source:return-1",
                 "action": "assignment_released",
-                "new_value": {"reason": "contact_results_return"},
+                "new_value": {
+                    "reason": "contact_results_return",
+                    "return_reason": "대상 조건 불일치",
+                },
                 "user_name": "영업담당자",
                 "created_at": "2026-08-05T10:00:01+09:00",
             }
@@ -201,6 +206,7 @@ class ProspectContactResultsTabTests(unittest.TestCase):
             rows[0]["_returned_at"],
             "2026-08-05T10:00:01+09:00",
         )
+        self.assertEqual(rows[0]["_return_reason"], "대상 조건 불일치")
 
     def test_return_db_admin_uses_admin_guard_and_review_actions(self):
         source = inspect.getsource(prospect._render_return_db_admin)
@@ -210,6 +216,7 @@ class ProspectContactResultsTabTests(unittest.TestCase):
             "관리자만 반납 DB를 확인할 수 있습니다.",
             'statuses=["long_hold"]',
             "sales_assignments.list_admin_assignment_audit(",
+            '"반납사유"',
             "재배정 허용",
             "영구 제외",
             "sales_assignments.admin_reactivate(",

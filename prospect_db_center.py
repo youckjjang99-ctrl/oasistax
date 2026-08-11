@@ -182,12 +182,9 @@ SAVED_PROSPECT_VISIBLE_COLUMNS = (
     "사업자유형",
     "발굴유형",
     "연락처",
-    "이메일",
-    "인스타",
     "업종명",
     "가입자",
     "고용증가값",
-    "이메일보내기",
     "문자보내기",
     "카카오톡보내기",
 )
@@ -199,7 +196,6 @@ MOBILE_DB_REQUEST_STATUS_LABELS = {
     "cancelled": "신청 취소",
 }
 OUTREACH_COLUMN_CHANNELS = {
-    "이메일보내기": "email",
     "문자보내기": "sms",
     "카카오톡보내기": "kakao",
 }
@@ -1233,11 +1229,7 @@ def _saved_prospect_table_frame(
                 and str(row.get("_company_uid") or "").strip()
             )
         )
-        email = str(row.get("이메일") or "").strip()
         mobile = normalize_phone(row.get("휴대전화") or "")
-        instagram = str(
-            row.get("인스타그램URL") or row.get("인스타그램") or ""
-        ).strip()
         records.append(
             {
                 "업체명": str(row.get("업체명") or ""),
@@ -1245,18 +1237,9 @@ def _saved_prospect_table_frame(
                 "사업자유형": str(row.get("사업자유형") or ""),
                 "발굴유형": str(row.get("발굴유형") or "분류 확인 중"),
                 "연락처": normalize_phone(row.get("대표전화") or ""),
-                "이메일": email,
-                "인스타": instagram,
                 "업종명": str(row.get("업종명") or ""),
                 "가입자": int(row.get("가입자") or 0),
                 "고용증가값": str(row.get("고용증가값") or ""),
-                "이메일보내기": (
-                    "📧"
-                    if email
-                    and bool(row.get("_canonical_email_available"))
-                    and not blocked
-                    else None
-                ),
                 "문자보내기": (
                     "💬"
                     if row_can_view_mobile
@@ -3805,14 +3788,13 @@ def _render_clean_saved_prospects(
         key="saved_prospect_excel_v984",
     )
     st.caption(
-        "오른쪽의 📧·💬·🟡 버튼을 누르면 선택한 업체 1곳에 보낼 내용을 "
+        "오른쪽의 💬·🟡 버튼을 누르면 선택한 업체 1곳에 보낼 내용을 "
         "직접 작성할 수 있습니다. 수신거부 또는 수신처가 없는 채널은 버튼이 표시되지 않습니다."
     )
     action_rows = _outreach_action_rows(
         frame,
         can_view_mobile=can_view_mobile,
     )
-    email_click_key = "saved_prospect_email_click_v1040"
     sms_click_key = "saved_prospect_sms_click_v1040"
     kakao_click_key = "saved_prospect_kakao_click_v1040"
     st.dataframe(
@@ -3821,14 +3803,6 @@ def _render_clean_saved_prospects(
         hide_index=True,
         column_order=list(SAVED_PROSPECT_VISIBLE_COLUMNS),
         column_config={
-            "이메일보내기": st.column_config.ButtonColumn(
-                "이메일보내기",
-                width="small",
-                type="tertiary",
-                key=email_click_key,
-                on_click=_queue_outreach_from_button,
-                args=(email_click_key, "email", action_rows),
-            ),
             "문자보내기": st.column_config.ButtonColumn(
                 "문자보내기",
                 width="small",
@@ -4300,6 +4274,13 @@ def _render_contact_results(
         "반납하면 내 배정 DB에서 제외되고 관리자 검토함으로 이동합니다. "
         "기존 연락 이력은 유지됩니다."
     )
+    return_reason = st.text_area(
+        "반납사유",
+        max_chars=500,
+        placeholder="반납하는 이유를 구체적으로 입력해 주세요.",
+        key=f"contact_results_return_reason_v1130_{selected_assignment_id}",
+        disabled=not selected_company_uid,
+    )
     return_submitted = st.button(
         "DB 반납하기",
         help="선택한 업체를 반납하고 내 활성 배정 목록에서 제외합니다.",
@@ -4308,14 +4289,19 @@ def _render_contact_results(
         disabled=not selected_company_uid,
     )
     if return_submitted:
-        return_result = sales_assignments.release_assignment(
-            owner_user_id,
-            selected_assignment.get("company_id"),
-            selected_company_uid,
-            reason="contact_results_return",
-            session_id=_assignment_session_id(),
-        )
-        if return_result.get("ok"):
+        return_result = None
+        if not return_reason.strip():
+            st.error("반납사유를 입력해 주세요.")
+        else:
+            return_result = sales_assignments.release_assignment(
+                owner_user_id,
+                selected_assignment.get("company_id"),
+                selected_company_uid,
+                reason="contact_results_return",
+                return_reason=return_reason.strip(),
+                session_id=_assignment_session_id(),
+            )
+        if return_result and return_result.get("ok"):
             st.session_state[_CONTACT_RESULTS_FLASH_KEY] = {
                 "level": "success",
                 "message": (
@@ -4325,7 +4311,7 @@ def _render_contact_results(
             }
             st.session_state[_CONTACT_RESULTS_RESET_SELECTION_KEY] = True
             st.rerun()
-        else:
+        elif return_result:
             st.error(
                 return_result.get("message")
                 or "업체를 반납하지 못했습니다."
@@ -4428,6 +4414,15 @@ def _return_db_review_rows(
         row["_returned_at"] = str(
             return_audit.get("created_at") or row.get("released_at") or ""
         )
+        return_audit_value = return_audit.get("new_value")
+        row["_return_reason"] = str(
+            (
+                return_audit_value.get("return_reason")
+                if isinstance(return_audit_value, dict)
+                else ""
+            )
+            or "기존 반납(사유 미기록)"
+        )
         review_rows.append(row)
     return review_rows
 
@@ -4491,6 +4486,7 @@ def _render_return_db_admin(current_user_id: str) -> None:
             {
                 "업체명": str(row.get("company_name") or "업체명 미확인"),
                 "반납 담당자": str(row.get("_returned_by_name") or ""),
+                "반납사유": str(row.get("_return_reason") or ""),
                 "반납일시": str(row.get("_returned_at") or "")
                 .replace("T", " ")[:19],
                 "현재상태": "관리자 검토 대기",
