@@ -5224,6 +5224,25 @@ def _render_db_request_home(owner_user_id: str) -> None:
         .st-key-db_request_panel [data-testid="stMarkdownContainer"] > p {
             color: #314968 !important;
         }
+        .st-key-db_request_panel [data-testid="stButton"] button {
+            background: #1766d6 !important;
+            border-color: #1766d6 !important;
+            color: #ffffff !important;
+        }
+        .st-key-db_request_panel [data-testid="stButton"] button p {
+            color: #ffffff !important;
+            font-weight: 700 !important;
+        }
+        .st-key-db_request_panel [data-testid="stButton"] button:hover {
+            background: #0f55ba !important;
+            border-color: #0f55ba !important;
+        }
+        .st-key-db_request_panel [data-testid="stButton"] button:disabled {
+            background: #91afd8 !important;
+            border-color: #91afd8 !important;
+            color: #ffffff !important;
+            opacity: 0.75 !important;
+        }
         </style>
             """
         ).lstrip(),
@@ -5297,6 +5316,7 @@ def _render_db_request_home(owner_user_id: str) -> None:
             st.write("희소 DB 보호를 위해 신청 후 관리자가 검토하여 배정합니다.")
             mobile_clicked = st.button(
                 "핸드폰 DB 배정 신청",
+                type="primary",
                 use_container_width=True,
                 disabled=invalid_employee_range,
                 key="request_mobile_db_v1090",

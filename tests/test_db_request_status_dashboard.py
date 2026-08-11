@@ -156,5 +156,9 @@ def test_db_request_form_is_visually_grouped_and_high_contrast():
     assert "border: 2px solid #a9bfdf" in source
     assert "opacity: 1 !important" in source
     assert "color: #52647d !important" in source
+    assert "background: #1766d6 !important" in source
+    assert 'button p {' in source
+    assert "color: #ffffff !important" in source
+    assert '"핸드폰 DB 배정 신청",\n                type="primary",' in source
     assert "textwrap.dedent(" in source
     assert ").lstrip()" in source
