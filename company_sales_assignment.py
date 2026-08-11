@@ -30,6 +30,7 @@ RPC_ADMIN_CHANGE_ASSIGNEE = "oasis_admin_change_company_assignee"
 RPC_ADMIN_RELEASE = "oasis_admin_release_company_assignment"
 RPC_ADMIN_REACTIVATE = "oasis_admin_reactivate_company_assignment"
 RPC_ADMIN_PERMANENT_EXCLUDE = "oasis_admin_permanent_exclude_company"
+RPC_ADMIN_REVIEW_RETURNED_BATCH = "oasis_admin_review_returned_companies_batch"
 RPC_SAVE_USER_NOTE = "oasis_save_user_prospect_note"
 RPC_RECORD_COMPANY_VIEWS = "oasis_record_company_views"
 RPC_ADMIN_SET_USER_LIMIT = "oasis_admin_set_sales_user_limit"
@@ -1851,6 +1852,82 @@ def admin_permanent_exclude(
     )
 
 
+def admin_review_returned_batch(
+    current_user_id: str,
+    company_uids: Sequence[Any],
+    *,
+    action: str,
+    reason: Any,
+    session_id: str = "",
+    db: CloudDatabase | None = None,
+) -> dict[str, Any]:
+    clean_uids = list(
+        dict.fromkeys(_company_uid(value) for value in (company_uids or []))
+    )
+    if not clean_uids or len(clean_uids) > 100:
+        return {
+            "ok": False,
+            "code": "INVALID_BATCH_SIZE",
+            "message": "한 번에 처리할 반납 DB를 1개 이상 100개 이하로 선택해 주세요.",
+            "processed_count": 0,
+        }
+    clean_action = _text(action).lower()
+    if clean_action not in {"reactivate", "permanent_exclude"}:
+        return {
+            "ok": False,
+            "code": "INVALID_ACTION",
+            "message": "지원하지 않는 반납 DB 처리 방식입니다.",
+            "processed_count": 0,
+        }
+    clean_reason = _bounded(reason, 400)
+    if not clean_reason:
+        return {
+            "ok": False,
+            "code": "REASON_REQUIRED",
+            "message": "검토 사유를 입력해 주세요.",
+            "processed_count": 0,
+        }
+
+    raw, error = _rpc(
+        RPC_ADMIN_REVIEW_RETURNED_BATCH,
+        {
+            "p_current_user_id": _user_id(current_user_id),
+            "p_company_uids": clean_uids,
+            "p_action": clean_action,
+            "p_reason": clean_reason,
+            "p_session_id": _nullable_text(session_id),
+        },
+        db=db,
+    )
+    if error:
+        return {**error, "processed_count": 0}
+    row = _first_row(raw)
+    if row is None:
+        return {
+            "ok": False,
+            "code": "MALFORMED_RESPONSE",
+            "message": _FAILURE_MESSAGES["MALFORMED_RESPONSE"],
+            "processed_count": 0,
+        }
+    success_value = row.get("success", row.get("ok"))
+    ok = success_value is True or _text(success_value).lower() in {
+        "true",
+        "t",
+        "1",
+    }
+    processed_count = max(0, int(row.get("processed_count") or 0))
+    return {
+        "ok": ok,
+        "code": _safe_code(row.get("code"), "OK" if ok else "REQUEST_FAILED"),
+        "message": (
+            "선택한 반납 DB를 일괄 처리했습니다."
+            if ok
+            else "반납 DB 일괄 처리를 완료하지 못했습니다."
+        ),
+        "processed_count": processed_count if ok else 0,
+    }
+
+
 def admin_set_user_limit(
     admin_user_id: str,
     target_user_id: str,
@@ -2107,6 +2184,7 @@ __all__ = [
     "CompanyIdentityError",
     "admin_change_assignee",
     "admin_permanent_exclude",
+    "admin_review_returned_batch",
     "admin_release_assignment",
     "admin_reactivate",
     "admin_set_user_limit",

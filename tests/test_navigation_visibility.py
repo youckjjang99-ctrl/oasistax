@@ -24,7 +24,7 @@ class NavigationVisibilityTests(unittest.TestCase):
 
         self.assertIn("def _queue_sidebar_collapse()", source)
         self.assertIn("def _render_queued_sidebar_collapse()", source)
-        self.assertIn("on_change=_queue_sidebar_collapse", source)
+        self.assertIn("on_change=_handle_main_menu_change", source)
         self.assertIn(
             'st.session_state.get("_oasis_sidebar_collapse_request", 0)',
             source,
@@ -37,6 +37,19 @@ class NavigationVisibilityTests(unittest.TestCase):
         self.assertIn("if (!mobileViewport.matches)", source)
         self.assertIn('[data-testid="stSidebarCollapseButton"] button', source)
         self.assertEqual(source.count("_render_queued_sidebar_collapse()"), 2)
+
+    def test_main_menu_survives_streamlit_session_reconnect_via_url(self):
+        source = (ROOT / "app.py").read_text(encoding="utf-8")
+
+        self.assertIn('_MAIN_MENU_QUERY_KEY = "_oasis_menu"', source)
+        self.assertIn("def _read_main_menu_query()", source)
+        self.assertIn("def _write_main_menu_query(target: str)", source)
+        self.assertIn("query_menu = _read_main_menu_query()", source)
+        self.assertIn("_write_main_menu_query(selected_menu_label)", source)
+        self.assertIn(
+            "query_menu if query_menu in menu_label_map else \"홈\"",
+            source,
+        )
 
     def test_enterprise_tools_are_visible_in_one_tab_row(self):
         source = (ROOT / "enterprise_center.py").read_text(encoding="utf-8")

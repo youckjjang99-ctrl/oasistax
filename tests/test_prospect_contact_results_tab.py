@@ -216,7 +216,7 @@ class ProspectContactResultsTabTests(unittest.TestCase):
         audit_rows = [
             {
                 "company_uid": "source:return-1",
-                "action": "assignment_released",
+                "action": "admin_recall",
                 "new_value": {
                     "reason": "contact_results_return",
                     "return_reason": "대상 조건 불일치",
@@ -245,10 +245,13 @@ class ProspectContactResultsTabTests(unittest.TestCase):
             'statuses=["long_hold"]',
             "sales_assignments.list_admin_assignment_audit(",
             '"반납사유"',
+            "st.data_editor(",
+            '"선택": st.column_config.CheckboxColumn(',
             "재배정 허용",
             "영구 제외",
-            "sales_assignments.admin_reactivate(",
-            "sales_assignments.admin_permanent_exclude(",
+            "sales_assignments.admin_review_returned_batch(",
+            "company_uids",
+            "processed_count",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, source)

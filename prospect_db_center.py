@@ -161,7 +161,7 @@ _SAVED_PROSPECT_RESET_SELECTION_KEY = (
     "_saved_prospect_reset_selection_v1140"
 )
 _RETURN_DB_ADMIN_FLASH_KEY = "_return_db_admin_flash_v1070"
-_RETURN_DB_ADMIN_SELECTION_KEY = "return_db_admin_assignment_v1070"
+_RETURN_DB_ADMIN_TABLE_KEY = "return_db_admin_table_v1150"
 _MOBILE_DB_ADMIN_SELECTION_KEY = "mobile_db_admin_request_v1090"
 _SAVED_DB_DASHBOARD_FILTER_KEY = "saved_db_dashboard_filter_v1100"
 _SAVED_DB_DASHBOARD_PAGE_KEY = "saved_db_dashboard_page_v1100"
@@ -4554,7 +4554,8 @@ def _return_db_review_rows(
         if (
             company_uid
             and company_uid not in return_audit_by_uid
-            and str(audit_row.get("action") or "") == "assignment_released"
+            and str(audit_row.get("action") or "")
+            in {"assignment_released", "admin_recall"}
             and str(new_value.get("reason") or "")
             == "contact_results_return"
         ):
@@ -4652,6 +4653,7 @@ def _render_return_db_admin(current_user_id: str) -> None:
     review_frame = pd.DataFrame(
         [
             {
+                "선택": False,
                 "업체명": str(row.get("company_name") or "업체명 미확인"),
                 "반납 담당자": str(row.get("_returned_by_name") or ""),
                 "반납사유": str(row.get("_return_reason") or ""),
@@ -4662,33 +4664,42 @@ def _render_return_db_admin(current_user_id: str) -> None:
             for row in review_rows
         ]
     )
-    st.dataframe(
+    edited_review_frame = st.data_editor(
         review_frame,
         use_container_width=True,
         hide_index=True,
+        column_config={
+            "선택": st.column_config.CheckboxColumn(
+                "선택",
+                width="small",
+                help="동시에 처리할 반납 DB를 선택합니다.",
+            ),
+            "업체명": st.column_config.TextColumn(width="medium"),
+            "반납 담당자": st.column_config.TextColumn(width="small"),
+            "반납사유": st.column_config.TextColumn(width="large"),
+            "반납일시": st.column_config.TextColumn(width="small"),
+            "현재상태": st.column_config.TextColumn(width="small"),
+        },
+        disabled=[
+            "업체명",
+            "반납 담당자",
+            "반납사유",
+            "반납일시",
+            "현재상태",
+        ],
+        key=_RETURN_DB_ADMIN_TABLE_KEY,
     )
-
-    review_by_id = {
-        str(row.get("assignment_id") or row.get("id") or ""): row
-        for row in review_rows
-        if str(row.get("assignment_id") or row.get("id") or "")
-    }
-    review_labels = {
-        assignment_id: (
-            f"{str(row.get('company_name') or '업체명 미확인')} · "
-            f"{str(row.get('_returned_at') or '').replace('T', ' ')[:10]}"
+    selected_indexes = [
+        index
+        for index, selected in enumerate(
+            edited_review_frame["선택"].fillna(False).tolist()
         )
-        for assignment_id, row in review_by_id.items()
-    }
-    selected_assignment_id = st.selectbox(
-        "검토할 반납 업체",
-        list(review_by_id),
-        format_func=lambda value: review_labels.get(value, "업체명 미확인"),
-        key=_RETURN_DB_ADMIN_SELECTION_KEY,
-    )
-    selected_return = review_by_id.get(selected_assignment_id, {})
+        if bool(selected) and index < len(review_rows)
+    ]
+    selected_returns = [review_rows[index] for index in selected_indexes]
+    st.caption(f"선택한 반납 DB: {len(selected_returns):,}개")
 
-    with st.form("return_db_admin_review_form_v1070"):
+    with st.form("return_db_admin_review_form_v1150"):
         review_action = st.radio(
             "검토 결과",
             ["재배정 허용", "영구 제외"],
@@ -4704,9 +4715,10 @@ def _render_return_db_admin(current_user_id: str) -> None:
             disabled=review_action != "영구 제외",
         )
         review_submitted = st.form_submit_button(
-            "검토 결과 저장",
+            f"선택 {len(selected_returns):,}개 일괄 처리",
             type="primary",
             use_container_width=True,
+            disabled=not selected_returns,
         )
 
     if not review_submitted:
@@ -4718,32 +4730,37 @@ def _render_return_db_admin(current_user_id: str) -> None:
         st.error("영구 제외 확인 항목을 체크해 주세요.")
         return
 
-    company_uid = str(selected_return.get("company_uid") or "")
-    company_id = selected_return.get("company_id")
-    if review_action == "재배정 허용":
-        action_result = sales_assignments.admin_reactivate(
-            current_user_id,
-            company_id,
-            company_uid,
-            reason=f"반납 검토 승인: {review_reason.strip()}",
-            session_id=_assignment_session_id(),
+    company_uids = list(
+        dict.fromkeys(
+            str(row.get("company_uid") or "").strip()
+            for row in selected_returns
+            if str(row.get("company_uid") or "").strip()
         )
-        success_message = "검토를 완료하고 업체를 재배정 가능 상태로 전환했습니다."
-    else:
-        action_result = sales_assignments.admin_permanent_exclude(
-            current_user_id,
-            company_id,
-            company_uid,
-            reason=f"반납 검토 영구 제외: {review_reason.strip()}",
-            session_id=_assignment_session_id(),
-        )
-        success_message = "검토를 완료하고 업체를 영구 제외했습니다."
+    )
+    if len(company_uids) != len(selected_returns):
+        st.error("선택한 업체의 식별정보를 확인할 수 없습니다.")
+        return
+    action_code = (
+        "reactivate" if review_action == "재배정 허용" else "permanent_exclude"
+    )
+    action_result = sales_assignments.admin_review_returned_batch(
+        current_user_id,
+        company_uids,
+        action=action_code,
+        reason=review_reason.strip(),
+        session_id=_assignment_session_id(),
+    )
 
     if action_result.get("ok"):
+        processed_count = int(action_result.get("processed_count") or 0)
         st.session_state[_RETURN_DB_ADMIN_FLASH_KEY] = {
             "level": "success",
-            "message": success_message,
+            "message": (
+                f"선택한 반납 DB {processed_count:,}개를 "
+                f"{review_action} 처리했습니다."
+            ),
         }
+        st.session_state.pop(_RETURN_DB_ADMIN_TABLE_KEY, None)
         st.rerun()
     else:
         st.error(

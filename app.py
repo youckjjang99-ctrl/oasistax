@@ -681,9 +681,37 @@ def _navigate_to_main_menu(target: str) -> None:
         "AI 사용량": "관리자",
     }
     st.session_state["active_main_menu_v1020"] = target
+    _write_main_menu_query(target)
     target_group = group_by_target.get(target)
     if target_group:
         st.session_state["sidebar_menu_group_v1020"] = target_group
+
+
+_MAIN_MENU_QUERY_KEY = "_oasis_menu"
+
+
+def _read_main_menu_query() -> str:
+    try:
+        value = st.query_params.get(_MAIN_MENU_QUERY_KEY, "")
+    except Exception:
+        return ""
+    if isinstance(value, list):
+        value = value[-1] if value else ""
+    return str(value or "").strip()
+
+
+def _write_main_menu_query(target: str) -> None:
+    clean_target = str(target or "").strip()
+    if not clean_target:
+        return
+    try:
+        current = st.query_params.get(_MAIN_MENU_QUERY_KEY, "")
+        if isinstance(current, list):
+            current = current[-1] if current else ""
+        if str(current or "") != clean_target:
+            st.query_params[_MAIN_MENU_QUERY_KEY] = clean_target
+    except Exception:
+        pass
 
 
 def _handle_pending_user_action(
@@ -717,6 +745,13 @@ def _queue_sidebar_collapse() -> None:
     ) + 1
     st.session_state["_oasis_sidebar_collapse_request"] = request_number
     st.session_state["_oasis_collapse_sidebar_once"] = request_number
+
+
+def _handle_main_menu_change() -> None:
+    _write_main_menu_query(
+        st.session_state.get("active_main_menu_v1020", "")
+    )
+    _queue_sidebar_collapse()
 
 
 def _render_queued_sidebar_collapse() -> None:
@@ -1854,6 +1889,13 @@ with st.sidebar:
     if pending_menu in menu_label_map:
         st.session_state["active_main_menu_v1020"] = pending_menu
 
+    query_menu = _read_main_menu_query()
+    if (
+        "active_main_menu_v1020" not in st.session_state
+        and query_menu in menu_label_map
+    ):
+        st.session_state["active_main_menu_v1020"] = query_menu
+
     current_sidebar_value = st.session_state.get(
         "active_main_menu_v1020",
         st.session_state.get("active_main_menu_v311"),
@@ -1865,7 +1907,9 @@ with st.sidebar:
         st.session_state["active_main_menu_v1020"] = "DB발굴"
         current_sidebar_value = "DB발굴"
     if current_sidebar_value not in menu_label_map:
-        current_sidebar_value = "홈"
+        current_sidebar_value = (
+            query_menu if query_menu in menu_label_map else "홈"
+        )
         st.session_state["active_main_menu_v1020"] = current_sidebar_value
 
     current_group = next(
@@ -1913,8 +1957,9 @@ with st.sidebar:
             key="active_main_menu_v1020",
             format_func=lambda value: menu_labels.get(value, value),
             label_visibility="visible",
-            on_change=_queue_sidebar_collapse,
+            on_change=_handle_main_menu_change,
         )
+    _write_main_menu_query(selected_menu_label)
     active_tab = menu_groups[selected_group][selected_menu_label]
 
     # v5.0 호환 처리: 이전 세션의 고객관리 메뉴는 통합 화면으로 이동

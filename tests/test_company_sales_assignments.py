@@ -10,6 +10,7 @@ from company_sales_assignment import (
     admin_change_assignee,
     admin_permanent_exclude,
     admin_reactivate,
+    admin_review_returned_batch,
     admin_release_assignment,
     admin_set_user_limit,
     assignment_feature_ready,
@@ -860,6 +861,53 @@ class AssignmentRpcTests(unittest.TestCase):
                     "p_company_uid": "business:1234567890",
                     "p_reason": "폐업 확인",
                     "p_session_id": "session-1",
+                },
+            ),
+        )
+
+    def test_admin_batch_return_review_sends_only_valid_unique_uids(self):
+        first_uid = "business:" + "".join(("123", "45", "67890"))
+        second_uid = "source:" + ("a" * 64)
+        database = _FakeDatabase(
+            {
+                "oasis_admin_review_returned_companies_batch": [
+                    {
+                        "success": True,
+                        "code": "BATCH_REVIEWED",
+                        "processed_count": 2,
+                    }
+                ]
+            }
+        )
+
+        result = admin_review_returned_batch(
+            "admin",
+            [
+                first_uid,
+                first_uid,
+                second_uid,
+            ],
+            action="permanent_exclude",
+            reason="영업 대상 제외",
+            session_id="admin-session",
+            db=database,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["processed_count"], 2)
+        self.assertEqual(
+            database.calls[0],
+            (
+                "oasis_admin_review_returned_companies_batch",
+                {
+                    "p_current_user_id": "admin",
+                    "p_company_uids": [
+                        first_uid,
+                        second_uid,
+                    ],
+                    "p_action": "permanent_exclude",
+                    "p_reason": "영업 대상 제외",
+                    "p_session_id": "admin-session",
                 },
             ),
         )
