@@ -67,6 +67,7 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
         self.assertNotIn("이메일", compact.columns)
         self.assertNotIn("인스타", compact.columns)
         self.assertNotIn("이메일보내기", compact.columns)
+        self.assertEqual(compact.loc[0, "이력관리"], "📄")
         self.assertEqual(compact.loc[0, "문자보내기"], "💬")
         self.assertEqual(compact.loc[0, "카카오톡보내기"], "🟡")
 
@@ -391,6 +392,21 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
             ),
             {},
         )
+
+    def test_activity_document_click_uses_only_assignment_id(self):
+        rows = prospect._outreach_action_rows(
+            self._frame(),
+            can_view_mobile=True,
+        )
+
+        self.assertEqual(
+            prospect._activity_assignment_id_from_click({"row": 0}, rows),
+            "assignment-1",
+        )
+        self.assertEqual(
+            prospect._activity_assignment_id_from_click({"row": 99}, rows),
+            "",
+        )
         self.assertEqual(
             prospect._outreach_request_from_click(
                 {"row": 100, "label": "📧"},
@@ -513,6 +529,9 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
             source,
         )
         self.assertIn("key=_SAVED_PROSPECT_TABLE_KEY", source)
+        self.assertIn('"이력관리": st.column_config.ButtonColumn(', source)
+        self.assertIn("_queue_activity_from_button", source)
+        self.assertNotIn('"selection_mode": "single-row"', source)
 
     def test_saved_db_dashboard_has_all_cards_and_server_side_filtering(self):
         cards = prospect.SAVED_DB_DASHBOARD_CARDS

@@ -182,6 +182,7 @@ OUTREACH_ALLOWED_ASSIGNMENT_STATUSES = frozenset(
     {"assigned", "pending_contact", "contacted", "consulting", "follow_up"}
 )
 SAVED_PROSPECT_VISIBLE_COLUMNS = (
+    "이력관리",
     "업체명",
     "사업자번호",
     "사업자유형",
@@ -1237,6 +1238,9 @@ def _saved_prospect_table_frame(
         mobile = normalize_phone(row.get("휴대전화") or "")
         records.append(
             {
+                "이력관리": (
+                    "📄" if str(row.get("_assignment_id") or "").strip() else None
+                ),
                 "업체명": str(row.get("업체명") or ""),
                 "사업자번호": str(row.get("사업자번호") or ""),
                 "사업자유형": str(row.get("사업자유형") or ""),
@@ -1357,6 +1361,36 @@ def _queue_outreach_from_button(
     )
     if request:
         st.session_state[_OUTREACH_REQUEST_KEY] = request
+
+
+def _activity_assignment_id_from_click(
+    click: object,
+    action_rows: list[dict],
+) -> str:
+    """Resolve an activity button click without placing company data in state."""
+
+    try:
+        if isinstance(click, dict):
+            row_index = int(click.get("row"))
+        else:
+            row_index = int(getattr(click, "row"))
+        if row_index < 0 or row_index >= len(action_rows):
+            return ""
+        return str(action_rows[row_index].get("assignment_id") or "").strip()
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return ""
+
+
+def _queue_activity_from_button(
+    click_key: str,
+    action_rows: list[dict],
+) -> None:
+    assignment_id = _activity_assignment_id_from_click(
+        st.session_state.get(click_key),
+        action_rows,
+    )
+    if assignment_id:
+        st.session_state[_ACTIVITY_DIALOG_REQUEST_KEY] = assignment_id
 
 
 def _claim_outreach_attempt(state: object, request_id: object) -> bool:
@@ -3626,6 +3660,19 @@ def _dismiss_company_activity_dialog() -> None:
     st.session_state.pop(_SAVED_PROSPECT_TABLE_KEY, None)
 
 
+def _show_contact_results_notice(*, as_toast: bool = False) -> None:
+    pending_notice = st.session_state.pop(_CONTACT_RESULTS_FLASH_KEY, None)
+    if not isinstance(pending_notice, dict):
+        return
+    message = str(pending_notice.get("message") or "").strip()
+    if not message:
+        return
+    level = str(pending_notice.get("level") or "info").strip().lower()
+    getattr(st, level, st.info)(message)
+    if as_toast and level == "success":
+        st.toast(message, icon="✅")
+
+
 @st.dialog(
     "업체 활동 관리",
     width="large",
@@ -3691,6 +3738,7 @@ def _render_clean_saved_prospects(
         "전사 배정 기능 적용 후에는 공개 연락처가 아직 없는 업체도 "
         "저장·배정 현황 확인을 위해 함께 표시합니다."
     )
+    _show_contact_results_notice(as_toast=True)
     if st.session_state.pop(_SAVED_PROSPECT_RESET_SELECTION_KEY, False):
         st.session_state.pop(_SAVED_PROSPECT_TABLE_KEY, None)
         st.session_state.pop(_ACTIVITY_DIALOG_REQUEST_KEY, None)
@@ -3846,6 +3894,7 @@ def _render_clean_saved_prospects(
             column
             for column in SAVED_PROSPECT_VISIBLE_COLUMNS
             if column not in OUTREACH_COLUMN_CHANNELS
+            and column != "이력관리"
         ]
     ]
     st.download_button(
@@ -3860,7 +3909,8 @@ def _render_clean_saved_prospects(
         key="saved_prospect_excel_v984",
     )
     st.caption(
-        "업체 행을 클릭하면 활동이력·연락결과·DB 반납 화면이 팝업으로 열립니다. "
+        "왼쪽의 📄 버튼을 누르면 활동이력·연락결과·DB 반납 화면이 "
+        "팝업으로 열립니다. "
         "오른쪽의 💬·🟡 버튼은 문자·카카오톡 보내기이며, 수신거부 또는 "
         "수신처가 없는 채널은 표시되지 않습니다."
     )
@@ -3868,20 +3918,31 @@ def _render_clean_saved_prospects(
         frame,
         can_view_mobile=can_view_mobile,
     )
+    activity_click_key = "saved_prospect_activity_click_v1110"
     sms_click_key = "saved_prospect_sms_click_v1040"
     kakao_click_key = "saved_prospect_kakao_click_v1040"
-    table_options: dict = {}
-    if assignment_mode:
-        table_options = {
-            "on_select": "rerun",
-            "selection_mode": "single-row",
-        }
-    table_event = st.dataframe(
+    st.dataframe(
         compact_frame,
         use_container_width=True,
         hide_index=True,
         column_order=list(SAVED_PROSPECT_VISIBLE_COLUMNS),
         column_config={
+            "이력관리": st.column_config.ButtonColumn(
+                "이력관리",
+                width="small",
+                type="tertiary",
+                key=activity_click_key,
+                on_click=_queue_activity_from_button,
+                args=(activity_click_key, action_rows),
+            ),
+            "업체명": st.column_config.TextColumn(width="medium"),
+            "사업자번호": st.column_config.TextColumn(width="small"),
+            "사업자유형": st.column_config.TextColumn(width="small"),
+            "발굴유형": st.column_config.TextColumn(width="small"),
+            "연락처": st.column_config.TextColumn(width="small"),
+            "업종명": st.column_config.TextColumn(width="medium"),
+            "가입자": st.column_config.NumberColumn(width="small"),
+            "고용증가값": st.column_config.TextColumn(width="small"),
             "문자보내기": st.column_config.ButtonColumn(
                 "문자보내기",
                 width="small",
@@ -3900,7 +3961,6 @@ def _render_clean_saved_prospects(
             ),
         },
         key=_SAVED_PROSPECT_TABLE_KEY,
-        **table_options,
     )
     if assignment_mode and total_count > _SAVED_DB_DASHBOARD_PAGE_SIZE:
         page_count = (
@@ -3940,18 +4000,6 @@ def _render_clean_saved_prospects(
         return
 
     if assignment_mode:
-        selected_indexes = list(table_event.selection.rows)
-        if selected_indexes:
-            selected_index = int(selected_indexes[0])
-            if 0 <= selected_index < len(frame):
-                selected_assignment_id = str(
-                    frame.iloc[selected_index].get("_assignment_id") or ""
-                )
-                if selected_assignment_id:
-                    st.session_state[_ACTIVITY_DIALOG_REQUEST_KEY] = (
-                        selected_assignment_id
-                    )
-
         requested_assignment_id = str(
             st.session_state.get(_ACTIVITY_DIALOG_REQUEST_KEY) or ""
         )
@@ -4173,12 +4221,7 @@ def _render_contact_results(
         "확정되고 전사 중복연락 방지 상태가 함께 갱신됩니다."
     )
 
-    pending_notice = st.session_state.pop(_CONTACT_RESULTS_FLASH_KEY, None)
-    if isinstance(pending_notice, dict):
-        message = str(pending_notice.get("message") or "").strip()
-        if message:
-            level = str(pending_notice.get("level") or "info").strip().lower()
-            getattr(st, level, st.info)(message)
+    _show_contact_results_notice()
 
     if assignment_rows is None:
         try:
@@ -4428,7 +4471,7 @@ def _render_contact_results(
             st.session_state[_CONTACT_RESULTS_FLASH_KEY] = {
                 "level": "success",
                 "message": (
-                    "업체를 반납해 내 배정 DB에서 제외하고 "
+                    "DB 반납이 완료되었습니다. 내 배정 DB에서 제외되고 "
                     "관리자 검토함으로 이동했습니다."
                 ),
             }

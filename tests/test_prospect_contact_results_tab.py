@@ -37,13 +37,14 @@ class ProspectContactResultsTabTests(unittest.TestCase):
             "저장된 영업후보 엑셀 다운로드",
             "_SAVED_PROSPECT_TABLE_KEY",
             "_show_outreach_dialog(",
-            '"on_select": "rerun"',
-            '"selection_mode": "single-row"',
+            '"이력관리": st.column_config.ButtonColumn(',
+            "_queue_activity_from_button",
             "_ACTIVITY_DIALOG_REQUEST_KEY",
             "_show_company_activity_dialog(",
         ):
             with self.subTest(retained_marker=retained_marker):
                 self.assertIn(retained_marker, source)
+        self.assertNotIn('"selection_mode": "single-row"', source)
         self.assertNotIn('st.expander("업체 연락결과 관리"', source)
 
     def test_contact_results_tab_contains_the_complete_moved_area_once(self):
@@ -266,6 +267,20 @@ class ProspectContactResultsTabTests(unittest.TestCase):
         self.assertIn("_load_user_assignment_rows(owner_user_id)", source)
         self.assertIn("clear_on_submit=True", source)
         self.assertIn("key=_CONTACT_RESULTS_SELECTION_KEY", source)
+
+    def test_return_success_is_shown_on_saved_list_as_banner_and_toast(self):
+        contact_source = inspect.getsource(prospect._render_contact_results)
+        saved_list_source = inspect.getsource(
+            prospect._render_clean_saved_prospects
+        )
+        notice_source = inspect.getsource(prospect._show_contact_results_notice)
+
+        self.assertIn("DB 반납이 완료되었습니다.", contact_source)
+        self.assertIn(
+            "_show_contact_results_notice(as_toast=True)",
+            saved_list_source,
+        )
+        self.assertIn('st.toast(message, icon="✅")', notice_source)
 
 
 if __name__ == "__main__":
