@@ -4,9 +4,11 @@ import base64
 import hashlib
 import os
 import re
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from cryptography.fernet import Fernet
 
@@ -173,7 +175,7 @@ class ClaimSalesApplicationRepository:
         cipher: ClaimSalesApplicationCipher | None = None,
     ) -> None:
         self.db = db or CloudDatabase()
-        self.cipher = cipher or ClaimSalesApplicationCipher.from_environment()
+        self.cipher = cipher
 
     def submit(
         self,
@@ -192,7 +194,8 @@ class ClaimSalesApplicationRepository:
                 "개인정보 수집·이용 안내를 확인하고 동의해주세요."
             )
         clean = validate_application(values)
-        ciphertext = self.cipher.encrypt(clean)
+        cipher = self.cipher or ClaimSalesApplicationCipher.from_environment()
+        ciphertext = cipher.encrypt(clean)
         now = datetime.now(timezone.utc)
         rows = self.db.insert(
             TABLE_CLAIM_SALES_APPLICATIONS,
@@ -212,6 +215,215 @@ class ClaimSalesApplicationRepository:
         )
         return dict(rows[0]) if rows else {"status": "submitted"}
 
+    def list_for_user(self, owner_user_id: str) -> list[dict[str, Any]]:
+        owner = str(owner_user_id or "").strip().lower()
+        if not owner:
+            return []
+        return self.db.select(
+            TABLE_CLAIM_SALES_APPLICATIONS,
+            filters={"owner_user_id": owner},
+            columns=(
+                "id,status,management_homepage_url,sales_code,"
+                "sales_homepage_url,reviewed_at,created_at"
+            ),
+            order="created_at.desc",
+            limit=100,
+        )
+
+    def list_for_admin(
+        self,
+        *,
+        current_user_id: str,
+        is_admin_user: bool,
+    ) -> list[dict[str, Any]]:
+        if not is_admin_user or not str(current_user_id or "").strip():
+            raise ClaimSalesApplicationError("관리자만 신청결과를 관리할 수 있습니다.")
+        return self.db.select(
+            TABLE_CLAIM_SALES_APPLICATIONS,
+            columns=(
+                "id,owner_user_id,status,management_homepage_url,sales_code,"
+                "sales_homepage_url,reviewed_at,created_at"
+            ),
+            order="created_at.desc",
+            limit=500,
+        )
+
+    def save_result(
+        self,
+        *,
+        application_id: str,
+        current_user_id: str,
+        is_admin_user: bool,
+        management_homepage_url: str,
+        sales_code: str,
+        sales_homepage_url: str,
+    ) -> dict[str, Any]:
+        if not is_admin_user:
+            raise ClaimSalesApplicationError("관리자만 신청결과를 입력할 수 있습니다.")
+        try:
+            clean_id = str(uuid.UUID(str(application_id or "")))
+        except ValueError as exc:
+            raise ClaimSalesApplicationError("수정할 신청 건을 확인해주세요.") from exc
+        admin_id = str(current_user_id or "").strip().lower()
+        if not admin_id:
+            raise ClaimSalesApplicationError("관리자 로그인을 확인해주세요.")
+        management_url = _normalize_result_url(management_homepage_url)
+        sales_url = _normalize_result_url(sales_homepage_url)
+        code = str(sales_code or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", code):
+            raise ClaimSalesApplicationError(
+                "영업코드는 영문, 숫자, 밑줄, 하이픈으로 입력해주세요."
+            )
+        now = datetime.now(timezone.utc).isoformat()
+        rows = self.db.update(
+            TABLE_CLAIM_SALES_APPLICATIONS,
+            {"id": clean_id},
+            {
+                "management_homepage_url": management_url,
+                "sales_code": code,
+                "sales_homepage_url": sales_url,
+                "status": "approved",
+                "reviewed_by_user_id": admin_id,
+                "reviewed_at": now,
+                "updated_at": now,
+            },
+        )
+        if not rows:
+            raise ClaimSalesApplicationError("수정할 신청 건을 찾지 못했습니다.")
+        return dict(rows[0])
+
+
+def _normalize_result_url(value: Any) -> str:
+    clean = str(value or "").strip()
+    if not clean:
+        raise ClaimSalesApplicationError("홈페이지 주소를 입력해주세요.")
+    if "://" not in clean:
+        clean = f"https://{clean}"
+    parsed = urlparse(clean)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ClaimSalesApplicationError("홈페이지 주소 형식을 확인해주세요.")
+    if len(clean) > 2048:
+        raise ClaimSalesApplicationError("홈페이지 주소가 너무 깁니다.")
+    return clean
+
+
+def _application_label(row: dict[str, Any], include_owner: bool = False) -> str:
+    created = str(row.get("created_at") or "").replace("T", " ")[:16]
+    status = str(row.get("status") or "submitted")
+    owner = str(row.get("owner_user_id") or "")
+    prefix = f"{owner} · " if include_owner else ""
+    return f"{prefix}{created or '신청일 미확인'} · {status}"
+
+
+def _render_result_fields(row: dict[str, Any]) -> None:
+    import streamlit as st
+
+    left, middle, right = st.columns(3)
+    left.text_input(
+        "관리 홈페이지 주소",
+        value=str(row.get("management_homepage_url") or ""),
+        disabled=True,
+        key=f"claim_result_management_{row.get('id')}",
+    )
+    middle.text_input(
+        "영업코드",
+        value=str(row.get("sales_code") or ""),
+        disabled=True,
+        key=f"claim_result_code_{row.get('id')}",
+    )
+    right.text_input(
+        "영업용 홈페이지 주소",
+        value=str(row.get("sales_homepage_url") or ""),
+        disabled=True,
+        key=f"claim_result_sales_{row.get('id')}",
+    )
+
+
+def _render_application_result(current_user_id: str) -> None:
+    import streamlit as st
+    from auth import is_admin
+
+    repository = ClaimSalesApplicationRepository()
+    admin_user = bool(is_admin(current_user_id))
+    try:
+        rows = (
+            repository.list_for_admin(
+                current_user_id=current_user_id,
+                is_admin_user=True,
+            )
+            if admin_user
+            else repository.list_for_user(current_user_id)
+        )
+    except Exception:
+        st.error("신청결과를 불러오지 못했습니다. 잠시 후 다시 시도해주세요.")
+        return
+    if not rows:
+        st.info("확인할 영업신청이 없습니다.")
+        return
+
+    selected_id = st.selectbox(
+        "신청 건 선택",
+        [str(row.get("id") or "") for row in rows],
+        format_func=lambda value: _application_label(
+            next(row for row in rows if str(row.get("id") or "") == value),
+            include_owner=admin_user,
+        ),
+        key="claim_sales_result_application_v1",
+    )
+    selected = next(
+        row for row in rows if str(row.get("id") or "") == selected_id
+    )
+    if not admin_user:
+        _render_result_fields(selected)
+        if not any(
+            str(selected.get(key) or "").strip()
+            for key in (
+                "management_homepage_url",
+                "sales_code",
+                "sales_homepage_url",
+            )
+        ):
+            st.info("관리자가 신청결과를 준비 중입니다.")
+        return
+
+    st.caption("관리자 전용 입력 화면입니다.")
+    with st.form(f"claim_sales_result_admin_{selected_id}"):
+        management_url = st.text_input(
+            "관리 홈페이지 주소",
+            value=str(selected.get("management_homepage_url") or ""),
+        )
+        sales_code = st.text_input(
+            "영업코드",
+            value=str(selected.get("sales_code") or ""),
+            max_chars=80,
+        )
+        sales_url = st.text_input(
+            "영업용 홈페이지 주소",
+            value=str(selected.get("sales_homepage_url") or ""),
+        )
+        save = st.form_submit_button(
+            "신청결과 저장",
+            type="primary",
+            use_container_width=True,
+        )
+    if not save:
+        return
+    try:
+        repository.save_result(
+            application_id=selected_id,
+            current_user_id=current_user_id,
+            is_admin_user=True,
+            management_homepage_url=management_url,
+            sales_code=sales_code,
+            sales_homepage_url=sales_url,
+        )
+    except ClaimSalesApplicationError as exc:
+        st.error(str(exc))
+    except Exception:
+        st.error("신청결과를 저장하지 못했습니다. 잠시 후 다시 시도해주세요.")
+    else:
+        st.success("신청결과를 저장했습니다.")
+
 
 def render_claim_sales_application(
     current_user_id: str,
@@ -228,7 +440,11 @@ def render_claim_sales_application(
         "목적으로만 수집하며, 원문을 별도 열에 남기지 않고 암호화해 저장합니다."
     )
 
-    with st.form(
+    application_tab, result_tab = st.tabs(["영업신청", "신청결과"])
+    with result_tab:
+        _render_application_result(current_user_id)
+
+    with application_tab, st.form(
         "claim_sales_application_form_v1",
         clear_on_submit=True,
         enter_to_submit=False,

@@ -29,11 +29,29 @@ class FakeDatabase:
     def __init__(self) -> None:
         self.table = ""
         self.rows: list[dict] = []
+        self.selected: list[dict] = []
+        self.select_arguments: dict = {}
+        self.update_arguments: dict = {}
 
     def insert(self, table: str, rows: list[dict]) -> list[dict]:
         self.table = table
         self.rows = rows
         return [{"id": "application-1", **rows[0]}]
+
+    def select(self, table: str, **kwargs) -> list[dict]:
+        self.table = table
+        self.select_arguments = kwargs
+        return self.selected
+
+    def update(
+        self,
+        table: str,
+        filters: dict,
+        values: dict,
+    ) -> list[dict]:
+        self.table = table
+        self.update_arguments = {"filters": filters, "values": values}
+        return [{"id": filters["id"], **values}]
 
 
 class ClaimSalesApplicationTests(unittest.TestCase):
@@ -113,6 +131,112 @@ class ClaimSalesApplicationTests(unittest.TestCase):
             "영업신청 제출",
         ):
             self.assertIn(label, source)
+
+    def test_user_result_query_is_owner_scoped_and_excludes_ciphertext(self):
+        db = FakeDatabase()
+        repository = ClaimSalesApplicationRepository(db=db)
+        repository.list_for_user(" Member@Example.com ")
+
+        self.assertEqual(
+            db.select_arguments["filters"],
+            {"owner_user_id": "member@example.com"},
+        )
+        columns = db.select_arguments["columns"]
+        self.assertIn("management_homepage_url", columns)
+        self.assertIn("sales_code", columns)
+        self.assertIn("sales_homepage_url", columns)
+        self.assertNotIn("secure_payload_ciphertext", columns)
+        self.assertNotIn("owner_user_id", columns)
+
+    def test_non_admin_cannot_list_or_save_results(self):
+        repository = ClaimSalesApplicationRepository(db=FakeDatabase())
+        with self.assertRaises(ClaimSalesApplicationError):
+            repository.list_for_admin(
+                current_user_id="member@example.com",
+                is_admin_user=False,
+            )
+        with self.assertRaises(ClaimSalesApplicationError):
+            repository.save_result(
+                application_id="68c9e4bd-41e3-4c3d-a3ba-2396b886a3a2",
+                current_user_id="member@example.com",
+                is_admin_user=False,
+                management_homepage_url="manage.example.com",
+                sales_code="SALES_01",
+                sales_homepage_url="sales.example.com",
+            )
+
+    def test_admin_can_save_result_with_normalized_urls(self):
+        db = FakeDatabase()
+        repository = ClaimSalesApplicationRepository(db=db)
+        application_id = "68c9e4bd-41e3-4c3d-a3ba-2396b886a3a2"
+        result = repository.save_result(
+            application_id=application_id,
+            current_user_id=" Admin@Example.com ",
+            is_admin_user=True,
+            management_homepage_url="manage.example.com/path",
+            sales_code="SALES_01",
+            sales_homepage_url="https://sales.example.com",
+        )
+
+        self.assertEqual(db.update_arguments["filters"], {"id": application_id})
+        values = db.update_arguments["values"]
+        self.assertEqual(
+            values["management_homepage_url"],
+            "https://manage.example.com/path",
+        )
+        self.assertEqual(values["sales_homepage_url"], "https://sales.example.com")
+        self.assertEqual(values["sales_code"], "SALES_01")
+        self.assertEqual(values["status"], "approved")
+        self.assertEqual(values["reviewed_by_user_id"], "admin@example.com")
+        self.assertTrue(values["reviewed_at"])
+        self.assertEqual(result["id"], application_id)
+
+    def test_result_validation_rejects_invalid_url_and_code(self):
+        repository = ClaimSalesApplicationRepository(db=FakeDatabase())
+        base = {
+            "application_id": "68c9e4bd-41e3-4c3d-a3ba-2396b886a3a2",
+            "current_user_id": "admin@example.com",
+            "is_admin_user": True,
+            "management_homepage_url": "manage.example.com",
+            "sales_code": "SALES_01",
+            "sales_homepage_url": "sales.example.com",
+        }
+        with self.assertRaises(ClaimSalesApplicationError):
+            repository.save_result(**{**base, "sales_code": "공백 코드"})
+        with self.assertRaises(ClaimSalesApplicationError):
+            repository.save_result(
+                **{**base, "management_homepage_url": "https:///missing-host"}
+            )
+
+    def test_ui_has_application_and_result_tabs(self):
+        module_source = (
+            Path(__file__).resolve().parents[1] / "claim_sales_application.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('st.tabs(["영업신청", "신청결과"])', module_source)
+        self.assertIn('from auth import is_admin', module_source)
+        for label in (
+            "관리 홈페이지 주소",
+            "영업코드",
+            "영업용 홈페이지 주소",
+            "신청결과 저장",
+        ):
+            self.assertIn(label, module_source)
+
+    def test_result_migration_adds_only_non_sensitive_result_columns(self):
+        migration = (
+            Path(__file__).resolve().parents[1]
+            / "supabase"
+            / "migrations"
+            / "20260811093421_claim_sales_application_results.sql"
+        ).read_text(encoding="utf-8")
+        for column in (
+            "management_homepage_url",
+            "sales_code",
+            "sales_homepage_url",
+        ):
+            self.assertIn(column, migration)
+        self.assertNotIn("secure_payload_ciphertext", migration)
+        self.assertNotIn("result_updated_by_user_id", migration)
 
 
 if __name__ == "__main__":

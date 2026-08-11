@@ -170,6 +170,32 @@ class CloudDatabase:
         _invalidate_written_rows(table, rows)
         return result
 
+    def update(
+        self,
+        table: str,
+        filters: dict[str, Any],
+        values: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        if not filters or not values:
+            raise ValueError("수정 대상과 값을 확인해주세요.")
+        params = {key: f"eq.{value}" for key, value in filters.items()}
+        response = requests.patch(
+            self._url(table),
+            headers=self.headers,
+            params=params,
+            data=json.dumps(values, ensure_ascii=False, default=str),
+            timeout=self.config.timeout,
+        )
+        if not response.ok:
+            raise RuntimeError(
+                f"{table} 수정 실패 HTTP {response.status_code}: "
+                f"{response.text[:800]}"
+            )
+        result = response.json() if response.text else []
+        rows = result if isinstance(result, list) else []
+        _invalidate_written_rows(table, rows)
+        return rows
+
     def rpc(
         self,
         function_name: str,
