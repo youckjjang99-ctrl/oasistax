@@ -8,6 +8,7 @@ from io import BytesIO
 from pathlib import Path
 import re
 import secrets
+import textwrap
 import time
 from zoneinfo import ZoneInfo
 
@@ -5079,22 +5080,24 @@ def _render_db_request_status_dashboard(metrics: dict) -> None:
         individual_count = max(0, int(metrics.get(individual_key) or 0))
         corporate_count = max(0, int(metrics.get(corporate_key) or 0))
         card_html.append(
-            f"""
-            <section class="oasis-db-status-card" aria-label="{label}">
-                <div class="oasis-db-status-title">{label}</div>
-                <div class="oasis-db-status-total">{total_count:,}<span>개</span></div>
-                <div class="oasis-db-status-breakdown">
-                    <div>
-                        <span>개인사업자 후보</span>
-                        <strong>{individual_count:,}개</strong>
+            textwrap.dedent(
+                f"""\
+                <section class="oasis-db-status-card" aria-label="{label}">
+                    <div class="oasis-db-status-title">{label}</div>
+                    <div class="oasis-db-status-total">{total_count:,}<span>개</span></div>
+                    <div class="oasis-db-status-breakdown">
+                        <div>
+                            <span>개인사업자 후보</span>
+                            <strong>{individual_count:,}개</strong>
+                        </div>
+                        <div>
+                            <span>법인사업자</span>
+                            <strong>{corporate_count:,}개</strong>
+                        </div>
                     </div>
-                    <div>
-                        <span>법인사업자</span>
-                        <strong>{corporate_count:,}개</strong>
-                    </div>
-                </div>
-            </section>
-            """
+                </section>
+                """
+            )
         )
     st.markdown("### DB 현황")
     st.caption(
@@ -5102,8 +5105,9 @@ def _render_db_request_status_dashboard(metrics: dict) -> None:
         "핸드폰번호를 모두 가진 업체는 두 전화번호 카드에 각각 포함됩니다."
     )
     st.markdown(
-        """
-        <style>
+        textwrap.dedent(
+            """\
+            <style>
         .oasis-db-status-grid {
             display: grid;
             grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -5166,7 +5170,8 @@ def _render_db_request_status_dashboard(metrics: dict) -> None:
         }
         </style>
         <div class="oasis-db-status-grid">
-        """
+            """
+        ).lstrip()
         + "".join(card_html)
         + "</div>",
         unsafe_allow_html=True,

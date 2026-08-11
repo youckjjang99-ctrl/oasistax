@@ -115,3 +115,29 @@ def test_request_screen_places_responsive_global_dashboard_above_request_form():
     assert "현재 나에게 활성 배정된 DB" not in renderer_source
     assert "@media (max-width: 760px)" in renderer_source
     assert "grid-template-columns: 1fr" in renderer_source
+
+
+def test_inventory_dashboard_html_is_not_emitted_as_a_markdown_code_block(
+    monkeypatch,
+):
+    rendered = []
+    monkeypatch.setattr(prospect.st, "caption", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        prospect.st,
+        "markdown",
+        lambda body, **kwargs: rendered.append((body, kwargs)),
+    )
+
+    prospect._render_db_request_status_dashboard(
+        {
+            "total_db_count": 10,
+            "total_individual_count": 7,
+            "total_corporate_count": 3,
+        }
+    )
+
+    html, kwargs = rendered[-1]
+    assert html.startswith("<style>")
+    assert '<section class="oasis-db-status-card"' in html
+    assert "\n    <section" not in html
+    assert kwargs["unsafe_allow_html"] is True
