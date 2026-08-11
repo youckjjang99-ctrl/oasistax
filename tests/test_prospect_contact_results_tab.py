@@ -248,11 +248,9 @@ class ProspectContactResultsTabTests(unittest.TestCase):
             '"반납사유"',
             "st.data_editor(",
             '"선택": st.column_config.CheckboxColumn(',
-            "_RETURN_DB_ADMIN_SELECTION_KEY",
-            "_RETURN_DB_ADMIN_ROW_SIGNATURE_KEY",
             '"선택": False',
-            "on_change=_sync_result_editor_selection",
-            "set()",
+            "edited_review_frame",
+            "selected_company_uids",
             "재배정 허용",
             "영구 제외",
             "sales_assignments.admin_review_returned_batch(",
@@ -261,6 +259,23 @@ class ProspectContactResultsTabTests(unittest.TestCase):
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, source)
+
+    def test_return_db_admin_batches_checkbox_changes_until_submit(self):
+        source = inspect.getsource(prospect._render_return_db_admin)
+
+        form_at = source.index(
+            'with st.form(\n        "return_db_admin_review_form_v1180"'
+        )
+        editor_at = source.index("edited_review_frame = st.data_editor(")
+        submit_at = source.index("review_submitted = st.form_submit_button(")
+        selected_at = source.index("selected_company_uids = [")
+
+        self.assertLess(form_at, editor_at)
+        self.assertLess(editor_at, submit_at)
+        self.assertLess(submit_at, selected_at)
+        self.assertIn("clear_on_submit=False", source)
+        self.assertIn("enter_to_submit=False", source)
+        self.assertNotIn("on_change=", source)
 
     def test_contact_save_success_forces_fresh_assignment_and_history_queries(self):
         source = inspect.getsource(prospect._render_contact_results)

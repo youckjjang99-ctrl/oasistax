@@ -161,12 +161,7 @@ _SAVED_PROSPECT_RESET_SELECTION_KEY = (
     "_saved_prospect_reset_selection_v1140"
 )
 _RETURN_DB_ADMIN_FLASH_KEY = "_return_db_admin_flash_v1070"
-_RETURN_DB_ADMIN_TABLE_KEY = "return_db_admin_table_v1150"
-_RETURN_DB_ADMIN_SELECTION_KEY = "_return_db_admin_selection_v1160"
-_RETURN_DB_ADMIN_EDITOR_GENERATION_KEY = (
-    "_return_db_admin_editor_generation_v1160"
-)
-_RETURN_DB_ADMIN_ROW_SIGNATURE_KEY = "_return_db_admin_row_signature_v1170"
+_RETURN_DB_ADMIN_TABLE_KEY = "return_db_admin_table_v1180"
 _MOBILE_DB_ADMIN_SELECTION_KEY = "mobile_db_admin_request_v1090"
 _SAVED_DB_DASHBOARD_FILTER_KEY = "saved_db_dashboard_filter_v1100"
 _SAVED_DB_DASHBOARD_PAGE_KEY = "saved_db_dashboard_page_v1100"
@@ -4652,7 +4647,6 @@ def _render_return_db_admin(current_user_id: str) -> None:
         audit_rows,
     )
     if not review_rows:
-        st.session_state[_RETURN_DB_ADMIN_SELECTION_KEY] = []
         st.success("관리자가 검토할 반납 DB가 없습니다.")
         return
 
@@ -4664,34 +4658,6 @@ def _render_return_db_admin(current_user_id: str) -> None:
     if len(available_review_uids) != len(review_uids):
         st.error("반납 DB 목록의 업체 식별정보를 확인할 수 없습니다.")
         return
-    editor_generation = int(
-        st.session_state.get(_RETURN_DB_ADMIN_EDITOR_GENERATION_KEY, 0) or 0
-    )
-    previous_row_signature = tuple(
-        str(uid)
-        for uid in st.session_state.get(
-            _RETURN_DB_ADMIN_ROW_SIGNATURE_KEY,
-            [],
-        )
-    )
-    current_row_signature = tuple(review_uids)
-    if previous_row_signature != current_row_signature:
-        st.session_state[_RETURN_DB_ADMIN_SELECTION_KEY] = []
-        editor_generation += 1
-        st.session_state[_RETURN_DB_ADMIN_EDITOR_GENERATION_KEY] = (
-            editor_generation
-        )
-        st.session_state[_RETURN_DB_ADMIN_ROW_SIGNATURE_KEY] = list(
-            current_row_signature
-        )
-    selected_uid_set = {
-        str(uid)
-        for uid in st.session_state.get(_RETURN_DB_ADMIN_SELECTION_KEY, [])
-        if str(uid) in available_review_uids
-    }
-    st.session_state[_RETURN_DB_ADMIN_SELECTION_KEY] = sorted(
-        selected_uid_set
-    )
     review_frame = pd.DataFrame(
         [
             {
@@ -4710,52 +4676,40 @@ def _render_return_db_admin(current_user_id: str) -> None:
         review_uids,
         name="company_uid",
     )
-    editor_key = f"{_RETURN_DB_ADMIN_TABLE_KEY}_{editor_generation}"
-    st.data_editor(
-        review_frame,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "선택": st.column_config.CheckboxColumn(
-                "선택",
-                width="small",
-                help="동시에 처리할 반납 DB를 선택합니다.",
-            ),
-            "업체명": st.column_config.TextColumn(width="medium"),
-            "반납 담당자": st.column_config.TextColumn(width="small"),
-            "반납사유": st.column_config.TextColumn(width="large"),
-            "반납일시": st.column_config.TextColumn(width="small"),
-            "현재상태": st.column_config.TextColumn(width="small"),
-        },
-        disabled=[
-            "업체명",
-            "반납 담당자",
-            "반납사유",
-            "반납일시",
-            "현재상태",
-        ],
-        key=editor_key,
-        on_change=_sync_result_editor_selection,
-        args=(
-            editor_key,
-            _RETURN_DB_ADMIN_SELECTION_KEY,
-            review_uids,
-            set(),
-        ),
+    st.caption(
+        "업체를 여러 개 체크한 뒤 아래의 일괄 처리 버튼을 눌러 주세요. "
+        "체크하는 동안에는 화면을 다시 불러오지 않습니다."
     )
-    selected_uid_set = {
-        str(uid)
-        for uid in st.session_state.get(_RETURN_DB_ADMIN_SELECTION_KEY, [])
-        if str(uid) in available_review_uids
-    }
-    selected_returns = [
-        row
-        for uid, row in zip(review_uids, review_rows)
-        if uid in selected_uid_set
-    ]
-    st.caption(f"선택한 반납 DB: {len(selected_returns):,}개")
-
-    with st.form("return_db_admin_review_form_v1150"):
+    with st.form(
+        "return_db_admin_review_form_v1180",
+        clear_on_submit=False,
+        enter_to_submit=False,
+    ):
+        edited_review_frame = st.data_editor(
+            review_frame,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "선택": st.column_config.CheckboxColumn(
+                    "선택",
+                    width="small",
+                    help="동시에 처리할 반납 DB를 선택합니다.",
+                ),
+                "업체명": st.column_config.TextColumn(width="medium"),
+                "반납 담당자": st.column_config.TextColumn(width="small"),
+                "반납사유": st.column_config.TextColumn(width="large"),
+                "반납일시": st.column_config.TextColumn(width="small"),
+                "현재상태": st.column_config.TextColumn(width="small"),
+            },
+            disabled=[
+                "업체명",
+                "반납 담당자",
+                "반납사유",
+                "반납일시",
+                "현재상태",
+            ],
+            key=_RETURN_DB_ADMIN_TABLE_KEY,
+        )
         review_action = st.radio(
             "검토 결과",
             ["재배정 허용", "영구 제외"],
@@ -4767,17 +4721,25 @@ def _render_return_db_admin(current_user_id: str) -> None:
             placeholder="검토 결과와 판단 근거를 입력해 주세요.",
         )
         permanent_confirm = st.checkbox(
-            "영구 제외 시 이 업체를 향후 배정 대상에서 제외하는 데 동의합니다.",
-            disabled=review_action != "영구 제외",
+            "영구 제외를 선택한 경우, 향후 배정 대상에서 제외하는 데 동의합니다.",
         )
         review_submitted = st.form_submit_button(
-            f"선택 {len(selected_returns):,}개 일괄 처리",
+            "선택 업체 일괄 처리",
             type="primary",
             use_container_width=True,
-            disabled=not selected_returns,
         )
 
     if not review_submitted:
+        return
+    selected_company_uids = [
+        str(company_uid)
+        for company_uid, selected in edited_review_frame["선택"]
+        .fillna(False)
+        .items()
+        if bool(selected) and str(company_uid) in available_review_uids
+    ]
+    if not selected_company_uids:
+        st.error("처리할 반납 DB를 한 개 이상 체크해 주세요.")
         return
     if not review_reason.strip():
         st.error("검토 사유를 입력해 주세요.")
@@ -4786,14 +4748,8 @@ def _render_return_db_admin(current_user_id: str) -> None:
         st.error("영구 제외 확인 항목을 체크해 주세요.")
         return
 
-    company_uids = list(
-        dict.fromkeys(
-            str(row.get("company_uid") or "").strip()
-            for row in selected_returns
-            if str(row.get("company_uid") or "").strip()
-        )
-    )
-    if len(company_uids) != len(selected_returns):
+    company_uids = list(dict.fromkeys(selected_company_uids))
+    if len(company_uids) != len(selected_company_uids):
         st.error("선택한 업체의 식별정보를 확인할 수 없습니다.")
         return
     action_code = (
@@ -4816,10 +4772,6 @@ def _render_return_db_admin(current_user_id: str) -> None:
                 f"{review_action} 처리했습니다."
             ),
         }
-        st.session_state[_RETURN_DB_ADMIN_SELECTION_KEY] = []
-        st.session_state[_RETURN_DB_ADMIN_EDITOR_GENERATION_KEY] = (
-            editor_generation + 1
-        )
         st.rerun()
     else:
         st.error(
