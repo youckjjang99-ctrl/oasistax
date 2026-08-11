@@ -3745,10 +3745,6 @@ def _render_clean_saved_prospects(
     _show_outreach_result_notice()
     assignment_mode = False
     selected_filter = _saved_db_dashboard_filter()
-    selected_label = SAVED_DB_DASHBOARD_FILTER_LABELS.get(
-        selected_filter,
-        "총 DB 수량",
-    )
     total_count = 0
     page_index = 0
     try:
@@ -3756,16 +3752,6 @@ def _render_clean_saved_prospects(
         if dashboard_result.get("ok"):
             metrics = dict(dashboard_result.get("metrics") or {})
             _render_saved_db_dashboard(metrics, selected_filter)
-            filter_row, reset_row = st.columns([4, 1])
-            filter_row.info(f"현재 목록: {selected_label}")
-            if selected_filter != "all":
-                reset_row.button(
-                    "전체 보기",
-                    key="saved_db_dashboard_reset_v1100",
-                    use_container_width=True,
-                    on_click=_select_saved_db_dashboard_filter,
-                    args=("all",),
-                )
             page_index = max(
                 0,
                 int(st.session_state.get(_SAVED_DB_DASHBOARD_PAGE_KEY, 0) or 0),
