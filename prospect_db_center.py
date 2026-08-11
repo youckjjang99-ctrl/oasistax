@@ -4772,7 +4772,7 @@ def _render_return_db_admin(current_user_id: str) -> None:
                 f"{review_action} 처리했습니다."
             ),
         }
-        st.rerun()
+        st.rerun(scope="fragment")
     else:
         st.error(
             action_result.get("message")

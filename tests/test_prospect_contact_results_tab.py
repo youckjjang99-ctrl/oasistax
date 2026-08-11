@@ -276,6 +276,8 @@ class ProspectContactResultsTabTests(unittest.TestCase):
         self.assertIn("clear_on_submit=False", source)
         self.assertIn("enter_to_submit=False", source)
         self.assertNotIn("on_change=", source)
+        self.assertIn('st.rerun(scope="fragment")', source)
+        self.assertNotIn("st.rerun()", source)
 
     def test_mobile_db_admin_only_lists_unprocessed_requests(self):
         source = inspect.getsource(prospect._render_mobile_db_admin)
