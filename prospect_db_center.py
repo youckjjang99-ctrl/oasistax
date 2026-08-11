@@ -5041,7 +5041,149 @@ def _available_allocation_candidates(
     return available, str(availability.get("warning") or "")
 
 
+def _load_assignable_db_inventory_dashboard(owner_user_id: str) -> dict:
+    ready, ready_message = _assignment_feature_status()
+    if not ready:
+        return {
+            "ok": False,
+            "message": ready_message,
+            "metrics": {},
+        }
+    return sales_assignments.get_assignable_db_inventory_dashboard(owner_user_id)
+
+
+def _render_db_request_status_dashboard(metrics: dict) -> None:
+    cards = (
+        (
+            "총 배정가능 DB",
+            "total_db_count",
+            "total_individual_count",
+            "total_corporate_count",
+        ),
+        (
+            "일반전화 DB",
+            "landline_db_count",
+            "landline_individual_count",
+            "landline_corporate_count",
+        ),
+        (
+            "핸드폰번호 DB",
+            "mobile_db_count",
+            "mobile_individual_count",
+            "mobile_corporate_count",
+        ),
+    )
+    card_html = []
+    for label, total_key, individual_key, corporate_key in cards:
+        total_count = max(0, int(metrics.get(total_key) or 0))
+        individual_count = max(0, int(metrics.get(individual_key) or 0))
+        corporate_count = max(0, int(metrics.get(corporate_key) or 0))
+        card_html.append(
+            f"""
+            <section class="oasis-db-status-card" aria-label="{label}">
+                <div class="oasis-db-status-title">{label}</div>
+                <div class="oasis-db-status-total">{total_count:,}<span>개</span></div>
+                <div class="oasis-db-status-breakdown">
+                    <div>
+                        <span>개인사업자 후보</span>
+                        <strong>{individual_count:,}개</strong>
+                    </div>
+                    <div>
+                        <span>법인사업자</span>
+                        <strong>{corporate_count:,}개</strong>
+                    </div>
+                </div>
+            </section>
+            """
+        )
+    st.markdown("### DB 현황")
+    st.caption(
+        "모든 조직에 공통으로 표시되는 현재 배정 가능 DB 재고입니다. 일반전화와 "
+        "핸드폰번호를 모두 가진 업체는 두 전화번호 카드에 각각 포함됩니다."
+    )
+    st.markdown(
+        """
+        <style>
+        .oasis-db-status-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 0.8rem;
+            margin: 0.35rem 0 1.4rem;
+        }
+        .oasis-db-status-card {
+            border: 1px solid #cbd8ee;
+            border-radius: 14px;
+            background: #ffffff;
+            padding: 1rem 1.05rem 0.9rem;
+            min-width: 0;
+            box-shadow: 0 4px 14px rgba(27, 75, 145, 0.06);
+        }
+        .oasis-db-status-title {
+            color: #274367;
+            font-size: 0.94rem;
+            font-weight: 700;
+        }
+        .oasis-db-status-total {
+            color: #0f4fb7;
+            font-size: 1.85rem;
+            font-weight: 800;
+            line-height: 1.25;
+            margin: 0.18rem 0 0.8rem;
+        }
+        .oasis-db-status-total span {
+            font-size: 0.9rem;
+            font-weight: 700;
+            margin-left: 0.15rem;
+        }
+        .oasis-db-status-breakdown {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 0.45rem;
+            border-top: 1px solid #e7edf6;
+            padding-top: 0.7rem;
+        }
+        .oasis-db-status-breakdown div {
+            min-width: 0;
+        }
+        .oasis-db-status-breakdown span,
+        .oasis-db-status-breakdown strong {
+            display: block;
+        }
+        .oasis-db-status-breakdown span {
+            color: #6b7890;
+            font-size: 0.76rem;
+            line-height: 1.3;
+        }
+        .oasis-db-status-breakdown strong {
+            color: #233a5b;
+            font-size: 0.9rem;
+            margin-top: 0.16rem;
+        }
+        @media (max-width: 760px) {
+            .oasis-db-status-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        </style>
+        <div class="oasis-db-status-grid">
+        """
+        + "".join(card_html)
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def _render_db_request_home(owner_user_id: str) -> None:
+    dashboard_result = _load_assignable_db_inventory_dashboard(owner_user_id)
+    if dashboard_result.get("ok"):
+        _render_db_request_status_dashboard(
+            dict(dashboard_result.get("metrics") or {})
+        )
+    else:
+        st.warning(
+            dashboard_result.get("message")
+            or "DB 현황을 불러오지 못했습니다. 잠시 후 다시 시도해 주세요."
+        )
     st.markdown("### DB 신청")
     st.caption(
         "지역·사업자 유형·고용인원을 선택해 주세요. 일반번호 DB는 무작위로 즉시 "

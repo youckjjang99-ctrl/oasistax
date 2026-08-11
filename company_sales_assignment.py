@@ -18,6 +18,9 @@ RPC_CLAIM_SAVE_PROMOTE_CONTACTS = (
 )
 RPC_LIST_USER = "oasis_list_user_company_assignments"
 RPC_GET_USER_DB_DASHBOARD = "oasis_get_user_db_dashboard"
+RPC_GET_ASSIGNABLE_DB_INVENTORY_DASHBOARD = (
+    "oasis_get_assignable_db_inventory_dashboard"
+)
 RPC_LIST_USER_DB_ASSIGNMENTS = "oasis_list_user_db_assignments"
 RPC_FILTER_BLOCKED = "oasis_filter_blocked_company_uids"
 RPC_RESOLVE_CANDIDATE_UIDS = "oasis_resolve_candidate_company_uids"
@@ -224,6 +227,17 @@ _USER_DB_DASHBOARD_FIELDS = {
     "new_db_count",
     "in_progress_db_count",
     "completed_db_count",
+}
+_ASSIGNABLE_DB_INVENTORY_DASHBOARD_FIELDS = {
+    "total_db_count",
+    "landline_db_count",
+    "mobile_db_count",
+    "total_individual_count",
+    "total_corporate_count",
+    "landline_individual_count",
+    "landline_corporate_count",
+    "mobile_individual_count",
+    "mobile_corporate_count",
 }
 _USER_DB_FILTERS = {
     "all",
@@ -1012,6 +1026,48 @@ def get_user_db_dashboard(
         "ok": True,
         "code": "OK",
         "message": "내 DB 현황을 불러왔습니다.",
+        "assignment": {},
+        "metrics": metrics,
+        "warning": "",
+        "fallback_required": False,
+    }
+
+
+def get_assignable_db_inventory_dashboard(
+    current_user_id: str,
+    *,
+    db: CloudDatabase | None = None,
+) -> dict[str, Any]:
+    """Return count-only, organization-wide assignable DB inventory metrics."""
+
+    raw, error = _rpc(
+        RPC_GET_ASSIGNABLE_DB_INVENTORY_DASHBOARD,
+        {"p_current_user_id": _user_id(current_user_id)},
+        db=db,
+    )
+    if error:
+        return {**error, "metrics": {}}
+    row = _first_row(raw)
+    if row is None:
+        return {
+            "ok": False,
+            "code": "MALFORMED_RESPONSE",
+            "message": _FAILURE_MESSAGES["MALFORMED_RESPONSE"],
+            "assignment": {},
+            "metrics": {},
+            "warning": _FAILURE_MESSAGES["MALFORMED_RESPONSE"],
+            "fallback_required": False,
+        }
+    metrics: dict[str, int] = {}
+    for field in _ASSIGNABLE_DB_INVENTORY_DASHBOARD_FIELDS:
+        try:
+            metrics[field] = max(0, int(row.get(field) or 0))
+        except (TypeError, ValueError):
+            metrics[field] = 0
+    return {
+        "ok": True,
+        "code": "OK",
+        "message": "DB 현황을 불러왔습니다.",
         "assignment": {},
         "metrics": metrics,
         "warning": "",
@@ -2251,6 +2307,7 @@ __all__ = [
     "filter_company_availability",
     "get_user_limits",
     "get_user_db_dashboard",
+    "get_assignable_db_inventory_dashboard",
     "list_admin_assignments",
     "list_admin_assignment_metrics",
     "list_admin_assignment_audit",
