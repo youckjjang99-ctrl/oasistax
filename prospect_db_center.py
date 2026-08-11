@@ -4600,6 +4600,7 @@ def _return_db_review_rows(
     return review_rows
 
 
+@st.fragment
 def _render_return_db_admin(current_user_id: str) -> None:
     """Render the administrator-only queue for user-returned assignments."""
 

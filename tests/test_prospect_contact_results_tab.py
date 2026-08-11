@@ -240,6 +240,7 @@ class ProspectContactResultsTabTests(unittest.TestCase):
         source = inspect.getsource(prospect._render_return_db_admin)
 
         for marker in (
+            "@st.fragment",
             "from auth import is_admin",
             "관리자만 반납 DB를 확인할 수 있습니다.",
             'statuses=["long_hold"]',
