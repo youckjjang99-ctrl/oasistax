@@ -24,7 +24,7 @@ def test_contact_activity_rows_are_newest_first_in_korea_time() -> None:
         ]
     )
 
-    assert [row["메모·상담내용"] for row in rows] == [
+    assert [row["상담내용"] for row in rows] == [
         "후속 상담 기록",
         "첫 번째 기록",
     ]
@@ -50,7 +50,7 @@ def test_contact_activity_rows_keep_blank_details_readable() -> None:
             "일시 (KST)": "2026.08.05 09:00",
             "연락방식": "문자",
             "연락결과": "발송",
-            "메모·상담내용": "-",
+            "상담내용": "-",
             "다음 연락예정일": "-",
         }
     ]
@@ -72,4 +72,5 @@ def test_company_selection_shows_timeline_before_blank_entry_form() -> None:
     assert source.count("sales_assignments.list_company_contacts(") == 2
     assert "최신순" in source
     assert "일시 (KST)" in source
-    assert "메모·상담내용" in source
+    assert "상담내용" in source
+    assert "메모·상담내용" not in source

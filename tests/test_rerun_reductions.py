@@ -91,11 +91,10 @@ class RerunReductionTests(unittest.TestCase):
         expected_counts = {
             "app.py": 1,  # workbook-backed customer edit refresh
             "enterprise_center.py": 0,
-            # Three existing data refreshes, two intentional free-form
-            # outreach exits, three integrated company-management refreshes
-            # after a memo save, contact record, or assignment return, and
-            # one administrator return-review result refresh.
-            "prospect_db_center.py": 9,
+            # Saved-result and enrichment refreshes, two intentional
+            # outreach exits, contact record and assignment-return refreshes,
+            # and one administrator return-review result refresh.
+            "prospect_db_center.py": 7,
             # Auth refresh, two soft-delete dialog exits, and the existing
             # dialog close.  These are user actions, not polling reruns.
             "claim_correction_center.py": 4,

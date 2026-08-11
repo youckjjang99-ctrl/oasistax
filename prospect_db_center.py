@@ -153,7 +153,7 @@ _OUTREACH_REQUEST_KEY = "_saved_prospect_outreach_request_v1040"
 _OUTREACH_RESULT_KEY = "_saved_prospect_outreach_result_v1040"
 _OUTREACH_ATTEMPTS_KEY = "_saved_prospect_outreach_attempts_v1040"
 _CONTACT_RESULTS_FLASH_KEY = "_contact_results_flash_v1050"
-_CONTACT_RESULTS_SELECTION_KEY = "contact_results_assignment_v1050"
+_CONTACT_RESULTS_SELECTION_KEY = "contact_results_assignment_table_v1120"
 _CONTACT_RESULTS_RESET_SELECTION_KEY = "_contact_results_reset_selection_v1050"
 _RETURN_DB_ADMIN_FLASH_KEY = "_return_db_admin_flash_v1070"
 _RETURN_DB_ADMIN_SELECTION_KEY = "return_db_admin_assignment_v1070"
@@ -3487,6 +3487,7 @@ def _select_saved_db_dashboard_filter(filter_key: str) -> None:
         selected = "all"
     st.session_state[_SAVED_DB_DASHBOARD_FILTER_KEY] = selected
     st.session_state[_SAVED_DB_DASHBOARD_PAGE_KEY] = 0
+    st.session_state.pop(_CONTACT_RESULTS_SELECTION_KEY, None)
 
 
 def _set_saved_db_dashboard_page(page_index: int) -> None:
@@ -3494,6 +3495,7 @@ def _set_saved_db_dashboard_page(page_index: int) -> None:
         0,
         int(page_index),
     )
+    st.session_state.pop(_CONTACT_RESULTS_SELECTION_KEY, None)
 
 
 def _load_user_db_dashboard(owner_user_id: str) -> dict:
@@ -3640,6 +3642,10 @@ def _render_clean_saved_prospects(
     _show_outreach_result_notice()
     assignment_mode = False
     selected_filter = _saved_db_dashboard_filter()
+    selected_label = SAVED_DB_DASHBOARD_FILTER_LABELS.get(
+        selected_filter,
+        "총 DB 수량",
+    )
     total_count = 0
     page_index = 0
     try:
@@ -3647,10 +3653,6 @@ def _render_clean_saved_prospects(
         if dashboard_result.get("ok"):
             metrics = dict(dashboard_result.get("metrics") or {})
             _render_saved_db_dashboard(metrics, selected_filter)
-            selected_label = SAVED_DB_DASHBOARD_FILTER_LABELS.get(
-                selected_filter,
-                "총 DB 수량",
-            )
             filter_row, reset_row = st.columns([4, 1])
             filter_row.info(f"현재 목록: {selected_label}")
             if selected_filter != "all":
@@ -3882,66 +3884,18 @@ def _render_clean_saved_prospects(
             can_view_mobile=can_view_mobile,
         )
 
-    with st.expander("업체 메모·연락결과 관리", expanded=False):
+    with st.expander("업체 연락결과 관리", expanded=False):
         if assignment_mode:
             _render_contact_results(
                 owner_user_id,
                 can_view_mobile=can_view_mobile,
                 embedded=True,
+                assignment_rows=rows,
+                active_filter_label=selected_label,
             )
             return
 
-        st.caption(
-            "기존 저장 업체는 메모를 관리할 수 있습니다. 연락결과 기록은 "
-            "활성 배정 업체에 적용됩니다."
-        )
-        memo_rows = {
-            (
-                f"{row.get('업체명', '')} · "
-                f"{str(row.get('_company_uid') or row.get('_prospect_id') or '')[-10:]}"
-            ): row
-            for row in frame.to_dict("records")
-        }
-        memo_label = st.selectbox(
-            "메모를 관리할 업체",
-            list(memo_rows),
-            key="saved_prospect_memo_company_v1040",
-        )
-        memo_row = memo_rows.get(memo_label, {})
-        with st.form("saved_prospect_memo_form_v1040"):
-            memo_value = st.text_area(
-                "업체 메모",
-                value=str(memo_row.get("메모") or ""),
-                max_chars=10_000,
-                placeholder="담당자·통화 결과·다음 조치 등을 기록해 주세요.",
-            )
-            memo_submitted = st.form_submit_button(
-                "메모 저장",
-                use_container_width=True,
-            )
-        if memo_submitted:
-            try:
-                memo_prospect_id = str(memo_row.get("_prospect_id") or "")
-                memo_company_uid = str(memo_row.get("_company_uid") or "")
-                if assignment_mode and memo_company_uid:
-                    memo_result = sales_assignments.save_user_note(
-                        owner_user_id,
-                        memo_company_uid,
-                        memo_value,
-                        company_id=memo_prospect_id,
-                    )
-                    if not memo_result.get("ok"):
-                        raise RuntimeError("memo save failed")
-                else:
-                    save_prospect_memo(
-                        memo_prospect_id,
-                        memo_value,
-                        owner_user_id,
-                    )
-                st.success("업체 메모를 저장했습니다.")
-                st.rerun()
-            except Exception:
-                st.error("메모를 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.")
+        st.info("연락결과 관리는 활성 배정 업체에 적용됩니다.")
 
 
 def _activity_datetime(value: object) -> datetime | None:
@@ -3992,7 +3946,7 @@ def _contact_activity_rows(contacts: list[dict]) -> list[dict]:
             ),
             "연락방식": str(row.get("contact_method") or "-"),
             "연락결과": _contact_result_label(row.get("contact_result")),
-            "메모·상담내용": str(row.get("notes") or "").strip() or "-",
+            "상담내용": str(row.get("notes") or "").strip() or "-",
             "다음 연락예정일": _format_activity_time(
                 row.get("next_contact_at")
             ),
@@ -4082,16 +4036,61 @@ def _contact_progress_label(
     return sales_assignments.assignment_status_label(status)
 
 
+def _contact_assignment_selection_rows(
+    assignments: list[dict],
+    latest_contact_by_uid: dict[str, dict],
+    *,
+    can_view_mobile: bool,
+) -> list[dict]:
+    """Build aligned, permission-safe rows for the company selector."""
+
+    selection_rows: list[dict] = []
+    for assignment in assignments:
+        assignment_id = str(assignment.get("_assignment_id") or "")
+        company_uid = str(assignment.get("company_uid") or "")
+        if not assignment_id or not company_uid:
+            continue
+        source_data = (
+            assignment.get("source_data")
+            if isinstance(assignment.get("source_data"), dict)
+            else {}
+        )
+        selection_rows.append(
+            {
+                "_assignment_id": assignment_id,
+                "업체명": str(
+                    assignment.get("company_name") or "업체명 미확인"
+                ),
+                "기업유형": DISCOVERY_TYPE_LABELS.get(
+                    str(source_data.get("discovery_type") or "unknown"),
+                    "분류 확인 중",
+                ),
+                "연락현황": _contact_progress_label(
+                    assignment,
+                    latest_contact_by_uid.get(company_uid),
+                ),
+                "연락처": _assignment_contact_phone(
+                    assignment,
+                    can_view_mobile=can_view_mobile,
+                )
+                or "연락처 없음",
+            }
+        )
+    return selection_rows
+
+
 def _render_contact_results(
     owner_user_id: str,
     *,
     can_view_mobile: bool = False,
     embedded: bool = False,
+    assignment_rows: list[dict] | None = None,
+    active_filter_label: str = "",
 ) -> None:
     """Render contact management for the signed-in user's assignments only."""
 
     st.markdown(
-        "#### 업체 메모·연락결과" if embedded else "### 연락결과 기록"
+        "#### 업체 연락결과" if embedded else "### 연락결과 기록"
     )
     st.caption(
         "통화·이메일·문자·카카오톡·상담 결과를 저장하면 담당자가 "
@@ -4105,22 +4104,31 @@ def _render_contact_results(
             level = str(pending_notice.get("level") or "info").strip().lower()
             getattr(st, level, st.info)(message)
 
-    try:
-        assignment_result = _load_user_assignment_rows(owner_user_id)
-    except Exception as exc:
-        st.warning(safe_public_error(exc, "영업후보를 불러오지 못했습니다."))
-        return
-    if not assignment_result.get("ok"):
-        st.warning(
-            assignment_result.get("message")
-            or "연락결과 관리 기능을 준비하지 못했습니다."
-        )
-        return
-
-    rows = list(assignment_result.get("rows") or [])
+    if assignment_rows is None:
+        try:
+            assignment_result = _load_user_assignment_rows(owner_user_id)
+        except Exception as exc:
+            st.warning(
+                safe_public_error(exc, "영업후보를 불러오지 못했습니다.")
+            )
+            return
+        if not assignment_result.get("ok"):
+            st.warning(
+                assignment_result.get("message")
+                or "연락결과 관리 기능을 준비하지 못했습니다."
+            )
+            return
+        rows = list(assignment_result.get("rows") or [])
+    else:
+        rows = list(assignment_rows)
     if not rows:
         st.info("연락결과를 기록할 저장·배정 영업후보가 없습니다.")
         return
+    if active_filter_label:
+        st.info(
+            f"현재 대시보드 조건: {active_filter_label} · "
+            "아래 업체 목록에도 같은 조건이 적용됩니다."
+        )
 
     latest_contacts_result = sales_assignments.list_company_contacts(
         owner_user_id,
@@ -4136,131 +4144,60 @@ def _render_contact_results(
         )
 
     assignments_by_id: dict[str, dict] = {}
-    assignment_labels: dict[str, str] = {}
     for row in rows:
         assignment_id = str(row.get("_assignment_id") or "")
         company_uid = str(row.get("company_uid") or "")
         if not assignment_id or not company_uid:
             continue
         assignments_by_id[assignment_id] = row
-        company_name = str(row.get("company_name") or "업체명 미확인")
-        progress_label = _contact_progress_label(
-            row,
-            latest_contact_by_uid.get(company_uid),
-        )
-        contact_phone = _assignment_contact_phone(
-            row,
-            can_view_mobile=can_view_mobile,
-        )
-        source_data = (
-            row.get("source_data")
-            if isinstance(row.get("source_data"), dict)
-            else {}
-        )
-        discovery_label = DISCOVERY_TYPE_LABELS.get(
-            str(source_data.get("discovery_type") or "unknown"),
-            "분류 확인 중",
-        )
-        assignment_labels[assignment_id] = (
-            f"{company_name} · {discovery_label} · {progress_label} · "
-            f"{contact_phone or '연락처 없음'} · {assignment_id[-8:]}"
-        )
     if not assignments_by_id:
         st.info("연락결과를 기록할 저장·배정 영업후보가 없습니다.")
         return
 
     if st.session_state.pop(_CONTACT_RESULTS_RESET_SELECTION_KEY, False):
         st.session_state.pop(_CONTACT_RESULTS_SELECTION_KEY, None)
-    selection_col, return_col = st.columns(
-        [10, 1.4],
-        vertical_alignment="bottom",
+    selection_rows = _contact_assignment_selection_rows(
+        rows,
+        latest_contact_by_uid,
+        can_view_mobile=can_view_mobile,
     )
-    with selection_col:
-        selected_assignment_id = st.selectbox(
-            "연락결과를 기록할 업체",
-            list(assignments_by_id),
-            format_func=lambda value: assignment_labels.get(
-                value,
-                "업체명 미확인",
-            ),
-            key=_CONTACT_RESULTS_SELECTION_KEY,
-        )
+    st.markdown("##### 연락결과를 기록할 업체")
+    st.caption("업체 행을 선택하면 아래에 연락 이력과 입력 화면이 열립니다.")
+    selection_event = st.dataframe(
+        pd.DataFrame(selection_rows),
+        use_container_width=True,
+        hide_index=True,
+        column_order=["업체명", "기업유형", "연락현황", "연락처"],
+        column_config={
+            "업체명": st.column_config.TextColumn(width="large"),
+            "기업유형": st.column_config.TextColumn(width="medium"),
+            "연락현황": st.column_config.TextColumn(width="small"),
+            "연락처": st.column_config.TextColumn(width="medium"),
+        },
+        key=_CONTACT_RESULTS_SELECTION_KEY,
+        on_select="rerun",
+        selection_mode="single-row",
+        row_height=42,
+        height=min(430, max(160, 48 + (len(selection_rows) * 42))),
+    )
+    selected_indexes = list(selection_event.selection.rows)
+    if not selected_indexes:
+        st.info("목록에서 연락결과를 기록할 업체를 선택해 주세요.")
+        return
+    selected_index = int(selected_indexes[0])
+    if selected_index < 0 or selected_index >= len(selection_rows):
+        st.warning("선택한 업체를 확인하지 못했습니다. 다시 선택해 주세요.")
+        return
+    selected_assignment_id = str(
+        selection_rows[selected_index].get("_assignment_id") or ""
+    )
     selected_assignment = assignments_by_id.get(selected_assignment_id, {})
     selected_company_uid = str(selected_assignment.get("company_uid") or "")
-    with return_col:
-        return_submitted = st.button(
-            "반납",
-            help=(
-                "선택한 업체를 내 배정 DB에서 제외하고 미배정 DB로 "
-                "돌려보냅니다. 기존 연락 이력은 유지됩니다."
-            ),
-            key=f"contact_results_return_v1060_{selected_assignment_id}",
-            use_container_width=True,
-            disabled=not selected_company_uid,
-        )
-    if return_submitted:
-        return_result = sales_assignments.release_assignment(
-            owner_user_id,
-            selected_assignment.get("company_id"),
-            selected_company_uid,
-            reason="contact_results_return",
-            session_id=_assignment_session_id(),
-        )
-        if return_result.get("ok"):
-            st.session_state[_CONTACT_RESULTS_FLASH_KEY] = {
-                "level": "success",
-                "message": (
-                    "업체를 반납해 내 배정 DB에서 제외하고 "
-                    "관리자 검토함으로 이동했습니다."
-                ),
-            }
-            st.session_state[_CONTACT_RESULTS_RESET_SELECTION_KEY] = True
-            st.rerun()
-        else:
-            st.error(
-                return_result.get("message")
-                or "업체를 반납하지 못했습니다."
-            )
-
-    st.markdown("#### 업체 메모")
-    with st.form(
-        f"saved_prospect_integrated_memo_form_v1110_{selected_assignment_id}"
-    ):
-        memo_value = st.text_area(
-            "업체 메모",
-            value=str(selected_assignment.get("memo") or ""),
-            height=100,
-            max_chars=10_000,
-            placeholder="담당자·통화 결과·다음 조치 등을 기록해 주세요.",
-            key=f"saved_prospect_integrated_memo_v1110_{selected_assignment_id}",
-        )
-        memo_submitted = st.form_submit_button(
-            "메모 저장",
-            use_container_width=True,
-        )
-    if memo_submitted:
-        memo_result = sales_assignments.save_user_note(
-            owner_user_id,
-            selected_company_uid,
-            memo_value,
-            company_id=str(selected_assignment.get("company_id") or ""),
-        )
-        if memo_result.get("ok"):
-            st.session_state[_CONTACT_RESULTS_FLASH_KEY] = {
-                "level": "success",
-                "message": "업체 메모를 저장했습니다.",
-            }
-            st.rerun()
-        else:
-            st.error(
-                memo_result.get("message")
-                or "업체 메모를 저장하지 못했습니다."
-            )
 
     st.markdown("#### 업체 활동 이력")
     st.caption(
         "선택한 업체에 저장한 내 연락이력을 한국시간 기준 최신순으로 "
-        "보여줍니다. 연락결과와 메모·상담내용, 다음 연락예정일을 "
+        "보여줍니다. 연락결과와 상담내용, 다음 연락예정일을 "
         "한 번에 확인할 수 있습니다."
     )
     contact_history_result = sales_assignments.list_company_contacts(
@@ -4280,7 +4217,7 @@ def _render_contact_results(
                 "일시 (KST)": st.column_config.TextColumn(width="medium"),
                 "연락방식": st.column_config.TextColumn(width="small"),
                 "연락결과": st.column_config.TextColumn(width="small"),
-                "메모·상담내용": st.column_config.TextColumn(width="large"),
+                "상담내용": st.column_config.TextColumn(width="large"),
                 "다음 연락예정일": st.column_config.TextColumn(width="medium"),
             },
         )
@@ -4357,6 +4294,42 @@ def _render_contact_results(
                     contact_save_result.get("message")
                     or "연락결과를 저장하지 못했습니다."
                 )
+
+    st.markdown("##### DB 반납")
+    st.caption(
+        "반납하면 내 배정 DB에서 제외되고 관리자 검토함으로 이동합니다. "
+        "기존 연락 이력은 유지됩니다."
+    )
+    return_submitted = st.button(
+        "DB 반납하기",
+        help="선택한 업체를 반납하고 내 활성 배정 목록에서 제외합니다.",
+        key=f"contact_results_return_v1120_{selected_assignment_id}",
+        use_container_width=True,
+        disabled=not selected_company_uid,
+    )
+    if return_submitted:
+        return_result = sales_assignments.release_assignment(
+            owner_user_id,
+            selected_assignment.get("company_id"),
+            selected_company_uid,
+            reason="contact_results_return",
+            session_id=_assignment_session_id(),
+        )
+        if return_result.get("ok"):
+            st.session_state[_CONTACT_RESULTS_FLASH_KEY] = {
+                "level": "success",
+                "message": (
+                    "업체를 반납해 내 배정 DB에서 제외하고 "
+                    "관리자 검토함으로 이동했습니다."
+                ),
+            }
+            st.session_state[_CONTACT_RESULTS_RESET_SELECTION_KEY] = True
+            st.rerun()
+        else:
+            st.error(
+                return_result.get("message")
+                or "업체를 반납하지 못했습니다."
+            )
 
     with st.expander("자동 발송 이력", expanded=False):
         outreach_history_result = (
@@ -5958,7 +5931,7 @@ def render_prospect_db_center(
             st.info(
                 f"이미 내 영업DB에 저장된 업체 {own_excluded:,}건은 "
                 "신규 결과에서 제외했습니다. ② 저장된 영업후보에서 "
-                "업체를 확인하고 메모·연락 이력을 함께 관리할 수 있습니다."
+                "업체를 확인하고 상담·연락 이력을 함께 관리할 수 있습니다."
             )
         if result.get("assignment_view_warning") and is_admin_user:
             st.caption(

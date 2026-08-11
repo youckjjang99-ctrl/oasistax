@@ -542,11 +542,16 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
         selector_source = inspect.getsource(
             prospect._select_saved_db_dashboard_filter
         )
+        page_source = inspect.getsource(
+            prospect._set_saved_db_dashboard_page
+        )
         renderer_source = inspect.getsource(
             prospect._render_clean_saved_prospects
         )
         self.assertIn("_SAVED_DB_DASHBOARD_FILTER_KEY", selector_source)
         self.assertIn("_SAVED_DB_DASHBOARD_PAGE_KEY", selector_source)
+        self.assertIn("_CONTACT_RESULTS_SELECTION_KEY", selector_source)
+        self.assertIn("_CONTACT_RESULTS_SELECTION_KEY", page_source)
         self.assertIn("_saved_db_dashboard_filter()", renderer_source)
         self.assertIn("현재 목록:", renderer_source)
         self.assertIn('"전체 보기"', renderer_source)

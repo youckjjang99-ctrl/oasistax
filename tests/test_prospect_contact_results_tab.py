@@ -37,9 +37,11 @@ class ProspectContactResultsTabTests(unittest.TestCase):
             "저장된 영업후보 엑셀 다운로드",
             "saved_prospect_compact_table_v1041",
             "_show_outreach_dialog(",
-            "업체 메모·연락결과 관리",
+            "업체 연락결과 관리",
             "_render_contact_results(",
             "embedded=True",
+            "assignment_rows=rows",
+            "active_filter_label=selected_label",
         ):
             with self.subTest(retained_marker=retained_marker):
                 self.assertIn(retained_marker, source)
@@ -50,14 +52,12 @@ class ProspectContactResultsTabTests(unittest.TestCase):
         for marker in (
             "### 연락결과 기록",
             "연락결과를 기록할 업체",
-            '"반납"',
+            '"DB 반납하기"',
             "연락방식",
             "연락결과",
             "다음 연락예정일 지정",
             "다음 연락예정일",
             "상담내용",
-            "업체 메모",
-            "메모 저장",
             "연락결과 저장",
             "자동 발송 이력",
         ):
@@ -68,44 +68,51 @@ class ProspectContactResultsTabTests(unittest.TestCase):
         self.assertIn("sales_assignments.record_contact(", source)
         self.assertIn("sales_assignments.list_company_contacts(", source)
         self.assertIn("sales_assignments.release_assignment(", source)
-        self.assertIn("sales_assignments.save_user_note(", source)
         self.assertIn('reason="contact_results_return"', source)
-        self.assertIn('selected_assignment.get("memo")', source)
+        self.assertNotIn("sales_assignments.save_user_note(", source)
+        self.assertNotIn("업체 메모", source)
+        self.assertNotIn("메모 저장", source)
         self.assertNotIn("_show_outreach_dialog(", source)
 
-    def test_integrated_memo_uses_the_selected_assignment_and_user_scope(self):
+    def test_dashboard_filter_rows_are_passed_to_contact_manager(self):
+        source = inspect.getsource(prospect._render_clean_saved_prospects)
+
+        filter_load_at = source.index(
+            "_load_user_dashboard_assignment_rows("
+        )
+        manager_at = source.index("_render_contact_results(", filter_load_at)
+
+        self.assertLess(filter_load_at, manager_at)
+        self.assertIn("selected_filter", source[filter_load_at:manager_at])
+        self.assertIn("assignment_rows=rows", source[manager_at:])
+        self.assertIn("active_filter_label=selected_label", source[manager_at:])
+
+    def test_company_selector_is_an_aligned_single_row_table(self):
         source = inspect.getsource(prospect._render_contact_results)
 
-        memo_form_at = source.index("saved_prospect_integrated_memo_form_v1110")
-        save_note_at = source.index(
-            "sales_assignments.save_user_note(",
-            memo_form_at,
-        )
-        rerun_at = source.index("st.rerun()", save_note_at)
+        selector_at = source.index("selection_event = st.dataframe(")
+        history_at = source.index('st.markdown("#### 업체 활동 이력")')
 
-        self.assertLess(memo_form_at, save_note_at)
-        self.assertLess(save_note_at, rerun_at)
-        self.assertIn("owner_user_id", source[save_note_at:rerun_at])
-        self.assertIn("selected_company_uid", source[save_note_at:rerun_at])
+        self.assertLess(selector_at, history_at)
         self.assertIn(
-            "selected_assignment_id",
-            source[memo_form_at:save_note_at],
+            '["업체명", "기업유형", "연락현황", "연락처"]',
+            source[selector_at:history_at],
         )
+        self.assertIn('selection_mode="single-row"', source)
+        self.assertIn('on_select="rerun"', source)
 
-    def test_return_button_is_adjacent_to_assignment_selector(self):
+    def test_return_button_is_below_contact_save(self):
         source = inspect.getsource(prospect._render_contact_results)
 
-        columns_at = source.index("selection_col, return_col = st.columns(")
-        selector_at = source.index("with selection_col:", columns_at)
-        return_at = source.index("with return_col:", selector_at)
-        button_at = source.index('"반납"', return_at)
+        save_at = source.index('"연락결과 저장"')
+        return_at = source.index('st.markdown("##### DB 반납")', save_at)
+        button_at = source.index('"DB 반납하기"', return_at)
         release_at = source.index(
             "sales_assignments.release_assignment(",
             button_at,
         )
 
-        self.assertLess(columns_at, selector_at)
-        self.assertLess(selector_at, return_at)
+        self.assertLess(save_at, return_at)
         self.assertLess(return_at, button_at)
         self.assertLess(button_at, release_at)
         self.assertIn("_CONTACT_RESULTS_RESET_SELECTION_KEY", source)

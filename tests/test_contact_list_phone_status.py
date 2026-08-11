@@ -91,11 +91,45 @@ def test_latest_contact_is_selected_per_company_by_time() -> None:
 
 def test_contact_selector_includes_progress_phone_and_permission() -> None:
     source = inspect.getsource(prospect._render_contact_results)
+    selector_source = inspect.getsource(
+        prospect._contact_assignment_selection_rows
+    )
     render_source = inspect.getsource(prospect.render_prospect_db_center)
 
     assert "latest_contact_by_uid" in source
-    assert "progress_label" in source
-    assert "contact_phone" in source
-    assert "연락처 없음" in source
-    assert "can_view_mobile=can_view_mobile" in source
+    assert '"연락현황"' in selector_source
+    assert '"연락처"' in selector_source
+    assert "_contact_progress_label(" in selector_source
+    assert "_assignment_contact_phone(" in selector_source
+    assert "연락처 없음" in selector_source
+    assert "can_view_mobile=can_view_mobile" in selector_source
     assert "can_view_mobile=can_view_mobile" in render_source
+
+
+def test_contact_selector_rows_keep_aligned_columns_and_filtered_input() -> None:
+    rows = prospect._contact_assignment_selection_rows(
+        [
+            {
+                "_assignment_id": "assignment-one",
+                "company_uid": "source:" + ("c" * 64),
+                "company_name": "테스트 업체",
+                "status": "assigned",
+                "source_data": {
+                    "discovery_type": "growth",
+                    "mobile_phone": _phone("010", "1234", "5678"),
+                },
+            }
+        ],
+        {},
+        can_view_mobile=True,
+    )
+
+    assert rows == [
+        {
+            "_assignment_id": "assignment-one",
+            "업체명": "테스트 업체",
+            "기업유형": "고용증가기업",
+            "연락현황": "미연락",
+            "연락처": _phone("010", "1234", "5678"),
+        }
+    ]
