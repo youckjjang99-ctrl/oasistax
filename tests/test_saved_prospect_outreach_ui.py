@@ -84,7 +84,7 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
 
         self.assertEqual(
             tuple(compact.columns),
-            prospect.IN_PROGRESS_SAVED_PROSPECT_VISIBLE_COLUMNS,
+            prospect.CONTACT_STATUS_SAVED_PROSPECT_VISIBLE_COLUMNS,
         )
         self.assertNotIn("가입자", compact.columns)
         self.assertNotIn("고용증가값", compact.columns)
@@ -552,10 +552,10 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
         self.assertIn("_queue_activity_from_button", source)
         self.assertIn("sales_assignments.list_company_contacts(", source)
         self.assertIn("latest_contact_by_uid=latest_contact_by_uid", source)
-        self.assertIn('selected_filter == "in_progress"', source)
+        self.assertIn("_saved_db_shows_company_progress", source)
         self.assertIn("if show_company_progress:", source)
         self.assertIn(
-            "IN_PROGRESS_SAVED_PROSPECT_VISIBLE_COLUMNS",
+            "CONTACT_STATUS_SAVED_PROSPECT_VISIBLE_COLUMNS",
             source,
         )
         self.assertNotIn('"selection_mode": "single-row"', source)
@@ -575,6 +575,18 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
             ),
             "신규 배정",
         )
+
+    def test_in_progress_and_completed_filters_show_company_progress(self):
+        self.assertTrue(
+            prospect._saved_db_shows_company_progress("in_progress")
+        )
+        self.assertTrue(
+            prospect._saved_db_shows_company_progress("completed")
+        )
+        for filter_key in ("all", "landline", "mobile", "new"):
+            self.assertFalse(
+                prospect._saved_db_shows_company_progress(filter_key)
+            )
 
     def test_saved_db_dashboard_has_all_cards_and_server_side_filtering(self):
         cards = prospect.SAVED_DB_DASHBOARD_CARDS

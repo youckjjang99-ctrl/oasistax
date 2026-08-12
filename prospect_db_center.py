@@ -160,7 +160,7 @@ _OUTREACH_ATTEMPTS_KEY = "_saved_prospect_outreach_attempts_v1040"
 _CONTACT_RESULTS_FLASH_KEY = "_contact_results_flash_v1050"
 _CONTACT_RESULTS_SELECTION_KEY = "contact_results_assignment_table_v1120"
 _CONTACT_RESULTS_RESET_SELECTION_KEY = "_contact_results_reset_selection_v1050"
-_SAVED_PROSPECT_TABLE_KEY = "saved_prospect_compact_table_v1210"
+_SAVED_PROSPECT_TABLE_KEY = "saved_prospect_compact_table_v1220"
 _ACTIVITY_DIALOG_REQUEST_KEY = "_saved_prospect_activity_request_v1140"
 _SAVED_PROSPECT_RESET_SELECTION_KEY = (
     "_saved_prospect_reset_selection_v1140"
@@ -206,7 +206,7 @@ SAVED_PROSPECT_VISIBLE_COLUMNS = (
     "문자보내기",
     "카카오톡보내기",
 )
-IN_PROGRESS_SAVED_PROSPECT_VISIBLE_COLUMNS = (
+CONTACT_STATUS_SAVED_PROSPECT_VISIBLE_COLUMNS = (
     "이력관리",
     "업체명",
     "사업자번호",
@@ -1317,7 +1317,7 @@ def _saved_prospect_table_frame(
             }
         )
     visible_columns = (
-        IN_PROGRESS_SAVED_PROSPECT_VISIBLE_COLUMNS
+        CONTACT_STATUS_SAVED_PROSPECT_VISIBLE_COLUMNS
         if show_company_progress
         else SAVED_PROSPECT_VISIBLE_COLUMNS
     )
@@ -3557,6 +3557,13 @@ def _saved_db_dashboard_filter() -> str:
     return selected
 
 
+def _saved_db_shows_company_progress(selected_filter: str) -> bool:
+    return str(selected_filter or "").strip().lower() in {
+        "in_progress",
+        "completed",
+    }
+
+
 def _select_saved_db_dashboard_filter(filter_key: str) -> None:
     selected = str(filter_key or "all").strip().lower()
     if selected not in SAVED_DB_DASHBOARD_FILTER_LABELS:
@@ -4772,7 +4779,8 @@ def _render_clean_saved_prospects(
         canonical_contact_lookup_failed = True
 
     show_company_progress = bool(
-        assignment_mode and selected_filter == "in_progress"
+        assignment_mode
+        and _saved_db_shows_company_progress(selected_filter)
     )
     latest_contact_by_uid: dict[str, dict] = {}
     progress_lookup_failed = False
@@ -4849,7 +4857,7 @@ def _render_clean_saved_prospects(
         show_company_progress=show_company_progress,
     )
     active_visible_columns = (
-        IN_PROGRESS_SAVED_PROSPECT_VISIBLE_COLUMNS
+        CONTACT_STATUS_SAVED_PROSPECT_VISIBLE_COLUMNS
         if show_company_progress
         else SAVED_PROSPECT_VISIBLE_COLUMNS
     )
