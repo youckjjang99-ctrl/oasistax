@@ -3791,6 +3791,13 @@ def _open_direct_db_dialog() -> None:
     st.session_state[_DIRECT_DB_DIALOG_REQUEST_KEY] = True
 
 
+def _direct_db_button_label(summary: dict) -> str:
+    if not summary.get("ok"):
+        return "계약/등록 DB"
+    total_count = max(0, int(summary.get("total") or 0))
+    return f"계약/등록 DB\n\n{total_count:,}개"
+
+
 def _dismiss_direct_db_dialog() -> None:
     st.session_state.pop(_DIRECT_DB_DIALOG_REQUEST_KEY, None)
     st.session_state.pop(_DIRECT_DB_FORM_KEY, None)
@@ -4729,11 +4736,14 @@ def _render_clean_saved_prospects(
         st.warning(safe_public_error(exc, "저장목록을 불러오지 못했습니다."))
         return
 
+    direct_db_summary = direct_sales_customers.get_direct_customer_summary(
+        owner_user_id
+    )
     st.button(
-        "계약/등록 DB",
+        _direct_db_button_label(direct_db_summary),
         type="primary",
         use_container_width=True,
-        key="open_direct_db_dialog_v1200",
+        key="open_direct_db_dialog_v1230",
         on_click=_open_direct_db_dialog,
     )
 
@@ -5014,6 +5024,11 @@ def _activity_datetime(value: object) -> datetime | None:
 def _format_activity_time(value: object) -> str:
     parsed = _activity_datetime(value)
     return parsed.strftime("%Y.%m.%d %H:%M") if parsed else "-"
+
+
+def _format_db_request_time(value: object) -> str:
+    parsed = _activity_datetime(value)
+    return parsed.strftime("%Y-%m-%d %H:%M") if parsed else "-"
 
 
 def _contact_result_label(value: object) -> str:
@@ -6409,8 +6424,9 @@ def _render_db_request_home(owner_user_id: str) -> None:
             history_frame = pd.DataFrame(
                 [
                     {
-                        "신청일": str(row.get("requested_at") or "")
-                        .replace("T", " ")[:16],
+                        "신청일": _format_db_request_time(
+                            row.get("requested_at")
+                        ),
                         "지역": " ".join(
                             value
                             for value in (
@@ -6482,8 +6498,9 @@ def _render_mobile_db_admin(current_user_id: str) -> None:
                         f"{int(row.get('allocated_count') or 0)} / "
                         f"{int(row.get('requested_count') or 0)}"
                     ),
-                    "신청일": str(row.get("requested_at") or "")
-                    .replace("T", " ")[:16],
+                    "신청일": _format_db_request_time(
+                        row.get("requested_at")
+                    ),
                 }
                 for row in requests
             ]

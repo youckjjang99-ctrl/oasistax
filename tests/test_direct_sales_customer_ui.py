@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import prospect_db_center as prospect
+
 
 SOURCE = (
     Path(__file__).resolve().parents[1] / "prospect_db_center.py"
@@ -10,14 +12,35 @@ SAVED_SECTION = SOURCE.split("def _render_clean_saved_prospects(", 1)[1].split(
 
 
 def test_contract_registered_db_replaces_download_position():
-    contract_index = SAVED_SECTION.index('"계약/등록 DB"')
+    contract_index = SAVED_SECTION.index(
+        "_direct_db_button_label(direct_db_summary)"
+    )
     table_index = SAVED_SECTION.index("st.dataframe(")
     download_index = SAVED_SECTION.index('"저장된 영업후보 엑셀 다운로드"')
     assert contract_index < table_index < download_index
 
 
+def test_contract_registered_db_button_shows_combined_total_only():
+    label = prospect._direct_db_button_label(
+        {
+            "ok": True,
+            "total": 12,
+            "registered": 7,
+            "contracted": 5,
+        }
+    )
+
+    assert label == "계약/등록 DB\n\n12개"
+    assert "등록 DB 7" not in label
+    assert "계약 DB 5" not in label
+    assert "get_direct_customer_summary(" in SAVED_SECTION
+    assert "_direct_db_button_label(direct_db_summary)" in SAVED_SECTION
+
+
 def test_direct_db_is_available_even_when_assigned_list_is_empty():
-    contract_index = SAVED_SECTION.index('"계약/등록 DB"')
+    contract_index = SAVED_SECTION.index(
+        "_direct_db_button_label(direct_db_summary)"
+    )
     empty_return_index = SAVED_SECTION.index("if not rows:")
     assert contract_index < empty_return_index
 
@@ -57,4 +80,3 @@ def test_message_send_is_consent_and_dnc_guarded():
     assert 'row.get("marketing_consent_confirmed")' in resolver
     assert "legacy_phone_contact_is_suppressed(" in resolver
     assert "legacy_phone_contact_hash(" in resolver
-
