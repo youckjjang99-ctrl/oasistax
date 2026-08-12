@@ -49,6 +49,7 @@ def test_register_uses_actor_bound_rpc_and_never_assignment_rpc():
             "business_no": BUSINESS_NO,
             "business_type": "individual",
             "mobile_phone": MOBILE_PHONE,
+            "address": "서울특별시 중구 세종대로 1",
             "employee_count": 3,
             "marketing_consent_confirmed": True,
             "marketing_consent_method": "전화 확인",
@@ -64,6 +65,7 @@ def test_register_uses_actor_bound_rpc_and_never_assignment_rpc():
     assert "assignment" not in name
     assert parameters["p_current_user_id"] == _email("owner")
     assert parameters["p_mobile_phone_hash"] == HEX_A
+    assert parameters["p_address"] == "서울특별시 중구 세종대로 1"
     assert parameters["p_marketing_consent_confirmed"] is True
 
 
@@ -94,6 +96,7 @@ def test_list_is_owner_scoped_and_drops_unexpected_fields():
             "company_name": "테스트 업체",
             "business_no": FORMATTED_BUSINESS_NO,
             "sales_category": "registered",
+            "address": "서울특별시 중구 세종대로 1",
             "total_count": 1,
             "internal_secret": "must-not-leak",
         }]
@@ -108,6 +111,7 @@ def test_list_is_owner_scoped_and_drops_unexpected_fields():
     assert result["ok"] is True
     assert result["total_count"] == 1
     assert "internal_secret" not in result["customers"][0]
+    assert result["customers"][0]["address"] == "서울특별시 중구 세종대로 1"
     assert db.calls[0][1]["p_current_user_id"] == _email("owner")
     assert db.calls[0][1]["p_filter"] == "registered"
 

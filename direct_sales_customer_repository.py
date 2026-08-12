@@ -8,7 +8,7 @@ from cloud_db import CloudDatabase
 
 RPC_REGISTER = "oasis_register_direct_sales_customer"
 RPC_SUMMARY = "oasis_get_direct_sales_customer_summary"
-RPC_LIST = "oasis_list_direct_sales_customers"
+RPC_LIST = "oasis_list_direct_sales_customers_v2"
 RPC_RESERVE = "oasis_reserve_direct_customer_outreach"
 RPC_BEGIN = "oasis_begin_direct_customer_outreach"
 RPC_FINALIZE = "oasis_finalize_direct_customer_outreach"
@@ -132,6 +132,7 @@ def register_direct_customer(
         "p_mobile_phone": str(customer.get("mobile_phone") or "").strip(),
         "p_mobile_phone_hash": str(mobile_phone_hash or "").strip().lower(),
         "p_industry_name": str(customer.get("industry_name") or "").strip(),
+        "p_address": str(customer.get("address") or "").strip(),
         "p_employee_count": employee_count,
         "p_acquisition_source": str(
             customer.get("acquisition_source") or ""
@@ -225,6 +226,7 @@ def list_direct_customers(
         "landline_phone",
         "mobile_phone",
         "industry_name",
+        "address",
         "employee_count",
         "acquisition_source",
         "registration_memo",

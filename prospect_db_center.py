@@ -3923,6 +3923,8 @@ def _open_direct_db_dialog(category_label: str = "전체") -> None:
         else "전체"
     )
     st.session_state[_DIRECT_DB_FILTER_KEY] = selected_label
+    if selected_label == "계약 DB":
+        st.session_state.pop(_DIRECT_DB_FORM_KEY, None)
     st.session_state[_DIRECT_DB_DIALOG_REQUEST_KEY] = True
 
 
@@ -3930,6 +3932,14 @@ def _dismiss_direct_db_dialog() -> None:
     st.session_state.pop(_DIRECT_DB_DIALOG_REQUEST_KEY, None)
     st.session_state.pop(_DIRECT_DB_FORM_KEY, None)
     st.session_state.pop(_DIRECT_DB_TABLE_KEY, None)
+    st.session_state.pop(
+        f"{_DIRECT_DB_TABLE_KEY}_registered_v1260",
+        None,
+    )
+    st.session_state.pop(
+        f"{_DIRECT_DB_TABLE_KEY}_contracted_v1260",
+        None,
+    )
 
 
 def _direct_db_notice() -> None:
@@ -4082,6 +4092,11 @@ def _render_direct_db_registration_form(
                 ["개인사업자", "법인사업자"],
             )
             industry_name = st.text_input("업종명", max_chars=200)
+            address = st.text_input(
+                "사업장 주소",
+                placeholder="도로명 또는 지번 주소를 입력해 주세요.",
+                max_chars=300,
+            )
         with right:
             mobile_phone = st.text_input(
                 "휴대폰 번호",
@@ -4159,6 +4174,7 @@ def _render_direct_db_registration_form(
             "mobile_phone": clean_mobile,
             "landline_phone": clean_landline,
             "industry_name": industry_name,
+            "address": address,
             "employee_count": int(employee_count),
             "acquisition_source": acquisition_source,
             "registration_memo": registration_memo,
@@ -4211,35 +4227,32 @@ def _render_direct_db_registration_form(
     st.success(result.get("message") or "등록 DB에 업체를 추가했습니다.")
 
 
-@st.dialog(
-    "계약/등록 DB",
-    width="large",
-    on_dismiss=_dismiss_direct_db_dialog,
-)
-def _show_direct_db_dialog(
+def _render_direct_db_dialog_content(
     owner_user_id: str,
     owner_user_name: str,
+    *,
+    category: str,
 ) -> None:
     _direct_db_notice()
+    is_contracted = category == "contracted"
+    category_label = "계약 DB" if is_contracted else "등록 DB"
     summary = direct_sales_customers.get_direct_customer_summary(owner_user_id)
     if summary.get("ok"):
-        columns = st.columns(3)
-        columns[0].metric("전체", f"{int(summary.get('total') or 0):,}개")
-        columns[1].metric("등록 DB", f"{int(summary.get('registered') or 0):,}개")
-        columns[2].metric("계약 DB", f"{int(summary.get('contracted') or 0):,}개")
+        metric_key = "contracted" if is_contracted else "registered"
+        st.metric(category_label, f"{int(summary.get(metric_key) or 0):,}개")
     else:
-        st.warning("계약/등록 DB 연결을 확인하지 못했습니다.")
+        st.warning(f"{category_label} 연결을 확인하지 못했습니다.")
 
-    top_left, top_right = st.columns([3, 1])
-    with top_left:
-        selected_label = st.segmented_control(
-            "목록 구분",
-            ["전체", "등록 DB", "계약 DB"],
-            default="전체",
-            key=_DIRECT_DB_FILTER_KEY,
-            width="stretch",
+    if is_contracted:
+        st.caption(
+            "CRM 상태가 계약완료인 업체입니다. 이력과 메시지 발송내역을 "
+            "확인할 수 있습니다."
         )
-    with top_right:
+    else:
+        st.caption(
+            "직접 등록한 업체 중 아직 계약완료 상태가 아닌 업체입니다. "
+            "새 업체를 등록하거나 영업활동을 이어갈 수 있습니다."
+        )
         st.button(
             "+ DB 등록",
             type="primary",
@@ -4247,27 +4260,25 @@ def _show_direct_db_dialog(
             on_click=lambda: st.session_state.__setitem__(_DIRECT_DB_FORM_KEY, True),
         )
 
-    if st.session_state.get(_DIRECT_DB_FORM_KEY):
+    if not is_contracted and st.session_state.get(_DIRECT_DB_FORM_KEY):
         with st.container(border=True):
             _render_direct_db_registration_form(owner_user_id, owner_user_name)
         st.divider()
 
-    category = {
-        "전체": "all",
-        "등록 DB": "registered",
-        "계약 DB": "contracted",
-    }.get(selected_label, "all")
     result = direct_sales_customers.list_direct_customers(
         owner_user_id,
         category=category,
         limit=1000,
     )
     if not result.get("ok"):
-        st.error(result.get("message") or "계약/등록 DB를 불러오지 못했습니다.")
+        st.error(result.get("message") or f"{category_label}를 불러오지 못했습니다.")
         return
     rows = list(result.get("customers") or [])
     if not rows:
-        st.info("해당 조건의 등록 업체가 없습니다. 상단의 DB 등록으로 추가할 수 있습니다.")
+        if is_contracted:
+            st.info("아직 계약완료 처리된 업체가 없습니다.")
+        else:
+            st.info("등록 업체가 없습니다. 상단의 DB 등록으로 추가할 수 있습니다.")
         return
 
     st.caption(
@@ -4276,9 +4287,10 @@ def _show_direct_db_dialog(
     )
     frame = _direct_db_table_frame(rows)
     actions = _direct_db_action_rows(rows)
-    activity_click_key = "direct_db_activity_click_v1200"
-    sms_click_key = "direct_db_sms_click_v1200"
-    kakao_click_key = "direct_db_kakao_click_v1200"
+    key_suffix = "contracted" if is_contracted else "registered"
+    activity_click_key = f"direct_db_activity_click_{key_suffix}_v1260"
+    sms_click_key = f"direct_db_sms_click_{key_suffix}_v1260"
+    kakao_click_key = f"direct_db_kakao_click_{key_suffix}_v1260"
     st.dataframe(
         frame,
         hide_index=True,
@@ -4316,7 +4328,39 @@ def _show_direct_db_dialog(
                 args=(kakao_click_key, "kakao", actions),
             ),
         },
-        key=_DIRECT_DB_TABLE_KEY,
+        key=f"{_DIRECT_DB_TABLE_KEY}_{key_suffix}_v1260",
+    )
+
+
+@st.dialog(
+    "등록 DB",
+    width="large",
+    on_dismiss=_dismiss_direct_db_dialog,
+)
+def _show_registered_db_dialog(
+    owner_user_id: str,
+    owner_user_name: str,
+) -> None:
+    _render_direct_db_dialog_content(
+        owner_user_id,
+        owner_user_name,
+        category="registered",
+    )
+
+
+@st.dialog(
+    "계약 DB",
+    width="large",
+    on_dismiss=_dismiss_direct_db_dialog,
+)
+def _show_contracted_db_dialog(
+    owner_user_id: str,
+    owner_user_name: str,
+) -> None:
+    _render_direct_db_dialog_content(
+        owner_user_id,
+        owner_user_name,
+        category="contracted",
     )
 
 
@@ -4362,6 +4406,7 @@ def _show_direct_customer_activity_dialog(
             f"{_display_business_no(row.get('business_no')) or '-'}"
         )
         st.write(f"**업종명:** {row.get('industry_name') or '-'}")
+        st.write(f"**사업장 주소:** {row.get('address') or '-'}")
         st.write(f"**등록 경로:** {row.get('acquisition_source') or '-'}")
         st.write(f"**등록 메모:** {row.get('registration_memo') or '-'}")
         st.write(
@@ -4890,7 +4935,10 @@ def _render_clean_saved_prospects(
             direct_activity_request,
         )
     elif st.session_state.get(_DIRECT_DB_DIALOG_REQUEST_KEY):
-        _show_direct_db_dialog(owner_user_id, owner_user_name)
+        if st.session_state.get(_DIRECT_DB_FILTER_KEY) == "계약 DB":
+            _show_contracted_db_dialog(owner_user_id, owner_user_name)
+        else:
+            _show_registered_db_dialog(owner_user_id, owner_user_name)
 
     if not rows:
         if assignment_mode and selected_filter != "all":

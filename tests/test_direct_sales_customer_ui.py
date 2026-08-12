@@ -44,6 +44,19 @@ def test_dashboard_cards_open_the_requested_direct_db_category():
     assert '{"전체", "등록 DB", "계약 DB"}' in opener
 
 
+def test_registered_and_contracted_cards_open_separate_dialogs():
+    assert '@st.dialog(\n    "등록 DB"' in SOURCE
+    assert '@st.dialog(\n    "계약 DB"' in SOURCE
+    assert "def _show_registered_db_dialog(" in SOURCE
+    assert "def _show_contracted_db_dialog(" in SOURCE
+    assert 'category="registered"' in SOURCE
+    assert 'category="contracted"' in SOURCE
+    assert "st.segmented_control(" not in SOURCE.split(
+        "def _render_direct_db_dialog_content(", 1
+    )[1].split("def _dismiss_direct_activity_dialog(", 1)[0]
+    assert '== "계약 DB"' in SAVED_SECTION
+
+
 def test_popup_contains_requested_columns_and_registration_action():
     for label in (
         "이력관리",
@@ -57,6 +70,7 @@ def test_popup_contains_requested_columns_and_registration_action():
         "문자보내기",
         "카카오톡보내기",
         "+ DB 등록",
+        "사업장 주소",
     ):
         assert label in SOURCE
 
@@ -64,8 +78,9 @@ def test_popup_contains_requested_columns_and_registration_action():
 def test_direct_registration_reuses_customer_crm_and_history():
     registration = SOURCE.split(
         "def _render_direct_db_registration_form(", 1
-    )[1].split("@st.dialog(\n    \"계약/등록 DB\"", 1)[0]
+    )[1].split("def _render_direct_db_dialog_content(", 1)[0]
     assert "direct_sales_customers.register_direct_customer(" in registration
+    assert '"address": address' in registration
     assert "upsert_customer_record(" in registration
     assert "sync_crm_record(" in registration
     assert "save_customer_event(" in registration

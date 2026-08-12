@@ -15,6 +15,13 @@ FOLLOWUP_MIGRATION = (
     / "20260812051601_direct_customer_outbox_fk_index.sql"
 )
 FOLLOWUP_SQL = FOLLOWUP_MIGRATION.read_text(encoding="utf-8").lower()
+ADDRESS_MIGRATION = (
+    Path(__file__).resolve().parents[1]
+    / "supabase"
+    / "migrations"
+    / "20260812124727_direct_sales_customer_address.sql"
+)
+ADDRESS_SQL = ADDRESS_MIGRATION.read_text(encoding="utf-8").lower()
 
 
 def test_direct_registry_reuses_customer_and_crm_without_assignment_pool():
@@ -75,3 +82,22 @@ def test_only_targeted_indexes_are_added():
     assert "idx_oasis_direct_outreach_open_dispatch" in SQL
     assert "idx_oasis_direct_outreach_customer_fk" in FOLLOWUP_SQL
     assert "(direct_customer_id)" in FOLLOWUP_SQL
+
+
+def test_direct_registration_saves_address_in_canonical_customer_record():
+    assert "p_address text default ''" in ADDRESS_SQL
+    assert "update public.oasis_customers" in ADDRESS_SQL
+    assert "c.owner_user_id = v_actor" in ADDRESS_SQL
+    assert "address = v_address" in ADDRESS_SQL
+    assert "oasis_v911_lossless_jsonb_merge" in ADDRESS_SQL
+    assert "alter table" not in ADDRESS_SQL
+
+
+def test_address_list_rpc_remains_owner_scoped_and_service_role_only():
+    assert "oasis_list_direct_sales_customers_v2" in ADDRESS_SQL
+    assert "coalesce(customer.address, '')" in ADDRESS_SQL
+    assert "customer.owner_user_id = d.owner_user_id" in ADDRESS_SQL
+    assert "d.owner_user_id = v_actor" in ADDRESS_SQL
+    assert "public.oasis_sales_actor_is_active(v_actor)" in ADDRESS_SQL
+    assert "from public, anon, authenticated, service_role" in ADDRESS_SQL
+    assert ADDRESS_SQL.count("to service_role") == 2
