@@ -36,8 +36,7 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
                     "인스타그램": "@sample",
                     "인스타그램URL": "https://example.invalid/sample",
                     "업종명": "서비스업",
-                    "가입자": 12,
-                    "고용증가값": "+3명",
+                    "업체별 진행상황": "신규 배정",
                     "메모": "",
                     "_prospect_id": "prospect-1",
                     "_company_uid": "source:" + ("a" * 64),
@@ -67,6 +66,9 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
         self.assertNotIn("이메일", compact.columns)
         self.assertNotIn("인스타", compact.columns)
         self.assertNotIn("이메일보내기", compact.columns)
+        self.assertNotIn("가입자", compact.columns)
+        self.assertNotIn("고용증가값", compact.columns)
+        self.assertEqual(compact.loc[0, "업체별 진행상황"], "신규 배정")
         self.assertEqual(compact.loc[0, "이력관리"], "📄")
         self.assertEqual(compact.loc[0, "문자보내기"], "💬")
         self.assertEqual(compact.loc[0, "카카오톡보내기"], "🟡")
@@ -531,7 +533,25 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
         self.assertIn("key=_SAVED_PROSPECT_TABLE_KEY", source)
         self.assertIn('"이력관리": st.column_config.ButtonColumn(', source)
         self.assertIn("_queue_activity_from_button", source)
+        self.assertIn("sales_assignments.list_company_contacts(", source)
+        self.assertIn("latest_contact_by_uid=latest_contact_by_uid", source)
         self.assertNotIn('"selection_mode": "single-row"', source)
+
+    def test_saved_prospect_progress_uses_latest_contact_result(self):
+        self.assertEqual(
+            prospect._saved_prospect_progress_label(
+                {"status": "assigned"},
+                {"contact_result": "missed"},
+            ),
+            "부재중",
+        )
+        self.assertEqual(
+            prospect._saved_prospect_progress_label(
+                {"status": "assigned"},
+                None,
+            ),
+            "신규 배정",
+        )
 
     def test_saved_db_dashboard_has_all_cards_and_server_side_filtering(self):
         cards = prospect.SAVED_DB_DASHBOARD_CARDS

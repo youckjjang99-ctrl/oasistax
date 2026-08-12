@@ -160,7 +160,7 @@ _OUTREACH_ATTEMPTS_KEY = "_saved_prospect_outreach_attempts_v1040"
 _CONTACT_RESULTS_FLASH_KEY = "_contact_results_flash_v1050"
 _CONTACT_RESULTS_SELECTION_KEY = "contact_results_assignment_table_v1120"
 _CONTACT_RESULTS_RESET_SELECTION_KEY = "_contact_results_reset_selection_v1050"
-_SAVED_PROSPECT_TABLE_KEY = "saved_prospect_compact_table_v1140"
+_SAVED_PROSPECT_TABLE_KEY = "saved_prospect_compact_table_v1210"
 _ACTIVITY_DIALOG_REQUEST_KEY = "_saved_prospect_activity_request_v1140"
 _SAVED_PROSPECT_RESET_SELECTION_KEY = (
     "_saved_prospect_reset_selection_v1140"
@@ -201,8 +201,7 @@ SAVED_PROSPECT_VISIBLE_COLUMNS = (
     "발굴유형",
     "연락처",
     "업종명",
-    "가입자",
-    "고용증가값",
+    "업체별 진행상황",
     "문자보내기",
     "카카오톡보내기",
 )
@@ -1008,12 +1007,27 @@ def _row_can_view_mobile(row: dict, can_view_mobile: bool) -> bool:
     )
 
 
+def _saved_prospect_progress_label(
+    assignment: dict,
+    latest_contact: dict | None,
+) -> str:
+    """Show the latest real contact result, with a safe assignment fallback."""
+
+    label = _contact_progress_label(assignment, latest_contact)
+    if label == "미연락":
+        return "신규 배정"
+    if label == "미배정":
+        return "저장됨"
+    return label or "상태 확인 중"
+
+
 def _saved_candidate_frame(
     rows: list[dict],
     contacts: list[dict],
     can_view_mobile: bool = False,
     *,
     canonical_contacts_only: bool = False,
+    latest_contact_by_uid: dict[str, dict] | None = None,
 ) -> pd.DataFrame:
     phones_by_id: dict[str, list[dict]] = {}
     email_by_id: dict[str, dict] = {}
@@ -1042,8 +1056,10 @@ def _saved_candidate_frame(
                 str(contact.get("source_url") or ""),
             )
     display: list[dict] = []
+    latest_contact_by_uid = latest_contact_by_uid or {}
     for row in rows:
         prospect_id = str(row.get("id") or "")
+        company_uid = str(row.get("company_uid") or "").strip()
         analysis = _saved_sales_analysis(row)
         source_data = (
             row.get("source_data")
@@ -1181,6 +1197,10 @@ def _saved_candidate_frame(
                 "배정상태": sales_assignments.assignment_status_label(
                     row.get("status")
                 ),
+                "업체별 진행상황": _saved_prospect_progress_label(
+                    row,
+                    latest_contact_by_uid.get(company_uid),
+                ),
                 "배정만료": _assignment_expiry_text(
                     row.get("assignment_expires_at")
                 ),
@@ -1192,7 +1212,7 @@ def _saved_candidate_frame(
                     row.get("next_contact_at") or ""
                 ).replace("T", " ")[:16],
                 "_prospect_id": prospect_id,
-                "_company_uid": str(row.get("company_uid") or ""),
+                "_company_uid": company_uid,
                 "_assignment_id": str(
                     row.get("_assignment_id")
                     or row.get("assignment_id")
@@ -1259,8 +1279,9 @@ def _saved_prospect_table_frame(
                 "발굴유형": str(row.get("발굴유형") or "분류 확인 중"),
                 "연락처": normalize_phone(row.get("대표전화") or ""),
                 "업종명": str(row.get("업종명") or ""),
-                "가입자": int(row.get("가입자") or 0),
-                "고용증가값": str(row.get("고용증가값") or ""),
+                "업체별 진행상황": str(
+                    row.get("업체별 진행상황") or "상태 확인 중"
+                ),
                 "문자보내기": (
                     "💬"
                     if row_can_view_mobile
@@ -4729,6 +4750,23 @@ def _render_clean_saved_prospects(
         contacts = []
         canonical_contact_lookup_failed = True
 
+    latest_contact_by_uid: dict[str, dict] = {}
+    progress_lookup_failed = False
+    if assignment_mode:
+        try:
+            contact_history_result = sales_assignments.list_company_contacts(
+                owner_user_id,
+                limit=1000,
+            )
+            if contact_history_result.get("ok"):
+                latest_contact_by_uid = _latest_contact_by_company(
+                    list(contact_history_result.get("contacts") or [])
+                )
+            else:
+                progress_lookup_failed = True
+        except Exception:
+            progress_lookup_failed = True
+
     frame = _saved_candidate_frame(
         rows,
         contacts,
@@ -4737,11 +4775,17 @@ def _render_clean_saved_prospects(
         # row exists. Send eligibility remains fail-closed because the
         # _canonical_* flags are derived only from canonical rows.
         canonical_contacts_only=False,
+        latest_contact_by_uid=latest_contact_by_uid,
     )
     if canonical_contact_lookup_failed:
         st.warning(
             "정규 연락처 상태를 확인하지 못해 기존 공개 연락처만 표시합니다. "
             "안전 확인이 끝날 때까지 보내기 버튼은 사용할 수 없습니다."
+        )
+    if progress_lookup_failed:
+        st.warning(
+            "최신 연락이력을 확인하지 못해 일부 업체는 배정 상태를 기준으로 "
+            "진행상황을 표시합니다."
         )
     if not frame.empty:
         frame["대표전화"] = frame["대표전화"].map(normalize_phone)
@@ -4820,8 +4864,7 @@ def _render_clean_saved_prospects(
             "발굴유형": st.column_config.TextColumn(width="small"),
             "연락처": st.column_config.TextColumn(width="small"),
             "업종명": st.column_config.TextColumn(width="medium"),
-            "가입자": st.column_config.NumberColumn(width="small"),
-            "고용증가값": st.column_config.TextColumn(width="small"),
+            "업체별 진행상황": st.column_config.TextColumn(width="medium"),
             "문자보내기": st.column_config.ButtonColumn(
                 "문자보내기",
                 width="small",
