@@ -608,6 +608,21 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
         self.assertIn("dashboard_filter=dashboard_filter", loader_source)
         self.assertNotIn("list_user_assignments", loader_source)
 
+    def test_saved_db_dashboard_groups_and_emphasizes_cards(self):
+        source = inspect.getsource(prospect._render_saved_db_dashboard)
+
+        self.assertIn('key="saved_db_dashboard_panel_v1240"', source)
+        self.assertIn('dashboard_panel.markdown("##### 보유 현황")', source)
+        self.assertIn('"영업 진행 현황"', source)
+        self.assertIn('dashboard_panel.columns(3, gap="small")', source)
+        self.assertIn('button_label = f"{count:,}개\\n{label}"', source)
+        self.assertIn(
+            'type="primary" if selected_filter == filter_key else "secondary"',
+            source,
+        )
+        self.assertIn("@media (max-width: 760px)", source)
+        self.assertIn("카드를 누르면 해당 업체만 바로 표시됩니다", source)
+
     def test_saved_db_filter_and_page_survive_regular_reruns(self):
         selector_source = inspect.getsource(
             prospect._select_saved_db_dashboard_filter

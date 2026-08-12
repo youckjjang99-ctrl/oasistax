@@ -3649,27 +3649,107 @@ def _load_user_dashboard_assignment_rows(
 
 def _render_saved_db_dashboard(metrics: dict, selected_filter: str) -> None:
     st.markdown("#### 내 DB 현황")
-    st.caption(
-        "일반전화와 핸드폰번호를 모두 가진 업체는 두 카드에 함께 집계되므로 "
-        "전화번호 카드의 합계가 총 DB 수량과 다를 수 있습니다."
+    st.markdown(
+        textwrap.dedent(
+            """\
+            <style>
+            .st-key-saved_db_dashboard_panel_v1240 {
+                border: 1px solid #c9d8ec !important;
+                border-radius: 18px !important;
+                background: linear-gradient(180deg, #ffffff 0%, #f7faff 100%);
+                box-shadow: 0 8px 22px rgba(20, 67, 128, 0.07);
+                padding: 1.05rem 1.1rem 0.9rem !important;
+            }
+            .st-key-saved_db_dashboard_panel_v1240 h5 {
+                color: #17375f !important;
+                font-size: 0.95rem !important;
+                margin: 0 0 0.45rem !important;
+            }
+            .st-key-saved_db_dashboard_panel_v1240 hr {
+                border-color: #dbe5f2 !important;
+                margin: 0.85rem 0 !important;
+            }
+            .st-key-saved_db_dashboard_panel_v1240 [data-testid="stButton"] button {
+                min-height: 5.35rem !important;
+                border: 1px solid #c8d7ec !important;
+                border-radius: 13px !important;
+                background: #ffffff !important;
+                color: #174b92 !important;
+                box-shadow: 0 2px 7px rgba(28, 76, 142, 0.05);
+                transition: transform 0.12s ease, border-color 0.12s ease,
+                    box-shadow 0.12s ease;
+            }
+            .st-key-saved_db_dashboard_panel_v1240 [data-testid="stButton"] button:hover {
+                border-color: #2d72d9 !important;
+                box-shadow: 0 5px 13px rgba(25, 91, 187, 0.13);
+                transform: translateY(-1px);
+            }
+            .st-key-saved_db_dashboard_panel_v1240 [data-testid="stButton"] button[kind="primary"] {
+                border-color: #1559bf !important;
+                background: linear-gradient(135deg, #124ca8 0%, #1f6bd5 100%) !important;
+                color: #ffffff !important;
+                box-shadow: 0 7px 16px rgba(20, 82, 175, 0.22);
+            }
+            .st-key-saved_db_dashboard_panel_v1240 [data-testid="stButton"] button p {
+                color: inherit !important;
+                white-space: pre-line !important;
+                line-height: 1.35 !important;
+                font-size: 0.84rem !important;
+                font-weight: 700 !important;
+            }
+            .st-key-saved_db_dashboard_panel_v1240 [data-testid="stButton"] button p::first-line {
+                font-size: 1.42rem !important;
+                font-weight: 800 !important;
+                letter-spacing: -0.02em;
+            }
+            .st-key-saved_db_dashboard_panel_v1240 [data-testid="stCaptionContainer"] p {
+                color: #60718a !important;
+                opacity: 1 !important;
+                font-size: 0.78rem !important;
+            }
+            @media (max-width: 760px) {
+                .st-key-saved_db_dashboard_panel_v1240 {
+                    padding: 0.85rem 0.75rem 0.7rem !important;
+                    border-radius: 14px !important;
+                }
+                .st-key-saved_db_dashboard_panel_v1240 [data-testid="stButton"] button {
+                    min-height: 4.65rem !important;
+                }
+            }
+            </style>
+            """
+        ).lstrip(),
+        unsafe_allow_html=True,
     )
-    for row_start in (0, 3):
-        columns = st.columns(3)
-        for column, card in zip(
-            columns,
-            SAVED_DB_DASHBOARD_CARDS[row_start : row_start + 3],
-        ):
+    dashboard_panel = st.container(
+        border=True,
+        key="saved_db_dashboard_panel_v1240",
+    )
+    dashboard_panel.markdown("##### 보유 현황")
+    for row_start, group_title in ((0, "보유 현황"), (3, "영업 진행 현황")):
+        if row_start:
+            dashboard_panel.divider()
+            dashboard_panel.markdown(f"##### {group_title}")
+        columns = dashboard_panel.columns(3, gap="small")
+        group_cards = SAVED_DB_DASHBOARD_CARDS[
+            row_start : row_start + 3
+        ]
+        for column, card in zip(columns, group_cards):
             filter_key, label, metric_key = card
             count = max(0, int(metrics.get(metric_key) or 0))
-            button_label = f"{label}\n\n{count:,}개"
+            button_label = f"{count:,}개\n{label}"
             column.button(
                 button_label,
-                key=f"saved_db_dashboard_card_{filter_key}_v1100",
+                key=f"saved_db_dashboard_card_{filter_key}_v1240",
                 type="primary" if selected_filter == filter_key else "secondary",
                 use_container_width=True,
                 on_click=_select_saved_db_dashboard_filter,
                 args=(filter_key,),
             )
+    dashboard_panel.caption(
+        "일반전화와 핸드폰번호를 모두 가진 업체는 두 전화번호 카드에 함께 "
+        "집계될 수 있습니다. 카드를 누르면 해당 업체만 바로 표시됩니다."
+    )
 
 
 def _load_user_assignment_rows(owner_user_id: str) -> dict:
