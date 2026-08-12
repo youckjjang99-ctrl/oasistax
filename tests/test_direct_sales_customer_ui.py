@@ -1,7 +1,5 @@
 from pathlib import Path
 
-import prospect_db_center as prospect
-
 
 SOURCE = (
     Path(__file__).resolve().parents[1] / "prospect_db_center.py"
@@ -11,38 +9,39 @@ SAVED_SECTION = SOURCE.split("def _render_clean_saved_prospects(", 1)[1].split(
 )[0]
 
 
-def test_contract_registered_db_replaces_download_position():
-    contract_index = SAVED_SECTION.index(
-        "_direct_db_button_label(direct_db_summary)"
-    )
+def test_registered_and_contracted_db_are_rendered_in_dashboard():
+    dashboard_index = SAVED_SECTION.index("_render_saved_db_dashboard(")
     table_index = SAVED_SECTION.index("st.dataframe(")
     download_index = SAVED_SECTION.index('"저장된 영업후보 엑셀 다운로드"')
-    assert contract_index < table_index < download_index
-
-
-def test_contract_registered_db_button_shows_combined_total_only():
-    label = prospect._direct_db_button_label(
-        {
-            "ok": True,
-            "total": 12,
-            "registered": 7,
-            "contracted": 5,
-        }
-    )
-
-    assert label == "계약/등록 DB\n\n12개"
-    assert "등록 DB 7" not in label
-    assert "계약 DB 5" not in label
+    assert dashboard_index < table_index < download_index
     assert "get_direct_customer_summary(" in SAVED_SECTION
-    assert "_direct_db_button_label(direct_db_summary)" in SAVED_SECTION
+
+
+def test_combined_contract_registered_db_button_is_removed():
+    assert "_direct_db_button_label" not in SOURCE
+    assert 'key="open_direct_db_dialog_v1230"' not in SOURCE
 
 
 def test_direct_db_is_available_even_when_assigned_list_is_empty():
-    contract_index = SAVED_SECTION.index(
-        "_direct_db_button_label(direct_db_summary)"
-    )
+    contract_index = SAVED_SECTION.index("_render_saved_db_dashboard(")
     empty_return_index = SAVED_SECTION.index("if not rows:")
     assert contract_index < empty_return_index
+
+
+def test_dashboard_cards_open_the_requested_direct_db_category():
+    renderer = SOURCE.split("def _render_saved_db_dashboard(", 1)[1].split(
+        "def _load_user_assignment_rows(", 1
+    )[0]
+    opener = SOURCE.split("def _open_direct_db_dialog(", 1)[1].split(
+        "def _dismiss_direct_db_dialog(", 1
+    )[0]
+
+    assert '("registered", "등록 DB", "registered", "등록 DB")' in renderer
+    assert '("contracted", "계약 DB", "contracted", "계약 DB")' in renderer
+    assert "on_click=_open_direct_db_dialog" in renderer
+    assert "args=(direct_category,)" in renderer
+    assert "_DIRECT_DB_FILTER_KEY" in opener
+    assert '{"전체", "등록 DB", "계약 DB"}' in opener
 
 
 def test_popup_contains_requested_columns_and_registration_action():

@@ -3647,7 +3647,11 @@ def _load_user_dashboard_assignment_rows(
     }
 
 
-def _render_saved_db_dashboard(metrics: dict, selected_filter: str) -> None:
+def _render_saved_db_dashboard(
+    metrics: dict,
+    selected_filter: str,
+    direct_db_summary: dict | None = None,
+) -> None:
     st.markdown("#### 내 DB 현황")
     st.markdown(
         textwrap.dedent(
@@ -3712,6 +3716,16 @@ def _render_saved_db_dashboard(metrics: dict, selected_filter: str) -> None:
                     padding: 0.85rem 0.75rem 0.7rem !important;
                     border-radius: 14px !important;
                 }
+                .st-key-saved_db_dashboard_panel_v1240 [data-testid="stHorizontalBlock"] {
+                    flex-wrap: wrap !important;
+                    gap: 0.55rem !important;
+                }
+                .st-key-saved_db_dashboard_panel_v1240 [data-testid="stHorizontalBlock"]
+                    > [data-testid="stColumn"] {
+                    flex: 1 1 calc(50% - 0.3rem) !important;
+                    min-width: calc(50% - 0.3rem) !important;
+                    width: calc(50% - 0.3rem) !important;
+                }
                 .st-key-saved_db_dashboard_panel_v1240 [data-testid="stButton"] button {
                     min-height: 4.65rem !important;
                 }
@@ -3725,30 +3739,65 @@ def _render_saved_db_dashboard(metrics: dict, selected_filter: str) -> None:
         border=True,
         key="saved_db_dashboard_panel_v1240",
     )
-    dashboard_panel.markdown("##### 보유 현황")
-    for row_start, group_title in ((0, "보유 현황"), (3, "영업 진행 현황")):
-        if row_start:
+    direct_summary = (
+        direct_db_summary if isinstance(direct_db_summary, dict) else {}
+    )
+    dashboard_groups = (
+        (
+            "보유 현황",
+            (
+                (*SAVED_DB_DASHBOARD_CARDS[0], ""),
+                (*SAVED_DB_DASHBOARD_CARDS[1], ""),
+                (*SAVED_DB_DASHBOARD_CARDS[2], ""),
+                ("registered", "등록 DB", "registered", "등록 DB"),
+            ),
+        ),
+        (
+            "영업 진행 현황",
+            (
+                (*SAVED_DB_DASHBOARD_CARDS[3], ""),
+                (*SAVED_DB_DASHBOARD_CARDS[4], ""),
+                (*SAVED_DB_DASHBOARD_CARDS[5], ""),
+                ("contracted", "계약 DB", "contracted", "계약 DB"),
+            ),
+        ),
+    )
+    for group_index, (group_title, group_cards) in enumerate(dashboard_groups):
+        if group_index:
             dashboard_panel.divider()
-            dashboard_panel.markdown(f"##### {group_title}")
-        columns = dashboard_panel.columns(3, gap="small")
-        group_cards = SAVED_DB_DASHBOARD_CARDS[
-            row_start : row_start + 3
-        ]
+        dashboard_panel.markdown(f"##### {group_title}")
+        columns = dashboard_panel.columns(4, gap="small")
         for column, card in zip(columns, group_cards):
-            filter_key, label, metric_key = card
-            count = max(0, int(metrics.get(metric_key) or 0))
+            filter_key, label, metric_key, direct_category = card
+            metric_source = direct_summary if direct_category else metrics
+            count = max(0, int(metric_source.get(metric_key) or 0))
             button_label = f"{count:,}개\n{label}"
-            column.button(
-                button_label,
-                key=f"saved_db_dashboard_card_{filter_key}_v1240",
-                type="primary" if selected_filter == filter_key else "secondary",
-                use_container_width=True,
-                on_click=_select_saved_db_dashboard_filter,
-                args=(filter_key,),
-            )
+            if direct_category:
+                column.button(
+                    button_label,
+                    key=f"saved_db_dashboard_card_direct_{filter_key}_v1250",
+                    type="secondary",
+                    use_container_width=True,
+                    on_click=_open_direct_db_dialog,
+                    args=(direct_category,),
+                )
+            else:
+                column.button(
+                    button_label,
+                    key=f"saved_db_dashboard_card_{filter_key}_v1250",
+                    type=(
+                        "primary"
+                        if selected_filter == filter_key
+                        else "secondary"
+                    ),
+                    use_container_width=True,
+                    on_click=_select_saved_db_dashboard_filter,
+                    args=(filter_key,),
+                )
     dashboard_panel.caption(
         "일반전화와 핸드폰번호를 모두 가진 업체는 두 전화번호 카드에 함께 "
-        "집계될 수 있습니다. 카드를 누르면 해당 업체만 바로 표시됩니다."
+        "집계될 수 있습니다. 배정 DB 카드는 목록을 필터링하고, 등록·계약 "
+        "DB 카드는 해당 업체 관리창을 엽니다."
     )
 
 
@@ -3867,15 +3916,14 @@ def _show_company_activity_dialog(
     )
 
 
-def _open_direct_db_dialog() -> None:
+def _open_direct_db_dialog(category_label: str = "전체") -> None:
+    selected_label = (
+        category_label
+        if category_label in {"전체", "등록 DB", "계약 DB"}
+        else "전체"
+    )
+    st.session_state[_DIRECT_DB_FILTER_KEY] = selected_label
     st.session_state[_DIRECT_DB_DIALOG_REQUEST_KEY] = True
-
-
-def _direct_db_button_label(summary: dict) -> str:
-    if not summary.get("ok"):
-        return "계약/등록 DB"
-    total_count = max(0, int(summary.get("total") or 0))
-    return f"계약/등록 DB\n\n{total_count:,}개"
 
 
 def _dismiss_direct_db_dialog() -> None:
@@ -4763,7 +4811,16 @@ def _render_clean_saved_prospects(
         dashboard_result = _load_user_db_dashboard(owner_user_id)
         if dashboard_result.get("ok"):
             metrics = dict(dashboard_result.get("metrics") or {})
-            _render_saved_db_dashboard(metrics, selected_filter)
+            direct_db_summary = (
+                direct_sales_customers.get_direct_customer_summary(
+                    owner_user_id
+                )
+            )
+            _render_saved_db_dashboard(
+                metrics,
+                selected_filter,
+                direct_db_summary,
+            )
             page_index = max(
                 0,
                 int(st.session_state.get(_SAVED_DB_DASHBOARD_PAGE_KEY, 0) or 0),
@@ -4815,17 +4872,6 @@ def _render_clean_saved_prospects(
     except Exception as exc:
         st.warning(safe_public_error(exc, "저장목록을 불러오지 못했습니다."))
         return
-
-    direct_db_summary = direct_sales_customers.get_direct_customer_summary(
-        owner_user_id
-    )
-    st.button(
-        _direct_db_button_label(direct_db_summary),
-        type="primary",
-        use_container_width=True,
-        key="open_direct_db_dialog_v1230",
-        on_click=_open_direct_db_dialog,
-    )
 
     direct_outreach_request = st.session_state.get(
         _DIRECT_DB_OUTREACH_REQUEST_KEY
