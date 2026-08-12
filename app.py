@@ -2130,6 +2130,7 @@ elif active_tab == "DB발굴":
 
     render_prospect_db_center(
         CURRENT_USER_ID,
+        CURRENT_USER_NAME,
         can_view_mobile=CURRENT_USER_CAN_VIEW_MOBILE,
         is_admin_user=CURRENT_USER_IS_ADMIN,
     )

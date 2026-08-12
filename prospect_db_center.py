@@ -18,6 +18,7 @@ import streamlit as st
 from runtime_error_log import safe_public_error
 
 import company_sales_assignment as sales_assignments
+import direct_sales_customer_repository as direct_sales_customers
 import sales_outreach
 import sales_outreach_repository
 import localdata_contact_client
@@ -65,6 +66,9 @@ from prospect_db_repository import (
     search_history_table_status,
 )
 from sales_intelligence import analyze_sales_candidate, merge_analysis
+from cloud_sync import sync_crm_record
+from crm import get_customer_record, make_customer_key, upsert_customer_record
+from customer_history import save_customer_event
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -167,6 +171,13 @@ _MOBILE_DB_ADMIN_SELECTION_KEY = "mobile_db_admin_request_v1090"
 _SAVED_DB_DASHBOARD_FILTER_KEY = "saved_db_dashboard_filter_v1100"
 _SAVED_DB_DASHBOARD_PAGE_KEY = "saved_db_dashboard_page_v1100"
 _SAVED_DB_DASHBOARD_PAGE_SIZE = 100
+_DIRECT_DB_DIALOG_REQUEST_KEY = "_direct_db_dialog_request_v1200"
+_DIRECT_DB_FORM_KEY = "_direct_db_registration_form_v1200"
+_DIRECT_DB_FILTER_KEY = "direct_db_filter_v1200"
+_DIRECT_DB_TABLE_KEY = "direct_db_table_v1200"
+_DIRECT_DB_ACTIVITY_REQUEST_KEY = "_direct_db_activity_request_v1200"
+_DIRECT_DB_OUTREACH_REQUEST_KEY = "_direct_db_outreach_request_v1200"
+_DIRECT_DB_FLASH_KEY = "_direct_db_flash_v1200"
 SAVED_DB_DASHBOARD_CARDS = (
     ("all", "총 DB 수량", "total_db_count"),
     ("landline", "일반전화 DB", "landline_db_count"),
@@ -3727,8 +3738,872 @@ def _show_company_activity_dialog(
     )
 
 
+def _open_direct_db_dialog() -> None:
+    st.session_state[_DIRECT_DB_DIALOG_REQUEST_KEY] = True
+
+
+def _dismiss_direct_db_dialog() -> None:
+    st.session_state.pop(_DIRECT_DB_DIALOG_REQUEST_KEY, None)
+    st.session_state.pop(_DIRECT_DB_FORM_KEY, None)
+    st.session_state.pop(_DIRECT_DB_TABLE_KEY, None)
+
+
+def _direct_db_notice() -> None:
+    notice = st.session_state.pop(_DIRECT_DB_FLASH_KEY, None)
+    if not isinstance(notice, dict):
+        return
+    message = str(notice.get("message") or "").strip()
+    if message:
+        getattr(st, str(notice.get("level") or "info"), st.info)(message)
+
+
+def _display_business_no(value: object) -> str:
+    digits = re.sub(r"\D", "", str(value or ""))
+    if len(digits) == 10:
+        return f"{digits[:3]}-{digits[3:5]}-{digits[5:]}"
+    return str(value or "").strip()
+
+
+def _direct_db_table_frame(rows: list[dict]) -> pd.DataFrame:
+    records: list[dict] = []
+    for row in rows:
+        mobile = normalize_phone(row.get("mobile_phone") or "")
+        landline = normalize_phone(row.get("landline_phone") or "")
+        can_send = bool(
+            is_mobile_phone(mobile)
+            and row.get("marketing_consent_confirmed")
+            and str(row.get("marketing_consent_at") or "").strip()
+        )
+        records.append(
+            {
+                "이력관리": "📄",
+                "업체명": str(row.get("company_name") or ""),
+                "사업자번호": _display_business_no(row.get("business_no")),
+                "사업자유형": (
+                    "법인사업자"
+                    if str(row.get("business_type") or "") == "corporate"
+                    else "개인사업자"
+                ),
+                "발굴유형": "직접등록",
+                "연락처": mobile or landline,
+                "업종명": str(row.get("industry_name") or ""),
+                "고용인원": int(row.get("employee_count") or 0),
+                "문자보내기": "💬" if can_send else None,
+                "카카오톡보내기": "🟡" if can_send else None,
+            }
+        )
+    return pd.DataFrame(
+        records,
+        columns=(
+            "이력관리",
+            "업체명",
+            "사업자번호",
+            "사업자유형",
+            "발굴유형",
+            "연락처",
+            "업종명",
+            "고용인원",
+            "문자보내기",
+            "카카오톡보내기",
+        ),
+    )
+
+
+def _direct_db_action_rows(rows: list[dict]) -> list[dict]:
+    actions: list[dict] = []
+    for row in rows:
+        mobile = normalize_phone(row.get("mobile_phone") or "")
+        can_send = bool(
+            is_mobile_phone(mobile)
+            and row.get("marketing_consent_confirmed")
+            and str(row.get("marketing_consent_at") or "").strip()
+        )
+        actions.append(
+            {
+                "direct_customer_id": str(row.get("direct_customer_id") or ""),
+                "available_channels": ("sms", "kakao") if can_send else (),
+            }
+        )
+    return actions
+
+
+def _direct_db_action_from_click(
+    click: object,
+    action_rows: list[dict],
+) -> dict:
+    try:
+        row_index = int(
+            click.get("row") if isinstance(click, dict) else getattr(click, "row")
+        )
+        if row_index < 0 or row_index >= len(action_rows):
+            return {}
+        return dict(action_rows[row_index])
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return {}
+
+
+def _queue_direct_db_activity(click_key: str, action_rows: list[dict]) -> None:
+    selected = _direct_db_action_from_click(
+        st.session_state.get(click_key),
+        action_rows,
+    )
+    direct_customer_id = str(selected.get("direct_customer_id") or "")
+    if direct_customer_id:
+        st.session_state[_DIRECT_DB_ACTIVITY_REQUEST_KEY] = direct_customer_id
+        st.session_state.pop(_DIRECT_DB_DIALOG_REQUEST_KEY, None)
+
+
+def _queue_direct_db_outreach(
+    click_key: str,
+    channel: str,
+    action_rows: list[dict],
+) -> None:
+    selected = _direct_db_action_from_click(
+        st.session_state.get(click_key),
+        action_rows,
+    )
+    if channel not in tuple(selected.get("available_channels") or ()):
+        return
+    direct_customer_id = str(selected.get("direct_customer_id") or "")
+    if direct_customer_id:
+        st.session_state[_DIRECT_DB_OUTREACH_REQUEST_KEY] = {
+            "request_id": secrets.token_urlsafe(18),
+            "channel": channel,
+            "direct_customer_id": direct_customer_id,
+        }
+        st.session_state.pop(_DIRECT_DB_DIALOG_REQUEST_KEY, None)
+
+
+def _render_direct_db_registration_form(
+    owner_user_id: str,
+    owner_user_name: str,
+) -> None:
+    st.markdown("#### 새 업체 등록")
+    st.caption(
+        "직접 알고 있는 업체를 내 고객 원장에 등록합니다. "
+        "배정 DB 보유 한도와 반납 대상에는 포함되지 않습니다."
+    )
+    with st.form("direct_db_registration_form_v1200"):
+        left, right = st.columns(2)
+        with left:
+            company_name = st.text_input("업체명 *", max_chars=200)
+            business_no = st.text_input(
+                "사업자등록번호 *",
+                placeholder="000-00-00000",
+                max_chars=20,
+            )
+            representative_name = st.text_input("대표자명", max_chars=100)
+            business_type_label = st.selectbox(
+                "사업자유형 *",
+                ["개인사업자", "법인사업자"],
+            )
+            industry_name = st.text_input("업종명", max_chars=200)
+        with right:
+            mobile_phone = st.text_input(
+                "휴대폰 번호",
+                placeholder="010-0000-0000",
+                max_chars=30,
+            )
+            landline_phone = st.text_input(
+                "일반전화",
+                placeholder="02-0000-0000",
+                max_chars=30,
+            )
+            employee_count = st.number_input(
+                "고용인원",
+                min_value=0,
+                max_value=1_000_000,
+                value=0,
+                step=1,
+            )
+            acquisition_source = st.text_input(
+                "업체를 알게 된 경로",
+                placeholder="지인 소개, 기존 거래처, 직접 방문 등",
+                max_chars=200,
+            )
+        registration_memo = st.text_area(
+            "등록 메모",
+            placeholder="첫 상담 시 참고할 내용을 입력하세요.",
+            max_chars=2000,
+            height=90,
+        )
+        consent_confirmed = st.checkbox(
+            "광고성 문자·카카오톡 수신동의를 확인했습니다."
+        )
+        consent_method = st.selectbox(
+            "수신동의 확인방법",
+            ["전화 확인", "문자 확인", "서면 확인", "대면 확인", "기타"],
+            disabled=not consent_confirmed,
+        )
+        submitted = st.form_submit_button(
+            "DB 등록",
+            type="primary",
+            use_container_width=True,
+        )
+    if not submitted:
+        return
+
+    business_digits = re.sub(r"\D", "", business_no)
+    clean_mobile = normalize_phone(mobile_phone)
+    clean_landline = normalize_phone(landline_phone)
+    if not company_name.strip():
+        st.error("업체명을 입력해 주세요.")
+        return
+    if len(business_digits) != 10:
+        st.error("사업자등록번호 10자리를 정확히 입력해 주세요.")
+        return
+    if mobile_phone.strip() and not is_mobile_phone(clean_mobile):
+        st.error("휴대폰 번호를 정확히 입력해 주세요.")
+        return
+    try:
+        mobile_hash = (
+            legacy_phone_contact_hash(clean_mobile) if clean_mobile else ""
+        )
+    except Exception as exc:
+        st.error(safe_public_error(exc, "휴대폰 수신거부 확인정보를 만들지 못했습니다."))
+        return
+
+    result = direct_sales_customers.register_direct_customer(
+        owner_user_id,
+        {
+            "company_name": company_name,
+            "business_no": business_digits,
+            "representative_name": representative_name,
+            "business_type": (
+                "corporate" if business_type_label == "법인사업자" else "individual"
+            ),
+            "mobile_phone": clean_mobile,
+            "landline_phone": clean_landline,
+            "industry_name": industry_name,
+            "employee_count": int(employee_count),
+            "acquisition_source": acquisition_source,
+            "registration_memo": registration_memo,
+            "marketing_consent_confirmed": consent_confirmed,
+            "marketing_consent_method": consent_method if consent_confirmed else "",
+        },
+        mobile_phone_hash=mobile_hash,
+        manager_name=owner_user_name,
+    )
+    if not result.get("ok"):
+        renderer = st.warning if result.get("code") == "REVIEW_REQUIRED" else st.error
+        renderer(result.get("message") or "업체를 등록하지 못했습니다.")
+        return
+
+    formatted_business_no = (
+        f"{business_digits[:3]}-{business_digits[3:5]}-{business_digits[5:]}"
+    )
+    customer_key = make_customer_key(company_name, formatted_business_no)
+    current_crm = get_customer_record(owner_user_id, customer_key)
+    upsert_customer_record(
+        owner_user_id,
+        customer_key,
+        company_name=company_name.strip(),
+        business_no=formatted_business_no,
+        status=str(current_crm.get("status") or "신규"),
+        next_action=str(current_crm.get("next_action") or "없음"),
+        next_date=str(current_crm.get("next_date") or ""),
+        memo=str(current_crm.get("memo") or registration_memo),
+        event_title="직접등록 DB 추가",
+        event_detail="영업사원이 계약/등록 DB에서 업체를 등록했습니다.",
+    )
+    updated_crm = get_customer_record(owner_user_id, customer_key)
+    try:
+        sync_crm_record(owner_user_id, formatted_business_no, updated_crm)
+    except Exception:
+        pass
+    try:
+        save_customer_event(
+            user_id=owner_user_id,
+            business_no=formatted_business_no,
+            company_name=company_name.strip(),
+            event_id=f"direct-registration-{result.get('direct_customer_id')}",
+            event_title="직접등록 DB 추가",
+            event_detail="계약/등록 DB에서 고객 원장과 CRM에 연결",
+            source="direct_sales_registration",
+        )
+    except Exception:
+        pass
+    st.session_state[_DIRECT_DB_FORM_KEY] = False
+    st.success(result.get("message") or "등록 DB에 업체를 추가했습니다.")
+
+
+@st.dialog(
+    "계약/등록 DB",
+    width="large",
+    on_dismiss=_dismiss_direct_db_dialog,
+)
+def _show_direct_db_dialog(
+    owner_user_id: str,
+    owner_user_name: str,
+) -> None:
+    _direct_db_notice()
+    summary = direct_sales_customers.get_direct_customer_summary(owner_user_id)
+    if summary.get("ok"):
+        columns = st.columns(3)
+        columns[0].metric("전체", f"{int(summary.get('total') or 0):,}개")
+        columns[1].metric("등록 DB", f"{int(summary.get('registered') or 0):,}개")
+        columns[2].metric("계약 DB", f"{int(summary.get('contracted') or 0):,}개")
+    else:
+        st.warning("계약/등록 DB 연결을 확인하지 못했습니다.")
+
+    top_left, top_right = st.columns([3, 1])
+    with top_left:
+        selected_label = st.segmented_control(
+            "목록 구분",
+            ["전체", "등록 DB", "계약 DB"],
+            default="전체",
+            key=_DIRECT_DB_FILTER_KEY,
+            width="stretch",
+        )
+    with top_right:
+        st.button(
+            "+ DB 등록",
+            type="primary",
+            use_container_width=True,
+            on_click=lambda: st.session_state.__setitem__(_DIRECT_DB_FORM_KEY, True),
+        )
+
+    if st.session_state.get(_DIRECT_DB_FORM_KEY):
+        with st.container(border=True):
+            _render_direct_db_registration_form(owner_user_id, owner_user_name)
+        st.divider()
+
+    category = {
+        "전체": "all",
+        "등록 DB": "registered",
+        "계약 DB": "contracted",
+    }.get(selected_label, "all")
+    result = direct_sales_customers.list_direct_customers(
+        owner_user_id,
+        category=category,
+        limit=1000,
+    )
+    if not result.get("ok"):
+        st.error(result.get("message") or "계약/등록 DB를 불러오지 못했습니다.")
+        return
+    rows = list(result.get("customers") or [])
+    if not rows:
+        st.info("해당 조건의 등록 업체가 없습니다. 상단의 DB 등록으로 추가할 수 있습니다.")
+        return
+
+    st.caption(
+        "수신동의가 확인된 휴대폰 번호만 문자·카카오톡 버튼이 표시됩니다. "
+        "계약완료 상태는 CRM과 자동 연동됩니다."
+    )
+    frame = _direct_db_table_frame(rows)
+    actions = _direct_db_action_rows(rows)
+    activity_click_key = "direct_db_activity_click_v1200"
+    sms_click_key = "direct_db_sms_click_v1200"
+    kakao_click_key = "direct_db_kakao_click_v1200"
+    st.dataframe(
+        frame,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "이력관리": st.column_config.ButtonColumn(
+                "이력관리",
+                type="tertiary",
+                width="small",
+                key=activity_click_key,
+                on_click=_queue_direct_db_activity,
+                args=(activity_click_key, actions),
+            ),
+            "업체명": st.column_config.TextColumn(width="medium"),
+            "사업자번호": st.column_config.TextColumn(width="small"),
+            "사업자유형": st.column_config.TextColumn(width="small"),
+            "발굴유형": st.column_config.TextColumn(width="small"),
+            "연락처": st.column_config.TextColumn(width="small"),
+            "업종명": st.column_config.TextColumn(width="medium"),
+            "고용인원": st.column_config.NumberColumn(width="small"),
+            "문자보내기": st.column_config.ButtonColumn(
+                "문자보내기",
+                type="tertiary",
+                width="small",
+                key=sms_click_key,
+                on_click=_queue_direct_db_outreach,
+                args=(sms_click_key, "sms", actions),
+            ),
+            "카카오톡보내기": st.column_config.ButtonColumn(
+                "카카오톡보내기",
+                type="tertiary",
+                width="small",
+                key=kakao_click_key,
+                on_click=_queue_direct_db_outreach,
+                args=(kakao_click_key, "kakao", actions),
+            ),
+        },
+        key=_DIRECT_DB_TABLE_KEY,
+    )
+
+
+def _dismiss_direct_activity_dialog() -> None:
+    st.session_state.pop(_DIRECT_DB_ACTIVITY_REQUEST_KEY, None)
+    st.session_state[_DIRECT_DB_DIALOG_REQUEST_KEY] = True
+
+
+@st.dialog(
+    "업체 이력관리",
+    width="large",
+    on_dismiss=_dismiss_direct_activity_dialog,
+)
+def _show_direct_customer_activity_dialog(
+    owner_user_id: str,
+    direct_customer_id: str,
+) -> None:
+    result = direct_sales_customers.list_direct_customers(
+        owner_user_id,
+        direct_customer_id=direct_customer_id,
+        limit=1,
+    )
+    rows = list(result.get("customers") or []) if result.get("ok") else []
+    if not rows:
+        st.error("내 계약/등록 DB에서 업체를 찾지 못했습니다.")
+        return
+    row = rows[0]
+    st.markdown(f"### {row.get('company_name') or '업체명 미확인'}")
+    summary_columns = st.columns(4)
+    summary_columns[0].metric(
+        "구분",
+        "계약 DB" if row.get("sales_category") == "contracted" else "등록 DB",
+    )
+    summary_columns[1].metric("CRM 상태", str(row.get("crm_status") or "신규"))
+    summary_columns[2].metric(
+        "사업자유형",
+        "법인사업자" if row.get("business_type") == "corporate" else "개인사업자",
+    )
+    summary_columns[3].metric("고용인원", f"{int(row.get('employee_count') or 0):,}명")
+    with st.container(border=True):
+        st.write(
+            f"**사업자번호:** "
+            f"{_display_business_no(row.get('business_no')) or '-'}"
+        )
+        st.write(f"**업종명:** {row.get('industry_name') or '-'}")
+        st.write(f"**등록 경로:** {row.get('acquisition_source') or '-'}")
+        st.write(f"**등록 메모:** {row.get('registration_memo') or '-'}")
+        st.write(
+            "**메시지 수신동의:** "
+            + (
+                f"확인 · {row.get('marketing_consent_method') or '-'}"
+                if row.get("marketing_consent_confirmed")
+                else "미확인"
+            )
+        )
+
+    customer_key = make_customer_key(
+        row.get("company_name"),
+        row.get("business_no"),
+    )
+    crm_record = get_customer_record(owner_user_id, customer_key)
+    timeline = list(crm_record.get("timeline") or [])
+    st.markdown("#### CRM 활동이력")
+    if timeline:
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "일시": item.get("at", ""),
+                        "활동": item.get("title", ""),
+                        "내용": item.get("detail", ""),
+                    }
+                    for item in timeline
+                    if isinstance(item, dict)
+                ]
+            ),
+            hide_index=True,
+            use_container_width=True,
+        )
+    else:
+        st.caption("아직 저장된 CRM 활동이력이 없습니다.")
+
+    outreach = direct_sales_customers.list_outreach_history(
+        owner_user_id,
+        direct_customer_id,
+    )
+    history = list(outreach.get("history") or []) if outreach.get("ok") else []
+    st.markdown("#### 메시지 발송이력")
+    if history:
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "요청일시": str(item.get("reserved_at") or "").replace("T", " ")[:19],
+                        "채널": "카카오톡" if item.get("channel") == "kakao" else "문자",
+                        "상태": OUTREACH_HISTORY_STATUS_LABELS.get(
+                            str(item.get("status") or ""),
+                            str(item.get("status") or ""),
+                        ),
+                    }
+                    for item in history
+                ]
+            ),
+            hide_index=True,
+            use_container_width=True,
+        )
+    else:
+        st.caption("아직 저장된 메시지 발송이력이 없습니다.")
+
+
+def _finish_direct_outreach(level: str, message: str) -> None:
+    st.session_state[_DIRECT_DB_FLASH_KEY] = {
+        "level": str(level or "info"),
+        "message": str(message or ""),
+    }
+    st.session_state.pop(_DIRECT_DB_OUTREACH_REQUEST_KEY, None)
+    st.session_state[_DIRECT_DB_DIALOG_REQUEST_KEY] = True
+    getattr(st, str(level or "info"), st.info)(str(message or ""))
+
+
+def _dismiss_direct_outreach_dialog() -> None:
+    st.session_state.pop(_DIRECT_DB_OUTREACH_REQUEST_KEY, None)
+    st.session_state[_DIRECT_DB_DIALOG_REQUEST_KEY] = True
+
+
+def _resolve_direct_outreach_target(
+    owner_user_id: str,
+    request: dict,
+) -> dict:
+    direct_customer_id = str(request.get("direct_customer_id") or "")
+    channel = str(request.get("channel") or "").lower()
+    if channel not in {"sms", "kakao"}:
+        return {"ok": False, "message": "발송 채널을 다시 선택해 주세요."}
+    result = direct_sales_customers.list_direct_customers(
+        owner_user_id,
+        direct_customer_id=direct_customer_id,
+        limit=1,
+    )
+    rows = list(result.get("customers") or []) if result.get("ok") else []
+    if not rows:
+        return {"ok": False, "message": "내 계약/등록 DB 업체가 아닙니다."}
+    row = dict(rows[0])
+    mobile = normalize_phone(row.get("mobile_phone") or "")
+    if not is_mobile_phone(mobile):
+        return {"ok": False, "message": "발송 가능한 휴대폰 번호가 없습니다."}
+    if not row.get("marketing_consent_confirmed"):
+        return {"ok": False, "message": "광고성 정보 수신동의가 확인되지 않았습니다."}
+    try:
+        phone_hash = legacy_phone_contact_hash(mobile)
+        if legacy_phone_contact_is_suppressed(
+            str(row.get("company_uid") or ""),
+            mobile,
+        ):
+            return {"ok": False, "message": "수신거부 업체라 발송할 수 없습니다."}
+    except Exception as exc:
+        return {
+            "ok": False,
+            "message": safe_public_error(exc, "수신거부 상태를 확인하지 못했습니다."),
+        }
+    row.update(
+        {
+            "ok": True,
+            "recipient": mobile,
+            "recipient_phone_hash": phone_hash,
+        }
+    )
+    return row
+
+
+def _record_direct_outreach_crm(
+    owner_user_id: str,
+    target: dict,
+    channel: str,
+    detail: str,
+) -> None:
+    company_name = str(target.get("company_name") or "")
+    business_no = str(target.get("business_no") or "")
+    customer_key = make_customer_key(company_name, business_no)
+    current = get_customer_record(owner_user_id, customer_key)
+    upsert_customer_record(
+        owner_user_id,
+        customer_key,
+        company_name=company_name,
+        business_no=business_no,
+        status=str(current.get("status") or "신규"),
+        next_action=str(current.get("next_action") or "없음"),
+        next_date=str(current.get("next_date") or ""),
+        memo=str(current.get("memo") or ""),
+        event_title=("카카오톡 발송" if channel == "kakao" else "문자 발송"),
+        event_detail=detail,
+    )
+    try:
+        sync_crm_record(
+            owner_user_id,
+            business_no,
+            get_customer_record(owner_user_id, customer_key),
+        )
+    except Exception:
+        pass
+
+
+@st.dialog(
+    "계약/등록 DB 메시지 보내기",
+    on_dismiss=_dismiss_direct_outreach_dialog,
+)
+def _show_direct_customer_outreach_dialog(
+    owner_user_id: str,
+    request: dict,
+) -> None:
+    target = _resolve_direct_outreach_target(owner_user_id, request)
+    if not target.get("ok"):
+        st.error(target.get("message") or "발송 대상을 확인하지 못했습니다.")
+        return
+    channel = str(request.get("channel") or "").lower()
+    channel_label = "카카오톡" if channel == "kakao" else "문자"
+    request_id = re.sub(
+        r"[^A-Za-z0-9]",
+        "",
+        str(request.get("request_id") or ""),
+    )[:24] or "direct"
+    st.markdown(f"**{target.get('company_name') or '등록 업체'} · {channel_label} 작성**")
+    st.caption("수신처 " + _mask_outreach_recipient(channel, target.get("recipient")))
+
+    selected_template_code = sales_outreach.SOLAPI_ALIMTALK_DEFAULT_TEMPLATE_CODE
+    selected_template_label = sales_outreach.SOLAPI_CLAIM_AUTH_TEMPLATE_LABEL
+    customer_name = ""
+    auth_link = ""
+    body = ""
+    if channel == "kakao":
+        template_options = sales_outreach.claim_auth_alimtalk_templates()
+        template_labels = {
+            str(item.get("code") or ""): str(item.get("label") or "")
+            for item in template_options
+        }
+        selected_template_code = st.selectbox(
+            "알림톡 템플릿",
+            options=list(template_labels),
+            format_func=lambda code: template_labels.get(code, code),
+            key=f"direct_alimtalk_template_{request_id}",
+        )
+        selected_template_label = template_labels.get(
+            selected_template_code,
+            selected_template_label,
+        )
+        customer_name = st.text_input(
+            "고객이름",
+            value=str(target.get("representative_name") or ""),
+            max_chars=50,
+            key=f"direct_alimtalk_name_{request_id}",
+        )
+        auth_link = st.text_input(
+            "인증링크",
+            placeholder="예: example.com/auth/abc123",
+            help="http:// 또는 https://는 입력하지 말고 주소만 입력하세요.",
+            max_chars=500,
+            key=f"direct_alimtalk_link_{request_id}",
+        )
+        template_preview = _claim_auth_template_preview(selected_template_code)
+        st.markdown("**발송 예시**")
+        if template_preview.get("ok"):
+            preview = sales_outreach.render_claim_auth_alimtalk_preview(
+                template_preview,
+                customer_name,
+                auth_link,
+            )
+            with st.container(border=True):
+                st.text(str(preview.get("content") or ""))
+                for button in preview.get("buttons") or []:
+                    st.caption(
+                        "버튼 · "
+                        + str(button.get("name") or "")
+                        + (
+                            " → " + str(button.get("mobile_url") or "")
+                            if button.get("mobile_url")
+                            else ""
+                        )
+                    )
+        else:
+            st.warning(template_preview.get("message") or "템플릿 내용을 불러오지 못했습니다.")
+
+    readiness = dict(
+        sales_outreach.claim_auth_alimtalk_readiness(selected_template_code)
+        if channel == "kakao"
+        else sales_outreach.channel_readiness(channel)
+    )
+    send_window = dict(sales_outreach.outreach_send_window(channel) or {})
+    if not readiness.get("ready"):
+        st.warning("관리자 API 설정이 완료되지 않아 실제 발송은 차단됩니다.")
+    if not send_window.get("allowed"):
+        st.warning(send_window.get("message") or "현재 시간에는 발송할 수 없습니다.")
+
+    with st.form(f"direct_outreach_form_{request_id}"):
+        if channel == "sms":
+            body = st.text_area(
+                "내용",
+                height=220,
+                max_chars=2000,
+                placeholder="보낼 문자 내용을 입력하세요.",
+            )
+        confirmed = st.checkbox(
+            "등록된 수신동의와 현재 수신거부 상태를 다시 확인했습니다."
+        )
+        send_column, cancel_column = st.columns(2)
+        submitted = send_column.form_submit_button(
+            "실제 발송",
+            type="primary",
+            use_container_width=True,
+            disabled=(not readiness.get("ready") or not send_window.get("allowed")),
+        )
+        cancelled = cancel_column.form_submit_button(
+            "취소",
+            use_container_width=True,
+            on_click=_dismiss_direct_outreach_dialog,
+        )
+    if cancelled:
+        st.caption("발송을 취소했습니다. 창을 닫으면 계약/등록 DB 목록으로 돌아갑니다.")
+        return
+    if not submitted:
+        return
+    if not confirmed:
+        st.error("수신동의와 수신거부 상태 확인에 체크해 주세요.")
+        return
+    validation = dict(
+        sales_outreach.validate_claim_auth_alimtalk(
+            target.get("recipient"),
+            customer_name,
+            auth_link,
+            template_code=selected_template_code,
+        )
+        if channel == "kakao"
+        else sales_outreach.validate_message(
+            "sms",
+            target.get("recipient"),
+            "",
+            body,
+        )
+    )
+    if not validation.get("ok"):
+        st.error(validation.get("message") or "발송 내용을 확인해 주세요.")
+        return
+
+    latest = _resolve_direct_outreach_target(owner_user_id, request)
+    if (
+        not latest.get("ok")
+        or latest.get("recipient") != target.get("recipient")
+        or latest.get("updated_at") != target.get("updated_at")
+    ):
+        st.error("발송 직전 업체 상태가 변경되어 안전하게 중단했습니다.")
+        return
+    request_value = str(request.get("request_id") or "")
+    if not _claim_outreach_attempt(st.session_state, request_value):
+        st.error("같은 발송 요청이 이미 처리됐거나 처리 중입니다.")
+        return
+    fingerprint_subject = selected_template_label if channel == "kakao" else ""
+    fingerprint_body = (
+        f"{selected_template_code}\n{len(customer_name)}:{customer_name}\n{auth_link}"
+        if channel == "kakao"
+        else body
+    )
+    try:
+        content_hmac = sales_outreach_repository.message_fingerprint(
+            channel,
+            fingerprint_subject,
+            fingerprint_body,
+        )
+        recipient_hmac = sales_outreach_repository.recipient_fingerprint(
+            channel,
+            latest.get("recipient"),
+        )
+    except Exception:
+        _finish_direct_outreach("error", "발송 중복방지 보안설정을 확인하지 못했습니다.")
+        return
+    reservation = direct_sales_customers.reserve_outreach_attempt(
+        owner_user_id,
+        request_value,
+        content_hmac,
+        recipient_hmac,
+        latest.get("recipient_phone_hash"),
+        latest.get("direct_customer_id"),
+        latest.get("updated_at"),
+        channel,
+        consent_confirmed=confirmed,
+    )
+    if not reservation.get("ok") or not reservation.get("acquired"):
+        _finish_direct_outreach(
+            "warning",
+            reservation.get("message") or "발송 요청을 예약하지 못했습니다.",
+        )
+        return
+    dispatch = direct_sales_customers.begin_outreach_dispatch(
+        owner_user_id,
+        reservation.get("outbox_id"),
+        reservation.get("reservation_token"),
+        recipient_hmac,
+        latest.get("recipient_phone_hash"),
+    )
+    if not dispatch.get("ok") or not dispatch.get("dispatch_started"):
+        _finish_direct_outreach(
+            "warning",
+            dispatch.get("message") or "발송 직전 확인에 실패했습니다.",
+        )
+        return
+    try:
+        provider_result = dict(
+            sales_outreach.send_claim_auth_alimtalk(
+                latest.get("recipient"),
+                customer_name,
+                auth_link,
+                request_value,
+                template_code=selected_template_code,
+            )
+            if channel == "kakao"
+            else sales_outreach.send_outreach(
+                "sms",
+                latest.get("recipient"),
+                "",
+                body,
+                request_value,
+            )
+        )
+    except Exception:
+        provider_result = {"ok": False, "code": "DELIVERY_UNKNOWN"}
+    provider_code = str(provider_result.get("code") or "").upper()
+    final_status = (
+        "provider_accepted"
+        if provider_result.get("ok")
+        else (
+            "delivery_unknown"
+            if provider_code in {"DELIVERY_UNKNOWN", "PROVIDER_TIMEOUT"}
+            else "provider_rejected"
+        )
+    )
+    finalized = direct_sales_customers.finalize_outreach_attempt(
+        owner_user_id,
+        reservation.get("outbox_id"),
+        reservation.get("reservation_token"),
+        final_status,
+        safe_result_code=provider_code,
+    )
+    if not finalized.get("ok"):
+        _finish_direct_outreach(
+            "warning",
+            "외부 발송 결과와 자동 이력을 함께 확정하지 못했습니다. 재발송하지 마세요.",
+        )
+        return
+    if final_status == "provider_accepted":
+        _record_direct_outreach_crm(
+            owner_user_id,
+            latest,
+            channel,
+            f"OASIS 계약/등록 DB에서 {channel_label} 발송 접수",
+        )
+        _finish_direct_outreach(
+            "success",
+            f"{channel_label} 발송 요청을 공급자가 접수했고 CRM 이력을 저장했습니다.",
+        )
+    elif final_status == "delivery_unknown":
+        _finish_direct_outreach(
+            "warning",
+            "공급자 접수 여부를 확정하지 못했습니다. 재발송 전에 발송내역을 확인해 주세요.",
+        )
+    else:
+        _finish_direct_outreach(
+            "error",
+            provider_result.get("message") or "외부 발송 서비스가 요청을 접수하지 않았습니다.",
+        )
+
+
 def _render_clean_saved_prospects(
     owner_user_id: str,
+    owner_user_name: str = "",
     can_view_mobile: bool = False,
     is_admin_user: bool = False,
 ) -> None:
@@ -3804,6 +4679,34 @@ def _render_clean_saved_prospects(
     except Exception as exc:
         st.warning(safe_public_error(exc, "저장목록을 불러오지 못했습니다."))
         return
+
+    st.button(
+        "계약/등록 DB",
+        type="primary",
+        use_container_width=True,
+        key="open_direct_db_dialog_v1200",
+        on_click=_open_direct_db_dialog,
+    )
+
+    direct_outreach_request = st.session_state.get(
+        _DIRECT_DB_OUTREACH_REQUEST_KEY
+    )
+    direct_activity_request = str(
+        st.session_state.get(_DIRECT_DB_ACTIVITY_REQUEST_KEY) or ""
+    )
+    if isinstance(direct_outreach_request, dict):
+        _show_direct_customer_outreach_dialog(
+            owner_user_id,
+            direct_outreach_request,
+        )
+    elif direct_activity_request:
+        _show_direct_customer_activity_dialog(
+            owner_user_id,
+            direct_activity_request,
+        )
+    elif st.session_state.get(_DIRECT_DB_DIALOG_REQUEST_KEY):
+        _show_direct_db_dialog(owner_user_id, owner_user_name)
+
     if not rows:
         if assignment_mode and selected_filter != "all":
             st.info(
@@ -3884,17 +4787,6 @@ def _render_clean_saved_prospects(
             and column != "이력관리"
         ]
     ]
-    st.download_button(
-        "저장된 영업후보 엑셀 다운로드",
-        data=_excel_bytes(export_frame, "저장된 영업후보"),
-        file_name="OASIS_저장된_영업후보.xlsx",
-        mime=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
-        use_container_width=True,
-        key="saved_prospect_excel_v984",
-    )
     st.caption(
         "왼쪽의 📄 버튼을 누르면 활동이력·연락결과·DB 반납 화면이 "
         "팝업으로 열립니다. "
@@ -3976,6 +4868,18 @@ def _render_clean_saved_prospects(
             on_click=_set_saved_db_dashboard_page,
             args=(page_index + 1,),
         )
+
+    st.download_button(
+        "저장된 영업후보 엑셀 다운로드",
+        data=_excel_bytes(export_frame, "저장된 영업후보"),
+        file_name="OASIS_저장된_영업후보.xlsx",
+        mime=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+        use_container_width=True,
+        key="saved_prospect_excel_v1200",
+    )
 
     pending_request = st.session_state.get(_OUTREACH_REQUEST_KEY)
     if isinstance(pending_request, dict):
@@ -5633,6 +6537,7 @@ def _render_mobile_db_admin(current_user_id: str) -> None:
 
 def render_prospect_db_center(
     owner_user_id: str = "",
+    owner_user_name: str = "",
     *,
     can_view_mobile: bool = False,
     is_admin_user: bool = False,
@@ -5669,6 +6574,7 @@ def render_prospect_db_center(
     if workflow_step == "② 저장된 영업후보":
         _render_clean_saved_prospects(
             owner_user_id,
+            owner_user_name,
             can_view_mobile=can_view_mobile,
             is_admin_user=is_admin_user,
         )
