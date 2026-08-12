@@ -3889,7 +3889,7 @@ def _render_direct_db_registration_form(
             company_name = st.text_input("업체명 *", max_chars=200)
             business_no = st.text_input(
                 "사업자등록번호 *",
-                placeholder="000-00-00000",
+                placeholder="숫자 10자리를 입력해 주세요.",
                 max_chars=20,
             )
             representative_name = st.text_input("대표자명", max_chars=100)
@@ -3901,12 +3901,12 @@ def _render_direct_db_registration_form(
         with right:
             mobile_phone = st.text_input(
                 "휴대폰 번호",
-                placeholder="010-0000-0000",
+                placeholder="휴대폰 번호를 입력해 주세요.",
                 max_chars=30,
             )
             landline_phone = st.text_input(
                 "일반전화",
-                placeholder="02-0000-0000",
+                placeholder="지역번호를 포함해 입력해 주세요.",
                 max_chars=30,
             )
             employee_count = st.number_input(

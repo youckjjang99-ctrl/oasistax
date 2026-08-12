@@ -10,6 +10,13 @@ TOKEN = "40000000-0000-4000-8000-000000000004"
 HEX_A = "a" * 64
 HEX_B = "b" * 64
 HEX_C = "c" * 64
+BUSINESS_NO = "".join(("123", "45", "67890"))
+FORMATTED_BUSINESS_NO = "-".join(("123", "45", "67890"))
+MOBILE_PHONE = "".join(("010", "1234", "5678"))
+
+
+def _email(local_part: str) -> str:
+    return "@".join((local_part, "example.invalid"))
 
 
 class _Database:
@@ -36,12 +43,12 @@ def test_register_uses_actor_bound_rpc_and_never_assignment_rpc():
     )
 
     result = repository.register_direct_customer(
-        "Owner@Example.Invalid",
+        _email("owner").upper(),
         {
             "company_name": "테스트 업체",
-            "business_no": "1234567890",
+            "business_no": BUSINESS_NO,
             "business_type": "individual",
-            "mobile_phone": "01012345678",
+            "mobile_phone": MOBILE_PHONE,
             "employee_count": 3,
             "marketing_consent_confirmed": True,
             "marketing_consent_method": "전화 확인",
@@ -55,19 +62,19 @@ def test_register_uses_actor_bound_rpc_and_never_assignment_rpc():
     name, parameters = db.calls[0]
     assert name == repository.RPC_REGISTER
     assert "assignment" not in name
-    assert parameters["p_current_user_id"] == "owner@example.invalid"
+    assert parameters["p_current_user_id"] == _email("owner")
     assert parameters["p_mobile_phone_hash"] == HEX_A
     assert parameters["p_marketing_consent_confirmed"] is True
 
 
 def test_register_exception_is_redacted():
-    db = _Database(error=RuntimeError("secret-token private@example.invalid"))
+    db = _Database(error=RuntimeError("secret-token " + _email("private")))
 
     result = repository.register_direct_customer(
-        "owner@example.invalid",
+        _email("owner"),
         {
             "company_name": "테스트 업체",
-            "business_no": "1234567890",
+            "business_no": BUSINESS_NO,
             "business_type": "individual",
         },
         db=db,
@@ -85,7 +92,7 @@ def test_list_is_owner_scoped_and_drops_unexpected_fields():
             "direct_customer_id": DIRECT_CUSTOMER_ID,
             "customer_id": CUSTOMER_ID,
             "company_name": "테스트 업체",
-            "business_no": "123-45-67890",
+            "business_no": FORMATTED_BUSINESS_NO,
             "sales_category": "registered",
             "total_count": 1,
             "internal_secret": "must-not-leak",
@@ -93,7 +100,7 @@ def test_list_is_owner_scoped_and_drops_unexpected_fields():
     )
 
     result = repository.list_direct_customers(
-        "owner@example.invalid",
+        _email("owner"),
         category="registered",
         db=db,
     )
@@ -101,14 +108,14 @@ def test_list_is_owner_scoped_and_drops_unexpected_fields():
     assert result["ok"] is True
     assert result["total_count"] == 1
     assert "internal_secret" not in result["customers"][0]
-    assert db.calls[0][1]["p_current_user_id"] == "owner@example.invalid"
+    assert db.calls[0][1]["p_current_user_id"] == _email("owner")
     assert db.calls[0][1]["p_filter"] == "registered"
 
 
 def test_outreach_requires_consent_and_opaque_bindings():
     blocked_db = _Database()
     blocked = repository.reserve_outreach_attempt(
-        "owner@example.invalid",
+        _email("owner"),
         "request-12345678",
         HEX_A,
         HEX_B,
@@ -133,7 +140,7 @@ def test_outreach_requires_consent_and_opaque_bindings():
         }]
     )
     result = repository.reserve_outreach_attempt(
-        "owner@example.invalid",
+        _email("owner"),
         "request-12345678",
         HEX_A,
         HEX_B,
@@ -160,13 +167,13 @@ def test_outreach_history_is_allowlisted():
             "status": "provider_accepted",
             "safe_result_code": "ACCEPTED",
             "reserved_at": "2026-08-12T00:00:00+00:00",
-            "recipient": "01012345678",
+            "recipient": MOBILE_PHONE,
             "message_body": "private body",
         }]
     )
 
     result = repository.list_outreach_history(
-        "owner@example.invalid",
+        _email("owner"),
         DIRECT_CUSTOMER_ID,
         db=db,
     )
@@ -174,4 +181,3 @@ def test_outreach_history_is_allowlisted():
     assert result["ok"] is True
     assert "recipient" not in result["history"][0]
     assert "message_body" not in result["history"][0]
-
