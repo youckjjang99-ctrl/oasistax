@@ -201,6 +201,19 @@ SAVED_PROSPECT_VISIBLE_COLUMNS = (
     "발굴유형",
     "연락처",
     "업종명",
+    "가입자",
+    "고용증가값",
+    "문자보내기",
+    "카카오톡보내기",
+)
+IN_PROGRESS_SAVED_PROSPECT_VISIBLE_COLUMNS = (
+    "이력관리",
+    "업체명",
+    "사업자번호",
+    "사업자유형",
+    "발굴유형",
+    "연락처",
+    "업종명",
     "업체별 진행상황",
     "문자보내기",
     "카카오톡보내기",
@@ -1250,6 +1263,7 @@ def _saved_prospect_table_frame(
     frame: pd.DataFrame,
     *,
     can_view_mobile: bool,
+    show_company_progress: bool = False,
 ) -> pd.DataFrame:
     """Return the compact saved-prospect view in the exact UI column order."""
 
@@ -1279,6 +1293,8 @@ def _saved_prospect_table_frame(
                 "발굴유형": str(row.get("발굴유형") or "분류 확인 중"),
                 "연락처": normalize_phone(row.get("대표전화") or ""),
                 "업종명": str(row.get("업종명") or ""),
+                "가입자": int(row.get("가입자") or 0),
+                "고용증가값": str(row.get("고용증가값") or ""),
                 "업체별 진행상황": str(
                     row.get("업체별 진행상황") or "상태 확인 중"
                 ),
@@ -1300,7 +1316,12 @@ def _saved_prospect_table_frame(
                 ),
             }
         )
-    return pd.DataFrame(records, columns=SAVED_PROSPECT_VISIBLE_COLUMNS)
+    visible_columns = (
+        IN_PROGRESS_SAVED_PROSPECT_VISIBLE_COLUMNS
+        if show_company_progress
+        else SAVED_PROSPECT_VISIBLE_COLUMNS
+    )
+    return pd.DataFrame(records, columns=visible_columns)
 
 
 def _outreach_action_rows(
@@ -4750,9 +4771,12 @@ def _render_clean_saved_prospects(
         contacts = []
         canonical_contact_lookup_failed = True
 
+    show_company_progress = bool(
+        assignment_mode and selected_filter == "in_progress"
+    )
     latest_contact_by_uid: dict[str, dict] = {}
     progress_lookup_failed = False
-    if assignment_mode:
+    if show_company_progress:
         try:
             contact_history_result = sales_assignments.list_company_contacts(
                 owner_user_id,
@@ -4822,11 +4846,17 @@ def _render_clean_saved_prospects(
     compact_frame = _saved_prospect_table_frame(
         frame,
         can_view_mobile=can_view_mobile,
+        show_company_progress=show_company_progress,
+    )
+    active_visible_columns = (
+        IN_PROGRESS_SAVED_PROSPECT_VISIBLE_COLUMNS
+        if show_company_progress
+        else SAVED_PROSPECT_VISIBLE_COLUMNS
     )
     export_frame = compact_frame[
         [
             column
-            for column in SAVED_PROSPECT_VISIBLE_COLUMNS
+            for column in active_visible_columns
             if column not in OUTREACH_COLUMN_CHANNELS
             and column != "이력관리"
         ]
@@ -4848,7 +4878,7 @@ def _render_clean_saved_prospects(
         compact_frame,
         use_container_width=True,
         hide_index=True,
-        column_order=list(SAVED_PROSPECT_VISIBLE_COLUMNS),
+        column_order=list(active_visible_columns),
         column_config={
             "이력관리": st.column_config.ButtonColumn(
                 "이력관리",

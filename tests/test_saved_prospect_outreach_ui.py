@@ -36,6 +36,8 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
                     "인스타그램": "@sample",
                     "인스타그램URL": "https://example.invalid/sample",
                     "업종명": "서비스업",
+                    "가입자": 12,
+                    "고용증가값": "+3명",
                     "업체별 진행상황": "신규 배정",
                     "메모": "",
                     "_prospect_id": "prospect-1",
@@ -66,12 +68,27 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
         self.assertNotIn("이메일", compact.columns)
         self.assertNotIn("인스타", compact.columns)
         self.assertNotIn("이메일보내기", compact.columns)
-        self.assertNotIn("가입자", compact.columns)
-        self.assertNotIn("고용증가값", compact.columns)
-        self.assertEqual(compact.loc[0, "업체별 진행상황"], "신규 배정")
+        self.assertEqual(compact.loc[0, "가입자"], 12)
+        self.assertEqual(compact.loc[0, "고용증가값"], "+3명")
+        self.assertNotIn("업체별 진행상황", compact.columns)
         self.assertEqual(compact.loc[0, "이력관리"], "📄")
         self.assertEqual(compact.loc[0, "문자보내기"], "💬")
         self.assertEqual(compact.loc[0, "카카오톡보내기"], "🟡")
+
+    def test_in_progress_table_replaces_employment_columns_with_progress(self):
+        compact = prospect._saved_prospect_table_frame(
+            self._frame(),
+            can_view_mobile=True,
+            show_company_progress=True,
+        )
+
+        self.assertEqual(
+            tuple(compact.columns),
+            prospect.IN_PROGRESS_SAVED_PROSPECT_VISIBLE_COLUMNS,
+        )
+        self.assertNotIn("가입자", compact.columns)
+        self.assertNotIn("고용증가값", compact.columns)
+        self.assertEqual(compact.loc[0, "업체별 진행상황"], "신규 배정")
 
     def test_source_phone_stays_visible_when_contact_table_has_no_rows(self):
         phone = _phone("010", "0000", "0000")
@@ -527,7 +544,7 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
         source = inspect.getsource(prospect._render_clean_saved_prospects)
 
         self.assertIn(
-            "column_order=list(SAVED_PROSPECT_VISIBLE_COLUMNS)",
+            "column_order=list(active_visible_columns)",
             source,
         )
         self.assertIn("key=_SAVED_PROSPECT_TABLE_KEY", source)
@@ -535,6 +552,12 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
         self.assertIn("_queue_activity_from_button", source)
         self.assertIn("sales_assignments.list_company_contacts(", source)
         self.assertIn("latest_contact_by_uid=latest_contact_by_uid", source)
+        self.assertIn('selected_filter == "in_progress"', source)
+        self.assertIn("if show_company_progress:", source)
+        self.assertIn(
+            "IN_PROGRESS_SAVED_PROSPECT_VISIBLE_COLUMNS",
+            source,
+        )
         self.assertNotIn('"selection_mode": "single-row"', source)
 
     def test_saved_prospect_progress_uses_latest_contact_result(self):
