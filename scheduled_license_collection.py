@@ -88,7 +88,12 @@ def _is_retryable_failure(progress: dict[str, Any]) -> bool:
     database errors.
     """
     error = str(progress.get("last_error") or "").strip().lower()
-    return "forbidden" not in error
+    permanent_markers = (
+        "forbidden",
+        "service_key_is_not_registered_error",
+        "등록되지 않은 서비스키",
+    )
+    return not any(marker in error for marker in permanent_markers)
 
 
 def _collect_service(

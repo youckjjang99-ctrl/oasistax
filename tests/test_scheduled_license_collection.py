@@ -8,6 +8,18 @@ import scheduled_license_collection
 
 
 class ScheduledLicenseCollectionTest(unittest.TestCase):
+    def test_unregistered_service_key_is_not_retried(self) -> None:
+        self.assertFalse(
+            scheduled_license_collection._is_retryable_failure(
+                {"last_error": "SERVICE_KEY_IS_NOT_REGISTERED_ERROR"}
+            )
+        )
+        self.assertTrue(
+            scheduled_license_collection._is_retryable_failure(
+                {"last_error": "SERVICETIMEOUT_ERROR"}
+            )
+        )
+
     @patch.object(sys, "argv", ["scheduled_license_collection.py"])
     @patch(
         "scheduled_license_collection.localdata_contact_client.key_status",
