@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from collections import deque
@@ -13,6 +14,7 @@ from typing import Any
 import requests
 
 import daum_web_search_client
+import daum_provider_runtime
 import kakao_provider_runtime
 import naver_web_search_client
 from cloud_db import CloudDatabase
@@ -29,7 +31,10 @@ PHONE_ONLY_SOURCE_TYPES = {"comwel_all_employers"}
 KAKAO_DAILY_SAFE_REQUESTS = (
     kakao_provider_runtime.DEFAULT_DAILY_SAFE_REQUESTS
 )
-DAUM_DAILY_SAFE_RECORDS = 25000
+DAUM_DAILY_SAFE_RECORDS = 28500
+DAUM_DAILY_SAFE_REQUESTS = (
+    daum_provider_runtime.DEFAULT_DAILY_SAFE_REQUESTS
+)
 NAVER_DAILY_SAFE_RECORDS = 12000
 KAKAO_NO_MATCH_HELD = "KAKAO_NO_MATCH_HELD"
 KAKAO_CONSECUTIVE_ERROR_LIMIT = 10
@@ -77,6 +82,17 @@ class KakaoProviderError(RuntimeError):
 
     def __init__(self, safe_error_code: str, request_count: int = 0) -> None:
         self.safe_error_code = kakao_provider_runtime.safe_error_code(
+            safe_error_code
+        )
+        self.request_count = max(0, int(request_count))
+        super().__init__(self.safe_error_code)
+
+
+class DaumProviderError(RuntimeError):
+    """Safe Daum Web failure with the actual number of API requests."""
+
+    def __init__(self, safe_error_code: str, request_count: int = 0) -> None:
+        self.safe_error_code = daum_provider_runtime.safe_error_code(
             safe_error_code
         )
         self.request_count = max(0, int(request_count))
@@ -504,8 +520,18 @@ def _enrich_one(
             result = daum_web_search_client.search_public_phones(
                 str(prospect.get("company_name") or ""),
                 str(prospect.get("address") or ""),
+                str(prospect.get("business_no") or ""),
                 timeout=6,
-                size=10,
+                size=daum_web_search_client.DEFAULT_RESULT_SIZE,
+                # A stored landline already satisfies the lower-value phone
+                # need, so spend this company's Daum budget only on the
+                # mobile-first query. Companies with no phone may use one
+                # additional location-qualified mobile query.
+                request_budget=(
+                    1
+                    if normalize_phone(row.get("landline_phone"))
+                    else daum_web_search_client.DEFAULT_REQUEST_BUDGET
+                ),
             )
         else:
             result = enrich_company(
@@ -521,13 +547,15 @@ def _enrich_one(
                 website_max_pages=2,
             )
         kakao_provider = _kakao_provider_result(result)
+        provider_request_count = (
+            result.get("request_count")
+            if phone_provider == "daum"
+            else kakao_provider.get("request_count")
+        )
         request_count = (
             0
             if result.get("cache_hit")
-            else max(
-                0,
-                int(kakao_provider.get("request_count") or 0),
-            )
+            else max(0, int(provider_request_count or 0))
         )
         if stage == "phone" and phone_provider == "kakao":
             kakao_outcome = str(
@@ -549,6 +577,15 @@ def _enrich_one(
                     ),
                     request_count,
                 )
+        elif (
+            stage == "phone"
+            and phone_provider == "daum"
+            and not result.get("ok")
+        ):
+            raise DaumProviderError(
+                result.get("status") or "PROVIDER_ERROR",
+                request_count,
+            )
         elif not result.get("ok"):
             provider_limit = _provider_limit_message(result)
             if provider_limit:
@@ -597,15 +634,23 @@ def _enrich_one(
             if phase_matched != (kakao_outcome == "matched"):
                 raise KakaoProviderError("INVALID_JSON", request_count)
         else:
+            # Provider-phase metrics must only count contacts discovered by
+            # this call. Existing phones preserved on the row are not a new
+            # Daum match.
             phase_matched = (
-                any((mobile_phone, landline_phone))
+                any((mobile, landline))
                 if stage == "phone"
-                else any((email_value, instagram_id, instagram_url))
+                else any((email, instagram))
             )
         kakao_no_match = (
             stage == "phone"
             and phone_provider == "kakao"
             and not phase_matched
+        )
+        needs_mobile_fallback = (
+            stage == "phone"
+            and phone_provider == "kakao"
+            and mobile is None
         )
         overall_matched = any(
             (
@@ -618,7 +663,7 @@ def _enrich_one(
         )
         next_check = (
             checked_at
-            if kakao_no_match
+            if needs_mobile_fallback
             else checked_at + timedelta(
                 days=30 if phase_matched else 90
             )
@@ -629,6 +674,16 @@ def _enrich_one(
                 "source_type": value.get("source_type"),
                 "source_url": value.get("source_url"),
                 "confidence": int(value.get("confidence") or 0),
+                **({
+                    "query_mode": str(
+                        (value.get("metadata") or {}).get("query_mode")
+                        or ""
+                    ),
+                    "evidence": str(
+                        (value.get("metadata") or {}).get("evidence")
+                        or ""
+                    ),
+                } if value.get("metadata") else {}),
             }
             for key, value in {
                 "mobile_phone": mobile,
@@ -657,10 +712,10 @@ def _enrich_one(
             "attempt_count": attempt_count,
             "last_error": "",
             status_field: (
-                "matched"
+                "pending"
+                if needs_mobile_fallback
+                else "matched"
                 if phase_matched
-                else "pending"
-                if kakao_no_match
                 else "no_match"
             ),
             fields["checked_at"]: _iso(checked_at),
@@ -669,9 +724,9 @@ def _enrich_one(
             fields["last_error"]: "",
         }
         if stage == "phone":
-            if phase_matched or phone_provider == "daum":
+            if phone_provider == "daum" or not needs_mobile_fallback:
                 values[PHONE_PROVIDER_FIELD] = "complete"
-            elif hold_kakao_no_match:
+            elif kakao_no_match and hold_kakao_no_match:
                 values[PHONE_PROVIDER_FIELD] = "kakao"
                 values["last_error"] = KAKAO_NO_MATCH_HELD
                 values[fields["last_error"]] = KAKAO_NO_MATCH_HELD
@@ -696,14 +751,15 @@ def _enrich_one(
             "outcome": "matched" if phase_matched else "no_match",
             "request_count": request_count,
             "held": bool(kakao_no_match and hold_kakao_no_match),
+            "diagnostics": dict(result.get("diagnostics") or {}),
         }
     except Exception as exc:
-        is_kakao_error = (
-            stage == "phone" and phone_provider == "kakao"
+        is_provider_error = (
+            stage == "phone" and phone_provider in {"kakao", "daum"}
         )
-        if isinstance(exc, KakaoProviderError):
+        if isinstance(exc, (KakaoProviderError, DaumProviderError)):
             request_count = exc.request_count
-        if isinstance(exc, KakaoProviderError):
+        if isinstance(exc, (KakaoProviderError, DaumProviderError)):
             safe_error_code = exc.safe_error_code
         elif isinstance(exc, UpstreamLimitError):
             message = str(exc).upper()
@@ -721,8 +777,16 @@ def _enrich_one(
             safe_error_code
         )
         is_quota = safe_error_code == "HTTP_429"
+        is_daum_client_error = (
+            phone_provider == "daum"
+            and re.fullmatch(r"HTTP_4[0-9]{2}", safe_error_code) is not None
+        )
         next_retry = (
-            kakao_provider_runtime.next_kst_quota_reset(checked_at)
+            (
+                daum_provider_runtime.next_kst_quota_reset(checked_at)
+                if phone_provider == "daum"
+                else kakao_provider_runtime.next_kst_quota_reset(checked_at)
+            )
             if is_quota
             else checked_at + timedelta(minutes=5)
         )
@@ -775,8 +839,8 @@ def _enrich_one(
             "outcome": "error",
             "safe_error_code": safe_error_code,
             "request_count": request_count,
-            "provider_error": is_kakao_error,
-            "halt": is_quota,
+            "provider_error": is_provider_error,
+            "halt": is_quota or is_daum_client_error,
             "fatal": persistence_failed,
         }
 
@@ -798,6 +862,17 @@ def _run_provider_batches(
         "error": 0,
         "skipped": 0,
     }
+    diagnostics = {
+        "documents": 0,
+        "raw_mobile": 0,
+        "raw_landline": 0,
+        "name_rejected": 0,
+        "evidence_rejected": 0,
+        "accepted_mobile": 0,
+        "accepted_landline": 0,
+        "source_pages_checked": 0,
+        "source_pages_verified": 0,
+    }
     processed = 0
     exit_code = 0
     held_no_match_keys: list[str] = []
@@ -807,23 +882,31 @@ def _run_provider_batches(
     )
     consecutive_provider_errors = 0
     quota_provider_error = False
+    quota_runtime = (
+        kakao_provider_runtime
+        if phone_provider == "kakao"
+        else daum_provider_runtime
+        if phone_provider == "daum"
+        else None
+    )
 
     try:
         while processed < max_records:
             select_limit = min(batch_size, max_records - processed)
-            if phone_provider == "kakao":
+            if quota_runtime is not None:
                 remaining_requests = max_requests - daily_request_count
                 if remaining_requests < 2:
                     exit_code = EXIT_DAILY_QUOTA
                     _safe_runtime_event(
                         "daily_request_limit_reached",
+                        provider=phone_provider,
                         request_count=daily_request_count,
                         request_limit=max_requests,
                     )
                     break
-                # A maximum of ten provider calls can be concurrently in
-                # flight. The consecutive-error guard therefore cannot be
-                # hidden behind a pre-submitted batch of hundreds of calls.
+                # Keep each batch inside the consecutive-error guard and
+                # reserve two calls per company for the mobile-first plus
+                # location-qualified mobile fallback search.
                 select_limit = min(
                     select_limit,
                     max(
@@ -833,7 +916,10 @@ def _run_provider_batches(
                     ),
                     remaining_requests // 2,
                 )
-                if len(first_outcomes) < KAKAO_INITIAL_ZERO_MATCH_LIMIT:
+                if (
+                    phone_provider == "kakao"
+                    and len(first_outcomes) < KAKAO_INITIAL_ZERO_MATCH_LIMIT
+                ):
                     select_limit = min(
                         select_limit,
                         KAKAO_INITIAL_ZERO_MATCH_LIMIT
@@ -850,10 +936,10 @@ def _run_provider_batches(
 
             reserved_request_count = 0
             reservation_quota_date = ""
-            if phone_provider == "kakao":
+            if quota_runtime is not None:
                 reserved_request_count = 2 * len(rows)
                 try:
-                    reservation = kakao_provider_runtime.reserve_quota(
+                    reservation = quota_runtime.reserve_quota(
                         reserved_request_count,
                         max_requests,
                     )
@@ -865,13 +951,14 @@ def _run_provider_batches(
                     )
                 except Exception:
                     exit_code = EXIT_RUNTIME_ERROR
-                    _safe_runtime_event("quota_reservation_failed")
+                    _safe_runtime_event(
+                        "quota_reservation_failed",
+                        provider=phone_provider,
+                    )
                     break
                 if not reservation.get("reserved"):
                     quota_provider_error = (
-                        kakao_provider_runtime.is_quota_blocked(
-                            reservation
-                        )
+                        quota_runtime.is_quota_blocked(reservation)
                         or str(
                             reservation.get("last_safe_error_code") or ""
                         ) == "HTTP_429"
@@ -883,6 +970,7 @@ def _run_provider_batches(
                     )
                     _safe_runtime_event(
                         "daily_request_limit_reached",
+                        provider=phone_provider,
                         request_count=daily_request_count,
                         request_limit=max_requests,
                     )
@@ -917,7 +1005,8 @@ def _run_provider_batches(
                             "status": "error",
                             "outcome": "error",
                             "request_count": 0,
-                            "provider_error": phone_provider == "kakao",
+                            "provider_error": phone_provider
+                            in {"kakao", "daum"},
                             "safe_error_code": "PROVIDER_ERROR",
                         }
 
@@ -930,30 +1019,39 @@ def _run_provider_batches(
                         0,
                         int(result.get("request_count") or 0),
                     )
-
-                    if phone_provider != "kakao":
-                        if result.get("halt"):
-                            halted_reason = "provider_limit"
-                            exit_code = EXIT_PROVIDER_GUARD
-                        continue
+                    result_diagnostics = result.get("diagnostics") or {}
+                    if isinstance(result_diagnostics, dict):
+                        for key in diagnostics:
+                            diagnostics[key] += max(
+                                0,
+                                int(result_diagnostics.get(key) or 0),
+                            )
 
                     outcome = str(
                         result.get("outcome") or status
                     ).lower()
                     if outcome not in {"matched", "no_match", "error"}:
                         continue
-                    if len(first_outcomes) < KAKAO_INITIAL_ZERO_MATCH_LIMIT:
-                        first_outcomes.append(outcome)
-                    recent_outcomes.append(outcome)
+                    if phone_provider == "kakao":
+                        if (
+                            len(first_outcomes)
+                            < KAKAO_INITIAL_ZERO_MATCH_LIMIT
+                        ):
+                            first_outcomes.append(outcome)
+                        recent_outcomes.append(outcome)
 
-                    if result.get("held"):
+                    if phone_provider == "kakao" and result.get("held"):
                         contact_key = str(result.get("contact_key") or "")
                         if contact_key:
                             held_no_match_keys.append(contact_key)
 
                     if outcome == "matched":
                         consecutive_provider_errors = 0
-                        if held_no_match_keys and not halted_reason:
+                        if (
+                            phone_provider == "kakao"
+                            and held_no_match_keys
+                            and not halted_reason
+                        ):
                             _release_kakao_no_match_holds(
                                 held_no_match_keys
                             )
@@ -962,8 +1060,14 @@ def _run_provider_batches(
                         consecutive_provider_errors = 0
                     elif result.get("provider_error"):
                         consecutive_provider_errors += 1
-                        code = kakao_provider_runtime.safe_error_code(
-                            result.get("safe_error_code")
+                        code = (
+                            daum_provider_runtime.safe_error_code(
+                                result.get("safe_error_code")
+                            )
+                            if phone_provider == "daum"
+                            else kakao_provider_runtime.safe_error_code(
+                                result.get("safe_error_code")
+                            )
                         )
                         if code == "HTTP_429" or not batch_error_code:
                             batch_error_code = code
@@ -979,6 +1083,9 @@ def _run_provider_batches(
                         quota_provider_error = True
                         halted_reason = "quota_error"
                         exit_code = EXIT_PROVIDER_QUOTA
+                    elif result.get("halt"):
+                        halted_reason = "provider_limit"
+                        exit_code = EXIT_PROVIDER_GUARD
                     elif (
                         not halted_reason
                         and consecutive_provider_errors
@@ -986,11 +1093,14 @@ def _run_provider_batches(
                     ):
                         halted_reason = "consecutive_provider_errors"
                         exit_code = EXIT_PROVIDER_GUARD
-                        guard_trip_reason = (
-                            kakao_provider_runtime.GUARD_REASON_CONSECUTIVE_PROVIDER_ERRORS
-                        )
+                        if phone_provider == "kakao":
+                            guard_trip_reason = (
+                                kakao_provider_runtime.GUARD_REASON_CONSECUTIVE_PROVIDER_ERRORS
+                            )
                         guard_observed_count = consecutive_provider_errors
                     elif (
+                        phone_provider == "kakao"
+                        and
                         not halted_reason
                         and len(first_outcomes)
                         == KAKAO_INITIAL_ZERO_MATCH_LIMIT
@@ -1007,6 +1117,8 @@ def _run_provider_batches(
                         guard_observed_count = len(first_outcomes)
                         guard_matched_count = first_outcomes.count("matched")
                     elif (
+                        phone_provider == "kakao"
+                        and
                         not halted_reason
                         and len(recent_outcomes)
                         == KAKAO_ROLLING_ZERO_MATCH_LIMIT
@@ -1028,9 +1140,9 @@ def _run_provider_batches(
                             if pending is not future:
                                 pending.cancel()
 
-            if phone_provider == "kakao":
+            if quota_runtime is not None:
                 try:
-                    updated_usage = kakao_provider_runtime.reconcile_usage(
+                    updated_usage = quota_runtime.reconcile_usage(
                         reserved_request_count,
                         (
                             reserved_request_count
@@ -1043,14 +1155,18 @@ def _run_provider_batches(
                     daily_request_count = int(
                         updated_usage.get("request_count") or 0
                     )
-                    if not kakao_provider_runtime.renew_lease(lease_token):
+                    if not quota_runtime.renew_lease(lease_token):
                         halted_reason = "lease_lost"
                         exit_code = EXIT_LEASE_UNAVAILABLE
                 except Exception:
                     halted_reason = "runtime_persistence_failed"
                     exit_code = EXIT_RUNTIME_ERROR
 
-                if guard_trip_reason and exit_code == EXIT_PROVIDER_GUARD:
+                if (
+                    phone_provider == "kakao"
+                    and guard_trip_reason
+                    and exit_code == EXIT_PROVIDER_GUARD
+                ):
                     try:
                         tripped = kakao_provider_runtime.trip_guard(
                             lease_token,
@@ -1077,10 +1193,15 @@ def _run_provider_batches(
                         "processed": processed,
                         **(
                             {"request_count": daily_request_count}
-                            if phone_provider == "kakao"
+                            if quota_runtime is not None
                             else {}
                         ),
                         **totals,
+                        **(
+                            {"diagnostics": diagnostics}
+                            if phone_provider == "daum"
+                            else {}
+                        ),
                     },
                     ensure_ascii=False,
                 ),
@@ -1089,6 +1210,7 @@ def _run_provider_batches(
             if halted_reason:
                 _safe_runtime_event(
                     "stopped_by_guard",
+                    provider=phone_provider,
                     safe_error_code=batch_error_code,
                     reason=halted_reason,
                     processed=processed,
@@ -1161,17 +1283,29 @@ def run_enrichment(
                 max_requests,
             ),
         )
+    elif phone_provider == "daum":
+        if not daum_web_search_client.key_status()["configured"]:
+            raise RuntimeError("Daum provider key is required")
+        if int(max_records) <= 0:
+            max_records = DAUM_DAILY_SAFE_RECORDS
+        max_records = max(
+            1,
+            min(DAUM_DAILY_SAFE_RECORDS, int(max_records)),
+        )
+        max_requests = (
+            int(max_requests)
+            if int(max_requests) > 0
+            else DAUM_DAILY_SAFE_REQUESTS
+        )
+        max_requests = max(
+            1,
+            min(
+                daum_provider_runtime.MAX_DAILY_SAFE_REQUESTS,
+                max_requests,
+            ),
+        )
     else:
-        if stage == "phone":
-            if not daum_web_search_client.key_status()["configured"]:
-                raise RuntimeError("Daum provider key is required")
-            if int(max_records) <= 0:
-                max_records = DAUM_DAILY_SAFE_RECORDS
-            max_records = max(
-                1,
-                min(DAUM_DAILY_SAFE_RECORDS, int(max_records)),
-            )
-        else:
+        if stage != "phone":
             if not naver_web_search_client.key_status()["configured"]:
                 raise RuntimeError("Naver provider key is required")
             if int(max_records) <= 0:
@@ -1341,6 +1475,53 @@ def run_enrichment(
                     ),
                 )
 
+        elif phone_provider == "daum":
+            lease_token = daum_provider_runtime.new_lease_token()
+            try:
+                acquired = daum_provider_runtime.acquire_lease(lease_token)
+            except Exception:
+                _safe_runtime_event(
+                    "lease_check_failed",
+                    provider="daum",
+                )
+                return EXIT_RUNTIME_ERROR
+            if not acquired:
+                _safe_runtime_event(
+                    "lease_unavailable",
+                    provider="daum",
+                )
+                return EXIT_LEASE_UNAVAILABLE
+            try:
+                usage = daum_provider_runtime.get_daily_usage()
+                daily_request_count = int(
+                    usage.get("request_count") or 0
+                )
+            except Exception:
+                _safe_runtime_event(
+                    "usage_check_failed",
+                    provider="daum",
+                )
+                return EXIT_RUNTIME_ERROR
+            if daum_provider_runtime.is_quota_blocked(usage):
+                _safe_runtime_event(
+                    "daily_quota_blocked",
+                    provider="daum",
+                    safe_error_code=(
+                        usage.get("last_safe_error_code") or "HTTP_429"
+                    ),
+                    request_count=daily_request_count,
+                    request_limit=max_requests,
+                )
+                return EXIT_PROVIDER_QUOTA
+            if daily_request_count >= max_requests:
+                _safe_runtime_event(
+                    "daily_request_limit_reached",
+                    provider="daum",
+                    request_count=daily_request_count,
+                    request_limit=max_requests,
+                )
+                return EXIT_DAILY_QUOTA
+
         print(
             json.dumps(
                 {
@@ -1354,7 +1535,7 @@ def run_enrichment(
                     "max_records": max_records,
                     **(
                         {"daily_request_limit": max_requests}
-                        if phone_provider == "kakao"
+                        if phone_provider in {"kakao", "daum"}
                         else {}
                     ),
                 },
@@ -1375,9 +1556,16 @@ def run_enrichment(
     finally:
         if lease_token:
             try:
-                kakao_provider_runtime.release_lease(lease_token)
+                (
+                    daum_provider_runtime
+                    if phone_provider == "daum"
+                    else kakao_provider_runtime
+                ).release_lease(lease_token)
             except Exception:
-                _safe_runtime_event("lease_release_failed")
+                _safe_runtime_event(
+                    "lease_release_failed",
+                    provider=phone_provider,
+                )
 
 
 def main() -> int:
