@@ -742,7 +742,7 @@ def load_other_company_candidates(
         "p_business_type": normalized_business_type,
     }
     response = requests.post(
-        f"{config.url}/rest/v1/rpc/oasis_search_other_companies_v1",
+        f"{config.url}/rest/v1/rpc/oasis_search_other_companies_v2",
         headers=_rest_headers(),
         data=json.dumps(payload, ensure_ascii=False),
         timeout=max(config.timeout, 60),

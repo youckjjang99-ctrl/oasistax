@@ -83,7 +83,7 @@ def test_other_company_repository_uses_dedicated_rpc(
     assert rows[0]["신규업체"] is False
     assert rows[0]["고용증가구분"] == "고용증가·신규개업 해당 없음"
     assert request_post.call_args.args[0].endswith(
-        "/rpc/oasis_search_other_companies_v1"
+        "/rpc/oasis_search_other_companies_v2"
     )
     payload = json.loads(request_post.call_args.kwargs["data"])
     assert payload["p_province_code"] == "11"
@@ -167,3 +167,16 @@ def test_other_company_correction_uses_comwel_source_facts() -> None:
     assert "w.is_new_2025 is false" in normalized
     assert "w.province = trim(p_province_name)" in normalized
     assert "w.district = trim(p_district)" in normalized
+
+
+def test_db_request_migration_excludes_new_signals_from_other_pool() -> None:
+    migration = Path(
+        "supabase/migrations/20260813203000_add_db_request_discovery_type.sql"
+    ).read_text(encoding="utf-8")
+    normalized = " ".join(migration.lower().split())
+
+    assert "oasis_search_other_companies_v2" in normalized
+    assert "c.is_new_company is false" in normalized
+    assert "c.opening_signal_basis" in normalized
+    assert "s.contact_ref_key" in normalized
+    assert "not exists" in normalized

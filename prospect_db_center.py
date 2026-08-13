@@ -151,6 +151,15 @@ DISCOVERY_TYPE_LABELS.update(
         "unknown": "분류 확인 중",
     }
 )
+DB_REQUEST_DISCOVERY_TYPE_OPTIONS = {
+    "고용증가업체": "growth",
+    "신규업체(추정 포함)": "recent_opening",
+    "그 외 업체": "other",
+}
+DB_REQUEST_DISCOVERY_TYPE_LABELS = {
+    value: label for label, value in DB_REQUEST_DISCOVERY_TYPE_OPTIONS.items()
+}
+DB_REQUEST_DISCOVERY_TYPE_LABELS["all"] = "기존 통합 신청"
 PROSPECT_RESULT_PAGE_SIZE_OPTIONS = (25, 50, 100)
 _PROSPECT_SAVE_FLASH_KEY = "_prospect_save_flash_v989"
 _PROSPECT_SAVE_APPROVAL_KEY = "_prospect_save_approval_v1042"
@@ -6101,6 +6110,7 @@ def _collect_allocation_candidates(
     business_type: str,
     channel: str,
     *,
+    discovery_type: str = "all",
     minimum_employees: int = 1,
     maximum_employees: int = 300,
     pool_size: int = 500,
@@ -6159,13 +6169,33 @@ def _collect_allocation_candidates(
             ),
         ),
     )
+    requested_discovery_type = str(discovery_type or "all").strip().lower()
+    if requested_discovery_type not in {
+        "all",
+        "growth",
+        "recent_opening",
+        "other",
+    }:
+        requested_discovery_type = "all"
+    selected_searches = (
+        searches
+        if requested_discovery_type == "all"
+        else tuple(
+            search
+            for search in searches
+            if search[0] == requested_discovery_type
+        )
+    )
     by_uid: dict[str, dict] = {}
     warnings: list[str] = []
-    for discovery_type, search in searches:
+    for candidate_discovery_type, search in selected_searches:
         result = search()
         if not result.get("ok"):
             warnings.append(
-                str(result.get("message") or f"{discovery_type} 조회 실패")
+                str(
+                    result.get("message")
+                    or f"{candidate_discovery_type} 조회 실패"
+                )
             )
             continue
         for original in result.get("items") or []:
@@ -6195,11 +6225,11 @@ def _collect_allocation_candidates(
                 existing = by_uid[company_uid]
                 existing["발굴유형"] = _merge_discovery_type(
                     str(existing.get("발굴유형") or ""),
-                    discovery_type,
+                    candidate_discovery_type,
                 )
                 continue
             item["company_uid"] = company_uid
-            item["발굴유형"] = discovery_type
+            item["발굴유형"] = candidate_discovery_type
             item["배정경로"] = channel
             by_uid[company_uid] = item
     candidates = list(by_uid.values())
@@ -6455,10 +6485,10 @@ def _render_db_request_home(owner_user_id: str) -> None:
     request_panel = st.container(border=True, key="db_request_panel")
     request_panel.markdown("### DB 신청")
     request_panel.caption(
-        "지역·사업자 유형·고용인원을 선택해 주세요. 일반번호 DB는 무작위로 즉시 "
+        "지역·사업자 유형·업체 분류·고용인원을 선택해 주세요. 일반번호 DB는 무작위로 즉시 "
         "배정되고, 핸드폰 DB는 관리자가 신청 순서와 보유 현황을 검토해 배정합니다."
     )
-    filter_col1, filter_col2, filter_col3 = request_panel.columns(3)
+    filter_col1, filter_col2, filter_col3, filter_col4 = request_panel.columns(4)
     region_name = filter_col1.selectbox(
         "도·광역시",
         province_options()[1:],
@@ -6475,6 +6505,12 @@ def _render_db_request_home(owner_user_id: str) -> None:
         key="simple_db_business_type_v1090",
     )
     business_type = BUSINESS_TYPE_OPTIONS[business_type_name]
+    discovery_type_name = filter_col4.selectbox(
+        "업체 분류",
+        list(DB_REQUEST_DISCOVERY_TYPE_OPTIONS.keys()),
+        key="simple_db_discovery_type_v1230",
+    )
+    discovery_type = DB_REQUEST_DISCOVERY_TYPE_OPTIONS[discovery_type_name]
 
     employee_col1, employee_col2 = request_panel.columns(2)
     minimum_employees = employee_col1.number_input(
@@ -6536,6 +6572,7 @@ def _render_db_request_home(owner_user_id: str) -> None:
                     district_name,
                     business_type,
                     "landline",
+                    discovery_type=discovery_type,
                     minimum_employees=int(minimum_employees),
                     maximum_employees=int(maximum_employees),
                 )
@@ -6586,6 +6623,7 @@ def _render_db_request_home(owner_user_id: str) -> None:
             region_name,
             "" if district_name == ALL_DISTRICTS else district_name,
             business_type,
+            discovery_type=discovery_type,
             minimum_employees=int(minimum_employees),
             maximum_employees=int(maximum_employees),
             session_id=_assignment_session_id(),
@@ -6621,6 +6659,10 @@ def _render_db_request_home(owner_user_id: str) -> None:
                         ),
                         "사업자유형": BUSINESS_TYPE_LABELS.get(
                             str(row.get("business_type") or "all"), "전체"
+                        ),
+                        "업체분류": DB_REQUEST_DISCOVERY_TYPE_LABELS.get(
+                            str(row.get("discovery_type") or "all"),
+                            "기존 통합 신청",
                         ),
                         "고용인원": (
                             f"{int(row.get('minimum_employees') or 1):,}"
@@ -6674,6 +6716,10 @@ def _render_mobile_db_admin(current_user_id: str) -> None:
                     "사업자유형": BUSINESS_TYPE_LABELS.get(
                         str(row.get("business_type") or "all"), "전체"
                     ),
+                    "업체분류": DB_REQUEST_DISCOVERY_TYPE_LABELS.get(
+                        str(row.get("discovery_type") or "all"),
+                        "기존 통합 신청",
+                    ),
                     "고용인원": (
                         f"{int(row.get('minimum_employees') or 1):,}"
                         f"~{int(row.get('maximum_employees') or 300):,}명"
@@ -6698,7 +6744,8 @@ def _render_mobile_db_admin(current_user_id: str) -> None:
         list(by_id),
         format_func=lambda value: (
             f"{by_id[value].get('requested_user_name') or '담당자 미확인'} · "
-            f"{by_id[value].get('region') or ''}"
+            f"{by_id[value].get('region') or ''} · "
+            f"{DB_REQUEST_DISCOVERY_TYPE_LABELS.get(str(by_id[value].get('discovery_type') or 'all'), '기존 통합 신청')}"
         ),
         key=_MOBILE_DB_ADMIN_SELECTION_KEY,
     )
@@ -6761,6 +6808,7 @@ def _render_mobile_db_admin(current_user_id: str) -> None:
                 str(selected.get("district") or ALL_DISTRICTS) or ALL_DISTRICTS,
                 str(selected.get("business_type") or "all"),
                 "mobile",
+                discovery_type=str(selected.get("discovery_type") or "all"),
                 minimum_employees=int(selected.get("minimum_employees") or 1),
                 maximum_employees=int(selected.get("maximum_employees") or 300),
             )

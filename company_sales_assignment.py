@@ -284,6 +284,7 @@ _MOBILE_DB_REQUEST_FIELDS = {
     "region",
     "district",
     "business_type",
+    "discovery_type",
     "minimum_employees",
     "maximum_employees",
     "requested_count",
@@ -2098,11 +2099,27 @@ def submit_mobile_db_request(
     district: Any = "",
     business_type: Any = "all",
     *,
+    discovery_type: Any = "all",
     minimum_employees: int = 1,
     maximum_employees: int = 300,
     session_id: str = "",
     db: CloudDatabase | None = None,
 ) -> dict[str, Any]:
+    safe_discovery_type = _bounded(discovery_type, 30).lower() or "all"
+    if safe_discovery_type not in {
+        "all",
+        "growth",
+        "recent_opening",
+        "other",
+    }:
+        return {
+            "ok": False,
+            "code": "INVALID_INPUT",
+            "message": "신청할 업체 분류를 확인해 주세요.",
+            "assignment": {},
+            "warning": "업체 분류를 확인해 주세요.",
+            "fallback_required": False,
+        }
     try:
         minimum_count = max(1, min(int(minimum_employees), 10000))
         maximum_count = max(1, min(int(maximum_employees), 10000))
@@ -2125,6 +2142,7 @@ def submit_mobile_db_request(
             "p_region": _bounded(region, 100),
             "p_district": _bounded(district, 100),
             "p_business_type": _bounded(business_type, 20).lower() or "all",
+            "p_discovery_type": safe_discovery_type,
             "p_minimum_employees": minimum_count,
             "p_maximum_employees": maximum_count,
             "p_session_id": _bounded(session_id, 200) or None,

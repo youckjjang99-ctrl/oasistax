@@ -125,6 +125,48 @@ class SplitCandidateTests(unittest.TestCase):
     @patch.object(
         prospect,
         "_krx_listed_company_names",
+        return_value=frozenset(),
+    )
+    @patch.object(prospect, "collect_other_companies")
+    @patch.object(prospect, "collect_recent_opening_companies")
+    @patch.object(prospect, "collect_contactable_growth_companies")
+    def test_request_discovery_type_only_queries_selected_pool(
+        self,
+        growth,
+        recent,
+        other,
+        _listed_names,
+    ):
+        growth.return_value = {"ok": True, "items": []}
+        recent.return_value = {
+            "ok": True,
+            "items": [
+                _candidate(
+                    SYNTHETIC_BUSINESS_ONE,
+                    mobile=SYNTHETIC_MOBILE,
+                )
+            ],
+        }
+        other.return_value = {"ok": True, "items": []}
+
+        rows, warnings = prospect._collect_allocation_candidates(
+            "서울특별시",
+            "전체",
+            "all",
+            "mobile",
+            discovery_type="recent_opening",
+        )
+
+        self.assertFalse(warnings)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["발굴유형"], "recent_opening")
+        growth.assert_not_called()
+        recent.assert_called_once()
+        other.assert_not_called()
+
+    @patch.object(
+        prospect,
+        "_krx_listed_company_names",
         return_value=frozenset({"공식상장사"}),
     )
     @patch.object(prospect, "collect_other_companies")
@@ -269,6 +311,36 @@ class MobileRequestRpcTests(unittest.TestCase):
         self.assertEqual(database.calls[0][1]["p_minimum_employees"], 5)
         self.assertEqual(database.calls[0][1]["p_maximum_employees"], 50)
 
+    def test_submit_mobile_request_forwards_discovery_type(self):
+        database = _FakeDatabase(
+            {
+                assignments.RPC_SUBMIT_MOBILE_DB_REQUEST: [
+                    {
+                        "success": True,
+                        "code": "requested",
+                        "request_id": "request-2",
+                        "status": "pending",
+                        "discovery_type": "recent_opening",
+                    }
+                ]
+            }
+        )
+
+        result = assignments.submit_mobile_db_request(
+            "sales-user",
+            "서울특별시",
+            discovery_type="recent_opening",
+            db=database,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            database.calls[0][1]["p_discovery_type"], "recent_opening"
+        )
+        self.assertEqual(
+            result["request"]["discovery_type"], "recent_opening"
+        )
+
     def test_submit_rejects_inverted_employee_range_before_rpc(self):
         database = _FakeDatabase({})
 
@@ -277,6 +349,20 @@ class MobileRequestRpcTests(unittest.TestCase):
             "서울특별시",
             minimum_employees=50,
             maximum_employees=5,
+            db=database,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "INVALID_INPUT")
+        self.assertFalse(database.calls)
+
+    def test_submit_rejects_unknown_discovery_type_before_rpc(self):
+        database = _FakeDatabase({})
+
+        result = assignments.submit_mobile_db_request(
+            "sales-user",
+            "서울특별시",
+            discovery_type="unexpected",
             db=database,
         )
 
@@ -319,6 +405,25 @@ class MobileRequestMigrationTests(unittest.TestCase):
         self.assertIn("maximum_employees integer not null default 300", sql)
         self.assertIn("p_minimum_employees integer", sql)
         self.assertIn("p_maximum_employees integer", sql)
+        self.assertIn("to service_role", sql)
+        self.assertIn("from public, anon, authenticated", sql)
+
+    def test_discovery_type_migration_updates_requests_and_rpc_contracts(self):
+        root = Path(__file__).resolve().parents[1]
+        sql = (
+            root
+            / "supabase"
+            / "migrations"
+            / "20260813203000_add_db_request_discovery_type.sql"
+        ).read_text(encoding="utf-8").lower()
+
+        self.assertIn("discovery_type text not null default 'all'", sql)
+        self.assertIn(
+            "'all', 'growth', 'recent_opening', 'other'",
+            sql,
+        )
+        self.assertIn("p_discovery_type text", sql)
+        self.assertIn("r.discovery_type", sql)
         self.assertIn("to service_role", sql)
         self.assertIn("from public, anon, authenticated", sql)
 
