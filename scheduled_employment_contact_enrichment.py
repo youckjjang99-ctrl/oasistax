@@ -12,6 +12,7 @@ from typing import Any
 
 import requests
 
+import daum_web_search_client
 import kakao_provider_runtime
 import naver_web_search_client
 from cloud_db import CloudDatabase
@@ -22,12 +23,13 @@ from contact_matching import is_mobile_phone, normalize_phone
 TABLE_CONTACTS = "oasis_employment_contacts"
 CONTACT_TYPES = {"phone", "email", "instagram"}
 CONTACT_STAGES = {"phone", "digital"}
-PHONE_PROVIDERS = {"auto", "kakao", "naver"}
+PHONE_PROVIDERS = {"auto", "kakao", "daum"}
 PHONE_PROVIDER_FIELD = "phone_provider_stage"
 PHONE_ONLY_SOURCE_TYPES = {"comwel_all_employers"}
 KAKAO_DAILY_SAFE_REQUESTS = (
     kakao_provider_runtime.DEFAULT_DAILY_SAFE_REQUESTS
 )
+DAUM_DAILY_SAFE_RECORDS = 25000
 NAVER_DAILY_SAFE_RECORDS = 12000
 KAKAO_NO_MATCH_HELD = "KAKAO_NO_MATCH_HELD"
 KAKAO_CONSECUTIVE_ERROR_LIMIT = 10
@@ -117,7 +119,11 @@ def _select_rows(
         "limit": str(max(1, min(5000, int(limit)))),
     }
     if stage == "phone" and phone_provider:
-        params[PHONE_PROVIDER_FIELD] = f"eq.{phone_provider}"
+        params[PHONE_PROVIDER_FIELD] = (
+            "in.(daum,naver)"
+            if phone_provider == "daum"
+            else f"eq.{phone_provider}"
+        )
         if phone_provider == "kakao" and status == "pending":
             # A no-match stays in Kakao while zero-match guards are evaluated.
             # Excluding the marker prevents it being selected again in-run.
@@ -163,9 +169,9 @@ def _eligible_rows(
         raise ValueError("stage must be phone or digital")
     if (
         stage == "phone"
-        and phone_provider not in {"kakao", "naver"}
+        and phone_provider not in {"kakao", "daum"}
     ):
-        raise ValueError("phone_provider must be kakao or naver")
+        raise ValueError("phone_provider must be kakao or daum")
     limit = max(1, min(5000, int(limit)))
     now = _now()
     due_before = _iso(now)
@@ -273,6 +279,11 @@ def _claim(
     fields = STAGE_FIELDS[stage]
     status_field = fields["status"]
     status = str(row.get(status_field) or "pending")
+    expected_provider = (
+        str(row.get(PHONE_PROVIDER_FIELD) or phone_provider or "")
+        if stage == "phone"
+        else None
+    )
     return _patch(
         str(row.get("contact_key") or ""),
         {
@@ -282,9 +293,7 @@ def _claim(
         },
         expected_status=status,
         status_field=status_field,
-        expected_phone_provider_stage=(
-            phone_provider if stage == "phone" else None
-        ),
+        expected_phone_provider_stage=expected_provider,
     )
 
 
@@ -321,6 +330,9 @@ def _accepted_contacts(
 
 
 def _provider_limit_message(result: dict[str, Any]) -> str:
+    root_status = str(result.get("status") or "").upper()
+    if any(marker in root_status for marker in RATE_LIMIT_MARKERS):
+        return f"provider:{root_status}"
     for row in result.get("trace") or []:
         status = str((row or {}).get("status") or "").upper()
         if any(marker in status for marker in RATE_LIMIT_MARKERS):
@@ -378,7 +390,7 @@ def _rpc_integer(value: Any, operation: str) -> int:
 
 
 def _release_kakao_no_match_holds(contact_keys: list[str]) -> None:
-    """Advance only confirmed normal no-matches to the Naver queue."""
+    """Advance only confirmed normal no-matches to the Daum queue."""
     now = _iso(_now())
     for contact_key in dict.fromkeys(contact_keys):
         updated = _patch(
@@ -386,7 +398,7 @@ def _release_kakao_no_match_holds(contact_keys: list[str]) -> None:
             {
                 "status": "pending",
                 "phone_status": "pending",
-                PHONE_PROVIDER_FIELD: "naver",
+                PHONE_PROVIDER_FIELD: "daum",
                 "last_error": "",
                 "phone_last_error": "",
                 "next_check_at": now,
@@ -459,11 +471,16 @@ def _enrich_one(
 ) -> dict[str, Any]:
     if stage not in CONTACT_STAGES:
         raise ValueError("stage must be phone or digital")
-    if stage == "phone" and phone_provider not in {"kakao", "naver"}:
-        raise ValueError("phone_provider must be kakao or naver")
+    if stage == "phone" and phone_provider not in {"kakao", "daum"}:
+        raise ValueError("phone_provider must be kakao or daum")
     fields = STAGE_FIELDS[stage]
     status_field = fields["status"]
     contact_key = str(row.get("contact_key") or "")
+    expected_provider = (
+        str(row.get(PHONE_PROVIDER_FIELD) or phone_provider or "")
+        if stage == "phone"
+        else None
+    )
     if not _claim(row, stage, phone_provider):
         return {
             "status": "skipped",
@@ -476,23 +493,32 @@ def _enrich_one(
     stage_attempt_count = int(row.get(fields["attempt_count"]) or 0) + 1
     request_count = 0
     try:
-        result = enrich_company(
-            {
-                "company_name": row.get("company_name"),
-                "address": row.get("address"),
-                "business_no": row.get("business_no"),
-                "industry_name": row.get("industry_name"),
-            },
-            skip_kakao=stage == "phone" and phone_provider == "naver",
-            skip_naver=stage == "phone" and phone_provider == "kakao",
-            skip_localdata=True,
-            kakao_runtime_managed=True,
-            bulk_mode=stage == "phone",
-            contact_stage=stage,
-            website_timeout=6 if stage == "phone" else 8,
-            max_website_candidates=2,
-            website_max_pages=2,
-        )
+        prospect = {
+            "company_name": row.get("company_name"),
+            "address": row.get("address"),
+            "business_no": row.get("business_no"),
+            "industry_name": row.get("industry_name"),
+        }
+        if stage == "phone" and phone_provider == "daum":
+            result = daum_web_search_client.search_public_phones(
+                str(prospect.get("company_name") or ""),
+                str(prospect.get("address") or ""),
+                timeout=6,
+                size=10,
+            )
+        else:
+            result = enrich_company(
+                prospect,
+                skip_kakao=False,
+                skip_naver=stage == "phone",
+                skip_localdata=True,
+                kakao_runtime_managed=True,
+                bulk_mode=stage == "phone",
+                contact_stage=stage,
+                website_timeout=6 if stage == "phone" else 8,
+                max_website_candidates=2,
+                website_max_pages=2,
+            )
         kakao_provider = _kakao_provider_result(result)
         request_count = (
             0
@@ -523,6 +549,9 @@ def _enrich_one(
                     request_count,
                 )
         elif not result.get("ok"):
+            provider_limit = _provider_limit_message(result)
+            if provider_limit:
+                raise UpstreamLimitError(provider_limit)
             raise RuntimeError("PROVIDER_ERROR")
         accepted = _accepted_contacts(result, stage)
         provider_limit = _provider_limit_message(result)
@@ -639,22 +668,20 @@ def _enrich_one(
             fields["last_error"]: "",
         }
         if stage == "phone":
-            if phase_matched or phone_provider == "naver":
+            if phase_matched or phone_provider == "daum":
                 values[PHONE_PROVIDER_FIELD] = "complete"
             elif hold_kakao_no_match:
                 values[PHONE_PROVIDER_FIELD] = "kakao"
                 values["last_error"] = KAKAO_NO_MATCH_HELD
                 values[fields["last_error"]] = KAKAO_NO_MATCH_HELD
             else:
-                values[PHONE_PROVIDER_FIELD] = "naver"
+                values[PHONE_PROVIDER_FIELD] = "daum"
         _patch(
             contact_key,
             values,
             expected_status="processing",
             status_field=status_field,
-            expected_phone_provider_stage=(
-                phone_provider if stage == "phone" else None
-            ),
+            expected_phone_provider_stage=expected_provider,
         )
         return {
             "status": (
@@ -733,9 +760,7 @@ def _enrich_one(
                 },
                 expected_status="processing",
                 status_field=status_field,
-                expected_phone_provider_stage=(
-                    phone_provider if stage == "phone" else None
-                ),
+                expected_phone_provider_stage=expected_provider,
             )
         except Exception:
             # Preserve the provider's safe code/request count for quota and
@@ -1103,7 +1128,7 @@ def run_enrichment(
         raise ValueError("stage must be phone or digital")
     phone_provider = str(phone_provider or "auto").strip().lower()
     if phone_provider not in PHONE_PROVIDERS:
-        raise ValueError("phone_provider must be auto, kakao, or naver")
+        raise ValueError("phone_provider must be auto, kakao, or daum")
     requested_auto = stage == "phone" and phone_provider == "auto"
     if requested_auto:
         phone_provider = "kakao"
@@ -1134,14 +1159,21 @@ def run_enrichment(
             ),
         )
     else:
-        naver_configured = naver_web_search_client.key_status()[
-            "configured"
-        ]
-        if not naver_configured:
-            raise RuntimeError("Naver provider key is required")
-        if int(max_records) <= 0:
-            max_records = NAVER_DAILY_SAFE_RECORDS
-        max_records = max(1, min(25000, int(max_records)))
+        if stage == "phone":
+            if not daum_web_search_client.key_status()["configured"]:
+                raise RuntimeError("Daum provider key is required")
+            if int(max_records) <= 0:
+                max_records = DAUM_DAILY_SAFE_RECORDS
+            max_records = max(
+                1,
+                min(DAUM_DAILY_SAFE_RECORDS, int(max_records)),
+            )
+        else:
+            if not naver_web_search_client.key_status()["configured"]:
+                raise RuntimeError("Naver provider key is required")
+            if int(max_records) <= 0:
+                max_records = NAVER_DAILY_SAFE_RECORDS
+            max_records = max(1, min(25000, int(max_records)))
         max_requests = 0
 
     lease_token = ""
@@ -1298,7 +1330,7 @@ def run_enrichment(
                     return EXIT_RUNTIME_ERROR
                 return run_enrichment(
                     stage="phone",
-                    phone_provider="naver",
+                    phone_provider="daum",
                     workers=workers,
                     batch_size=batch_size,
                     max_records=(

@@ -89,6 +89,36 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
             f"neq.{job.KAKAO_NO_MATCH_HELD}",
         )
 
+    @patch.object(job.requests, "get")
+    @patch.object(job, "CloudDatabase")
+    def test_daum_selection_includes_legacy_naver_queue(
+        self,
+        cloud_database,
+        request_get,
+    ) -> None:
+        db = Mock()
+        db.headers = {}
+        db.config.timeout = 20
+        db._url.return_value = "https://example.supabase.co/rest/v1/contacts"
+        cloud_database.return_value = db
+        response = Mock(ok=True, text="[]")
+        response.json.return_value = []
+        request_get.return_value = response
+
+        job._select_rows(
+            stage="phone",
+            status="pending",
+            limit=25,
+            phone_provider="daum",
+        )
+
+        self.assertEqual(
+            request_get.call_args.kwargs["params"][
+                "phone_provider_stage"
+            ],
+            "in.(daum,naver)",
+        )
+
     @patch.object(job, "CloudDatabase")
     def test_kakao_hold_check_uses_service_role_rpc(
         self,
@@ -178,7 +208,7 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
             {"phone_status": "processing"},
             expected_status="pending",
             status_field="phone_status",
-            expected_phone_provider_stage="naver",
+            expected_phone_provider_stage="daum",
         )
 
         self.assertTrue(claimed)
@@ -191,7 +221,7 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
             request_patch.call_args.kwargs["params"][
                 "phone_provider_stage"
             ],
-            "eq.naver",
+            "eq.daum",
         )
 
     @patch.object(job, "_patch", return_value=True)
@@ -203,10 +233,37 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
             {
                 "contact_key": "place:test",
                 "phone_status": "pending",
+                "phone_provider_stage": "daum",
+            },
+            "phone",
+            "daum",
+        )
+
+        self.assertTrue(claimed)
+        self.assertEqual(
+            patch_row.call_args.kwargs[
+                "expected_phone_provider_stage"
+            ],
+            "daum",
+        )
+        self.assertEqual(
+            patch_row.call_args.kwargs["expected_status"],
+            "pending",
+        )
+
+    @patch.object(job, "_patch", return_value=True)
+    def test_daum_worker_claims_legacy_naver_row_atomically(
+        self,
+        patch_row,
+    ) -> None:
+        claimed = job._claim(
+            {
+                "contact_key": "place:legacy",
+                "phone_status": "pending",
                 "phone_provider_stage": "naver",
             },
             "phone",
-            "naver",
+            "daum",
         )
 
         self.assertTrue(claimed)
@@ -216,13 +273,9 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
             ],
             "naver",
         )
-        self.assertEqual(
-            patch_row.call_args.kwargs["expected_status"],
-            "pending",
-        )
 
     @patch.object(
-        job.naver_web_search_client,
+        job.daum_web_search_client,
         "key_status",
         return_value={"configured": True},
     )
@@ -232,7 +285,7 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
         self,
         eligible,
         _enrich_one,
-        _naver_key,
+        _daum_key,
     ) -> None:
         eligible.side_effect = [
             [{"contact_key": "place:test"}],
@@ -241,22 +294,22 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
 
         result = job.run_enrichment(
             stage="phone",
-            phone_provider="naver",
+            phone_provider="daum",
             max_records=1,
         )
 
         self.assertEqual(result, 0)
 
     @patch.object(
-        job.naver_web_search_client,
+        job.daum_web_search_client,
         "key_status",
         return_value={"configured": True},
     )
     @patch.object(job, "_eligible_rows")
-    def test_auto_provider_finishes_kakao_queue_before_naver(
+    def test_auto_provider_finishes_kakao_queue_before_daum(
         self,
         eligible,
-        _naver_key,
+        _daum_key,
     ) -> None:
         eligible.side_effect = [
             [{"contact_key": "kakao:pending"}],
@@ -468,7 +521,7 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
             "contacts": [],
         },
     )
-    def test_kakao_no_match_moves_to_naver_queue(
+    def test_kakao_no_match_moves_to_daum_queue(
         self,
         enrich,
         patch_row,
@@ -488,7 +541,7 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
         saved = patch_row.call_args_list[-1].args[1]
         self.assertEqual(saved["status"], "pending")
         self.assertEqual(saved["phone_status"], "pending")
-        self.assertEqual(saved["phone_provider_stage"], "naver")
+        self.assertEqual(saved["phone_provider_stage"], "daum")
         self.assertEqual(saved["attempt_count"], 3)
         self.assertIn("phone_next_check_at", saved)
         self.assertFalse(enrich.call_args.kwargs["skip_kakao"])
@@ -529,7 +582,7 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
         self.assertEqual(result["outcome"], "no_match")
         saved = patch_row.call_args_list[-1].args[1]
         self.assertEqual(saved["phone_status"], "pending")
-        self.assertEqual(saved["phone_provider_stage"], "naver")
+        self.assertEqual(saved["phone_provider_stage"], "daum")
 
     @patch.object(job, "_patch", return_value=True)
     @patch.object(job, "enrich_company")
@@ -567,13 +620,13 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
 
     @patch.object(job, "_patch", return_value=True)
     @patch.object(
-        job,
-        "enrich_company",
+        job.daum_web_search_client,
+        "search_public_phones",
         return_value={"ok": True, "contacts": []},
     )
-    def test_naver_no_match_completes_phone_pipeline(
+    def test_daum_no_match_completes_phone_pipeline(
         self,
-        enrich,
+        daum_search,
         patch_row,
     ) -> None:
         result = job._enrich_one(
@@ -581,31 +634,35 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
                 "contact_key": "place:test",
                 "status": "pending",
                 "phone_status": "pending",
-                "phone_provider_stage": "naver",
+                "phone_provider_stage": "daum",
                 "company_name": "테스트기업",
                 "address": "경기도 수원시",
             },
             "phone",
-            "naver",
+            "daum",
         )
         self.assertEqual(result["status"], "no_match")
         saved = patch_row.call_args_list[-1].args[1]
         self.assertEqual(saved["status"], "no_match")
         self.assertEqual(saved["phone_status"], "no_match")
         self.assertEqual(saved["phone_provider_stage"], "complete")
-        self.assertTrue(enrich.call_args.kwargs["skip_kakao"])
-        self.assertFalse(enrich.call_args.kwargs["skip_naver"])
+        daum_search.assert_called_once_with(
+            "테스트기업",
+            "경기도 수원시",
+            timeout=6,
+            size=10,
+        )
 
     @patch.object(job, "_patch", return_value=True)
     @patch.object(
-        job,
-        "enrich_company",
+        job.daum_web_search_client,
+        "search_public_phones",
         return_value={
             "ok": True,
             "contacts": [],
             "trace": [
                 {
-                    "stage": "naver_phone",
+                    "stage": "daum_web_phone",
                     "status": "HTTP_429",
                 }
             ],
@@ -624,22 +681,22 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
                 "address": "서울특별시 강남구",
             },
             "phone",
-            "naver",
+            "daum",
         )
         self.assertEqual(result["status"], "error")
         self.assertTrue(result["halt"])
         saved = patch_row.call_args_list[-1].args[1]
         self.assertEqual(saved["phone_status"], "error")
-        self.assertEqual(saved["phone_provider_stage"], "naver")
+        self.assertEqual(saved["phone_provider_stage"], "daum")
         self.assertEqual(saved["phone_last_error"], "HTTP_429")
 
     @patch.object(job, "_patch", return_value=True)
     @patch.object(
-        job,
-        "enrich_company",
+        job.daum_web_search_client,
+        "search_public_phones",
         side_effect=RuntimeError("temporary upstream failure"),
     )
-    def test_naver_error_remains_retryable_in_naver_queue(
+    def test_daum_error_remains_retryable_in_daum_queue(
         self,
         _enrich,
         patch_row,
@@ -648,25 +705,25 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
             {
                 "contact_key": "place:retry",
                 "phone_status": "pending",
-                "phone_provider_stage": "naver",
+                "phone_provider_stage": "daum",
                 "company_name": "테스트기업",
                 "address": "서울특별시 강남구",
             },
             "phone",
-            "naver",
+            "daum",
         )
 
         self.assertEqual(result["status"], "error")
         self.assertFalse(result["halt"])
         saved = patch_row.call_args_list[-1].args[1]
         self.assertEqual(saved["phone_status"], "error")
-        self.assertEqual(saved["phone_provider_stage"], "naver")
+        self.assertEqual(saved["phone_provider_stage"], "daum")
         self.assertIn("phone_next_check_at", saved)
         self.assertEqual(
             patch_row.call_args_list[-1].kwargs[
                 "expected_phone_provider_stage"
             ],
-            "naver",
+            "daum",
         )
 
     @patch.object(job, "_patch", return_value=True)
