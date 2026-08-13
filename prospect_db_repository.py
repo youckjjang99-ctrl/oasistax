@@ -55,6 +55,24 @@ SUPABASE_PROVINCE_CODES = {
     name: code for code, name in SUPABASE_PROVINCE_NAMES.items()
 }
 
+NEW_COMPANY_CONFIDENCE_LABELS = {
+    "high": "높음",
+    "medium": "보통",
+    "low": "낮음",
+    "pending": "판정 보류",
+}
+NEW_COMPANY_REASON_LABELS = {
+    "nps_recent_applied": "최근 국민연금 사업장 적용",
+    "no_earlier_employment_history": "과거 고용이력 없음",
+    "comwel_first_seen": "근로복지공단 신규 최초 등장",
+    "license_date_match": "최근 인허가일 일치",
+}
+NEW_COMPANY_SOURCE_LABELS = {
+    "license_date": "지방행정 인허가일",
+    "nps_applied_on": "국민연금 사업장 적용일",
+    "comwel_first_seen": "근로복지공단 최초 등장 연도",
+}
+
 
 def _business_no(value: Any) -> str:
     digits = re.sub(r"[^0-9]", "", str(value or ""))
@@ -883,12 +901,28 @@ def load_recent_opening_candidates(
         "p_limit": row_limit,
         "p_business_type": normalized_business_type,
     }
+    rpc_name = "oasis_search_recent_openings_v3"
     response = requests.post(
-        f"{config.url}/rest/v1/rpc/oasis_search_recent_openings_v2",
+        f"{config.url}/rest/v1/rpc/{rpc_name}",
         headers=_rest_headers(),
         data=json.dumps(payload, ensure_ascii=False),
         timeout=max(config.timeout, 60),
     )
+    if (
+        not response.ok
+        and response.status_code in {400, 404}
+        and (
+            "PGRST202" in response.text
+            or "oasis_search_recent_openings_v3" in response.text
+        )
+    ):
+        rpc_name = "oasis_search_recent_openings_v2"
+        response = requests.post(
+            f"{config.url}/rest/v1/rpc/{rpc_name}",
+            headers=_rest_headers(),
+            data=json.dumps(payload, ensure_ascii=False),
+            timeout=max(config.timeout, 60),
+        )
     if not response.ok:
         raise RuntimeError(
             "신규개업 추정·연락처 후보 조회 실패 "
@@ -930,6 +964,55 @@ def load_recent_opening_candidates(
         else:
             opening_label = f"{opening_year or 2025}년 신규 추정"
             opening_basis = "근로복지공단 연간 자료 최초 등장"
+        raw_score = row.get("new_company_score")
+        confidence_score = (
+            60 if raw_score in (None, "") else int(raw_score)
+        )
+        confidence_code = str(
+            row.get("new_company_confidence") or "medium"
+        ).strip().lower()
+        confidence_label = NEW_COMPANY_CONFIDENCE_LABELS.get(
+            confidence_code,
+            NEW_COMPANY_CONFIDENCE_LABELS["pending"],
+        )
+        raw_reason_codes = row.get("new_company_reason_codes") or []
+        reason_codes = (
+            list(raw_reason_codes)
+            if isinstance(raw_reason_codes, list)
+            else []
+        )
+        if not reason_codes:
+            reason_codes = [
+                (
+                    "nps_recent_applied"
+                    if source_type == "nps_monthly"
+                    else "comwel_first_seen"
+                ),
+                "no_earlier_employment_history",
+            ]
+        confidence_reasons = [
+            NEW_COMPANY_REASON_LABELS.get(code, code)
+            for code in reason_codes
+            if str(code or "").strip()
+        ]
+        estimated_opening_date = str(
+            row.get("estimated_opening_date") or opening_date
+        )
+        estimated_opening_year = int(
+            row.get("estimated_opening_year") or opening_year or 0
+        )
+        estimated_source_code = str(
+            row.get("estimated_opening_source")
+            or (
+                "nps_applied_on"
+                if source_type == "nps_monthly"
+                else "comwel_first_seen"
+            )
+        )
+        estimated_source_label = NEW_COMPANY_SOURCE_LABELS.get(
+            estimated_source_code,
+            opening_basis,
+        )
         current_count = int(row.get("current_employee_count") or 0)
         results.append(
             {
@@ -993,11 +1076,17 @@ def load_recent_opening_candidates(
                 "자료생성년월": str(row.get("source_period") or ""),
                 "신규업체": True,
                 "신규개업구분": opening_label,
-                "신규추정일": opening_date,
-                "신규추정연도": opening_year,
+                "신규신뢰도": confidence_label,
+                "신규점수": confidence_score,
+                "신규판정근거": confidence_reasons,
+                "신규추정일": estimated_opening_date,
+                "신규추정연도": estimated_opening_year,
                 "신규근거": opening_basis,
+                "신규추정일출처": estimated_source_label,
                 "신규정밀도": str(
-                    row.get("opening_signal_precision") or ""
+                    row.get("estimated_opening_precision")
+                    or row.get("opening_signal_precision")
+                    or ""
                 ),
                 "원본데이터": dict(row),
             }
@@ -1107,6 +1196,20 @@ def _database_row(
         "previous_data_created_ym": str(
             prospect.get("전년자료생성년월") or ""
         ),
+    }
+    source_data["new_company_classification"] = {
+        "is_estimated_new_company": bool(prospect.get("신규업체")),
+        "confidence": str(prospect.get("신규신뢰도") or ""),
+        "score": int(prospect.get("신규점수") or 0),
+        "reason_labels": list(prospect.get("신규판정근거") or []),
+        "estimated_opening_date": str(prospect.get("신규추정일") or ""),
+        "estimated_opening_year": int(
+            prospect.get("신규추정연도") or 0
+        ),
+        "estimated_opening_source": str(
+            prospect.get("신규추정일출처") or ""
+        ),
+        "precision": str(prospect.get("신규정밀도") or ""),
     }
     sales_analysis = prospect.get("영업분석")
     if isinstance(sales_analysis, dict):

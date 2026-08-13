@@ -67,6 +67,17 @@ class RecentOpeningDiscoveryTest(unittest.TestCase):
                     "instagram": "",
                     "instagram_url": "",
                     "contact_status": "matched",
+                    "new_company_score": 100,
+                    "new_company_confidence": "high",
+                    "new_company_reason_codes": [
+                        "nps_recent_applied",
+                        "no_earlier_employment_history",
+                        "comwel_first_seen",
+                    ],
+                    "estimated_opening_date": "2026-05-03",
+                    "estimated_opening_year": 2026,
+                    "estimated_opening_precision": "day",
+                    "estimated_opening_source": "nps_applied_on",
                 },
                 {
                     "source_type": "comwel_annual",
@@ -133,6 +144,13 @@ class RecentOpeningDiscoveryTest(unittest.TestCase):
         self.assertEqual(len(rows), 3)
         self.assertEqual(rows[0]["source_key"], "recent_opening:1234567890")
         self.assertEqual(rows[0]["신규추정일"], "2026-05-03")
+        self.assertEqual(rows[0]["신규신뢰도"], "높음")
+        self.assertEqual(rows[0]["신규점수"], 100)
+        self.assertIn("과거 고용이력 없음", rows[0]["신규판정근거"])
+        self.assertEqual(
+            rows[0]["신규추정일출처"],
+            "국민연금 사업장 적용일",
+        )
         self.assertEqual(
             rows[0]["신규근거"],
             "국민연금 사업장 적용일",
@@ -154,7 +172,7 @@ class RecentOpeningDiscoveryTest(unittest.TestCase):
         payload = json.loads(request_post.call_args.kwargs["data"])
         self.assertTrue(
             request_post.call_args.args[0].endswith(
-                "/rpc/oasis_search_recent_openings_v2"
+                "/rpc/oasis_search_recent_openings_v3"
             )
         )
         self.assertEqual(payload["p_province_code"], "11")
