@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import calendar
+import re
+from datetime import date, datetime, timezone
 from typing import Any
 
 from cloud_db import CloudDatabase
@@ -8,10 +10,29 @@ from cloud_db import CloudDatabase
 
 TABLE_LICENSED_BUSINESSES = "oasis_licensed_businesses"
 TABLE_LICENSE_SYNC_RUNS = "oasis_license_sync_runs"
+TABLE_RECENT_LICENSE_SIGNALS = "oasis_recent_license_signals"
 
 
 def _timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _months_ago(value: date, months: int) -> date:
+    month_index = value.year * 12 + value.month - 1 - max(1, int(months))
+    year, zero_based_month = divmod(month_index, 12)
+    month = zero_based_month + 1
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def _license_date(value: Any) -> date | None:
+    digits = re.sub(r"[^0-9]", "", str(value or ""))
+    if len(digits) != 8:
+        return None
+    try:
+        return datetime.strptime(digits, "%Y%m%d").date()
+    except ValueError:
+        return None
 
 
 def table_status() -> tuple[bool, str]:
@@ -24,6 +45,77 @@ def table_status() -> tuple[bool, str]:
         return True, "인허가 원천업체 테이블 연결 완료"
     except Exception as exc:
         return False, str(exc)
+
+
+def compact_table_status() -> tuple[bool, str]:
+    try:
+        CloudDatabase().select(
+            TABLE_RECENT_LICENSE_SIGNALS,
+            columns="signal_key",
+            limit=1,
+        )
+        return True, "최근 인허가일 경량 신호 테이블 연결 완료"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def save_recent_license_signals(
+    items: list[dict[str, Any]],
+    *,
+    retention_months: int = 12,
+) -> int:
+    """Persist only hashed match keys and recent licence dates.
+
+    Company names, addresses, phone numbers, and raw API responses are sent to
+    a service-role-only RPC for hashing and are never stored in the table.
+    """
+    cutoff = _months_ago(datetime.now(timezone.utc).date(), retention_months)
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        parsed_date = _license_date(item.get("license_date"))
+        source_key = str(item.get("source_key") or "").strip()
+        company_name = str(item.get("company_name") or "").strip()
+        address = str(item.get("address") or "").strip()
+        if (
+            not parsed_date
+            or parsed_date < cutoff
+            or not source_key
+            or not company_name
+            or not address
+        ):
+            continue
+        rows.append(
+            {
+                "source_key": source_key,
+                "company_name": company_name,
+                "address": address,
+                "license_date": parsed_date.isoformat(),
+                "is_active": bool(item.get("is_active")),
+            }
+        )
+    if not rows:
+        return 0
+
+    database = CloudDatabase()
+    saved = 0
+    for start in range(0, len(rows), 500):
+        result = database.rpc(
+            "oasis_upsert_recent_license_signals",
+            {
+                "p_rows": rows[start : start + 500],
+                "p_retention_months": max(1, int(retention_months)),
+            },
+        )
+        saved += int(result or 0)
+    return saved
+
+
+def cleanup_recent_license_signals(*, retention_months: int = 12) -> int:
+    result = CloudDatabase().rpc(
+        "oasis_cleanup_recent_license_signals",
+        {"p_retention_months": max(1, int(retention_months))},
+    )
+    return int(result or 0)
 
 
 def latest_sync_watermark(

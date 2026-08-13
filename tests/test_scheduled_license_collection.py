@@ -63,14 +63,17 @@ class ScheduledLicenseCollectionTest(unittest.TestCase):
 
     @patch("scheduled_license_collection._upsert_progress")
     @patch("scheduled_license_collection.save_sync_run")
-    @patch("scheduled_license_collection.save_businesses", return_value=1)
+    @patch(
+        "scheduled_license_collection.save_recent_license_signals",
+        return_value=1,
+    )
     @patch(
         "scheduled_license_collection.localdata_contact_client.fetch_business_page"
     )
     def test_service_resumes_from_checkpoint_and_completes(
         self,
         fetch_page,
-        _save_businesses,
+        _save_signals,
         _save_sync_run,
         upsert_progress,
     ) -> None:
@@ -90,6 +93,7 @@ class ScheduledLicenseCollectionTest(unittest.TestCase):
         )
 
         self.assertEqual(fetch_page.call_args.kwargs["page_no"], 7)
+        self.assertTrue(fetch_page.call_args.kwargs["minimal"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["saved"], 1)
         self.assertEqual(
@@ -133,14 +137,17 @@ class ScheduledLicenseCollectionTest(unittest.TestCase):
 
     @patch("scheduled_license_collection._upsert_progress")
     @patch("scheduled_license_collection.save_sync_run")
-    @patch("scheduled_license_collection.save_businesses", return_value=100)
+    @patch(
+        "scheduled_license_collection.save_recent_license_signals",
+        return_value=100,
+    )
     @patch(
         "scheduled_license_collection.localdata_contact_client.fetch_business_page"
     )
     def test_api_page_cap_does_not_stop_after_first_100_rows(
         self,
         fetch_page,
-        _save_businesses,
+        _save_signals,
         _save_sync_run,
         _upsert_progress,
     ) -> None:

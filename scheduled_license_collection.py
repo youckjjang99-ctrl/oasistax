@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 import localdata_contact_client
 from cloud_db import CloudDatabase
 from korea_regions import ALL_DISTRICTS, ALL_PROVINCES
-from licensed_business_repository import save_businesses, save_sync_run
-from scheduled_license_phone_enrichment import run_enrichment
+from licensed_business_repository import (
+    cleanup_recent_license_signals,
+    save_recent_license_signals,
+    save_sync_run,
+)
 
 
 TABLE_RUNS = "oasis_license_collection_runs"
@@ -24,9 +28,18 @@ def _now() -> str:
 
 
 def _monthly_run_key() -> str:
-    # Start a fresh checkpoint after fixing the old first-page-only logic.
-    # Saved businesses are upserted, so existing rows are not duplicated.
-    return datetime.now(timezone.utc).strftime("monthly-%Y-%m-pagination-v2")
+    # Compact collection has its own checkpoint and never resumes the legacy
+    # full-company/raw-response collection.
+    return datetime.now(timezone.utc).strftime("monthly-%Y-%m-compact-v1")
+
+
+def _months_ago_ymd(months: int) -> str:
+    today = datetime.now(timezone.utc).date()
+    month_index = today.year * 12 + today.month - 1 - max(1, int(months))
+    year, zero_based_month = divmod(month_index, 12)
+    month = zero_based_month + 1
+    day = min(today.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day).strftime("%Y%m%d")
 
 
 def _upsert_run(run_key: str, values: dict[str, Any]) -> None:
@@ -85,6 +98,8 @@ def _collect_service(
     start_page: int,
     max_pages: int,
     rows_per_page: int,
+    license_since: str = "",
+    retention_months: int = 12,
 ) -> dict[str, Any]:
     pages = 0
     received_total = 0
@@ -104,6 +119,8 @@ def _collect_service(
             province=ALL_PROVINCES,
             district=ALL_DISTRICTS,
             timeout=30,
+            license_since=license_since,
+            minimal=True,
         )
         pages += 1
         raw_received = int(
@@ -133,7 +150,7 @@ def _collect_service(
                 message=message,
                 province=ALL_PROVINCES,
                 district=ALL_DISTRICTS,
-                sync_mode="full",
+                sync_mode="recent_license_compact",
                 window_end=_now(),
                 is_complete=False,
             )
@@ -146,7 +163,10 @@ def _collect_service(
                 "error": message,
             }
 
-        saved = save_businesses(result.get("items") or [])
+        saved = save_recent_license_signals(
+            result.get("items") or [],
+            retention_months=retention_months,
+        )
         received_total += received
         saved_total += saved
         total_count = max(0, int(result.get("total_count") or 0))
@@ -170,7 +190,7 @@ def _collect_service(
             message=str(result.get("message") or ""),
             province=ALL_PROVINCES,
             district=ALL_DISTRICTS,
-            sync_mode="full",
+            sync_mode="recent_license_compact",
             window_end=_now(),
             is_complete=complete,
         )
@@ -226,10 +246,13 @@ def run_collection(
     workers: int = 8,
     max_pages: int = 1000,
     rows_per_page: int = 1000,
+    retention_months: int = 12,
 ) -> int:
     if not localdata_contact_client.key_status()["configured"]:
         raise RuntimeError("DATA_GO_KR_SERVICE_KEY가 설정되지 않았습니다.")
     services = list(localdata_contact_client.SERVICES)
+    retention_months = max(1, min(24, int(retention_months)))
+    license_since = _months_ago_ymd(retention_months)
     existing = _progress_rows(run_key)
     targets: list[tuple[str, int]] = []
     excluded_forbidden = 0
@@ -279,6 +302,8 @@ def run_collection(
                 start_page=start_page,
                 max_pages=max_pages,
                 rows_per_page=rows_per_page,
+                license_since=license_since,
+                retention_months=retention_months,
             ): service_key
             for service_key, start_page in targets
         }
@@ -327,6 +352,9 @@ def run_collection(
                 flush=True,
             )
 
+    removed_expired = cleanup_recent_license_signals(
+        retention_months=retention_months
+    )
     final_status = "completed" if failed == 0 else "partial"
     _upsert_run(
         run_key,
@@ -339,7 +367,12 @@ def run_collection(
             "saved_count": saved,
             "heartbeat_at": _now(),
             "completed_at": _now(),
+            "last_error": "",
         },
+    )
+    print(
+        f"compact license signals saved={saved} expired_removed={removed_expired}",
+        flush=True,
     )
     return 0 if failed == 0 else 2
 
@@ -359,6 +392,11 @@ def main() -> int:
         "--max-pages",
         type=int,
         default=int(os.environ.get("LICENSE_COLLECTION_MAX_PAGES", "1000")),
+    )
+    parser.add_argument(
+        "--retention-months",
+        type=int,
+        default=int(os.environ.get("LICENSE_SIGNAL_RETENTION_MONTHS", "12")),
     )
     args = parser.parse_args()
 
@@ -386,8 +424,8 @@ def main() -> int:
             run_key=args.run_key,
             workers=args.workers,
             max_pages=args.max_pages,
+            retention_months=args.retention_months,
         )
-        collection_status = collection_status or run_enrichment()
 
     return collection_status
 

@@ -8,6 +8,7 @@ import localdata_contact_client
 import licensed_business_sync
 from korea_regions import (
     ALL_DISTRICTS,
+    ALL_PROVINCES,
     district_label,
     district_options,
     matches_region,
@@ -138,6 +139,43 @@ class LicenseApiRegionTest(unittest.TestCase):
         self.assertEqual(
             mock_get.call_args.kwargs["params"]["cond[DAT_UPDT_PNT::LT]"],
             "20260724000000",
+        )
+
+    @patch.dict(
+        os.environ,
+        {
+            "DATA_GO_KR_SERVICE_KEY": "test-key",
+            "OASIS_ENABLE_LOCALDATA": "true",
+        },
+    )
+    @patch("localdata_contact_client.requests.get")
+    def test_compact_fetch_excludes_phone_and_raw_payload(self, mock_get) -> None:
+        mock_get.return_value = _Response()
+        service_key = next(iter(localdata_contact_client.SERVICES))
+
+        result = localdata_contact_client.fetch_business_page(
+            service_key,
+            province=ALL_PROVINCES,
+            district=ALL_DISTRICTS,
+            license_since="20250813",
+            minimal=True,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            mock_get.call_args.kwargs["params"]["cond[LCPMT_YMD::GTE]"],
+            "20250813",
+        )
+        self.assertTrue(result["items"])
+        self.assertEqual(
+            set(result["items"][0]),
+            {
+                "source_key",
+                "company_name",
+                "address",
+                "is_active",
+                "license_date",
+            },
         )
 
     @patch("licensed_business_sync.save_sync_run")

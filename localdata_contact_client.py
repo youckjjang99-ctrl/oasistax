@@ -368,6 +368,8 @@ def fetch_business_page(
     district: str = ALL_DISTRICTS,
     updated_since: str = "",
     updated_before: str = "",
+    license_since: str = "",
+    minimal: bool = False,
 ) -> dict[str, Any]:
     """업종별 인허가 원천 데이터를 공통 업체 형식으로 반환."""
     if not is_enabled():
@@ -409,6 +411,8 @@ def fetch_business_page(
         params["cond[DAT_UPDT_PNT::GTE]"] = str(updated_since).strip()
     if str(updated_before or "").strip():
         params["cond[DAT_UPDT_PNT::LT]"] = str(updated_before).strip()
+    if str(license_since or "").strip():
+        params["cond[LCPMT_YMD::GTE]"] = str(license_since).strip()
     try:
         response = requests.get(
             config["url"],
@@ -470,68 +474,72 @@ def fetch_business_page(
             )
         ).strip()
         resolved_province, resolved_district = resolve_region(address)
-        items.append(
-            {
-                "source": "public_license_195",
-                "source_key": (
-                    f"{service_key}:{management_no}"
-                    if management_no
-                    else f"{service_key}:{company_name}:{address}"
-                ),
-                "service_key": service_key,
-                "category": config.get("category", ""),
-                "industry_name": config.get("label", service_key),
-                "management_no": management_no,
-                "company_name": company_name,
-                "address": address,
-                "province": resolved_province,
-                "district": resolved_district,
-                "phone": normalize_phone(
-                    _first(
-                        raw,
-                        "SITE_TEL",
-                        "siteTel",
-                        "site_tel",
-                        "TEL_NO",
-                        "telNo",
-                        "전화번호",
-                    )
-                ),
-                "business_status_code": str(
-                    _first(
-                        raw,
-                        "SALS_STTS_CD",
-                        "salsSttsCd",
-                        "sals_stts_cd",
-                    )
-                ).strip(),
-                "business_status_name": str(
-                    _first(
-                        raw,
-                        "SALS_STTS_NM",
-                        "salsSttsNm",
-                        "sals_stts_nm",
-                    )
-                ).strip(),
-                "is_active": _active(raw),
-                "license_date": str(
-                    _first(raw, "LCPMT_YMD", "lcpmtYmd", "license_date")
-                ).strip(),
-                "close_date": str(
-                    _first(raw, "CLSBIZ_YMD", "clsbizYmd", "close_date")
-                ).strip(),
-                "source_updated_at": str(
-                    _first(
-                        raw,
-                        "DAT_UPDT_PNT",
-                        "datUpdtPnt",
-                        "dat_updt_pnt",
-                        "최종수정시점",
-                    )
-                ).strip(),
-                "raw": raw,
-            }
-        )
+        item = {
+            "source_key": (
+                f"{service_key}:{management_no}"
+                if management_no
+                else f"{service_key}:{company_name}:{address}"
+            ),
+            "company_name": company_name,
+            "address": address,
+            "is_active": _active(raw),
+            "license_date": str(
+                _first(raw, "LCPMT_YMD", "lcpmtYmd", "license_date")
+            ).strip(),
+        }
+        if not minimal:
+            item.update(
+                {
+                    "source": "public_license_195",
+                    "service_key": service_key,
+                    "category": config.get("category", ""),
+                    "industry_name": config.get("label", service_key),
+                    "management_no": management_no,
+                    "province": resolved_province,
+                    "district": resolved_district,
+                    "phone": normalize_phone(
+                        _first(
+                            raw,
+                            "SITE_TEL",
+                            "siteTel",
+                            "site_tel",
+                            "TEL_NO",
+                            "telNo",
+                            "전화번호",
+                        )
+                    ),
+                    "business_status_code": str(
+                        _first(
+                            raw,
+                            "SALS_STTS_CD",
+                            "salsSttsCd",
+                            "sals_stts_cd",
+                        )
+                    ).strip(),
+                    "business_status_name": str(
+                        _first(
+                            raw,
+                            "SALS_STTS_NM",
+                            "salsSttsNm",
+                            "sals_stts_nm",
+                        )
+                    ).strip(),
+                    "close_date": str(
+                        _first(raw, "CLSBIZ_YMD", "clsbizYmd", "close_date")
+                    ).strip(),
+                    "source_updated_at": str(
+                        _first(
+                            raw,
+                            "DAT_UPDT_PNT",
+                            "datUpdtPnt",
+                            "dat_updt_pnt",
+                            "최종수정시점",
+                        )
+                    ).strip(),
+                    "raw": raw,
+                }
+            )
+        items.append(item)
     raw_received_count = len(items)
     if requested_region:
         items = [
@@ -554,6 +562,7 @@ def fetch_business_page(
         "district": "" if district == ALL_DISTRICTS else district,
         "updated_since": str(updated_since or ""),
         "updated_before": str(updated_before or ""),
+        "license_since": str(license_since or ""),
         "raw_received_count": raw_received_count,
         "region_filtered_count": raw_received_count - len(items),
         "items": items,

@@ -901,28 +901,26 @@ def load_recent_opening_candidates(
         "p_limit": row_limit,
         "p_business_type": normalized_business_type,
     }
-    rpc_name = "oasis_search_recent_openings_v3"
-    response = requests.post(
-        f"{config.url}/rest/v1/rpc/{rpc_name}",
-        headers=_rest_headers(),
-        data=json.dumps(payload, ensure_ascii=False),
-        timeout=max(config.timeout, 60),
-    )
-    if (
-        not response.ok
-        and response.status_code in {400, 404}
-        and (
-            "PGRST202" in response.text
-            or "oasis_search_recent_openings_v3" in response.text
-        )
+    response = None
+    for rpc_name in (
+        "oasis_search_recent_openings_v4",
+        "oasis_search_recent_openings_v3",
+        "oasis_search_recent_openings_v2",
     ):
-        rpc_name = "oasis_search_recent_openings_v2"
         response = requests.post(
             f"{config.url}/rest/v1/rpc/{rpc_name}",
             headers=_rest_headers(),
             data=json.dumps(payload, ensure_ascii=False),
             timeout=max(config.timeout, 60),
         )
+        if response.ok:
+            break
+        missing_rpc = response.status_code in {400, 404} and (
+            "PGRST202" in response.text or rpc_name in response.text
+        )
+        if not missing_rpc:
+            break
+    assert response is not None
     if not response.ok:
         raise RuntimeError(
             "신규개업 추정·연락처 후보 조회 실패 "

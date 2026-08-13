@@ -172,7 +172,7 @@ class RecentOpeningDiscoveryTest(unittest.TestCase):
         payload = json.loads(request_post.call_args.kwargs["data"])
         self.assertTrue(
             request_post.call_args.args[0].endswith(
-                "/rpc/oasis_search_recent_openings_v3"
+                "/rpc/oasis_search_recent_openings_v4"
             )
         )
         self.assertEqual(payload["p_province_code"], "11")
