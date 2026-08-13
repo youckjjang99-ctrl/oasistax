@@ -363,15 +363,19 @@ def main() -> int:
     args = parser.parse_args()
 
     collection_status = 0
-    if not localdata_contact_client.is_enabled():
+    key_state = localdata_contact_client.key_status()
+    if not key_state["configured"]:
+        if key_state["key_present"] and not key_state["enabled"]:
+            reason = "OASIS_ENABLE_LOCALDATA 설정으로 수집이 명시적으로 중지되었습니다."
+        else:
+            reason = "DATA_GO_KR_SERVICE_KEY가 없어 지방행정 인허가 수집을 건너뜁니다."
         print(
             json.dumps(
                 {
                     "status": "disabled",
-                    "message": (
-                        "행안부 인허가 수집은 핵심 고용증가 흐름에서 "
-                        "분리되어 실행하지 않습니다."
-                    ),
+                    "message": reason,
+                    "key_present": bool(key_state["key_present"]),
+                    "enabled": bool(key_state["enabled"]),
                 },
                 ensure_ascii=False,
             ),

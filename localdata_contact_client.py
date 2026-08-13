@@ -121,7 +121,13 @@ def _service_key() -> str:
 
 
 def is_enabled() -> bool:
-    return os.environ.get(ENABLED_ENV, "").strip().lower() in {
+    configured = os.environ.get(ENABLED_ENV, "").strip().lower()
+    if not configured:
+        # The service key is the primary opt-in. Requiring a second switch
+        # kept scheduled licence-date collection disabled even when the
+        # public-data credential had already been registered.
+        return bool(_service_key())
+    return configured in {
         "1",
         "true",
         "yes",

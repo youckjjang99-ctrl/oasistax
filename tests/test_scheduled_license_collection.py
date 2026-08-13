@@ -10,16 +10,56 @@ import scheduled_license_collection
 class ScheduledLicenseCollectionTest(unittest.TestCase):
     @patch.object(sys, "argv", ["scheduled_license_collection.py"])
     @patch(
-        "scheduled_license_collection.localdata_contact_client.is_enabled",
-        return_value=False,
+        "scheduled_license_collection.localdata_contact_client.key_status",
+        return_value={
+            "configured": False,
+            "key_present": False,
+            "enabled": False,
+        },
     )
     def test_disabled_license_collection_does_not_start_other_collectors(
         self,
-        _is_enabled,
+        _key_status,
     ) -> None:
         result = scheduled_license_collection.main()
 
         self.assertEqual(result, 0)
+
+    @patch.dict(
+        "os.environ",
+        {
+            "DATA_GO_KR_SERVICE_KEY": "test-key",
+            "OASIS_ENABLE_LOCALDATA": "",
+        },
+        clear=False,
+    )
+    def test_service_key_enables_collection_without_second_switch(self) -> None:
+        self.assertTrue(
+            scheduled_license_collection.localdata_contact_client.is_enabled()
+        )
+        self.assertTrue(
+            scheduled_license_collection.localdata_contact_client.key_status()[
+                "configured"
+            ]
+        )
+
+    @patch.dict(
+        "os.environ",
+        {
+            "DATA_GO_KR_SERVICE_KEY": "test-key",
+            "OASIS_ENABLE_LOCALDATA": "false",
+        },
+        clear=False,
+    )
+    def test_explicit_disable_still_overrides_service_key(self) -> None:
+        self.assertFalse(
+            scheduled_license_collection.localdata_contact_client.is_enabled()
+        )
+        self.assertFalse(
+            scheduled_license_collection.localdata_contact_client.key_status()[
+                "configured"
+            ]
+        )
 
     @patch("scheduled_license_collection._upsert_progress")
     @patch("scheduled_license_collection.save_sync_run")
