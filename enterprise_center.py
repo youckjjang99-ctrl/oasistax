@@ -32,7 +32,6 @@ from registered_policy_match import (
     build_customer_labels,
     load_registered_customers,
 )
-from procurement_ui import render_procurement_summary_panel
 from enterprise_customer_management import (
     confirm_delete_dialog,
     filter_active_customers,
@@ -765,8 +764,6 @@ def render_enterprise_management_center(
                 hide_index=True,
                 use_container_width=True,
             )
-
-        render_procurement_summary_panel(user_id, business_no)
 
         if is_individual:
             st.markdown("#### 종합소득세 신고정보")
