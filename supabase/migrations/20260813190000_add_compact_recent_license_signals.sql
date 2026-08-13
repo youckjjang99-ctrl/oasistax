@@ -99,6 +99,15 @@ begin
           and parsed_license_date >= current_date - make_interval(months => v_retention)
           and parsed_license_date <= current_date
     ),
+    deduplicated as (
+        select distinct on (signal_key)
+            signal_key,
+            match_key,
+            license_date,
+            is_active
+        from prepared
+        order by signal_key, license_date desc, is_active desc
+    ),
     upserted as (
         insert into public.oasis_recent_license_signals (
             signal_key,
@@ -113,7 +122,7 @@ begin
             license_date,
             is_active,
             now()
-        from prepared
+        from deduplicated
         on conflict (signal_key) do update
         set match_key = excluded.match_key,
             license_date = excluded.license_date,

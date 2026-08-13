@@ -60,3 +60,12 @@ def test_migration_table_has_no_original_identifiers() -> None:
     assert "license_date date not null" in table_block
     assert "enable row level security" in migration
     assert "to service_role" in migration
+
+
+def test_migration_deduplicates_same_source_key_within_batch() -> None:
+    migration = Path(
+        "supabase/migrations/20260813193000_deduplicate_compact_license_signal_batches.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "select distinct on (signal_key)" in migration
+    assert "from deduplicated" in migration
