@@ -202,6 +202,54 @@ class ScheduledLicenseCollectionTest(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["received"], 250)
 
+    @patch("scheduled_license_collection._upsert_progress")
+    @patch("scheduled_license_collection.save_sync_run")
+    @patch(
+        "scheduled_license_collection.save_recent_license_signals",
+        return_value=100,
+    )
+    @patch(
+        "scheduled_license_collection.localdata_contact_client.fetch_business_page"
+    )
+    def test_large_service_prefetches_pages_and_commits_in_order(
+        self,
+        fetch_page,
+        _save_signals,
+        _save_sync_run,
+        upsert_progress,
+    ) -> None:
+        def page_result(_service_key, **kwargs):
+            page_no = kwargs["page_no"]
+            received = 50 if page_no == 3 else 100
+            return {
+                "ok": True,
+                "items": [
+                    {"source_key": f"{page_no}-{index}"}
+                    for index in range(received)
+                ],
+                "raw_received_count": received,
+                "total_count": 250,
+                "response_page_size": 100,
+                "message": "정상",
+            }
+
+        fetch_page.side_effect = page_result
+
+        result = scheduled_license_collection._collect_service(
+            "monthly-2026-08-parallel",
+            "ecommerce_businesses",
+            start_page=1,
+            max_pages=5000,
+            rows_per_page=1000,
+            page_workers=3,
+        )
+
+        self.assertEqual(fetch_page.call_count, 3)
+        self.assertEqual(result["status"], "completed")
+        completed_call = upsert_progress.call_args_list[-1]
+        self.assertEqual(completed_call.kwargs["status"], "completed")
+        self.assertEqual(completed_call.kwargs["next_page"], 4)
+
 
 if __name__ == "__main__":
     unittest.main()

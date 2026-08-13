@@ -21,6 +21,10 @@ from licensed_business_repository import (
 
 TABLE_RUNS = "oasis_license_collection_runs"
 TABLE_PROGRESS = "oasis_license_collection_progress"
+LARGE_SERVICE_KEYS = {
+    "ecommerce_businesses",
+    "general_restaurants",
+}
 
 
 def _now() -> str:
@@ -105,6 +109,7 @@ def _collect_service(
     rows_per_page: int,
     license_since: str = "",
     retention_months: int = 12,
+    page_workers: int = 1,
 ) -> dict[str, Any]:
     pages = 0
     received_total = 0
@@ -116,8 +121,16 @@ def _collect_service(
         next_page=start_page,
         last_error="",
     )
-    for page_no in range(start_page, max_pages + 1):
-        result = localdata_contact_client.fetch_business_page(
+    page_workers = max(1, min(12, int(page_workers)))
+    page_executor = (
+        ThreadPoolExecutor(max_workers=page_workers)
+        if page_workers > 1
+        else None
+    )
+    prefetched: dict[int, Any] = {}
+
+    def fetch_page(page_no: int) -> dict[str, Any]:
+        return localdata_contact_client.fetch_business_page(
             service_key,
             page_no=page_no,
             rows=rows_per_page,
@@ -127,6 +140,49 @@ def _collect_service(
             license_since=license_since,
             minimal=True,
         )
+
+    def stop_prefetch() -> None:
+        if page_executor is not None:
+            page_executor.shutdown(wait=False, cancel_futures=True)
+
+    if page_executor is not None:
+        for prefetched_page in range(
+            start_page,
+            min(max_pages + 1, start_page + page_workers),
+        ):
+            prefetched[prefetched_page] = page_executor.submit(
+                fetch_page, prefetched_page
+            )
+    for page_no in range(start_page, max_pages + 1):
+        if page_executor is None:
+            result = fetch_page(page_no)
+        else:
+            try:
+                result = prefetched.pop(page_no).result()
+            except Exception as exc:  # pragma: no cover - network guard
+                result = {
+                    "ok": False,
+                    "status": "REQUEST_FAILED",
+                    "message": str(exc),
+                    "items": [],
+                    "raw_received_count": 0,
+                }
+            next_prefetch_page = page_no + page_workers
+            hinted_total = max(0, int(result.get("total_count") or 0))
+            hinted_page_size = max(
+                0, int(result.get("response_page_size") or 0)
+            )
+            hinted_last_page = (
+                (hinted_total + hinted_page_size - 1) // hinted_page_size
+                if hinted_total and hinted_page_size
+                else 0
+            )
+            if next_prefetch_page <= max_pages and (
+                not hinted_last_page or next_prefetch_page <= hinted_last_page
+            ):
+                prefetched[next_prefetch_page] = page_executor.submit(
+                    fetch_page, next_prefetch_page
+                )
         pages += 1
         raw_received = int(
             result.get("raw_received_count")
@@ -159,6 +215,7 @@ def _collect_service(
                 window_end=_now(),
                 is_complete=False,
             )
+            stop_prefetch()
             return {
                 "service_key": service_key,
                 "status": "failed",
@@ -215,6 +272,7 @@ def _collect_service(
             flush=True,
         )
         if complete:
+            stop_prefetch()
             return {
                 "service_key": service_key,
                 "status": "completed",
@@ -224,6 +282,7 @@ def _collect_service(
                 "error": "",
             }
 
+    stop_prefetch()
     message = f"최대 {max_pages}페이지에 도달했습니다."
     _upsert_progress(
         run_key,
@@ -249,7 +308,7 @@ def run_collection(
     *,
     run_key: str,
     workers: int = 8,
-    max_pages: int = 1000,
+    max_pages: int = 5000,
     rows_per_page: int = 1000,
     retention_months: int = 12,
 ) -> int:
@@ -257,6 +316,13 @@ def run_collection(
         raise RuntimeError("DATA_GO_KR_SERVICE_KEY가 설정되지 않았습니다.")
     services = list(localdata_contact_client.SERVICES)
     retention_months = max(1, min(24, int(retention_months)))
+    large_page_workers = max(
+        1,
+        min(
+            12,
+            int(os.environ.get("LICENSE_COLLECTION_LARGE_PAGE_WORKERS", "8")),
+        ),
+    )
     license_since = _months_ago_ymd(retention_months)
     existing = _progress_rows(run_key)
     targets: list[tuple[str, int]] = []
@@ -309,6 +375,11 @@ def run_collection(
                 rows_per_page=rows_per_page,
                 license_since=license_since,
                 retention_months=retention_months,
+                page_workers=(
+                    large_page_workers
+                    if service_key in LARGE_SERVICE_KEYS
+                    else 1
+                ),
             ): service_key
             for service_key, start_page in targets
         }
@@ -396,7 +467,7 @@ def main() -> int:
     parser.add_argument(
         "--max-pages",
         type=int,
-        default=int(os.environ.get("LICENSE_COLLECTION_MAX_PAGES", "1000")),
+        default=int(os.environ.get("LICENSE_COLLECTION_MAX_PAGES", "5000")),
     )
     parser.add_argument(
         "--retention-months",
