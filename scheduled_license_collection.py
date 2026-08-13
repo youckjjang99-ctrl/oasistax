@@ -35,7 +35,7 @@ def _now() -> str:
 def _monthly_run_key() -> str:
     # Compact collection has its own checkpoint and never resumes the legacy
     # full-company/raw-response collection.
-    return datetime.now(timezone.utc).strftime("monthly-%Y-%m-compact-v1")
+    return datetime.now(timezone.utc).strftime("monthly-%Y-%m-compact-v2")
 
 
 def _months_ago_ymd(months: int) -> str:

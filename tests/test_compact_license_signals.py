@@ -69,3 +69,40 @@ def test_migration_deduplicates_same_source_key_within_batch() -> None:
 
     assert "select distinct on (signal_key)" in migration
     assert "from deduplicated" in migration
+
+
+def test_improved_matching_keeps_source_pii_transient() -> None:
+    migration = Path(
+        "supabase/migrations/20260813200000_improve_license_contact_matching.sql"
+    ).read_text(encoding="utf-8").lower()
+
+    added_columns = migration.split(
+        "alter table public.oasis_recent_license_signals",
+        1,
+    )[1].split(";", 1)[0]
+    assert "contact_ref_key text" in added_columns
+    assert "contact_match_method text" in added_columns
+    assert "has_mobile_phone boolean" in added_columns
+    assert "has_landline_phone boolean" in added_columns
+    assert "company_name text" not in added_columns
+    assert "address text" not in added_columns
+    assert "mobile_phone text" not in added_columns
+    assert "landline_phone text" not in added_columns
+    assert "exact_address" in migration
+    assert "address_core" in migration
+    assert "unique_region_name" in migration
+    assert "extensions.digest" in migration
+
+
+def test_improved_matching_is_service_only_and_replays_collection() -> None:
+    migration = Path(
+        "supabase/migrations/20260813200000_improve_license_contact_matching.sql"
+    ).read_text(encoding="utf-8").lower()
+    collector = Path("scheduled_license_collection.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "revoke all on function public.oasis_compact_address_core(text)" in migration
+    assert "revoke all on function public.oasis_address_province_code(text)" in migration
+    assert "to service_role" in migration
+    assert "compact-v2" in collector
