@@ -34,6 +34,19 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
         self.addCleanup(self.guard_trip_patcher.stop)
         self.addCleanup(self.held_work_patcher.stop)
 
+    @patch("builtins.print")
+    def test_runtime_event_reports_actual_provider(self, print_mock) -> None:
+        job._safe_runtime_event(
+            "runtime_processing_failed",
+            provider="daum",
+            safe_error_code="RUNTIMEERROR",
+            processed=0,
+        )
+
+        payload = print_mock.call_args.args[0]
+        self.assertIn('"provider": "daum"', payload)
+        self.assertIn('"status": "runtime_processing_failed"', payload)
+
     @patch.object(job.requests, "get")
     @patch.object(job, "CloudDatabase")
     def test_digital_selection_excludes_phone_only_sources(

@@ -417,13 +417,14 @@ def _release_kakao_no_match_holds(contact_keys: list[str]) -> None:
 def _safe_runtime_event(
     status: str,
     *,
+    provider: str = "kakao",
     category: str = "",
     safe_error_code: str = "",
     **values: Any,
 ) -> None:
     payload: dict[str, Any] = {
         "job": "employment-phone-enrichment",
-        "provider": "kakao",
+        "provider": str(provider or "").strip().lower(),
         "status": status,
     }
     if category:
@@ -1107,9 +1108,11 @@ def _run_provider_batches(
         ):
             _release_kakao_no_match_holds(held_no_match_keys)
         return exit_code
-    except Exception:
+    except Exception as exc:
         _safe_runtime_event(
             "runtime_processing_failed",
+            provider=phone_provider,
+            safe_error_code=type(exc).__name__.upper(),
             processed=processed,
         )
         return EXIT_RUNTIME_ERROR
