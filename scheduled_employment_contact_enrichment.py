@@ -870,6 +870,11 @@ def _run_provider_batches(
         "evidence_rejected": 0,
         "accepted_mobile": 0,
         "accepted_landline": 0,
+        "accepted_mobile_business_no": 0,
+        "accepted_mobile_address": 0,
+        "accepted_mobile_name_and_region": 0,
+        "accepted_mobile_independent_sources": 0,
+        "accepted_mobile_source_page": 0,
         "source_pages_checked": 0,
         "source_pages_verified": 0,
     }
