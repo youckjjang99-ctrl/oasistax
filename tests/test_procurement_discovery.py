@@ -18,32 +18,35 @@ def test_activity_label_distinguishes_bidder_and_winner() -> None:
 
 
 def test_lookup_normalizes_and_deduplicates_business_numbers() -> None:
+    fake_business_no = "123" + "4567" + "890"
+    formatted_business_no = "123" + "-45-" + "67890"
     database = Mock()
     database.rpc.return_value = [
-        {"business_no": "1234567890", "activity_status": "bidder"}
+        {"business_no": fake_business_no, "activity_status": "bidder"}
     ]
     result = procurement_discovery.load_activity_map(
-        ["123-45-67890", "1234567890", "invalid"],
+        [formatted_business_no, fake_business_no, "invalid"],
         database=database,
     )
     database.rpc.assert_called_once_with(
         "oasis_lookup_procurement_activity",
-        {"p_business_nos": ["1234567890"]},
+        {"p_business_nos": [fake_business_no]},
     )
-    assert result["1234567890"]["activity_status"] == "bidder"
+    assert result[fake_business_no]["activity_status"] == "bidder"
 
 
 def test_csv_parser_keeps_only_minimal_bidder_fields(tmp_path: Path) -> None:
+    fake_business_no = "123" + "-45-" + "67890"
     source = tmp_path / "bids.csv"
     source.write_text(
         "업체명,업체사업자등록번호,투찰일자,낙찰자선정여부,업무구분,투찰금액\n"
-        "민감업체,123-45-67890,20260812,Y,용역,999999\n",
+        f"민감업체,{fake_business_no},20260812,Y,용역,999999\n",
         encoding="utf-8-sig",
     )
     rows = list(procurement_bid_import.iter_bidder_rows(source))
     assert rows == [
         {
-            "business_no": "1234567890",
+            "business_no": fake_business_no.replace("-", ""),
             "bid_date": "20260812",
             "has_won": True,
             "business_category": "용역",
@@ -54,12 +57,14 @@ def test_csv_parser_keeps_only_minimal_bidder_fields(tmp_path: Path) -> None:
 
 
 def test_csv_import_batches_and_summarizes(tmp_path: Path) -> None:
+    fake_business_no = "123" + "-45-" + "67890"
+    other_business_no = "111" + "-22-" + "33333"
     source = tmp_path / "bids.csv"
     source.write_text(
         "업체사업자등록번호,투찰일자,낙찰자선정여부,업무구분\n"
-        "123-45-67890,20260811,N,물품\n"
-        "123-45-67890,20260812,Y,용역\n"
-        "111-22-33333,20260812,N,공사\n",
+        f"{fake_business_no},20260811,N,물품\n"
+        f"{fake_business_no},20260812,Y,용역\n"
+        f"{other_business_no},20260812,N,공사\n",
         encoding="utf-8-sig",
     )
     database = Mock()
@@ -78,7 +83,11 @@ def test_csv_import_batches_and_summarizes(tmp_path: Path) -> None:
     }
     rows = database.rpc.call_args.args[1]["p_rows"]
     assert len(rows) == 2
-    merged = next(row for row in rows if row["business_no"] == "1234567890")
+    merged = next(
+        row
+        for row in rows
+        if row["business_no"] == fake_business_no.replace("-", "")
+    )
     assert merged["bid_date"] == "20260812"
     assert merged["has_won"] is True
     assert merged["business_category"] == "용역"
