@@ -127,7 +127,7 @@ class ScheduledLicenseCollectionTest(unittest.TestCase):
     ) -> None:
         fetch_page.return_value = {
             "ok": False,
-            "status": "TIMEOUT",
+            "status": "FORBIDDEN",
             "message": "응답시간 초과",
             "items": [],
             "raw_received_count": 0,
@@ -146,6 +146,52 @@ class ScheduledLicenseCollectionTest(unittest.TestCase):
             upsert_progress.call_args.kwargs["next_page"],
             4,
         )
+
+    @patch("scheduled_license_collection.time.sleep")
+    @patch("scheduled_license_collection._upsert_progress")
+    @patch("scheduled_license_collection.save_sync_run")
+    @patch(
+        "scheduled_license_collection.save_recent_license_signals",
+        return_value=1,
+    )
+    @patch(
+        "scheduled_license_collection.localdata_contact_client.fetch_business_page"
+    )
+    def test_temporary_timeout_is_retried_on_same_page(
+        self,
+        fetch_page,
+        _save_signals,
+        _save_sync_run,
+        _upsert_progress,
+        sleep,
+    ) -> None:
+        fetch_page.side_effect = [
+            {
+                "ok": False,
+                "status": "TIMEOUT",
+                "message": "SERVICETIMEOUT_ERROR",
+                "items": [],
+                "raw_received_count": 0,
+            },
+            {
+                "ok": True,
+                "items": [{"source_key": "recovered"}],
+                "raw_received_count": 1,
+                "message": "정상",
+            },
+        ]
+
+        result = scheduled_license_collection._collect_service(
+            "monthly-2026-08-retry",
+            "test-service",
+            start_page=4,
+            max_pages=100,
+            rows_per_page=1000,
+        )
+
+        self.assertEqual(fetch_page.call_count, 2)
+        sleep.assert_called_once()
+        self.assertEqual(result["status"], "completed")
 
     @patch("scheduled_license_collection._upsert_progress")
     @patch("scheduled_license_collection.save_sync_run")

@@ -5,6 +5,7 @@ import calendar
 import json
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timezone
 from typing import Any
@@ -130,16 +131,29 @@ def _collect_service(
     prefetched: dict[int, Any] = {}
 
     def fetch_page(page_no: int) -> dict[str, Any]:
-        return localdata_contact_client.fetch_business_page(
-            service_key,
-            page_no=page_no,
-            rows=rows_per_page,
-            province=ALL_PROVINCES,
-            district=ALL_DISTRICTS,
-            timeout=30,
-            license_since=license_since,
-            minimal=True,
-        )
+        result: dict[str, Any] = {}
+        for attempt in range(3):
+            result = localdata_contact_client.fetch_business_page(
+                service_key,
+                page_no=page_no,
+                rows=rows_per_page,
+                province=ALL_PROVINCES,
+                district=ALL_DISTRICTS,
+                timeout=30,
+                license_since=license_since,
+                minimal=True,
+            )
+            if result.get("ok"):
+                return result
+            message = " ".join(
+                str(value or "")
+                for value in (result.get("status"), result.get("message"))
+            ).strip()
+            if not _is_retryable_failure({"last_error": message}):
+                return result
+            if attempt < 2:
+                time.sleep(0.5 * (2**attempt))
+        return result
 
     def stop_prefetch() -> None:
         if page_executor is not None:
