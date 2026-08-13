@@ -26,6 +26,7 @@ TABLE_COPILOT_ASSETS = "oasis_copilot_assets"
 TABLE_BACKUP_RUNS = "oasis_backup_runs"
 TABLE_RESTORE_DRILLS = "oasis_restore_drills"
 TABLE_CUSTOMER_ARCHIVE_EVENTS = "oasis_customer_archive_events"
+TABLE_CUSTOMER_PROCUREMENT = "oasis_customer_procurement_summaries"
 PRIVATE_CUSTOMER_ASSET_BUCKET = "oasis-customer-assets"
 _HTTP_CLIENT_LOCAL = threading.local()
 
