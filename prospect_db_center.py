@@ -177,6 +177,10 @@ _SAVED_PROSPECT_RESET_SELECTION_KEY = (
 _RETURN_DB_ADMIN_FLASH_KEY = "_return_db_admin_flash_v1070"
 _RETURN_DB_ADMIN_TABLE_KEY = "return_db_admin_table_v1180"
 _MOBILE_DB_ADMIN_SELECTION_KEY = "mobile_db_admin_request_v1090"
+_SPECIFIC_DB_SEARCH_RESULT_KEY = "_specific_db_search_result_v1240"
+_SPECIFIC_DB_SEARCH_INPUT_KEY = "specific_db_business_no_v1240"
+_SPECIFIC_DB_ADMIN_SELECTION_KEY = "specific_db_admin_request_v1240"
+_SPECIFIC_DB_ADMIN_FLASH_KEY = "_specific_db_admin_flash_v1240"
 _SAVED_DB_DASHBOARD_FILTER_KEY = "saved_db_dashboard_filter_v1100"
 _SAVED_DB_DASHBOARD_PAGE_KEY = "saved_db_dashboard_page_v1100"
 _SAVED_DB_DASHBOARD_PAGE_SIZE = 100
@@ -233,6 +237,20 @@ MOBILE_DB_REQUEST_STATUS_LABELS = {
     "approved": "배정 완료",
     "rejected": "신청 반려",
     "cancelled": "신청 취소",
+}
+SPECIFIC_DB_REQUEST_STATUS_LABELS = {
+    "pending": "승인 대기",
+    "approved": "승인·배정 완료",
+    "rejected": "신청 반려",
+    "cancelled": "신청 취소",
+}
+SPECIFIC_DB_SEARCH_STATUS_LABELS = {
+    "available": "신청 가능",
+    "pending_own": "내 신청 승인 대기",
+    "pending_other": "다른 신청 검토 중",
+    "already_owned": "내 DB에 배정됨",
+    "permanently_excluded": "영구 제외",
+    "unavailable": "신청 불가",
 }
 OUTREACH_COLUMN_CHANNELS = {
     "문자보내기": "sms",
@@ -6422,6 +6440,156 @@ def _render_db_request_status_dashboard(metrics: dict) -> None:
     )
 
 
+def _render_specific_company_db_search(owner_user_id: str) -> None:
+    with st.container(border=True):
+        st.markdown("### 사업자등록번호로 DB 찾기")
+        st.caption(
+            "사업자등록번호 10자리로 보유 DB를 확인할 수 있습니다. "
+            "휴대전화는 승인 전까지 일부가 가려지며, 신청 후 관리자가 검토합니다."
+        )
+        input_col, button_col = st.columns([4, 1])
+        business_no_input = input_col.text_input(
+            "사업자등록번호",
+            placeholder="000-00-00000",
+            max_chars=12,
+            key=_SPECIFIC_DB_SEARCH_INPUT_KEY,
+        )
+        search_clicked = button_col.button(
+            "DB 검색",
+            type="primary",
+            use_container_width=True,
+            key="search_specific_company_db_v1240",
+        )
+        if search_clicked:
+            result = sales_assignments.search_company_db_by_business_no(
+                owner_user_id,
+                business_no_input,
+            )
+            st.session_state[_SPECIFIC_DB_SEARCH_RESULT_KEY] = {
+                **result,
+                "query_business_no": re.sub(r"[^0-9]", "", business_no_input),
+            }
+
+        search_result = st.session_state.get(_SPECIFIC_DB_SEARCH_RESULT_KEY)
+        current_query = re.sub(r"[^0-9]", "", business_no_input)
+        if not isinstance(search_result, dict) or (
+            search_result.get("query_business_no") != current_query
+        ):
+            search_result = None
+
+        if search_result and not search_result.get("ok"):
+            st.error(
+                search_result.get("message")
+                or "사업자등록번호를 확인해 주세요."
+            )
+        elif search_result and not search_result.get("found"):
+            st.info(
+                search_result.get("message")
+                or "해당 사업자등록번호로 신청 가능한 DB를 찾지 못했습니다."
+            )
+        elif search_result:
+            row = dict(search_result.get("result") or {})
+            status = str(row.get("request_status") or "unavailable")
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "업체명": str(row.get("company_name") or "업체명 미확인"),
+                            "사업자등록번호": _display_business_no(
+                                row.get("business_no")
+                            ),
+                            "사업자유형": (
+                                "법인사업자"
+                                if row.get("business_type") == "corporate"
+                                else "개인사업자 후보"
+                            ),
+                            "업종명": str(row.get("industry_name") or "-"),
+                            "주소": str(row.get("address") or "-"),
+                            "일반전화": str(row.get("landline_phone") or "-") ,
+                            "핸드폰번호": str(
+                                row.get("masked_mobile_phone") or "미보유"
+                            ),
+                            "상태": SPECIFIC_DB_SEARCH_STATUS_LABELS.get(
+                                status, "신청 불가"
+                            ),
+                        }
+                    ]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+            if row.get("has_mobile_phone"):
+                st.caption(
+                    "핸드폰번호 원문은 관리자 승인 후 해당 업체가 내 DB에 "
+                    "배정될 때만 표시됩니다."
+                )
+            request_clicked = st.button(
+                "이 업체 DB 신청",
+                type="primary",
+                use_container_width=True,
+                disabled=not bool(row.get("requestable")),
+                key=f"submit_specific_db_request_v1240_{row.get('company_uid')}",
+            )
+            if request_clicked:
+                submitted = sales_assignments.submit_specific_company_db_request(
+                    owner_user_id,
+                    row.get("business_no"),
+                    session_id=_assignment_session_id(),
+                )
+                if submitted.get("ok"):
+                    row["requestable"] = False
+                    row["request_status"] = "pending_own"
+                    st.session_state[_SPECIFIC_DB_SEARCH_RESULT_KEY] = {
+                        **search_result,
+                        "result": row,
+                    }
+                    st.success(
+                        submitted.get("message")
+                        or "DB 신청을 접수했습니다. 관리자 승인 후 배정됩니다."
+                    )
+                else:
+                    st.error(
+                        submitted.get("message")
+                        or "DB 신청을 접수하지 못했습니다."
+                    )
+
+        history = sales_assignments.list_user_specific_company_db_requests(
+            owner_user_id,
+            limit=20,
+        )
+        if history.get("ok") and history.get("requests"):
+            with st.expander("내 개별 DB 신청내역", expanded=False):
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "신청일": _format_db_request_time(
+                                    item.get("requested_at")
+                                ),
+                                "업체명": str(
+                                    item.get("company_name") or "업체명 미확인"
+                                ),
+                                "사업자등록번호": _display_business_no(
+                                    item.get("business_no")
+                                ),
+                                "핸드폰번호": str(
+                                    item.get("masked_mobile_phone") or "미보유"
+                                ),
+                                "상태": SPECIFIC_DB_REQUEST_STATUS_LABELS.get(
+                                    str(item.get("status") or ""), "확인 중"
+                                ),
+                                "관리자 메모": str(
+                                    item.get("decision_reason") or ""
+                                ),
+                            }
+                            for item in history.get("requests") or []
+                        ]
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+
 def _render_db_request_home(owner_user_id: str) -> None:
     dashboard_result = _load_assignable_db_inventory_dashboard(owner_user_id)
     if dashboard_result.get("ok"):
@@ -6433,6 +6601,7 @@ def _render_db_request_home(owner_user_id: str) -> None:
             dashboard_result.get("message")
             or "DB 현황을 불러오지 못했습니다. 잠시 후 다시 시도해 주세요."
         )
+    _render_specific_company_db_search(owner_user_id)
     st.markdown(
         textwrap.dedent(
             """\
@@ -6680,6 +6849,113 @@ def _render_db_request_home(owner_user_id: str) -> None:
             st.dataframe(history_frame, use_container_width=True, hide_index=True)
 
 
+@st.fragment
+def _render_specific_company_db_admin(current_user_id: str) -> None:
+    flash = st.session_state.pop(_SPECIFIC_DB_ADMIN_FLASH_KEY, None)
+    if isinstance(flash, dict) and flash.get("message"):
+        if flash.get("ok"):
+            st.success(str(flash["message"]))
+        else:
+            st.error(str(flash["message"]))
+
+    st.markdown("#### 사업자번호 개별 DB 신청")
+    st.caption(
+        "사용자가 사업자등록번호로 직접 찾은 업체입니다. 승인하면 해당 사용자에게 "
+        "즉시 배정되고, 휴대전화 원문은 배정된 사용자에게만 공개됩니다."
+    )
+    result = sales_assignments.list_admin_specific_company_db_requests(
+        current_user_id,
+        statuses=["pending"],
+        limit=500,
+    )
+    if not result.get("ok"):
+        st.error(result.get("message") or "개별 DB 신청을 불러오지 못했습니다.")
+        return
+    requests = list(result.get("requests") or [])
+    if not requests:
+        st.info("처리할 개별 DB 신청이 없습니다.")
+        return
+
+    st.metric("개별 승인 대기", f"{len(requests):,}건")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "신청자": str(
+                        row.get("requested_user_name") or "담당자 미확인"
+                    ),
+                    "업체명": str(row.get("company_name") or "업체명 미확인"),
+                    "사업자등록번호": _display_business_no(
+                        row.get("business_no")
+                    ),
+                    "사업자유형": (
+                        "법인사업자"
+                        if row.get("business_type") == "corporate"
+                        else "개인사업자 후보"
+                    ),
+                    "일반전화": str(row.get("landline_phone") or "-"),
+                    "핸드폰번호": str(
+                        row.get("masked_mobile_phone") or "미보유"
+                    ),
+                    "신청일": _format_db_request_time(row.get("requested_at")),
+                }
+                for row in requests
+            ]
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+    by_id = {str(row.get("request_id") or ""): row for row in requests}
+    selected_id = st.selectbox(
+        "처리할 개별 신청",
+        list(by_id),
+        format_func=lambda value: (
+            f"{by_id[value].get('requested_user_name') or '담당자 미확인'} · "
+            f"{by_id[value].get('company_name') or '업체명 미확인'} · "
+            f"{_display_business_no(by_id[value].get('business_no'))}"
+        ),
+        key=_SPECIFIC_DB_ADMIN_SELECTION_KEY,
+    )
+    reason = st.text_input(
+        "개별 신청 관리 메모 (반려 시 필수)",
+        max_chars=500,
+        key=f"specific_db_admin_reason_v1240_{selected_id}",
+    )
+    approve_col, reject_col = st.columns(2)
+    approve_clicked = approve_col.button(
+        "승인 및 DB 배정",
+        type="primary",
+        use_container_width=True,
+        key=f"approve_specific_db_v1240_{selected_id}",
+    )
+    reject_clicked = reject_col.button(
+        "신청 반려",
+        use_container_width=True,
+        key=f"reject_specific_db_v1240_{selected_id}",
+    )
+    if not approve_clicked and not reject_clicked:
+        return
+    if reject_clicked and not reason.strip():
+        st.error("반려 사유를 입력해 주세요.")
+        return
+
+    reviewed = sales_assignments.admin_review_specific_company_db_request(
+        current_user_id,
+        selected_id,
+        "approve" if approve_clicked else "reject",
+        reason=reason,
+        session_id=_assignment_session_id(),
+    )
+    st.session_state[_SPECIFIC_DB_ADMIN_FLASH_KEY] = {
+        "ok": bool(reviewed.get("ok")),
+        "message": reviewed.get("message")
+        or ("개별 DB 신청을 처리했습니다." if reviewed.get("ok") else "처리하지 못했습니다."),
+    }
+    if reviewed.get("ok"):
+        _load_assignable_db_inventory_dashboard.clear()
+    st.rerun(scope="fragment")
+
+
 def _render_mobile_db_admin(current_user_id: str) -> None:
     from auth import is_admin
 
@@ -6687,6 +6963,9 @@ def _render_mobile_db_admin(current_user_id: str) -> None:
     if not is_admin(current_user_id):
         st.error("관리자만 핸드폰 DB 신청을 관리할 수 있습니다.")
         return
+    _render_specific_company_db_admin(current_user_id)
+    st.divider()
+    st.markdown("#### 조건별 핸드폰 DB 신청")
     result = sales_assignments.list_admin_mobile_db_requests(
         current_user_id,
         statuses=["pending"],

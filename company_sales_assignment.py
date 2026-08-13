@@ -43,6 +43,21 @@ RPC_SUBMIT_MOBILE_DB_REQUEST = "oasis_submit_mobile_db_request"
 RPC_LIST_USER_MOBILE_DB_REQUESTS = "oasis_list_user_mobile_db_requests"
 RPC_LIST_ADMIN_MOBILE_DB_REQUESTS = "oasis_list_admin_mobile_db_requests"
 RPC_ADMIN_UPDATE_MOBILE_DB_REQUEST = "oasis_admin_update_mobile_db_request"
+RPC_SEARCH_COMPANY_DB_BY_BUSINESS_NO = (
+    "oasis_search_company_db_by_business_no"
+)
+RPC_SUBMIT_SPECIFIC_COMPANY_DB_REQUEST = (
+    "oasis_submit_specific_company_db_request"
+)
+RPC_LIST_USER_SPECIFIC_COMPANY_DB_REQUESTS = (
+    "oasis_list_user_specific_company_db_requests"
+)
+RPC_LIST_ADMIN_SPECIFIC_COMPANY_DB_REQUESTS = (
+    "oasis_list_admin_specific_company_db_requests"
+)
+RPC_ADMIN_REVIEW_SPECIFIC_COMPANY_DB_REQUEST = (
+    "oasis_admin_review_specific_company_db_request"
+)
 
 
 _UID_PATTERN = re.compile(
@@ -178,6 +193,11 @@ _FAILURE_MESSAGES = {
     "MALFORMED_RESPONSE": (
         "배정 처리 결과를 확인하지 못했습니다. 잠시 후 다시 시도해 주세요."
     ),
+    "UNAVAILABLE": "현재 신청할 수 없는 업체입니다.",
+    "PENDING_OTHER": "현재 다른 신청을 검토 중인 업체입니다.",
+    "REASON_REQUIRED": "반려 사유를 입력해 주세요.",
+    "CONTACT_UNAVAILABLE": "승인 시점에 유효한 전화번호 DB를 확인하지 못했습니다.",
+    "ASSIGNMENT_FAILED": "업체를 배정하지 못했습니다.",
 }
 
 _ASSIGNMENT_FIELDS = {
@@ -293,6 +313,43 @@ _MOBILE_DB_REQUEST_FIELDS = {
     "decision_reason",
     "requested_at",
     "decided_at",
+}
+_SPECIFIC_DB_SEARCH_FIELDS = {
+    "found",
+    "code",
+    "message",
+    "company_uid",
+    "company_name",
+    "business_no",
+    "business_type",
+    "industry_name",
+    "address",
+    "masked_mobile_phone",
+    "landline_phone",
+    "has_mobile_phone",
+    "has_landline_phone",
+    "requestable",
+    "request_status",
+    "request_id",
+}
+_SPECIFIC_DB_REQUEST_FIELDS = {
+    "request_id",
+    "requested_user_id",
+    "requested_user_name",
+    "company_name",
+    "business_no",
+    "business_type",
+    "industry_name",
+    "address",
+    "masked_mobile_phone",
+    "landline_phone",
+    "has_mobile_phone",
+    "has_landline_phone",
+    "status",
+    "decision_reason",
+    "requested_at",
+    "decided_at",
+    "assignment_id",
 }
 
 
@@ -2306,6 +2363,262 @@ def admin_update_mobile_db_request(
     )
 
 
+def search_company_db_by_business_no(
+    current_user_id: str,
+    business_no: Any,
+    *,
+    db: CloudDatabase | None = None,
+) -> dict[str, Any]:
+    """Search one company without returning the raw mobile number."""
+
+    normalized = _digits(business_no)
+    if len(normalized) != 10:
+        return {
+            "ok": False,
+            "found": False,
+            "code": "INVALID_INPUT",
+            "message": "사업자등록번호 10자리를 입력해 주세요.",
+            "result": {},
+            "warning": "사업자등록번호를 확인해 주세요.",
+            "fallback_required": False,
+        }
+    raw, error = _rpc(
+        RPC_SEARCH_COMPANY_DB_BY_BUSINESS_NO,
+        {
+            "p_current_user_id": _user_id(current_user_id),
+            "p_business_no": normalized,
+        },
+        db=db,
+    )
+    if error:
+        return {**error, "found": False, "result": {}}
+    row = _first_row(raw)
+    if row is None:
+        code = "MALFORMED_RESPONSE"
+        return {
+            "ok": False,
+            "found": False,
+            "code": code,
+            "message": _FAILURE_MESSAGES[code],
+            "result": {},
+            "warning": _FAILURE_MESSAGES[code],
+            "fallback_required": False,
+        }
+    found = row.get("found") is True or _text(row.get("found")).lower() in {
+        "true",
+        "t",
+        "1",
+    }
+    code = _safe_code(row.get("code"), "FOUND" if found else "NOT_FOUND")
+    result = {
+        key: value
+        for key, value in row.items()
+        if key in _SPECIFIC_DB_SEARCH_FIELDS
+    }
+    # Defense in depth: an unexpected database column can never expose a raw
+    # mobile value through this public helper.
+    result.pop("mobile_phone", None)
+    return {
+        "ok": code != "INVALID_INPUT",
+        "found": found,
+        "code": code,
+        "message": _text(row.get("message")) or (
+            "업체를 찾았습니다." if found else "업체를 찾지 못했습니다."
+        ),
+        "result": result,
+        "warning": "" if found else _text(row.get("message")),
+        "fallback_required": False,
+    }
+
+
+def _specific_db_request_mutation_result(
+    raw: Any,
+    *,
+    success_message: str,
+) -> dict[str, Any]:
+    row = _first_row(raw)
+    if row is None:
+        code = "MALFORMED_RESPONSE"
+        return {
+            "ok": False,
+            "code": code,
+            "message": _FAILURE_MESSAGES[code],
+            "request": {},
+            "assignment": {},
+            "warning": _FAILURE_MESSAGES[code],
+            "fallback_required": False,
+        }
+    success_value = row.get("success", row.get("ok"))
+    ok = success_value is True or _text(success_value).lower() in {
+        "true",
+        "t",
+        "1",
+    }
+    code = _safe_code(row.get("code"), "OK" if ok else "REQUEST_FAILED")
+    request = {
+        key: value
+        for key, value in row.items()
+        if key in _SPECIFIC_DB_REQUEST_FIELDS
+    }
+    message = _text(row.get("message"))
+    if not message:
+        message = _safe_message(
+            code,
+            success_message=success_message,
+            ok=ok,
+        )
+    return {
+        "ok": ok,
+        "code": code,
+        "message": message,
+        "request": request,
+        "assignment": {
+            "assignment_id": row.get("assignment_id")
+        } if row.get("assignment_id") else {},
+        "warning": "" if ok else message,
+        "fallback_required": False,
+    }
+
+
+def submit_specific_company_db_request(
+    current_user_id: str,
+    business_no: Any,
+    *,
+    session_id: str = "",
+    db: CloudDatabase | None = None,
+) -> dict[str, Any]:
+    normalized = _digits(business_no)
+    if len(normalized) != 10:
+        return {
+            "ok": False,
+            "code": "INVALID_INPUT",
+            "message": "사업자등록번호 10자리를 입력해 주세요.",
+            "request": {},
+            "assignment": {},
+            "warning": "사업자등록번호를 확인해 주세요.",
+            "fallback_required": False,
+        }
+    raw, error = _rpc(
+        RPC_SUBMIT_SPECIFIC_COMPANY_DB_REQUEST,
+        {
+            "p_current_user_id": _user_id(current_user_id),
+            "p_business_no": normalized,
+            "p_session_id": _bounded(session_id, 200) or None,
+        },
+        db=db,
+    )
+    if error:
+        return {**error, "request": {}}
+    return _specific_db_request_mutation_result(
+        raw,
+        success_message="DB 신청을 접수했습니다.",
+    )
+
+
+def list_user_specific_company_db_requests(
+    current_user_id: str,
+    *,
+    limit: int = 20,
+    db: CloudDatabase | None = None,
+) -> dict[str, Any]:
+    raw, error = _rpc(
+        RPC_LIST_USER_SPECIFIC_COMPANY_DB_REQUESTS,
+        {
+            "p_current_user_id": _user_id(current_user_id),
+            "p_limit": max(1, min(int(limit), 100)),
+        },
+        db=db,
+    )
+    if error:
+        return {**error, "requests": []}
+    requests = [
+        {
+            key: value
+            for key, value in row.items()
+            if key in _SPECIFIC_DB_REQUEST_FIELDS
+        }
+        for row in _rows(raw)
+    ]
+    return {
+        "ok": True,
+        "code": "OK",
+        "message": "개별 DB 신청내역을 불러왔습니다.",
+        "assignment": {},
+        "requests": requests,
+        "warning": "",
+        "fallback_required": False,
+    }
+
+
+def list_admin_specific_company_db_requests(
+    current_user_id: str,
+    *,
+    statuses: Sequence[str] | None = None,
+    limit: int = 200,
+    db: CloudDatabase | None = None,
+) -> dict[str, Any]:
+    raw, error = _rpc(
+        RPC_LIST_ADMIN_SPECIFIC_COMPANY_DB_REQUESTS,
+        {
+            "p_current_user_id": _user_id(current_user_id),
+            "p_statuses": [
+                _text(status).lower()
+                for status in (statuses or [])
+                if _text(status)
+            ],
+            "p_limit": max(1, min(int(limit), 1000)),
+        },
+        db=db,
+    )
+    if error:
+        return {**error, "requests": []}
+    requests = [
+        {
+            key: value
+            for key, value in row.items()
+            if key in _SPECIFIC_DB_REQUEST_FIELDS
+        }
+        for row in _rows(raw)
+    ]
+    return {
+        "ok": True,
+        "code": "OK",
+        "message": "개별 DB 신청현황을 불러왔습니다.",
+        "assignment": {},
+        "requests": requests,
+        "warning": "",
+        "fallback_required": False,
+    }
+
+
+def admin_review_specific_company_db_request(
+    current_user_id: str,
+    request_id: Any,
+    action: Any,
+    *,
+    reason: Any = "",
+    session_id: str = "",
+    db: CloudDatabase | None = None,
+) -> dict[str, Any]:
+    raw, error = _rpc(
+        RPC_ADMIN_REVIEW_SPECIFIC_COMPANY_DB_REQUEST,
+        {
+            "p_current_user_id": _user_id(current_user_id),
+            "p_request_id": _text(request_id),
+            "p_action": _bounded(action, 20).lower(),
+            "p_reason": _bounded(reason, 500),
+            "p_session_id": _bounded(session_id, 200) or None,
+        },
+        db=db,
+    )
+    if error:
+        return {**error, "request": {}}
+    return _specific_db_request_mutation_result(
+        raw,
+        success_message="개별 DB 신청을 처리했습니다.",
+    )
+
+
 __all__ = [
     "CompanyIdentityError",
     "admin_change_assignee",
@@ -2314,6 +2627,7 @@ __all__ = [
     "admin_release_assignment",
     "admin_reactivate",
     "admin_set_user_limit",
+    "admin_review_specific_company_db_request",
     "admin_update_mobile_db_request",
     "assignment_feature_ready",
     "assignment_status_label",
@@ -2330,16 +2644,20 @@ __all__ = [
     "list_admin_assignment_metrics",
     "list_admin_assignment_audit",
     "list_admin_mobile_db_requests",
+    "list_admin_specific_company_db_requests",
     "list_blocked_company_uids",
     "list_company_contacts",
     "list_user_assignments",
     "list_user_db_assignments",
     "list_user_mobile_db_requests",
+    "list_user_specific_company_db_requests",
     "record_contact",
     "record_company_views",
     "resolve_candidate_company_uids",
     "release_assignment",
     "release_expired_assignments",
     "save_user_note",
+    "search_company_db_by_business_no",
+    "submit_specific_company_db_request",
     "submit_mobile_db_request",
 ]
