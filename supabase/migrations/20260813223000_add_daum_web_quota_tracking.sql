@@ -177,6 +177,10 @@ declare
     v_provider text := lower(btrim(coalesce(p_provider, '')));
     v_count integer := coalesce(p_request_count, 0);
     v_safe_limit integer := coalesce(p_safe_limit, 0);
+    v_provider_hard_limit integer := case
+        when v_provider = 'daum_web' then 30000
+        else 90000
+    end;
     v_now timestamptz := clock_timestamp();
     v_quota_date date := timezone('Asia/Seoul', v_now)::date;
     v_request_count bigint;
@@ -185,10 +189,7 @@ declare
 begin
     if v_provider not in ('kakao_local', 'daum_web')
        or v_count not between 1 and 10000
-       or v_safe_limit not between 1 and case
-           when v_provider = 'daum_web' then 30000
-           else 90000
-       end
+       or v_safe_limit not between 1 and v_provider_hard_limit
        or v_count > v_safe_limit then
         raise exception using
             errcode = '22023',
