@@ -1209,6 +1209,11 @@ def _database_row(
         ),
         "precision": str(prospect.get("신규정밀도") or ""),
     }
+    procurement_activity = str(
+        prospect.get("나라장터활동") or ""
+    ).strip()
+    if procurement_activity:
+        source_data["procurement_activity"] = procurement_activity
     sales_analysis = prospect.get("영업분석")
     if isinstance(sales_analysis, dict):
         source_data["sales_intelligence_v971"] = sales_analysis

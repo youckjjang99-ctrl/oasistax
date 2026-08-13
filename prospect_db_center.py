@@ -19,6 +19,7 @@ from runtime_error_log import safe_public_error
 
 import company_sales_assignment as sales_assignments
 import direct_sales_customer_repository as direct_sales_customers
+import procurement_discovery
 import sales_outreach
 import sales_outreach_repository
 import localdata_contact_client
@@ -213,6 +214,7 @@ SAVED_PROSPECT_VISIBLE_COLUMNS = (
     "사업자유형",
     "발굴유형",
     "연락처",
+    "나라장터활동",
     "업종명",
     "가입자",
     "고용증가값",
@@ -226,6 +228,7 @@ CONTACT_STATUS_SAVED_PROSPECT_VISIBLE_COLUMNS = (
     "사업자유형",
     "발굴유형",
     "연락처",
+    "나라장터활동",
     "업종명",
     "업체별 진행상황",
     "문자보내기",
@@ -1071,6 +1074,19 @@ def _saved_prospect_progress_label(
     return label or "상태 확인 중"
 
 
+def _procurement_activity_map(business_nos: list[object]) -> dict[str, str]:
+    """Load compact G2B labels without blocking the primary DB workflow."""
+
+    try:
+        rows = procurement_discovery.load_activity_map(business_nos)
+    except Exception:
+        return {}
+    return {
+        business_no: procurement_discovery.activity_label(row)
+        for business_no, row in rows.items()
+    }
+
+
 def _saved_candidate_frame(
     rows: list[dict],
     contacts: list[dict],
@@ -1107,6 +1123,9 @@ def _saved_candidate_frame(
             )
     display: list[dict] = []
     latest_contact_by_uid = latest_contact_by_uid or {}
+    procurement_by_business = _procurement_activity_map(
+        [row.get("business_no") for row in rows]
+    )
     for row in rows:
         prospect_id = str(row.get("id") or "")
         company_uid = str(row.get("company_uid") or "").strip()
@@ -1196,6 +1215,12 @@ def _saved_candidate_frame(
                 "발굴유형": DISCOVERY_TYPE_LABELS.get(
                     str(source_data.get("discovery_type") or "unknown"),
                     "분류 확인 중",
+                ),
+                "나라장터활동": procurement_by_business.get(
+                    procurement_discovery.business_digits(
+                        row.get("business_no")
+                    ),
+                    str(source_data.get("procurement_activity") or ""),
                 ),
                 "대표전화": preferred_phone,
                 "휴대전화": mobile_phone,
@@ -1329,6 +1354,7 @@ def _saved_prospect_table_frame(
                 "사업자유형": str(row.get("사업자유형") or ""),
                 "발굴유형": str(row.get("발굴유형") or "분류 확인 중"),
                 "연락처": normalize_phone(row.get("대표전화") or ""),
+                "나라장터활동": str(row.get("나라장터활동") or ""),
                 "업종명": str(row.get("업종명") or ""),
                 "가입자": int(row.get("가입자") or 0),
                 "고용증가값": str(row.get("고용증가값") or ""),
@@ -5122,6 +5148,7 @@ def _render_clean_saved_prospects(
             "사업자유형": st.column_config.TextColumn(width="small"),
             "발굴유형": st.column_config.TextColumn(width="small"),
             "연락처": st.column_config.TextColumn(width="small"),
+            "나라장터활동": st.column_config.TextColumn(width="small"),
             "업종명": st.column_config.TextColumn(width="medium"),
             "업체별 진행상황": st.column_config.TextColumn(width="medium"),
             "문자보내기": st.column_config.ButtonColumn(
@@ -7930,6 +7957,15 @@ def render_prospect_db_center(
                 items,
                 can_view_mobile=can_view_mobile,
             )
+            procurement_by_business = _procurement_activity_map(
+                display["사업자등록번호"].tolist()
+            )
+            display["나라장터활동"] = display["사업자등록번호"].map(
+                lambda value: procurement_by_business.get(
+                    procurement_discovery.business_digits(value),
+                    "",
+                )
+            )
             display["대표전화"] = display["대표전화"].map(normalize_phone)
             display["휴대전화"] = display["휴대전화"].map(normalize_phone)
             display["일반전화"] = display["일반전화"].map(normalize_phone)
@@ -8040,6 +8076,7 @@ def render_prospect_db_center(
                 for column in [
                     "선택",
                     "사업장명",
+                    "나라장터활동",
                     *(["휴대전화"] if can_view_mobile else []),
                     "일반전화",
                     "이메일",
@@ -8189,6 +8226,7 @@ def render_prospect_db_center(
                             "사업장명",
                             "사업자유형",
                             "사업자번호상태",
+                            "나라장터활동",
                             "이메일",
                             "인스타그램",
                             "인스타그램URL",
