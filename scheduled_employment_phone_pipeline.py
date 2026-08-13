@@ -49,6 +49,7 @@ def run_phone_pipeline() -> int:
                 "job": "employment-phone-pipeline",
                 "status": "started",
                 "order": ["kakao", "daum"],
+                "daum_strategy": "verified_mobile_first",
                 "kakao_max_requests": kakao_request_limit,
                 "daum_max_records": daum_limit,
                 "daum_max_requests": daum_request_limit,
