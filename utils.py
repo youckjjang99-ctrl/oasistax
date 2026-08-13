@@ -35,7 +35,7 @@ def image_to_base64(path):
 @lru_cache(maxsize=1)
 def get_logo_path():
     for path in [
-        ROOT_DIR / "logo_web.png",
+        ROOT_DIR / "assets" / "oasis_logo.png",
         ROOT_DIR / "logo.png",
         ROOT_DIR / "logo.jpg",
         ROOT_DIR / "logo.jpeg",

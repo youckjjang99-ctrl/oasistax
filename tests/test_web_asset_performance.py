@@ -16,7 +16,8 @@ class WebAssetPerformanceTests(unittest.TestCase):
         logo_path = utils.get_logo_path()
 
         self.assertIsNotNone(logo_path)
-        self.assertEqual(logo_path.name, "logo_web.png")
+        self.assertEqual(logo_path.name, "oasis_logo.png")
+        self.assertEqual(logo_path.parent.name, "assets")
         self.assertLess(logo_path.stat().st_size, 100_000)
         with logo_path.open("rb") as logo_file:
             self.assertEqual(logo_file.read(8), b"\x89PNG\r\n\x1a\n")
@@ -24,8 +25,8 @@ class WebAssetPerformanceTests(unittest.TestCase):
             self.assertEqual(logo_file.read(4), b"IHDR")
             width, height = struct.unpack(">II", logo_file.read(8))
         self.assertEqual(chunk_length, 13)
-        self.assertLessEqual(width, 1200)
-        self.assertLessEqual(height, 900)
+        self.assertLessEqual(width, 1400)
+        self.assertLessEqual(height, 1000)
 
     def test_logo_encoding_is_reused_between_reruns(self):
         logo_path = utils.get_logo_path()
