@@ -27,6 +27,9 @@ TABLE_BACKUP_RUNS = "oasis_backup_runs"
 TABLE_RESTORE_DRILLS = "oasis_restore_drills"
 TABLE_CUSTOMER_ARCHIVE_EVENTS = "oasis_customer_archive_events"
 TABLE_CUSTOMER_PROCUREMENT = "oasis_customer_procurement_summaries"
+TABLE_PROCUREMENT_BIDDER_SIGNALS = "oasis_procurement_bidder_signals"
+TABLE_PROCUREMENT_CONTACT_ACTIVITY = "oasis_procurement_contact_activity"
+TABLE_PROCUREMENT_SYNC_RUNS = "oasis_procurement_sync_runs"
 PRIVATE_CUSTOMER_ASSET_BUCKET = "oasis-customer-assets"
 _HTTP_CLIENT_LOCAL = threading.local()
 
