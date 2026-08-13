@@ -6441,16 +6441,19 @@ def _render_db_request_status_dashboard(metrics: dict) -> None:
 
 
 def _render_specific_company_db_search(owner_user_id: str) -> None:
-    with st.container(border=True):
+    with st.container(border=True, key="specific_company_db_search_panel"):
         st.markdown("### 사업자등록번호로 DB 찾기")
         st.caption(
-            "사업자등록번호 10자리로 보유 DB를 확인할 수 있습니다. "
+            "사업자등록번호는 하이픈 없이 숫자 10자리로 입력해도 조회됩니다. "
             "휴대전화는 승인 전까지 일부가 가려지며, 신청 후 관리자가 검토합니다."
         )
-        input_col, button_col = st.columns([4, 1])
+        input_col, button_col = st.columns(
+            [4, 1],
+            vertical_alignment="bottom",
+        )
         business_no_input = input_col.text_input(
             "사업자등록번호",
-            placeholder="000-00-00000",
+            placeholder="예: 1330776788 또는 133-07-76788",
             max_chars=12,
             key=_SPECIFIC_DB_SEARCH_INPUT_KEY,
         )
@@ -6461,10 +6464,15 @@ def _render_specific_company_db_search(owner_user_id: str) -> None:
             key="search_specific_company_db_v1240",
         )
         if search_clicked:
-            result = sales_assignments.search_company_db_by_business_no(
-                owner_user_id,
-                business_no_input,
-            )
+            with st.spinner(
+                "DB를 조회 중입니다. 잠시만 기다려 주세요.",
+                show_time=True,
+                width="stretch",
+            ):
+                result = sales_assignments.search_company_db_by_business_no(
+                    owner_user_id,
+                    business_no_input,
+                )
             st.session_state[_SPECIFIC_DB_SEARCH_RESULT_KEY] = {
                 **result,
                 "query_business_no": re.sub(r"[^0-9]", "", business_no_input),

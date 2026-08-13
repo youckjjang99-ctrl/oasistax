@@ -60,6 +60,37 @@ def test_exact_search_normalizes_business_no_and_drops_raw_mobile():
     ]
 
 
+def test_exact_search_accepts_digits_only_business_no():
+    database = _FakeDatabase(
+        {
+            assignments.RPC_SEARCH_COMPANY_DB_BY_BUSINESS_NO: [
+                {
+                    "found": False,
+                    "code": "not_found",
+                    "message": "조회 결과 없음",
+                }
+            ]
+        }
+    )
+
+    result = assignments.search_company_db_by_business_no(
+        "sales-user",
+        "1330776788",
+        db=database,
+    )
+
+    assert result["ok"] is True
+    assert database.calls == [
+        (
+            assignments.RPC_SEARCH_COMPANY_DB_BY_BUSINESS_NO,
+            {
+                "p_current_user_id": "sales-user",
+                "p_business_no": "1330776788",
+            },
+        )
+    ]
+
+
 def test_invalid_business_no_stops_before_rpc():
     database = _FakeDatabase({})
 
@@ -198,6 +229,9 @@ def test_ui_places_exact_search_on_request_screen_and_admin_queue():
     assert "masked_mobile_phone" in search_source
     assert 'row.get("mobile_phone")' not in search_source
     assert "이 업체 DB 신청" in search_source
+    assert 'vertical_alignment="bottom"' in search_source
+    assert "DB를 조회 중입니다" in search_source
+    assert "하이픈 없이 숫자 10자리" in search_source
     assert "_render_specific_company_db_admin(current_user_id)" in admin_source
     assert "승인 및 DB 배정" in admin_queue_source
     assert 'statuses=["pending"]' in admin_queue_source
