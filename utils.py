@@ -26,13 +26,16 @@ for folder in [TEMPLATE_DIR, UPLOAD_DIR, RESULT_DIR, HISTORY_DIR, USER_DATA_DIR]
     folder.mkdir(exist_ok=True)
 
 
+@lru_cache(maxsize=8)
 def image_to_base64(path):
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode()
 
 
+@lru_cache(maxsize=1)
 def get_logo_path():
     for path in [
+        ROOT_DIR / "assets" / "oasis_logo.png",
         ROOT_DIR / "logo.png",
         ROOT_DIR / "logo.jpg",
         ROOT_DIR / "logo.jpeg",
@@ -44,6 +47,7 @@ def get_logo_path():
     return None
 
 
+@lru_cache(maxsize=8)
 def logo_html(width=240):
     logo_path = get_logo_path()
     if logo_path:

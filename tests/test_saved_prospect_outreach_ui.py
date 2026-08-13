@@ -654,10 +654,31 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
         self.assertIn("list_prospects(", renderer_source)
         self.assertIn("목록 조회를 중단했습니다", renderer_source)
 
-    def test_dashboard_refreshes_without_client_cache(self):
-        source = inspect.getsource(prospect._load_user_db_dashboard)
-        self.assertIn("get_user_db_dashboard", source)
-        self.assertNotIn("cache_data", source)
+    def test_dashboard_cache_is_cleared_after_related_mutations(self):
+        prospect._load_user_db_dashboard.clear()
+        with patch.object(
+            prospect,
+            "_assignment_feature_status",
+            return_value=(True, ""),
+        ), patch.object(
+            prospect,
+            "_release_expired_assignments_if_due",
+        ), patch.object(
+            prospect.sales_assignments,
+            "get_user_db_dashboard",
+            return_value={"ok": True, "metrics": {"total_count": 1}},
+        ) as dashboard:
+            first = prospect._load_user_db_dashboard("owner-cache-test")
+            second = prospect._load_user_db_dashboard("owner-cache-test")
+            self.assertEqual(first, second)
+            dashboard.assert_called_once()
+
+            prospect._clear_saved_db_read_caches()
+            prospect._load_user_db_dashboard("owner-cache-test")
+            self.assertEqual(dashboard.call_count, 2)
+
+        contact_source = inspect.getsource(prospect._render_contact_results)
+        self.assertIn("_clear_saved_db_read_caches", contact_source)
 
     def test_resolver_rejects_a_stale_or_unowned_assignment(self):
         request = {

@@ -1913,6 +1913,8 @@ def _show_prospect_save_approval_dialog(
             session_id=_assignment_session_id(),
             promote_review_contacts=True,
         )
+        if int(save_result.get("success_count") or 0) > 0:
+            _clear_saved_db_read_caches()
         notices = _approved_prospect_save_notices(save_result)
         post_save_contact = request.get("post_save_contact")
         if isinstance(post_save_contact, dict):
@@ -2458,6 +2460,7 @@ def _show_outreach_dialog(
             session_id=_assignment_session_id(),
         )
         if crm_result.get("ok"):
+            _clear_saved_db_read_caches()
             flash = (
                 f"{channel_label} 발송 요청을 공급자가 접수했고 자동 발송 이력과 "
                 "CRM 연락이력을 저장했습니다."
@@ -3648,6 +3651,11 @@ def _set_saved_db_dashboard_page(page_index: int) -> None:
     st.session_state.pop(_ACTIVITY_DIALOG_REQUEST_KEY, None)
 
 
+@st.cache_data(
+    show_spinner=False,
+    ttl=20,
+    max_entries=64,
+)
 def _load_user_db_dashboard(owner_user_id: str) -> dict:
     ready, ready_message = _assignment_feature_status()
     if not ready:
@@ -3708,6 +3716,21 @@ def _load_user_dashboard_assignment_rows(
         "rows": rows,
         "total_count": int(assignment_result.get("total_count") or 0),
     }
+
+
+@st.cache_data(
+    show_spinner=False,
+    ttl=20,
+    max_entries=64,
+)
+def _load_direct_customer_summary(owner_user_id: str) -> dict:
+    return direct_sales_customers.get_direct_customer_summary(owner_user_id)
+
+
+def _clear_saved_db_read_caches() -> None:
+    """Refresh only the DB reads affected by assignment or contact changes."""
+    _load_user_db_dashboard.clear()
+    _load_direct_customer_summary.clear()
 
 
 def _render_saved_db_dashboard(
@@ -4252,6 +4275,7 @@ def _render_direct_db_registration_form(
         renderer(result.get("message") or "업체를 등록하지 못했습니다.")
         return
 
+    _clear_saved_db_read_caches()
     formatted_business_no = (
         f"{business_digits[:3]}-{business_digits[3:5]}-{business_digits[5:]}"
     )
@@ -4299,7 +4323,7 @@ def _render_direct_db_dialog_content(
     _direct_db_notice()
     is_contracted = category == "contracted"
     category_label = "계약 DB" if is_contracted else "등록 DB"
-    summary = direct_sales_customers.get_direct_customer_summary(owner_user_id)
+    summary = _load_direct_customer_summary(owner_user_id)
     if summary.get("ok"):
         metric_key = "contracted" if is_contracted else "registered"
         st.metric(category_label, f"{int(summary.get(metric_key) or 0):,}개")
@@ -4919,11 +4943,7 @@ def _render_clean_saved_prospects(
         dashboard_result = _load_user_db_dashboard(owner_user_id)
         if dashboard_result.get("ok"):
             metrics = dict(dashboard_result.get("metrics") or {})
-            direct_db_summary = (
-                direct_sales_customers.get_direct_customer_summary(
-                    owner_user_id
-                )
-            )
+            direct_db_summary = _load_direct_customer_summary(owner_user_id)
             _render_saved_db_dashboard(
                 metrics,
                 selected_filter,
@@ -5644,6 +5664,7 @@ def _render_contact_results(
                 session_id=_assignment_session_id(),
             )
             if contact_save_result.get("ok"):
+                _clear_saved_db_read_caches()
                 st.session_state[_CONTACT_RESULTS_FLASH_KEY] = {
                     "level": "success",
                     "message": "연락결과를 저장했습니다.",
@@ -5693,6 +5714,7 @@ def _render_contact_results(
                 session_id=_assignment_session_id(),
             )
         if return_result and return_result.get("ok"):
+            _clear_saved_db_read_caches()
             st.session_state[_CONTACT_RESULTS_FLASH_KEY] = {
                 "level": "success",
                 "message": (
@@ -6799,6 +6821,7 @@ def _render_db_request_home(owner_user_id: str) -> None:
                     )
                     saved_count = int(save_result.get("saved_count") or 0)
                     if saved_count:
+                        _clear_saved_db_read_caches()
                         _load_assignable_db_inventory_dashboard.clear()
                         extra = ""
                         if saved_count < MEMBER_PROSPECT_TARGET_COUNT:
@@ -7172,6 +7195,7 @@ def _render_mobile_db_admin(current_user_id: str) -> None:
                     "추가 배정을 중단하고 관리자에게 확인해 주세요."
                 )
                 return
+            _clear_saved_db_read_caches()
             _load_assignable_db_inventory_dashboard.clear()
             _load_user_mobile_db_requests.clear()
             st.success(f"핸드폰 DB {allocated}개를 배정했습니다.")
