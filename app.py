@@ -699,6 +699,8 @@ def _navigate_to_main_menu(target: str) -> None:
         "클라우드 DB 관리": "관리자",
         "AI 사용량": "관리자",
     }
+    if target == "기업정보등록":
+        st.session_state["_oasis_enterprise_transition_target"] = target
     st.session_state["active_main_menu_v1020"] = target
     _write_main_menu_query(target)
     target_group = group_by_target.get(target)
@@ -767,10 +769,92 @@ def _queue_sidebar_collapse() -> None:
 
 
 def _handle_main_menu_change() -> None:
-    _write_main_menu_query(
-        st.session_state.get("active_main_menu_v1020", "")
-    )
+    target = st.session_state.get("active_main_menu_v1020", "")
+    if target == "기업정보등록":
+        st.session_state["_oasis_enterprise_transition_target"] = target
+    _write_main_menu_query(target)
     _queue_sidebar_collapse()
+
+
+def _render_enterprise_menu_transition():
+    """Cover stale route content while the enterprise page is being rebuilt."""
+    target = st.session_state.pop(
+        "_oasis_enterprise_transition_target",
+        "",
+    )
+    if target != "기업정보등록":
+        return None
+
+    placeholder = st.empty()
+    placeholder.markdown(
+        """
+        <style>
+        .oasis-enterprise-transition {
+            position: fixed;
+            inset: 0;
+            z-index: 999999;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            background: rgba(247, 250, 255, 0.98);
+            backdrop-filter: blur(3px);
+            animation: oasis-transition-failsafe 0.2s ease 25s forwards;
+        }
+        .oasis-enterprise-transition-card {
+            width: min(420px, calc(100vw - 48px));
+            padding: 28px 24px;
+            border: 1px solid #b9d2f5;
+            border-radius: 18px;
+            background: #ffffff;
+            box-shadow: 0 18px 48px rgba(17, 68, 145, 0.16);
+            text-align: center;
+        }
+        .oasis-enterprise-transition-spinner {
+            width: 34px;
+            height: 34px;
+            margin: 0 auto 14px;
+            border: 4px solid #dbe9fb;
+            border-top-color: #0b5fd7;
+            border-radius: 50%;
+            animation: oasis-transition-spin 0.75s linear infinite;
+        }
+        .oasis-enterprise-transition-title {
+            color: #0b2d61;
+            font-size: 18px;
+            font-weight: 800;
+        }
+        .oasis-enterprise-transition-copy {
+            margin-top: 7px;
+            color: #49627f;
+            font-size: 14px;
+        }
+        @keyframes oasis-transition-spin {
+            to { transform: rotate(360deg); }
+        }
+        @keyframes oasis-transition-failsafe {
+            to { opacity: 0; visibility: hidden; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            .oasis-enterprise-transition-spinner { animation-duration: 1.5s; }
+        }
+        </style>
+        <div class="oasis-enterprise-transition" role="status" aria-live="polite">
+            <div class="oasis-enterprise-transition-card">
+                <div class="oasis-enterprise-transition-spinner"></div>
+                <div class="oasis-enterprise-transition-title">기업정보등록 화면을 준비하고 있습니다</div>
+                <div class="oasis-enterprise-transition-copy">등록된 기업과 첨부자료를 안전하게 불러오는 중입니다.</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    return placeholder
+
+
+def _finish_enterprise_menu_transition(placeholder) -> None:
+    if placeholder is not None:
+        placeholder.empty()
 
 
 def _render_queued_sidebar_collapse() -> None:
@@ -1856,6 +1940,11 @@ USER_DIRS = _get_user_dirs_once(CURRENT_USER_ID)
 USER_UPLOAD_DIR = USER_DIRS["uploads"]
 USER_RESULT_DIR = USER_DIRS["results"]
 
+# Streamlit keeps the previous route visible while a new full-script render is
+# running. Cover that short interval so widgets from DB발굴 do not appear mixed
+# with the heavier 기업정보등록 screen.
+ENTERPRISE_TRANSITION_PLACEHOLDER = _render_enterprise_menu_transition()
+
 # v3.0.0: 상단 탭/가로 메뉴 대신 사이드바 기반 메뉴로 전환
 with st.sidebar:
     st.markdown(
@@ -2726,6 +2815,9 @@ elif active_tab == "기업등록":
             CURRENT_USER_ID,
             CURRENT_USER_NAME,
         )
+        _finish_enterprise_menu_transition(
+            ENTERPRISE_TRANSITION_PLACEHOLDER
+        )
         st.stop()
 
     st.markdown("### 크레탑 PDF로 법인사업자 자동등록")
@@ -2780,6 +2872,9 @@ elif active_tab == "기업등록":
     if cretop_pdf is not None:
         if not cretop_manager_name.strip():
             st.warning("담당자명을 입력해주세요.")
+            _finish_enterprise_menu_transition(
+                ENTERPRISE_TRANSITION_PLACEHOLDER
+            )
             st.stop()
 
         st.caption("PDF 업로드가 완료되었습니다. 아래 버튼을 눌러 분석을 시작하세요.")
@@ -3417,6 +3512,8 @@ elif CURRENT_USER_IS_ADMIN and active_tab == "클라우드 DB 관리":
                 f"{result['success']}건 성공, "
                 f"{result['failed']}건은 대기 중입니다."
             )
+
+_finish_enterprise_menu_transition(ENTERPRISE_TRANSITION_PLACEHOLDER)
 
 st.markdown("""
 <div class="oasis-footer">

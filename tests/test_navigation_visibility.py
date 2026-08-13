@@ -57,6 +57,22 @@ class NavigationVisibilityTests(unittest.TestCase):
             source,
         )
 
+    def test_enterprise_navigation_masks_stale_route_until_render_finishes(self):
+        source = (ROOT / "app.py").read_text(encoding="utf-8")
+
+        self.assertIn("def _render_enterprise_menu_transition()", source)
+        self.assertIn('target == "기업정보등록"', source)
+        self.assertIn("oasis-enterprise-transition", source)
+        self.assertIn(
+            "ENTERPRISE_TRANSITION_PLACEHOLDER = "
+            "_render_enterprise_menu_transition()",
+            source,
+        )
+        self.assertIn(
+            "_finish_enterprise_menu_transition(ENTERPRISE_TRANSITION_PLACEHOLDER)",
+            source,
+        )
+
     def test_enterprise_tools_are_visible_in_one_tab_row(self):
         source = (ROOT / "enterprise_center.py").read_text(encoding="utf-8")
         expected_labels = [

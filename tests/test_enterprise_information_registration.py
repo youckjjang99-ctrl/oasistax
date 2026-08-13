@@ -168,3 +168,13 @@ def test_menu_and_requested_document_labels_are_present():
         "세무조정계산서",
     ]:
         assert label in module_source
+
+
+def test_enterprise_source_overview_is_cached_for_short_ui_reruns():
+    source = Path("enterprise_documents.py").read_text(encoding="utf-8")
+
+    assert "def _load_enterprise_source_overview_cached(" in source
+    assert "ttl=8" in source
+    assert "show_spinner=False" in source
+    assert "_enterprise_source_overview_revision(" in source
+    assert "_load_enterprise_source_overview_cached.clear()" in source

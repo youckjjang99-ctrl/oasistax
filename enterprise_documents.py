@@ -349,6 +349,36 @@ def load_enterprise_source_overview(
     }
 
 
+@st.cache_data(
+    ttl=8,
+    max_entries=128,
+    show_spinner=False,
+    scope="session",
+)
+def _load_enterprise_source_overview_cached(
+    user_id: str,
+    business_no: str,
+    company_name: str,
+    metadata_mtime_ns: int,
+    metadata_size: int,
+) -> dict[str, dict[str, Any]]:
+    """Reuse the expensive multi-source overview during short UI reruns."""
+    del metadata_mtime_ns, metadata_size
+    return load_enterprise_source_overview(
+        user_id,
+        business_no,
+        company_name,
+    )
+
+
+def _enterprise_source_overview_revision(user_id: str) -> tuple[int, int]:
+    try:
+        stat = _metadata_path(user_id).stat()
+        return int(stat.st_mtime_ns), int(stat.st_size)
+    except OSError:
+        return 0, 0
+
+
 def _render_note_input(user_id: str, customer: pd.Series, document_type: str) -> None:
     business_no = _normalize_business_no(customer.get("사업자등록번호", ""))
     company_name = _clean(customer.get("업체명", ""))
@@ -365,6 +395,7 @@ def _render_note_input(user_id: str, customer: pd.Series, document_type: str) ->
         save_enterprise_document_note(
             user_id, business_no, company_name, document_type, note, customer_id=customer_id,
         )
+        _load_enterprise_source_overview_cached.clear()
         st.success("자료 메모를 해당 기업에 연결해 저장했습니다.")
         st.rerun()
 
@@ -400,6 +431,7 @@ def _render_generic_upload(user_id: str, customer: pd.Series, document_type: str
                 analysis_summary=analysis.get("summary", ""),
                 extracted_fields={**analysis, "extraction_method": extraction.get("method", "")},
             )
+        _load_enterprise_source_overview_cached.clear()
         st.success("파일 원본과 분석 결과를 해당 기업에 연결해 저장했습니다.")
         st.rerun()
     except Exception as exc:
@@ -431,7 +463,16 @@ def render_enterprise_information_assets(user_id: str, user_name: str = "") -> N
     st.session_state["_oasis_active_company_business_no"] = business_no
     st.session_state["_oasis_active_company_name"] = company_name
 
-    overview = load_enterprise_source_overview(user_id, business_no, company_name)
+    metadata_mtime_ns, metadata_size = _enterprise_source_overview_revision(
+        user_id
+    )
+    overview = _load_enterprise_source_overview_cached(
+        user_id,
+        business_no,
+        company_name,
+        metadata_mtime_ns,
+        metadata_size,
+    )
     st.dataframe(pd.DataFrame([
         {"자료": DOCUMENT_TYPES[item], "상태": "등록됨" if overview[item]["available"] else "미등록", "연결 건수": overview[item]["count"]}
         for item in UPLOAD_DOCUMENT_TYPES
