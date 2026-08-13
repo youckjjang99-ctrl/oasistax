@@ -7,6 +7,14 @@ from unittest.mock import Mock, patch
 import scheduled_employment_contact_enrichment as job
 
 
+def _mobile(middle: str, last: str) -> str:
+    return "-".join(("010", middle, last))
+
+
+def _landline(middle: str, last: str) -> str:
+    return "-".join(("02", middle, last))
+
+
 class EmploymentContactEnrichmentTest(unittest.TestCase):
     def setUp(self) -> None:
         self.guard_state_patcher = patch.object(
@@ -305,11 +313,29 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
             [{"contact_key": "place:test"}],
         ]
 
-        result = job.run_enrichment(
-            stage="phone",
-            phone_provider="daum",
-            max_records=1,
-        )
+        with patch.multiple(
+            job.daum_provider_runtime,
+            acquire_lease=Mock(return_value=True),
+            release_lease=Mock(return_value=True),
+            renew_lease=Mock(return_value=True),
+            get_daily_usage=Mock(
+                return_value={"request_count": 0, "blocked_until": ""}
+            ),
+            reserve_quota=Mock(return_value={
+                "request_count": 2,
+                "reserved": True,
+                "blocked_until": "",
+                "quota_date": "2026-08-13",
+            }),
+            reconcile_usage=Mock(
+                return_value={"request_count": 2, "blocked_until": ""}
+            ),
+        ):
+            result = job.run_enrichment(
+                stage="phone",
+                phone_provider="daum",
+                max_records=1,
+            )
 
         self.assertEqual(result, 0)
 
@@ -662,9 +688,149 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
         daum_search.assert_called_once_with(
             "테스트기업",
             "경기도 수원시",
+            "",
             timeout=6,
-            size=10,
+            size=20,
+            request_budget=2,
         )
+
+    @patch.object(job, "_patch", return_value=True)
+    @patch.object(job.daum_web_search_client, "search_public_phones")
+    def test_daum_mobile_match_saves_mobile_and_source_attribution(
+        self,
+        daum_search,
+        patch_row,
+    ) -> None:
+        daum_search.return_value = {
+            "ok": True,
+            "request_count": 1,
+            "contacts": [{
+                "contact_type": "phone",
+                "contact_value": _mobile("1234", "5678"),
+                "source_type": "daum_web_snippet",
+                "source_url": "https://example.com/contact",
+                "confidence": 91,
+                "verification_status": "auto_verified",
+                "metadata": {
+                    "query_mode": "mobile_first",
+                    "evidence": "distinctive_company_name",
+                },
+            }],
+            "diagnostics": {"accepted_mobile": 1},
+        }
+
+        result = job._enrich_one(
+            {
+                "contact_key": "place:mobile",
+                "phone_status": "pending",
+                "phone_provider_stage": "daum",
+                "company_name": "오아시스정책연구소",
+                "address": "서울특별시 강남구",
+            },
+            "phone",
+            "daum",
+        )
+
+        self.assertEqual(result["outcome"], "matched")
+        self.assertEqual(result["request_count"], 1)
+        saved = patch_row.call_args_list[-1].args[1]
+        self.assertEqual(saved["mobile_phone"], _mobile("1234", "5678"))
+        self.assertEqual(saved["phone_status"], "matched")
+        self.assertEqual(saved["phone_provider_stage"], "complete")
+        self.assertEqual(
+            saved["contact_sources"]["mobile_phone"]["source_type"],
+            "daum_web_snippet",
+        )
+        self.assertEqual(
+            saved["contact_sources"]["mobile_phone"]["query_mode"],
+            "mobile_first",
+        )
+
+    @patch.object(job, "_patch", return_value=True)
+    @patch.object(
+        job.daum_web_search_client,
+        "search_public_phones",
+        return_value={"ok": True, "request_count": 1, "contacts": []},
+    )
+    def test_existing_landline_is_not_a_fresh_daum_match(
+        self,
+        daum_search,
+        patch_row,
+    ) -> None:
+        result = job._enrich_one(
+            {
+                "contact_key": "place:existing-landline",
+                "status": "matched",
+                "phone_status": "pending",
+                "phone_provider_stage": "daum",
+                "company_name": "테스트기업",
+                "address": "서울특별시 강남구",
+                "landline_phone": _landline("1234", "5678"),
+                "contact_sources": {
+                    "landline_phone": {"source_type": "kakao_local"}
+                },
+            },
+            "phone",
+            "daum",
+        )
+
+        self.assertEqual(result["outcome"], "no_match")
+        saved = patch_row.call_args_list[-1].args[1]
+        self.assertEqual(
+            saved["landline_phone"],
+            _landline("1234", "5678"),
+        )
+        self.assertEqual(saved["phone_status"], "no_match")
+        self.assertEqual(saved["phone_provider_stage"], "complete")
+        self.assertEqual(
+            saved["contact_sources"]["landline_phone"]["source_type"],
+            "kakao_local",
+        )
+        self.assertEqual(
+            daum_search.call_args.kwargs["request_budget"],
+            1,
+        )
+
+    @patch.object(job, "_patch", return_value=True)
+    @patch.object(job, "enrich_company")
+    def test_kakao_landline_only_moves_to_mobile_daum_queue(
+        self,
+        enrich,
+        patch_row,
+    ) -> None:
+        enrich.return_value = {
+            "ok": True,
+            "provider_results": {
+                "kakao": {"outcome": "matched", "request_count": 1}
+            },
+            "contacts": [{
+                "contact_type": "phone",
+                "contact_value": _landline("1234", "5678"),
+                "source_type": "kakao_local",
+                "confidence": 95,
+                "verification_status": "auto_verified",
+            }],
+        }
+
+        result = job._enrich_one(
+            {
+                "contact_key": "place:landline-only",
+                "phone_status": "pending",
+                "phone_provider_stage": "kakao",
+                "company_name": "테스트기업",
+            },
+            "phone",
+            "kakao",
+        )
+
+        self.assertEqual(result["outcome"], "matched")
+        saved = patch_row.call_args_list[-1].args[1]
+        self.assertEqual(
+            saved["landline_phone"],
+            _landline("1234", "5678"),
+        )
+        self.assertEqual(saved["phone_status"], "pending")
+        self.assertEqual(saved["phone_provider_stage"], "daum")
 
     @patch.object(job, "_patch", return_value=True)
     @patch.object(

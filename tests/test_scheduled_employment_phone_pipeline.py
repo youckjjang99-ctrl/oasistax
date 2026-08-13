@@ -16,6 +16,10 @@ class EmploymentPhonePipelineTest(unittest.TestCase):
             [item.kwargs["phone_provider"] for item in run_enrichment.call_args_list],
             ["kakao", "daum"],
         )
+        self.assertEqual(
+            run_enrichment.call_args_list[1].kwargs["max_requests"],
+            pipeline.DAUM_DAILY_SAFE_REQUESTS,
+        )
 
     @patch.object(pipeline, "run_enrichment", side_effect=[3])
     def test_does_not_start_daum_when_kakao_job_fails(

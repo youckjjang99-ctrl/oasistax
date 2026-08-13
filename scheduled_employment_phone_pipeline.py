@@ -5,6 +5,7 @@ import os
 
 from scheduled_employment_contact_enrichment import (
     DAUM_DAILY_SAFE_RECORDS,
+    DAUM_DAILY_SAFE_REQUESTS,
     EXIT_DAILY_QUOTA,
     KAKAO_DAILY_SAFE_REQUESTS,
     run_enrichment,
@@ -22,9 +23,10 @@ def run_phone_pipeline() -> int:
     """Run Kakao first, then Daum Web against Kakao no-match rows.
 
     The queue transition itself is handled atomically by
-    scheduled_employment_contact_enrichment: Kakao no-match rows move to the
-    Daum queue, while a Daum match or no-match moves to the terminal
-    ``complete`` stage. Terminal rows are therefore never selected again.
+    scheduled_employment_contact_enrichment: Kakao no-match and landline-only
+    rows move to the mobile-first Daum queue, while a Daum match or no-match
+    moves to the terminal ``complete`` stage. Terminal rows are therefore
+    never selected again.
     """
     workers = _env_int("EMPLOYMENT_CONTACT_WORKERS", 12)
     batch_size = _env_int("EMPLOYMENT_CONTACT_BATCH_SIZE", 200)
@@ -36,6 +38,10 @@ def run_phone_pipeline() -> int:
         "EMPLOYMENT_DAUM_MAX_RECORDS",
         DAUM_DAILY_SAFE_RECORDS,
     )
+    daum_request_limit = _env_int(
+        "EMPLOYMENT_DAUM_MAX_REQUESTS",
+        DAUM_DAILY_SAFE_REQUESTS,
+    )
 
     print(
         json.dumps(
@@ -45,6 +51,7 @@ def run_phone_pipeline() -> int:
                 "order": ["kakao", "daum"],
                 "kakao_max_requests": kakao_request_limit,
                 "daum_max_records": daum_limit,
+                "daum_max_requests": daum_request_limit,
             },
             ensure_ascii=False,
         ),
@@ -68,6 +75,7 @@ def run_phone_pipeline() -> int:
         workers=workers,
         batch_size=batch_size,
         max_records=daum_limit,
+        max_requests=daum_request_limit,
     )
     print(
         json.dumps(
