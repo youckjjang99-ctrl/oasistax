@@ -13,6 +13,7 @@ class ProspectContactResultsTabTests(unittest.TestCase):
             "② 저장된 영업후보",
             "③ 반납DB 관리",
             "④ 핸드폰DB 관리",
+            "⑤ 핸드폰후보 검토",
         )
 
         positions = [source.index(f'"{label}"') for label in labels]
@@ -24,6 +25,7 @@ class ProspectContactResultsTabTests(unittest.TestCase):
         self.assertIn("if is_admin_user:", source)
         self.assertIn('workflow_steps.append("③ 반납DB 관리")', source)
         self.assertIn('workflow_steps.append("④ 핸드폰DB 관리")', source)
+        self.assertIn('workflow_steps.append("⑤ 핸드폰후보 검토")', source)
         self.assertIn(
             'if workflow_step == "③ 반납DB 관리":',
             source,
@@ -284,6 +286,24 @@ class ProspectContactResultsTabTests(unittest.TestCase):
 
         self.assertIn('statuses=["pending"]', source)
         self.assertNotIn('statuses=["pending", "partially_approved"]', source)
+
+    def test_daum_mobile_review_is_admin_only_and_requires_source_review(self):
+        source = inspect.getsource(
+            prospect._render_daum_mobile_candidate_review_admin
+        )
+
+        for marker in (
+            "from auth import is_admin",
+            "관리자만 핸드폰 후보를 검토할 수 있습니다.",
+            "list_admin_daum_mobile_candidates(",
+            'statuses=["pending"]',
+            "검색 원문 확인",
+            "admin_review_daum_mobile_candidate(",
+            "이미 다른 핸드폰번호가 ",
+            "등록된 업체는 기존 번호를 덮어쓰지 않습니다.",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, source)
 
     def test_contact_save_success_forces_fresh_assignment_and_history_queries(self):
         source = inspect.getsource(prospect._render_contact_results)

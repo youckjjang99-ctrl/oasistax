@@ -58,6 +58,12 @@ RPC_LIST_ADMIN_SPECIFIC_COMPANY_DB_REQUESTS = (
 RPC_ADMIN_REVIEW_SPECIFIC_COMPANY_DB_REQUEST = (
     "oasis_admin_review_specific_company_db_request"
 )
+RPC_LIST_ADMIN_DAUM_MOBILE_CANDIDATES = (
+    "oasis_list_admin_daum_mobile_candidates"
+)
+RPC_ADMIN_REVIEW_DAUM_MOBILE_CANDIDATE = (
+    "oasis_admin_review_daum_mobile_candidate"
+)
 
 
 _UID_PATTERN = re.compile(
@@ -197,6 +203,10 @@ _FAILURE_MESSAGES = {
     "PENDING_OTHER": "현재 다른 신청을 검토 중인 업체입니다.",
     "REASON_REQUIRED": "반려 사유를 입력해 주세요.",
     "CONTACT_UNAVAILABLE": "승인 시점에 유효한 전화번호 DB를 확인하지 못했습니다.",
+    "MOBILE_ALREADY_EXISTS": (
+        "이미 다른 핸드폰번호가 등록되어 있어 자동으로 덮어쓰지 않았습니다."
+    ),
+    "ALREADY_REVIEWED": "이미 처리된 핸드폰 후보입니다.",
     "ASSIGNMENT_FAILED": "업체를 배정하지 못했습니다.",
 }
 
@@ -350,6 +360,23 @@ _SPECIFIC_DB_REQUEST_FIELDS = {
     "requested_at",
     "decided_at",
     "assignment_id",
+}
+_DAUM_MOBILE_CANDIDATE_FIELDS = {
+    "candidate_id",
+    "contact_key",
+    "company_name",
+    "business_no",
+    "address",
+    "industry_name",
+    "mobile_phone",
+    "source_url",
+    "query_mode",
+    "evidence",
+    "confidence",
+    "occurrence_count",
+    "review_status",
+    "first_seen_at",
+    "last_seen_at",
 }
 
 
@@ -2619,6 +2646,97 @@ def admin_review_specific_company_db_request(
     )
 
 
+def list_admin_daum_mobile_candidates(
+    current_user_id: str,
+    *,
+    statuses: Sequence[str] | None = None,
+    limit: int = 300,
+    db: CloudDatabase | None = None,
+) -> dict[str, Any]:
+    raw, error = _rpc(
+        RPC_LIST_ADMIN_DAUM_MOBILE_CANDIDATES,
+        {
+            "p_current_user_id": _user_id(current_user_id),
+            "p_statuses": [
+                _bounded(status, 30).lower()
+                for status in (statuses or ["pending"])
+                if _text(status)
+            ],
+            "p_limit": max(1, min(int(limit), 1000)),
+        },
+        db=db,
+    )
+    if error:
+        return {**error, "candidates": []}
+    candidates = [
+        {
+            key: value
+            for key, value in row.items()
+            if key in _DAUM_MOBILE_CANDIDATE_FIELDS
+        }
+        for row in _rows(raw)
+    ]
+    return {
+        "ok": True,
+        "code": "OK",
+        "message": "핸드폰 검토 후보를 불러왔습니다.",
+        "candidates": candidates,
+        "warning": "",
+        "fallback_required": False,
+    }
+
+
+def admin_review_daum_mobile_candidate(
+    current_user_id: str,
+    candidate_id: Any,
+    action: Any,
+    *,
+    reason: Any = "",
+    db: CloudDatabase | None = None,
+) -> dict[str, Any]:
+    raw, error = _rpc(
+        RPC_ADMIN_REVIEW_DAUM_MOBILE_CANDIDATE,
+        {
+            "p_current_user_id": _user_id(current_user_id),
+            "p_candidate_id": _text(candidate_id),
+            "p_action": _bounded(action, 20).lower(),
+            "p_reason": _bounded(reason, 500),
+        },
+        db=db,
+    )
+    if error:
+        return error
+    row = _first_row(raw)
+    if row is None:
+        return {
+            "ok": False,
+            "code": "MALFORMED_RESPONSE",
+            "message": _FAILURE_MESSAGES["MALFORMED_RESPONSE"],
+            "warning": _FAILURE_MESSAGES["MALFORMED_RESPONSE"],
+            "fallback_required": False,
+        }
+    success_value = row.get("success", row.get("ok"))
+    ok = success_value is True or _text(success_value).lower() in {
+        "true",
+        "t",
+        "1",
+    }
+    code = _safe_code(row.get("code"), "OK" if ok else "REQUEST_FAILED")
+    message = _text(row.get("message")) or _safe_message(
+        code,
+        success_message="핸드폰 후보를 처리했습니다.",
+        ok=ok,
+    )
+    return {
+        "ok": ok,
+        "code": code,
+        "message": message,
+        "review_status": _text(row.get("review_status")),
+        "warning": "" if ok else _FAILURE_MESSAGES.get(code, message),
+        "fallback_required": False,
+    }
+
+
 __all__ = [
     "CompanyIdentityError",
     "admin_change_assignee",
@@ -2628,6 +2746,7 @@ __all__ = [
     "admin_reactivate",
     "admin_set_user_limit",
     "admin_review_specific_company_db_request",
+    "admin_review_daum_mobile_candidate",
     "admin_update_mobile_db_request",
     "assignment_feature_ready",
     "assignment_status_label",
@@ -2644,6 +2763,7 @@ __all__ = [
     "list_admin_assignment_metrics",
     "list_admin_assignment_audit",
     "list_admin_mobile_db_requests",
+    "list_admin_daum_mobile_candidates",
     "list_admin_specific_company_db_requests",
     "list_blocked_company_uids",
     "list_company_contacts",

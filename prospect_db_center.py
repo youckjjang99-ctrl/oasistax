@@ -7203,6 +7203,167 @@ def _render_mobile_db_admin(current_user_id: str) -> None:
         st.error(safe_public_error(exc, "핸드폰 DB를 배정하지 못했습니다."))
 
 
+def _format_review_mobile(value: object, *, masked: bool = False) -> str:
+    phone = re.sub(r"[^0-9]", "", normalize_phone(value))
+    if not re.fullmatch(r"010[0-9]{8}", phone):
+        return "-"
+    if masked:
+        return f"{phone[:3]}-****-{phone[-4:]}"
+    return f"{phone[:3]}-{phone[3:7]}-{phone[7:]}"
+
+
+def _review_evidence_label(value: object) -> str:
+    evidence = value if isinstance(value, dict) else {}
+    if evidence.get("source_page_checked"):
+        return "원문 확인 필요"
+    if int(evidence.get("document_mobile_count") or 0) > 1:
+        return "복수 번호 확인 필요"
+    if evidence.get("admin_region_match"):
+        return "업체명·지역 일치"
+    return "업체명 일치"
+
+
+@st.fragment
+def _render_daum_mobile_candidate_review_admin(
+    current_user_id: str,
+) -> None:
+    from auth import is_admin
+
+    st.markdown("### 핸드폰 후보 검토")
+    if not is_admin(current_user_id):
+        st.error("관리자만 핸드폰 후보를 검토할 수 있습니다.")
+        return
+
+    flash = st.session_state.pop("daum_mobile_review_flash_v1260", None)
+    if isinstance(flash, dict):
+        if flash.get("ok"):
+            st.success(str(flash.get("message") or "처리했습니다."))
+        else:
+            st.error(str(flash.get("message") or "처리하지 못했습니다."))
+
+    result = sales_assignments.list_admin_daum_mobile_candidates(
+        current_user_id,
+        statuses=["pending"],
+        limit=500,
+    )
+    if not result.get("ok"):
+        st.error(result.get("message") or "핸드폰 후보를 불러오지 못했습니다.")
+        return
+    candidates = list(result.get("candidates") or [])
+    st.caption(
+        "자동 확정 기준에는 못 미쳤지만 업체명이 일치하는 공개 010 후보입니다. "
+        "원문을 확인한 뒤 승인해 주세요."
+    )
+    st.metric("검토 대기", f"{len(candidates):,}건")
+    if not candidates:
+        st.success("검토 대기 중인 핸드폰 후보가 없습니다.")
+        return
+
+    st.dataframe(
+        pd.DataFrame([
+            {
+                "업체명": str(row.get("company_name") or "업체명 미확인"),
+                "사업자번호": _display_business_no(row.get("business_no")),
+                "핸드폰 후보": _format_review_mobile(
+                    row.get("mobile_phone"), masked=True
+                ),
+                "검증상태": _review_evidence_label(row.get("evidence")),
+                "신뢰도": int(row.get("confidence") or 0),
+                "발견횟수": int(row.get("occurrence_count") or 1),
+                "최근발견": _format_db_request_time(row.get("last_seen_at")),
+            }
+            for row in candidates
+        ]),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    by_id = {
+        str(row.get("candidate_id") or ""): row
+        for row in candidates
+        if row.get("candidate_id")
+    }
+    selected_id = st.selectbox(
+        "검토할 업체",
+        list(by_id),
+        format_func=lambda value: (
+            f"{by_id[value].get('company_name') or '업체명 미확인'} · "
+            f"{_display_business_no(by_id[value].get('business_no'))} · "
+            f"{_format_review_mobile(by_id[value].get('mobile_phone'), masked=True)}"
+        ),
+        key="daum_mobile_review_selection_v1260",
+    )
+    selected = by_id[selected_id]
+    detail_left, detail_right = st.columns(2)
+    detail_left.text_input(
+        "검토 핸드폰번호",
+        value=_format_review_mobile(selected.get("mobile_phone")),
+        disabled=True,
+        key=f"daum_mobile_review_phone_v1260_{selected_id}",
+    )
+    detail_right.text_input(
+        "업종",
+        value=str(selected.get("industry_name") or "-"),
+        disabled=True,
+        key=f"daum_mobile_review_industry_v1260_{selected_id}",
+    )
+    st.text_input(
+        "주소",
+        value=str(selected.get("address") or "-"),
+        disabled=True,
+        key=f"daum_mobile_review_address_v1260_{selected_id}",
+    )
+    source_url = str(selected.get("source_url") or "").strip()
+    if re.match(r"^https?://", source_url, re.I):
+        st.link_button(
+            "검색 원문 확인",
+            source_url,
+            use_container_width=True,
+        )
+    else:
+        st.warning("확인할 수 있는 원문 링크가 없습니다. 이 후보는 제외를 권장합니다.")
+
+    reason = st.text_input(
+        "검토 메모 (제외 시 필수)",
+        max_chars=500,
+        key=f"daum_mobile_review_reason_v1260_{selected_id}",
+    )
+    st.caption(
+        "승인 시 해당 업체의 핸드폰번호로 반영됩니다. 이미 다른 핸드폰번호가 "
+        "등록된 업체는 기존 번호를 덮어쓰지 않습니다."
+    )
+    approve_col, reject_col = st.columns(2)
+    approve_clicked = approve_col.button(
+        "검토 승인 및 연락처 반영",
+        type="primary",
+        use_container_width=True,
+        key=f"approve_daum_mobile_v1260_{selected_id}",
+    )
+    reject_clicked = reject_col.button(
+        "후보 제외",
+        use_container_width=True,
+        key=f"reject_daum_mobile_v1260_{selected_id}",
+    )
+    if not approve_clicked and not reject_clicked:
+        return
+    if reject_clicked and not reason.strip():
+        st.error("제외 사유를 입력해 주세요.")
+        return
+    reviewed = sales_assignments.admin_review_daum_mobile_candidate(
+        current_user_id,
+        selected_id,
+        "approve" if approve_clicked else "reject",
+        reason=reason,
+    )
+    st.session_state["daum_mobile_review_flash_v1260"] = {
+        "ok": bool(reviewed.get("ok")),
+        "message": reviewed.get("message") or "검토 결과를 확인해 주세요.",
+    }
+    if reviewed.get("ok"):
+        _load_assignable_db_inventory_dashboard.clear()
+    st.rerun(scope="fragment")
+
+
 def render_prospect_db_center(
     owner_user_id: str = "",
     owner_user_name: str = "",
@@ -7222,6 +7383,7 @@ def render_prospect_db_center(
     if is_admin_user:
         workflow_steps.append("③ 반납DB 관리")
         workflow_steps.append("④ 핸드폰DB 관리")
+        workflow_steps.append("⑤ 핸드폰후보 검토")
     if (
         st.session_state.get("prospect_workflow_step_v1081")
         == "③ 연락결과 기록"
@@ -7252,6 +7414,9 @@ def render_prospect_db_center(
         return
     if workflow_step == "④ 핸드폰DB 관리":
         _render_mobile_db_admin(owner_user_id)
+        return
+    if workflow_step == "⑤ 핸드폰후보 검토":
+        _render_daum_mobile_candidate_review_admin(owner_user_id)
         return
     if workflow_step == "① DB신청":
         _render_db_request_home(owner_user_id)

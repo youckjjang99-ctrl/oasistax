@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -23,6 +24,12 @@ from contact_matching import is_mobile_phone, normalize_phone
 
 
 TABLE_CONTACTS = "oasis_employment_contacts"
+RPC_UPSERT_DAUM_MOBILE_REVIEW = (
+    "oasis_upsert_daum_mobile_review_candidates"
+)
+RPC_RECORD_ENRICHMENT_METRICS = (
+    "oasis_record_contact_enrichment_run_metrics"
+)
 CONTACT_TYPES = {"phone", "email", "instagram"}
 CONTACT_STAGES = {"phone", "digital"}
 PHONE_PROVIDERS = {"auto", "kakao", "daum"}
@@ -479,6 +486,81 @@ def _best(
     return candidates[0] if candidates else None
 
 
+def _persist_daum_mobile_review_candidates(
+    contact_key: str,
+    candidates: Any,
+    auto_verified_mobile: Any = "",
+) -> None:
+    """Persist only bounded, evidence-only Daum mobile review records."""
+
+    safe_candidates: list[dict[str, Any]] = []
+    for raw in list(candidates or [])[:5]:
+        if not isinstance(raw, dict):
+            continue
+        phone = re.sub(
+            r"[^0-9]",
+            "",
+            normalize_phone(raw.get("mobile_phone")),
+        )
+        if not re.fullmatch(r"010[0-9]{8}", phone):
+            continue
+        source_url = str(raw.get("source_url") or "").strip()
+        if source_url and not re.match(r"^https?://", source_url, re.I):
+            source_url = ""
+        evidence = raw.get("evidence")
+        try:
+            confidence = int(raw.get("confidence") or 0)
+        except (TypeError, ValueError):
+            confidence = 0
+        safe_candidates.append({
+            "mobile_phone": phone,
+            "source_url": source_url[:2000],
+            "query_mode": str(raw.get("query_mode") or "")[:40],
+            "confidence": max(0, min(84, confidence)),
+            "evidence": evidence if isinstance(evidence, dict) else {},
+        })
+
+    auto_phone = re.sub(
+        r"[^0-9]",
+        "",
+        normalize_phone(auto_verified_mobile),
+    )
+    if not safe_candidates and not re.fullmatch(r"010[0-9]{8}", auto_phone):
+        return
+    CloudDatabase().rpc(
+        RPC_UPSERT_DAUM_MOBILE_REVIEW,
+        {
+            "p_contact_key": str(contact_key or ""),
+            "p_candidates": safe_candidates,
+            "p_auto_verified_mobile": auto_phone,
+        },
+    )
+
+
+def _record_enrichment_metrics(
+    run_id: str,
+    provider: str,
+    started_at: datetime,
+    processed: int,
+    request_count: int,
+    diagnostics: dict[str, int],
+) -> None:
+    CloudDatabase().rpc(
+        RPC_RECORD_ENRICHMENT_METRICS,
+        {
+            "p_run_id": run_id,
+            "p_provider": provider,
+            "p_started_at": _iso(started_at),
+            "p_processed_count": max(0, int(processed)),
+            "p_request_count": max(0, int(request_count)),
+            "p_diagnostics": {
+                str(key): max(0, int(value))
+                for key, value in diagnostics.items()
+            },
+        },
+    )
+
+
 def _enrich_one(
     row: dict[str, Any],
     stage: str = "phone",
@@ -600,6 +682,13 @@ def _enrich_one(
         landline = _best(accepted, "phone", mobile=False)
         email = _best(accepted, "email")
         instagram = _best(accepted, "instagram")
+
+        if stage == "phone" and phone_provider == "daum":
+            _persist_daum_mobile_review_candidates(
+                contact_key,
+                result.get("review_candidates") or [],
+                mobile.get("contact_value") if mobile else "",
+            )
 
         mobile_phone = (
             normalize_phone(mobile.get("contact_value"))
@@ -877,7 +966,10 @@ def _run_provider_batches(
         "accepted_mobile_source_page": 0,
         "source_pages_checked": 0,
         "source_pages_verified": 0,
+        "review_mobile_candidates": 0,
     }
+    run_id = str(uuid.uuid4())
+    run_started_at = _now()
     processed = 0
     exit_code = 0
     held_no_match_keys: list[str] = []
@@ -1186,6 +1278,23 @@ def _run_provider_batches(
                     if not tripped:
                         halted_reason = "guard_persistence_failed"
                         exit_code = EXIT_RUNTIME_ERROR
+
+            if phone_provider == "daum":
+                try:
+                    _record_enrichment_metrics(
+                        run_id,
+                        phone_provider,
+                        run_started_at,
+                        processed,
+                        daily_request_count,
+                        diagnostics,
+                    )
+                except Exception:
+                    _safe_runtime_event(
+                        "metrics_persistence_failed",
+                        provider=phone_provider,
+                        processed=processed,
+                    )
 
             print(
                 json.dumps(

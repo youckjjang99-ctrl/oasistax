@@ -35,12 +35,26 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
             "_has_kakao_no_match_holds",
             return_value=False,
         )
+        self.review_persist_patcher = patch.object(
+            job,
+            "_persist_daum_mobile_review_candidates",
+            return_value=None,
+        )
+        self.metrics_persist_patcher = patch.object(
+            job,
+            "_record_enrichment_metrics",
+            return_value=None,
+        )
         self.guard_state = self.guard_state_patcher.start()
         self.guard_trip = self.guard_trip_patcher.start()
         self.held_work = self.held_work_patcher.start()
+        self.review_persist = self.review_persist_patcher.start()
+        self.metrics_persist = self.metrics_persist_patcher.start()
         self.addCleanup(self.guard_state_patcher.stop)
         self.addCleanup(self.guard_trip_patcher.stop)
         self.addCleanup(self.held_work_patcher.stop)
+        self.addCleanup(self.review_persist_patcher.stop)
+        self.addCleanup(self.metrics_persist_patcher.stop)
 
     @patch("builtins.print")
     def test_runtime_event_reports_actual_provider(self, print_mock) -> None:
@@ -744,6 +758,55 @@ class EmploymentContactEnrichmentTest(unittest.TestCase):
         self.assertEqual(
             saved["contact_sources"]["mobile_phone"]["query_mode"],
             "mobile_first",
+        )
+        self.review_persist.assert_called_with(
+            "place:mobile",
+            [],
+            _mobile("1234", "5678"),
+        )
+
+    @patch.object(job, "_patch", return_value=True)
+    @patch.object(job.daum_web_search_client, "search_public_phones")
+    def test_daum_unverified_mobile_is_queued_without_auto_saving(
+        self,
+        daum_search,
+        patch_row,
+    ) -> None:
+        candidate = {
+            "mobile_phone": _mobile("2468", "1357"),
+            "source_url": "https://example.com/article",
+            "query_mode": "mobile_first",
+            "confidence": 72,
+            "evidence": {"source_page_checked": True},
+        }
+        daum_search.return_value = {
+            "ok": True,
+            "request_count": 2,
+            "contacts": [],
+            "review_candidates": [candidate],
+            "diagnostics": {"review_mobile_candidates": 1},
+        }
+
+        result = job._enrich_one(
+            {
+                "contact_key": "place:review-mobile",
+                "phone_status": "pending",
+                "phone_provider_stage": "daum",
+                "company_name": "오아시스정책연구소",
+                "address": "서울특별시 강남구",
+            },
+            "phone",
+            "daum",
+        )
+
+        self.assertEqual(result["outcome"], "no_match")
+        saved = patch_row.call_args_list[-1].args[1]
+        self.assertEqual(saved["mobile_phone"], "")
+        self.assertEqual(saved["phone_status"], "no_match")
+        self.review_persist.assert_called_with(
+            "place:review-mobile",
+            [candidate],
+            "",
         )
 
     @patch.object(job, "_patch", return_value=True)
