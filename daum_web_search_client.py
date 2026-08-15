@@ -32,7 +32,8 @@ AUTO_CONFIRM_SCORE = 85
 MIN_REQUEST_INTERVAL_SECONDS = 0.15
 DEFAULT_RESULT_SIZE = 20
 DEFAULT_REQUEST_BUDGET = 2
-MAX_SOURCE_PAGE_VERIFICATIONS = 3
+MAX_SOURCE_PAGE_VERIFICATIONS = 5
+MAX_REVIEW_MOBILE_CANDIDATES = 5
 MIN_INDEPENDENT_MOBILE_SOURCES = 2
 AMBIGUOUS_LOCAL_REGIONS = {"중구", "동구", "서구", "남구", "북구"}
 BROAD_REGION_ALIASES = {
@@ -144,6 +145,7 @@ def _empty_result(
         "queries": [query] if query else [],
         "candidates": [],
         "contacts": [],
+        "review_candidates": [],
         "request_count": max(0, int(request_count)),
         "diagnostics": {
             "documents": 0,
@@ -160,6 +162,7 @@ def _empty_result(
             "accepted_mobile_source_page": 0,
             "source_pages_checked": 0,
             "source_pages_verified": 0,
+            "review_mobile_candidates": 0,
         },
         "trace": [
             {
@@ -415,6 +418,7 @@ def search_public_phones(
         "accepted_mobile_source_page": 0,
         "source_pages_checked": 0,
         "source_pages_verified": 0,
+        "review_mobile_candidates": 0,
     }
     evidence_rank = {
         "name_and_region": 1,
@@ -728,6 +732,83 @@ def search_public_phones(
         0,
         len(mobile_observations) - len(best_mobile),
     )
+    review_candidates: list[dict[str, Any]] = []
+    if not best_mobile:
+        domains_by_phone = _domains_by_phone()
+        for phone, rows in mobile_observations.items():
+            reviewable = [
+                row
+                for row in rows
+                if row.get("strong_name")
+                and not row.get("region_conflict")
+                and row.get("source_url")
+            ]
+            if not reviewable:
+                continue
+            best_row = max(
+                reviewable,
+                key=lambda row: (
+                    int(row.get("name_score") or 0),
+                    int(row.get("location_score") or 0),
+                    1 if row.get("admin_region_match") else 0,
+                    1
+                    if int(row.get("document_mobile_count") or 0) == 1
+                    else 0,
+                ),
+            )
+            source_url = str(best_row.get("source_url") or "")
+            independent_source_count = len(
+                domains_by_phone.get(phone, set())
+            )
+            confidence = min(
+                AUTO_CONFIRM_SCORE - 1,
+                max(45, int(best_row.get("name_score") or 0))
+                + min(15, int(best_row.get("location_score") or 0))
+                + (8 if best_row.get("admin_region_match") else 0)
+                + min(6, independent_source_count * 3)
+                + (
+                    4
+                    if int(best_row.get("document_mobile_count") or 0) == 1
+                    else 0
+                ),
+            )
+            review_candidates.append({
+                "mobile_phone": phone,
+                "source_url": source_url,
+                "query_mode": str(best_row.get("query_mode") or ""),
+                "confidence": confidence,
+                "evidence": {
+                    "name_score": int(best_row.get("name_score") or 0),
+                    "location_score": int(
+                        best_row.get("location_score") or 0
+                    ),
+                    "admin_region_match": bool(
+                        best_row.get("admin_region_match")
+                    ),
+                    "business_number_match": bool(
+                        best_row.get("business_match")
+                    ),
+                    "independent_source_count": independent_source_count,
+                    "document_mobile_count": int(
+                        best_row.get("document_mobile_count") or 0
+                    ),
+                    "source_page_checked": source_url in source_page_cache,
+                    "source_page_verified": False,
+                    "reason": (
+                        "source_page_not_verified"
+                        if source_url in source_page_cache
+                        else "automatic_evidence_insufficient"
+                    ),
+                },
+            })
+        review_candidates.sort(
+            key=lambda row: int(row.get("confidence") or 0),
+            reverse=True,
+        )
+        review_candidates = review_candidates[
+            :MAX_REVIEW_MOBILE_CANDIDATES
+        ]
+        diagnostics["review_mobile_candidates"] = len(review_candidates)
     for phone, (row, evidence) in best_mobile.items():
         diagnostics["accepted_mobile"] += 1
         diagnostics[f"accepted_mobile_{evidence}"] += 1
@@ -750,6 +831,7 @@ def search_public_phones(
         "queries": queries,
         "candidates": candidates,
         "contacts": contacts,
+        "review_candidates": review_candidates,
         "request_count": request_count,
         "diagnostics": diagnostics,
         "trace": trace,

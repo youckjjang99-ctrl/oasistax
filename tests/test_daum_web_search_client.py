@@ -178,6 +178,16 @@ class DaumWebSearchClientTest(unittest.TestCase):
         self.assertEqual(result["contacts"], [])
         self.assertEqual(result["diagnostics"]["source_pages_checked"], 1)
         self.assertEqual(result["diagnostics"]["source_pages_verified"], 0)
+        self.assertEqual(len(result["review_candidates"]), 1)
+        self.assertEqual(
+            result["review_candidates"][0]["mobile_phone"],
+            _mobile("2468", "1357"),
+        )
+        self.assertLess(result["review_candidates"][0]["confidence"], 85)
+        self.assertEqual(
+            result["diagnostics"]["review_mobile_candidates"],
+            1,
+        )
         verify_source.assert_called_once()
 
     @patch.dict("os.environ", {"KAKAO_REST_API_KEY": "test-key"})
@@ -393,6 +403,7 @@ class DaumWebSearchClientTest(unittest.TestCase):
         )
 
         self.assertEqual(result["contacts"], [])
+        self.assertEqual(result["review_candidates"], [])
         verify_source.assert_not_called()
 
     @patch.dict("os.environ", {"KAKAO_REST_API_KEY": "test-key"})
@@ -537,6 +548,11 @@ class DaumWebSearchClientTest(unittest.TestCase):
 
         self.assertEqual(result["contacts"], [])
         self.assertEqual(result["diagnostics"]["accepted_mobile"], 0)
+        self.assertEqual(len(result["review_candidates"]), 2)
+        self.assertTrue(all(
+            int(row["evidence"]["document_mobile_count"]) == 2
+            for row in result["review_candidates"]
+        ))
         self.assertGreaterEqual(verify_source.call_count, 1)
         self.assertLessEqual(verify_source.call_count, 2)
 
@@ -586,7 +602,7 @@ class DaumWebSearchClientTest(unittest.TestCase):
         )
         self.assertLessEqual(
             result["diagnostics"]["source_pages_checked"],
-            3,
+            5,
         )
 
     @patch.dict("os.environ", {"KAKAO_REST_API_KEY": "test-key"})
