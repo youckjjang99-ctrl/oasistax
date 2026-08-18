@@ -1,6 +1,6 @@
 {
   "status": "success",
-  "generated_at": "2026-08-18T03:34:47+09:00",
+  "generated_at": "2026-08-19T03:33:14+09:00",
   "source": "github-actions",
   "record_count": 1000,
   "successful_pages": 10,
@@ -10,7 +10,7 @@
       "page": 1,
       "success": true,
       "status_code": 200,
-      "elapsed_seconds": 4.63,
+      "elapsed_seconds": 3.29,
       "row_count": 100,
       "message": "정상"
     },
@@ -18,7 +18,7 @@
       "page": 2,
       "success": true,
       "status_code": 200,
-      "elapsed_seconds": 2.28,
+      "elapsed_seconds": 1.72,
       "row_count": 100,
       "message": "정상"
     },
@@ -26,7 +26,7 @@
       "page": 3,
       "success": true,
       "status_code": 200,
-      "elapsed_seconds": 1.66,
+      "elapsed_seconds": 1.45,
       "row_count": 100,
       "message": "정상"
     },
@@ -34,7 +34,7 @@
       "page": 4,
       "success": true,
       "status_code": 200,
-      "elapsed_seconds": 1.08,
+      "elapsed_seconds": 1.18,
       "row_count": 100,
       "message": "정상"
     },
@@ -42,7 +42,7 @@
       "page": 5,
       "success": true,
       "status_code": 200,
-      "elapsed_seconds": 0.89,
+      "elapsed_seconds": 0.92,
       "row_count": 100,
       "message": "정상"
     },
@@ -50,7 +50,7 @@
       "page": 6,
       "success": true,
       "status_code": 200,
-      "elapsed_seconds": 0.88,
+      "elapsed_seconds": 0.79,
       "row_count": 100,
       "message": "정상"
     },
@@ -58,7 +58,7 @@
       "page": 7,
       "success": true,
       "status_code": 200,
-      "elapsed_seconds": 0.7,
+      "elapsed_seconds": 0.64,
       "row_count": 100,
       "message": "정상"
     },
@@ -66,7 +66,7 @@
       "page": 8,
       "success": true,
       "status_code": 200,
-      "elapsed_seconds": 0.5,
+      "elapsed_seconds": 0.64,
       "row_count": 100,
       "message": "정상"
     },
@@ -74,7 +74,7 @@
       "page": 9,
       "success": true,
       "status_code": 200,
-      "elapsed_seconds": 0.69,
+      "elapsed_seconds": 0.51,
       "row_count": 100,
       "message": "정상"
     },
@@ -82,7 +82,7 @@
       "page": 10,
       "success": true,
       "status_code": 200,
-      "elapsed_seconds": 0.69,
+      "elapsed_seconds": 0.52,
       "row_count": 100,
       "message": "정상"
     }
