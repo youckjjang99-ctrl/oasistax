@@ -11,6 +11,12 @@ RLS_PATH = ROOT / "supabase_v1032_company_sales_assignments_rls.sql"
 ASSIGNMENT_PATH = ROOT / "company_sales_assignment.py"
 REPOSITORY_PATH = ROOT / "prospect_db_repository.py"
 CENTER_PATH = ROOT / "prospect_db_center.py"
+EXPIRY_72_MIGRATION_PATH = (
+    ROOT
+    / "supabase"
+    / "migrations"
+    / "20260824053418_extend_assignment_expiry_to_72_hours.sql"
+)
 
 SQL = SQL_PATH.read_text(encoding="utf-8")
 SQL_LOWER = SQL.lower()
@@ -18,6 +24,9 @@ RLS_LOWER = RLS_PATH.read_text(encoding="utf-8").lower()
 ASSIGNMENT_SOURCE = ASSIGNMENT_PATH.read_text(encoding="utf-8")
 REPOSITORY_SOURCE = REPOSITORY_PATH.read_text(encoding="utf-8")
 CENTER_SOURCE = CENTER_PATH.read_text(encoding="utf-8")
+EXPIRY_72_MIGRATION = EXPIRY_72_MIGRATION_PATH.read_text(
+    encoding="utf-8"
+).lower()
 
 
 def _function_sql(name: str) -> str:
@@ -131,7 +140,7 @@ class CompanySalesAssignmentMigrationStaticTests(unittest.TestCase):
         self.assertIn("make_interval(hours => v_hours)", claim_sql)
         self.assertRegex(
             SQL_LOWER,
-            r"assignment_hours\s+integer\s+not\s+null\s+default\s+24",
+            r"assignment_hours\s+integer\s+not\s+null\s+default\s+72",
         )
         self.assertRegex(
             SQL_LOWER,
@@ -155,6 +164,22 @@ class CompanySalesAssignmentMigrationStaticTests(unittest.TestCase):
         self.assertIn("released_reason = 'assignment_expired'", expiry_sql)
         self.assertIn("'assignment_expired'", expiry_sql)
         self.assertIn("oasis_release_expired_company_assignments", filter_sql)
+
+    def test_72_hour_migration_updates_defaults_and_active_assignments(self):
+        self.assertIn(
+            "alter column assignment_hours set default 72",
+            EXPIRY_72_MIGRATION,
+        )
+        self.assertIn("assignment_hours = 72", EXPIRY_72_MIGRATION)
+        self.assertIn("assigned_at + interval '72 hours'", EXPIRY_72_MIGRATION)
+        self.assertIn(
+            "current_assignment_contact_count = 0",
+            EXPIRY_72_MIGRATION,
+        )
+        self.assertIn(
+            "current_assignment_first_contacted_at is null",
+            EXPIRY_72_MIGRATION,
+        )
 
     def test_scenario_5_contact_finalizes_owner_and_counts_every_attempt(self):
         contact_sql = _function_sql("oasis_record_company_sales_contact").lower()

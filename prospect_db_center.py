@@ -1791,8 +1791,8 @@ def _approved_prospect_save_notices(
                 "level": "success",
                 "message": (
                     "저장 완료: "
-                    f"{newly_saved_count:,}개 업체를 내 영업DB에 "
-                    "담았습니다. 24시간 안에 연락결과를 기록해 주세요."
+                    f"{newly_saved_count:,}개 · 72시간 내 "
+                    "연락결과를 기록해 주세요."
                 ),
             }
         )
