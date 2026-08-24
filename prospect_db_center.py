@@ -4930,6 +4930,10 @@ def _render_clean_saved_prospects(
         "전사 배정 기능 적용 후에는 공개 연락처가 아직 없는 업체도 "
         "저장·배정 현황 확인을 위해 함께 표시합니다."
     )
+    st.info(
+        "미접촉 신규 배정 DB는 배정 후 72시간 내 연락결과가 없으면 "
+        "자동 회수됩니다."
+    )
     _show_contact_results_notice(as_toast=True)
     if st.session_state.pop(_SAVED_PROSPECT_RESET_SELECTION_KEY, False):
         st.session_state.pop(_SAVED_PROSPECT_TABLE_KEY, None)
