@@ -622,11 +622,23 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
             'if selected_filter == filter_key',
             source,
         )
+
         self.assertIn("on_click=_open_direct_db_dialog", source)
         self.assertIn("args=(direct_category,)", source)
         self.assertIn("@media (max-width: 760px)", source)
         self.assertIn("flex-wrap: wrap", source)
         self.assertIn("등록·계약", source)
+
+    def test_saved_prospect_screen_shows_persistent_expiry_notice(self):
+        source = inspect.getsource(prospect._render_clean_saved_prospects)
+
+        notice = "72시간 내 연락결과가 없으면"
+        self.assertIn(notice, source)
+        self.assertIn("자동 회수됩니다.", source)
+        self.assertLess(
+            source.index(notice),
+            source.index("_render_saved_db_dashboard("),
+        )
 
     def test_saved_db_filter_and_page_survive_regular_reruns(self):
         selector_source = inspect.getsource(
