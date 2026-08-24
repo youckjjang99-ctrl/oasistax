@@ -1105,6 +1105,8 @@ class ProspectSaveNoticeTests(unittest.TestCase):
         rerun_index = source.index("st.rerun()", queue_index)
         self.assertLess(queue_index, rerun_index)
         self.assertIn("저장 완료: ", source)
+        self.assertIn("72시간 내", source)
+        self.assertNotIn("24시간 안에", source)
 
     def test_save_rerun_does_not_repeat_stale_assignment_warning(self):
         source = (

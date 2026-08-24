@@ -1040,7 +1040,7 @@ alter table public.oasis_company_sales_assignments
 create table if not exists public.oasis_sales_assignment_settings (
     user_id text primary key,
     max_uncontacted integer not null default 30,
-    assignment_hours integer not null default 24,
+    assignment_hours integer not null default 72,
     rejected_reactivation_days integer not null default 180,
     unreachable_reactivation_days integer not null default 30,
     created_at timestamptz not null default now(),
@@ -2348,7 +2348,7 @@ begin
     ), coalesce(
         (select s.assignment_hours from public.oasis_sales_assignment_settings s where s.user_id = p_current_user_id),
         (select s.assignment_hours from public.oasis_sales_assignment_settings s where s.user_id = '__default__'),
-        24
+        72
     )
     into v_limit, v_hours;
 
@@ -3269,7 +3269,7 @@ begin
     ), coalesce(
         (select s.assignment_hours from public.oasis_sales_assignment_settings s where s.user_id = p_new_assigned_user_id),
         (select s.assignment_hours from public.oasis_sales_assignment_settings s where s.user_id = '__default__'),
-        24
+        72
     ) into v_limit, v_hours;
 
     if v_assignment.assigned_user_id is distinct from p_new_assigned_user_id
