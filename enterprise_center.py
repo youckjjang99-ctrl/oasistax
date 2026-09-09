@@ -834,6 +834,9 @@ def render_enterprise_management_center(
         crm_section = crm_section or "CRM 관리"
 
         if crm_section == "CRM 관리":
+            from crm_editor import editor_guard, editor_saved, show_sync_result
+            editor_token, edit_revision = editor_guard(st, user_id, customer_key, crm_record, "enterprise")
+            crm_widget_suffix = editor_token
             c1, c2, c3 = st.columns(3)
             with c1:
                 current_status = crm_record.get("status", "신규")
@@ -941,13 +944,7 @@ def render_enterprise_management_center(
                 use_container_width=True,
                 key=f"enterprise_save_crm:{crm_widget_suffix}",
             ):
-                profile = save_crm_profile(
-                    user_id,
-                    customer_key,
-                    pipeline_stage,
-                    priority,
-                    assigned_manager,
-                )
+                profile = {"pipeline_stage": pipeline_stage, "priority": str(priority), "assigned_manager": assigned_manager}
                 ok, message = upsert_customer_record(
                     user_id,
                     customer_key,
@@ -957,6 +954,8 @@ def render_enterprise_management_center(
                     next_action,
                     next_date_value.strftime("%Y-%m-%d"),
                     memo,
+                    expected_revision=edit_revision,
+                    profile=profile,
                 )
                 if ok:
                     updated_crm = get_customer_record(
@@ -967,7 +966,7 @@ def render_enterprise_management_center(
                         updated_crm,
                         profile,
                     )
-                    sync_crm_record(
+                    sync_result = sync_crm_record(
                         user_id,
                         business_no,
                         updated_crm,
@@ -976,9 +975,8 @@ def render_enterprise_management_center(
                     # a second full-page rerun after saving CRM changes.
                     crm_record = updated_crm
                     crm_profile = profile
-                    st.success(
-                        "CRM 내용을 로컬과 Supabase에 저장했습니다."
-                    )
+                    editor_saved(st, user_id, customer_key, "enterprise")
+                    show_sync_result(st, sync_result)
                 else:
                     st.error(message)
 

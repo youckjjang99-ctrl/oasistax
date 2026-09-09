@@ -11,13 +11,14 @@ from typing import Any, Callable
 
 from cloud_db import CloudDatabase, TABLE_SYNC_OUTBOX, cloud_is_configured
 from runtime_error_log import sanitize_public_text
+from crm_file_store import locked_json
 
 
 OUTBOX_FEATURE_FLAG = "OASIS_DURABLE_OUTBOX_V1"
 DEFAULT_MAX_ATTEMPTS = 8
 MAX_ERROR_LENGTH = 500
 _RPC_FUNCTION_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_ALLOWED_OUTBOX_RPC_FUNCTIONS = {"oasis_upsert_customer_profile"}
+_ALLOWED_OUTBOX_RPC_FUNCTIONS = {"oasis_upsert_customer_profile", "oasis_save_crm_versioned"}
 _CUSTOMER_PROFILE_SUCCESS_STATUSES = {
     "linked",
     "linked_review_required",
@@ -28,6 +29,10 @@ _CUSTOMER_PROFILE_SUCCESS_STATUSES = {
 
 class LocalOutboxCorruptionError(RuntimeError):
     """Raised without overwriting a malformed local recovery queue."""
+
+
+class CrmOutboxReviewRequired(RuntimeError):
+    """Preserve a stale/legacy CRM operation without repeatedly overwriting it."""
 
 
 def durable_outbox_enabled() -> bool:
@@ -220,6 +225,11 @@ def make_rpc_outbox_job(
 
 
 def enqueue_local_outbox(path: Path, job: dict[str, Any]) -> dict[str, Any]:
+    with locked_json(path):
+        return _enqueue_local_outbox_locked(path, job)
+
+
+def _enqueue_local_outbox_locked(path: Path, job: dict[str, Any]) -> dict[str, Any]:
     queue = load_local_outbox(path)
     key = str(job.get("idempotency_key") or "")
     for existing in queue:
@@ -314,6 +324,8 @@ def _dispatch_outbox_payload(
 ) -> Any:
     operation = str(payload.get("operation") or "upsert").strip().lower()
     if operation == "upsert":
+        if payload.get("table") == "oasis_crm":
+            raise CrmOutboxReviewRequired("crm_legacy_version_review_required")
         rows = payload.get("rows")
         if not isinstance(rows, list):
             raise ValueError("동기화 upsert 행 형식이 올바르지 않습니다.")
@@ -336,6 +348,13 @@ def _dispatch_outbox_payload(
             function_name,
             dict(parameters),
         )
+        if function_name == "oasis_save_crm_versioned":
+            from crm_sync_protocol import validate_save_response
+            response = validate_save_response(result, parameters)
+            if response.get("status") == "conflict":
+                raise CrmOutboxReviewRequired("crm_version_conflict_review_required")
+            if response.get("status") != "applied":
+                raise RuntimeError("crm_versioned_sync_unconfirmed")
         if function_name == "oasis_upsert_customer_profile":
             if isinstance(result, list):
                 response = next(
@@ -415,8 +434,10 @@ def retry_local_outbox(
             item["attempt_count"] = attempts
             item["last_error_code"] = "sync_retry_failed"
             item["last_error_summary"] = sanitize_error_summary(exc)
-            if attempts >= maximum:
+            if isinstance(exc, CrmOutboxReviewRequired) or attempts >= maximum:
                 item["status"] = "dead_letter"
+                if isinstance(exc, CrmOutboxReviewRequired):
+                    item["last_error_code"] = "crm_review_required"
                 dead_letter += 1
             else:
                 item["status"] = "retry"
@@ -426,7 +447,22 @@ def retry_local_outbox(
         item["updated_at"] = _iso()
         changed = True
     if changed:
-        save_local_outbox(path, queue)
+        # Network calls above run without a file lock. Merge acknowledgements
+        # into the latest queue so new jobs appended during replay survive.
+        with locked_json(path):
+            latest = load_local_outbox(path)
+            updates = {str(item.get("id") or item.get("idempotency_key") or ""): item for item in queue}
+            merged = []
+            for item in latest:
+                key = str(item.get("id") or item.get("idempotency_key") or "")
+                update = updates.pop(key, None)
+                if update is not None and item.get("status") != "complete":
+                    item = update
+                merged.append(item)
+            # Legacy rows without IDs retain their original ordering/shape.
+            if any(not (item.get("id") or item.get("idempotency_key")) for item in queue):
+                merged = queue + latest[len(queue):]
+            save_local_outbox(path, merged)
     return {
         "success": success,
         "failed": failed,

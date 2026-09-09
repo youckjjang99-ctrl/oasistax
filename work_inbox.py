@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
+from copy import deepcopy
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
 import crm
 import work_task_repository
+from performance_cache import cache_generation, invalidate_cache
+from sales_read_cache import generation_key, read_scope, scoped_render
 
 
 SEOUL = ZoneInfo("Asia/Seoul")
@@ -14,7 +17,7 @@ _AUTOMATED_PAGE_SIZE = 500
 _SALES_PAGE_SIZE = 1000
 _MAX_PAGE_COUNT = 100
 _WORK_INBOX_CACHE_KEY = "_work_inbox_cache_v1"
-_WORK_INBOX_CACHE_SECONDS = 30.0
+_WORK_INBOX_CACHE_SECONDS = 20.0
 _STATUS_LABELS = {
     "scheduled": "예정",
     "pending": "대기",
@@ -409,9 +412,14 @@ def build_work_inbox(
 
 
 def invalidate_work_inbox_cache(user_id: str = "") -> None:
-    """Discard the short-lived per-browser work inbox snapshot."""
+    """Invalidate this owner's snapshots across sessions in this process."""
     import streamlit as st
 
+    owner = str(user_id or "").strip().lower()
+    if owner:
+        invalidate_cache("work_inbox", owner)
+    else:
+        invalidate_cache("work_inbox", "__all__")
     cached = st.session_state.get(_WORK_INBOX_CACHE_KEY)
     if not isinstance(cached, Mapping):
         return
@@ -428,23 +436,41 @@ def get_cached_work_inbox(
     """Reuse home counts briefly instead of repeating several RPCs per click."""
     import streamlit as st
 
-    now = datetime.now(SEOUL).timestamp()
+    scope = read_scope(user_id)
+    if not scope["ok"]:
+        st.session_state.pop(_WORK_INBOX_CACHE_KEY, None)
+        return {"ok": False, "items": [], "summary": {},
+                "warnings": ["현재 계정의 업무함 조회 권한을 확인하지 못했습니다."]}
+    user_id = scope["owner"]
+    current_time = datetime.now(SEOUL)
+    now = current_time.timestamp()
+    generations = (generation_key(user_id), cache_generation("crm", user_id),
+                   cache_generation("work_inbox", user_id),
+                   cache_generation("work_inbox", "__all__"))
+    read_key = (scope["role"], generations, current_time.date().isoformat())
     cached = st.session_state.get(_WORK_INBOX_CACHE_KEY)
     if (
         isinstance(cached, Mapping)
         and str(cached.get("user_id") or "") == str(user_id or "")
         and cached.get("crm_restore_ok") is crm_restore_ok
+        and cached.get("read_key") == read_key
         and 0 <= now - float(cached.get("cached_at") or 0) < _WORK_INBOX_CACHE_SECONDS
         and isinstance(cached.get("value"), Mapping)
     ):
-        return dict(cached["value"])
+        return deepcopy(cached["value"])
 
     value = build_work_inbox(user_id, crm_restore_ok=crm_restore_ok)
+    if (not isinstance(value, Mapping) or value.get("ok") is not True
+            or value.get("warnings") or not isinstance(value.get("summary"), Mapping)
+            or not isinstance(value.get("items"), list)):
+        st.session_state.pop(_WORK_INBOX_CACHE_KEY, None)
+        return value
     st.session_state[_WORK_INBOX_CACHE_KEY] = {
         "user_id": str(user_id or ""),
         "crm_restore_ok": crm_restore_ok,
         "cached_at": now,
-        "value": value,
+        "read_key": read_key,
+        "value": deepcopy(value),
     }
     return value
 
@@ -466,6 +492,7 @@ def _defer_until_tomorrow() -> datetime:
     return datetime.combine(tomorrow, time(hour=9), tzinfo=SEOUL)
 
 
+@scoped_render("user_id")
 def render_work_inbox_page(
     user_id: str,
     user_name: str = "",

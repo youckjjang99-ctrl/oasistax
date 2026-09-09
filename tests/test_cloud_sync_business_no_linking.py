@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import cloud_sync
+import uuid
+from types import SimpleNamespace
+import snapshot_read_cache
 
 
 class _FakeDatabase:
@@ -10,12 +13,19 @@ class _FakeDatabase:
         self.seen = []
         self.identity_filters = []
 
+    @staticmethod
+    def tagged(row, owner, business_no):
+        # The production reader now verifies the owner and row timestamp.
+        return {"id": str(uuid.uuid5(uuid.NAMESPACE_URL, owner + business_no)),
+                "owner_user_id": owner, "business_no": business_no,
+                "updated_at": "2026-01-01T00:00:00+00:00", **row}
+
     def select(self, table, filters, columns="*", limit=None):
         del table, columns, limit
         business_no = filters["business_no"]
         self.seen.append(business_no)
         row = self.rows_by_business_no.get(business_no)
-        return [row] if row else []
+        return [self.tagged(row, filters["owner_user_id"], business_no)] if row else []
 
     def select_all(
         self,
@@ -28,7 +38,8 @@ class _FakeDatabase:
     ):
         del table, columns, order, page_size, max_rows
         self.identity_filters.append(dict(filters))
-        return list(self.identity_rows)
+        return [self.tagged(row, filters["owner_user_id"], row["business_no"])
+                for row in self.identity_rows]
 
 
 def test_load_financial_snapshot_accepts_legacy_digits_only_key(monkeypatch):
@@ -168,4 +179,37 @@ def test_load_registry_snapshot_does_not_override_corporate_mismatch_by_name(
     )
 
     assert snapshot == {}
+
+
+def test_warm_legacy_registry_rechecks_ambiguity_after_remote_insert(monkeypatch):
+    database = _FakeDatabase({}, identity_rows=[
+        {"business_no": "fixture-legacy-a",
+         "registry_data": {"법인명": "합성검증 상호", "fixture": "a"}},
+    ])
+    # Enable the production cache path, unlike the old no-config legacy fake.
+    database.config = SimpleNamespace(url="https://example.invalid")
+    monkeypatch.setattr(cloud_sync, "cloud_is_configured", lambda: True)
+    monkeypatch.setattr(cloud_sync, "CloudDatabase", lambda: database)
+    snapshot_read_cache.clear_snapshot_cache()
+    key = "".join(("111", "11", "11111"))
+    assert cloud_sync.load_registry_snapshot("fixture-owner", key, "합성검증 상호")["fixture"] == "a"
+    database.identity_rows.append({"business_no": "fixture-legacy-b",
+                                  "registry_data": {"법인명": "합성검증상호", "fixture": "b"}})
+    assert cloud_sync.load_registry_snapshot("fixture-owner", key, "합성검증 상호") == {}
+    assert len(database.identity_filters) == 2
+    assert not snapshot_read_cache._CACHE
+
+
+def test_legacy_snapshot_does_not_hide_new_exact_business_key(monkeypatch):
+    database = _FakeDatabase({"".join(("111", "11", "11111")): {
+        "financial_data": {"fixture": "legacy"}}})
+    database.config = SimpleNamespace(url="https://example.invalid")
+    monkeypatch.setattr(cloud_sync, "cloud_is_configured", lambda: True)
+    monkeypatch.setattr(cloud_sync, "CloudDatabase", lambda: database)
+    snapshot_read_cache.clear_snapshot_cache()
+    key = "-".join(("111", "11", "11111"))
+    assert cloud_sync.load_financial_snapshot("fixture-owner", key) == {"fixture": "legacy"}
+    database.rows_by_business_no[key] = {"financial_data": {"fixture": "exact"}}
+    assert cloud_sync.load_financial_snapshot("fixture-owner", key) == {"fixture": "exact"}
+    snapshot_read_cache.clear_snapshot_cache()
 

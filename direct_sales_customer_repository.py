@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from cloud_db import CloudDatabase
+from sales_read_cache import sales_mutation, validated_count_row
 
 
 RPC_REGISTER = "oasis_register_direct_sales_customer"
@@ -105,6 +106,7 @@ def _error(code: str = "INVALID_REQUEST") -> dict[str, Any]:
     }
 
 
+@sales_mutation()
 def register_direct_customer(
     current_user_id: Any,
     customer: dict[str, Any],
@@ -164,19 +166,22 @@ def get_direct_customer_summary(
     if not actor:
         return {"ok": False, "total": 0, "registered": 0, "contracted": 0}
     try:
-        row = _single_row(
+        row = validated_count_row(
             (db or CloudDatabase()).rpc(
                 RPC_SUMMARY,
                 {"p_current_user_id": actor},
-            )
+            ),
+            ("total_count", "registered_count", "contracted_count"),
         )
+        if row is None:
+            return {"ok": False, "code": "MALFORMED_RESPONSE", "total": 0, "registered": 0, "contracted": 0}
     except Exception:
         return {"ok": False, "total": 0, "registered": 0, "contracted": 0}
     return {
         "ok": True,
-        "total": int(row.get("total_count") or 0),
-        "registered": int(row.get("registered_count") or 0),
-        "contracted": int(row.get("contracted_count") or 0),
+        "total": row["total_count"],
+        "registered": row["registered_count"],
+        "contracted": row["contracted_count"],
     }
 
 

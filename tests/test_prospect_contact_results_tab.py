@@ -181,13 +181,15 @@ class ProspectContactResultsTabTests(unittest.TestCase):
             "_release_expired_assignments_if_due",
         ) as release_expired, patch.object(
             prospect.sales_assignments,
-            "list_user_assignments",
-            return_value={"ok": True, "assignments": [assignment]},
+            "list_user_db_assignments",
+            return_value={"ok": True, "assignments": [assignment], "total_count": 1},
         ) as list_assignments:
             result = prospect._load_user_assignment_rows("owner-a")
 
         self.assertTrue(result["ok"])
-        list_assignments.assert_called_once_with("owner-a", limit=1000)
+        list_assignments.assert_called_once_with(
+            "owner-a", dashboard_filter="all", limit=1000, offset=0
+        )
         release_expired.assert_called_once_with("owner-a")
         self.assertEqual(result["rows"][0]["id"], "company-1")
         self.assertEqual(result["rows"][0]["memo"], "내 메모")

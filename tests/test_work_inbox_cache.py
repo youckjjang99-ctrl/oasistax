@@ -20,6 +20,7 @@ def test_work_inbox_is_reused_then_invalidated():
 
     with (
         patch.object(st, "session_state", state),
+        patch("sales_read_cache._load_access", return_value=({"user_id": "owner", "status": "approved", "role": "member"}, "ok")),
         patch("work_inbox.build_work_inbox", side_effect=[first, second]) as build,
     ):
         assert work_inbox.get_cached_work_inbox("owner") == first

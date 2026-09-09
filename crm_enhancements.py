@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import json
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from cloud_db import CloudDatabase, TABLE_CRM, cloud_is_configured
+from crm_file_store import CrmStorageError, atomic_write_json, locked_json, read_json_object
 from utils import get_user_dirs
 
 
@@ -31,22 +32,16 @@ def _path(user_id: str) -> Path:
 
 def _load_all(user_id: str) -> dict[str, Any]:
     path = _path(user_id)
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    with locked_json(path):
+        return read_json_object(path)
 
 
 def _save_all(user_id: str, data: dict[str, Any]) -> None:
     path = _path(user_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    with locked_json(path):
+        current = read_json_object(path)
+        current.update(data)
+        atomic_write_json(path, current)
 
 
 def get_crm_profile(
@@ -54,6 +49,14 @@ def get_crm_profile(
     customer_key: str,
     business_no: str = "",
 ) -> dict[str, Any]:
+    from crm import get_customer_record
+
+    customer = get_customer_record(user_id, customer_key)
+    canonical = customer.get("_v44_profile")
+    if "_v44_profile" in customer and not isinstance(canonical, dict):
+        raise CrmStorageError("CRM 확장정보 형식이 올바르지 않아 원본을 보존했습니다.")
+    if isinstance(canonical, dict) and canonical:
+        return deepcopy(canonical)
     data = _load_all(user_id)
     profile = data.get(customer_key, {})
     if isinstance(profile, dict) and profile:
@@ -78,8 +81,7 @@ def get_crm_profile(
                     else {}
                 )
                 if isinstance(cloud_profile, dict) and cloud_profile:
-                    data[customer_key] = cloud_profile
-                    _save_all(user_id, data)
+                    _save_all(user_id, {customer_key: cloud_profile})
                     return cloud_profile
         except Exception:
             pass
@@ -98,16 +100,25 @@ def save_crm_profile(
     priority: str,
     assigned_manager: str,
 ) -> dict[str, Any]:
-    data = _load_all(user_id)
+    from crm import _merge_profile_fields, _record_revision, mutate_crm_data
+
     record = {
         "pipeline_stage": pipeline_stage,
         "priority": str(priority),
         "assigned_manager": str(assigned_manager or "").strip(),
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
-    data[customer_key] = record
-    _save_all(user_id, data)
-    return record
+    def apply(data: dict[str, Any]) -> dict[str, Any]:
+        customer = data["customers"].setdefault(customer_key, {})
+        if not isinstance(customer, dict):
+            raise CrmStorageError("CRM 고객 자료 형식이 올바르지 않아 원본을 보존했습니다.")
+        customer["_v44_profile"] = _merge_profile_fields(customer.get("_v44_profile", {}), record)
+        customer["_local_revision"] = _record_revision(customer) + 1
+        customer["_sync_state"] = "pending"
+        customer["updated_at"] = record["updated_at"]
+        return deepcopy(customer["_v44_profile"])
+
+    return mutate_crm_data(user_id, apply)
 
 
 def save_crm_profiles_bulk(
@@ -117,7 +128,7 @@ def save_crm_profiles_bulk(
     """Merge several profile updates and write the local file once."""
     if not profiles:
         return 0
-    data = _load_all(user_id)
+    data: dict[str, Any] = {}
     updated = 0
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     for customer_key, profile in profiles.items():
@@ -139,13 +150,22 @@ def merge_profile_into_crm_record(
     crm_record: dict[str, Any],
     profile: dict[str, Any],
 ) -> dict[str, Any]:
-    result = dict(crm_record or {})
-    result["_v44_profile"] = dict(profile or {})
+    from crm import _merge_profile_fields
+
+    if not isinstance(crm_record, dict):
+        raise CrmStorageError("CRM 고객 자료 형식이 올바르지 않아 원본을 보존했습니다.")
+    result = deepcopy(crm_record)
+    result["_v44_profile"] = _merge_profile_fields(result.get("_v44_profile", {}), profile)
     return result
 
 
 def get_profile_summary(user_id: str) -> dict[str, int]:
+    from crm import load_crm_data
+
     data = _load_all(user_id)
+    for key, record in load_crm_data(user_id).get("customers", {}).items():
+        if isinstance(record, dict) and isinstance(record.get("_v44_profile"), dict):
+            data[key] = record["_v44_profile"]
     result = {
         "high_priority": 0,
         "active_pipeline": 0,

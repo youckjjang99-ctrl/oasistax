@@ -15,6 +15,7 @@ from cloud_db import (
     normalize_business_no,
 )
 from performance_cache import invalidate_cache
+from snapshot_read_cache import invalidate_snapshot_reads, read_snapshot
 from utils import get_user_dirs
 from sync_outbox import (
     cloud_outbox_status,
@@ -75,7 +76,7 @@ def _select_registry_row_by_identity(
     rows = CloudDatabase().select_all(
         TABLE_REGISTRY,
         filters={"owner_user_id": owner_user_id},
-        columns="business_no,registry_data",
+        columns="id,owner_user_id,business_no,updated_at,registry_data",
         order="updated_at.desc",
         max_rows=5000,
     )
@@ -234,6 +235,8 @@ def retry_cloud_sync_queue(
         dead_letter += int(local_result.get("dead_letter", 0))
     except Exception:
         failed += max(1, int(local_status.get("queued", 0)))
+    if success:
+        invalidate_snapshot_reads(user_id)
     return {"success": success, "failed": failed, "dead_letter": dead_letter}
 
 
@@ -623,21 +626,8 @@ def sync_crm_record(
     business_no: Any,
     crm_data: dict[str, Any],
 ) -> tuple[bool, str]:
-    business_no = normalize_business_no(business_no)
-    if not business_no:
-        return False, "사업자등록번호가 없어 CRM 동기화를 건너뛰었습니다."
-
-    return _safe_upsert(
-        user_id,
-        "crm",
-        TABLE_CRM,
-        [{
-            "owner_user_id": user_id,
-            "business_no": business_no,
-            "crm_data": dict(crm_data or {}),
-        }],
-        "owner_user_id,business_no",
-    )
+    from crm_cloud_store import save_crm_to_cloud
+    return save_crm_to_cloud(user_id, business_no, crm_data)
 
 
 def sync_financial_snapshot(
@@ -670,7 +660,7 @@ def sync_financial_snapshot(
                 data = _merge_snapshot_data(existing_data, data)
     data["사업자등록번호"] = business_no
 
-    return _safe_upsert(
+    result = _safe_upsert(
         user_id,
         "financial",
         TABLE_FINANCIALS,
@@ -681,6 +671,9 @@ def sync_financial_snapshot(
         }],
         "owner_user_id,business_no",
     )
+    if result[0]:
+        invalidate_snapshot_reads(user_id)
+    return result
 
 
 def sync_registry_snapshot(
@@ -713,7 +706,7 @@ def sync_registry_snapshot(
                 data = _merge_snapshot_data(existing_data, data)
     data["사업자등록번호"] = business_no
 
-    return _safe_upsert(
+    result = _safe_upsert(
         user_id,
         "registry",
         TABLE_REGISTRY,
@@ -724,6 +717,9 @@ def sync_registry_snapshot(
         }],
         "owner_user_id,business_no",
     )
+    if result[0]:
+        invalidate_snapshot_reads(user_id)
+    return result
 
 
 def load_financial_snapshot(
@@ -732,19 +728,18 @@ def load_financial_snapshot(
 ) -> dict[str, Any]:
     # Supabase에 저장된 최신 크레탑 재무 스냅샷을 읽습니다.
     business_no = normalize_business_no(business_no)
-    if not business_no or not cloud_is_configured():
+    user_id = str(user_id or "").strip()
+    if not user_id or not business_no or not cloud_is_configured():
         return {}
     try:
-        row = _select_snapshot_row(
-            TABLE_FINANCIALS,
-            user_id,
-            business_no,
-            "financial_data",
+        return read_snapshot(
+            CloudDatabase(), TABLE_FINANCIALS, user_id, (business_no,), "financial_data",
+            lambda: _select_snapshot_row(
+                TABLE_FINANCIALS, user_id, business_no,
+                "id,owner_user_id,business_no,updated_at,financial_data",
+            ),
+            cache_row=lambda row: row.get("business_no") == business_no,
         )
-        if not row:
-            return {}
-        data = row.get("financial_data", {})
-        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
@@ -758,25 +753,24 @@ def load_registry_snapshot(
     # Supabase에 저장된 최신 법인 등기 스냅샷을 읽습니다. 과거 버전에서
     # 다른 식별자로 저장된 행도 같은 소유자 안에서 안전하게 복구합니다.
     business_no = normalize_business_no(business_no)
-    if not business_no or not cloud_is_configured():
+    user_id = str(user_id or "").strip()
+    if not user_id or not business_no or not cloud_is_configured():
         return {}
     try:
-        row = _select_snapshot_row(
-            TABLE_REGISTRY,
-            user_id,
-            business_no,
-            "registry_data",
-        )
-        if not row:
-            row = _select_registry_row_by_identity(
-                user_id,
-                company_name=company_name,
-                corporate_no=corporate_no,
+        def fetch():
+            row = _select_snapshot_row(
+                TABLE_REGISTRY, user_id, business_no,
+                "id,owner_user_id,business_no,updated_at,registry_data",
             )
-        if not row:
-            return {}
-        data = row.get("registry_data", {})
-        return data if isinstance(data, dict) else {}
+            return row or _select_registry_row_by_identity(
+                user_id, company_name=company_name, corporate_no=corporate_no,
+            )
+        return read_snapshot(
+            CloudDatabase(), TABLE_REGISTRY, user_id,
+            (business_no, _registry_company_key(company_name), _registry_corporate_digits(corporate_no)),
+            "registry_data", fetch,
+            cache_row=lambda row: row.get("business_no") == business_no,
+        )
     except Exception:
         return {}
 

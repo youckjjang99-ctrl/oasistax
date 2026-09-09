@@ -6,13 +6,18 @@ OASIS CRM utilities (v3.2.0)
 from __future__ import annotations
 
 import json
-import os
+import hashlib
 import uuid
 from copy import deepcopy
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
+
+from crm_file_store import (
+    CrmConflictError, CrmStorageError, atomic_write_json, locked_json,
+    read_json_object,
+)
 
 from performance_cache import cache_generation, invalidate_cache
 
@@ -48,12 +53,18 @@ def _now() -> str:
 
 def _safe_user_id(user_id: str) -> str:
     safe = str(user_id or "default").strip() or "default"
-    return "".join(ch for ch in safe if ch.isalnum() or ch in ("-", "_", "."))
+    result = "".join(ch for ch in safe if ch.isalnum() or ch in ("-", "_", "."))
+    if result in {"", ".", ".."}:
+        raise CrmStorageError("사용자 ID를 확인해 주세요.")
+    return result
 
 
 def get_crm_file_path(user_id: str) -> Path:
     user_dir = USER_DATA_DIR / _safe_user_id(user_id)
-    user_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        user_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise CrmStorageError("CRM 저장 공간에 접근하지 못했습니다. 원본은 변경하지 않았습니다.") from None
     return user_dir / "crm_data.json"
 
 
@@ -66,22 +77,55 @@ def _load_crm_data_cached(
 ) -> Dict[str, Any]:
     """Read one immutable CRM snapshot keyed by the exact file revision."""
     del mtime_ns, file_size, generation
-    try:
-        with open(path_str, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return {"customers": {}}
-        data.setdefault("customers", {})
-        return data
-    except Exception:
-        return {"customers": {}}
+    return _CrmSnapshot(_read_crm(Path(path_str)))
+
+
+class _CrmSnapshot(dict):
+    """Optimistic whole-file token kept off disk and out of cloud payloads."""
+
+    def __init__(self, value: dict[str, Any]):
+        super().__init__(value)
+        self.base_revision = _document_revision(value)
+
+
+def _document_revision(data: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(data, ensure_ascii=False, sort_keys=True, allow_nan=False).encode("utf-8")
+    ).hexdigest()
+
+
+def _record_revision(record: dict[str, Any]) -> int:
+    value = record.get("_local_revision", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise CrmStorageError("CRM 저장 버전 형식이 올바르지 않아 원본을 보존했습니다.")
+    return value
+
+
+def _merge_profile_fields(existing: Any, changes: Any) -> dict[str, Any]:
+    """Edit the supported profile fields without erasing extension data."""
+    if not isinstance(existing, dict) or not isinstance(changes, dict):
+        raise CrmStorageError("CRM 확장정보 형식이 올바르지 않아 원본을 보존하고 저장을 중단했습니다.")
+    merged = deepcopy(existing)
+    editable = {"pipeline_stage", "priority", "assigned_manager", "updated_at"}
+    for key, value in changes.items():
+        if key in editable or key not in merged:
+            merged[key] = deepcopy(value)
+    return merged
+
+
+def _read_crm(path: Path) -> dict[str, Any]:
+    data = read_json_object(path)
+    data.setdefault("customers", {})
+    if not isinstance(data["customers"], dict):
+        raise CrmStorageError("CRM 고객 자료 형식이 올바르지 않아 저장을 중단했습니다.")
+    return data
 
 
 def load_crm_data(user_id: str) -> Dict[str, Any]:
     path = get_crm_file_path(user_id)
-    if not path.exists():
-        return {"customers": {}}
-    try:
+    with locked_json(path):
+        if not path.exists():
+            return _CrmSnapshot({"customers": {}})
         stat = path.stat()
         cached = _load_crm_data_cached(
             str(path),
@@ -91,21 +135,45 @@ def load_crm_data(user_id: str) -> Dict[str, Any]:
         )
         # Callers update nested records, so never expose the cached object.
         return deepcopy(cached)
-    except Exception:
-        return {"customers": {}}
 
 
 def save_crm_data(user_id: str, data: Dict[str, Any]) -> None:
     path = get_crm_file_path(user_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        with open(temp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(temp_path, path)
-    finally:
-        temp_path.unlink(missing_ok=True)
-    invalidate_cache("crm", _safe_user_id(user_id))
+    with locked_json(path):
+        current = _read_crm(path)
+        expected = getattr(data, "base_revision", None)
+        if expected is None:
+            # Plain dictionaries may initialize an empty store, never replace
+            # an existing document without having read its revision.
+            if current != {"customers": {}}:
+                raise CrmConflictError("최신 CRM 자료를 다시 불러온 후 저장해 주세요. 기존 자료는 보존했습니다.")
+        elif expected != _document_revision(current):
+            raise CrmConflictError("다른 작업에서 CRM 자료가 변경되었습니다. 새로 불러온 후 저장해 주세요.")
+        if not isinstance(data.get("customers"), dict):
+            raise CrmStorageError("CRM 고객 자료 형식이 올바르지 않습니다.")
+        atomic_write_json(path, dict(data))
+        if isinstance(data, _CrmSnapshot):
+            data.base_revision = _document_revision(data)
+        invalidate_cache("crm", _safe_user_id(user_id))
+
+
+def mutate_crm_data(user_id: str, callback: Callable[[dict[str, Any]], Any]) -> Any:
+    """Run an in-place mutation against the latest file and return its result.
+
+    A callback exception aborts the transaction. Network calls do not belong
+    inside this bounded local-file transaction.
+    """
+    path = get_crm_file_path(user_id)
+    with locked_json(path):
+        data = _read_crm(path)
+        before = _document_revision(data)
+        result = callback(data)
+        if not isinstance(data.get("customers"), dict):
+            raise CrmStorageError("CRM 고객 자료 형식이 올바르지 않습니다.")
+        if _document_revision(data) != before:
+            atomic_write_json(path, data)
+            invalidate_cache("crm", _safe_user_id(user_id))
+        return result
 
 
 def make_customer_key(company_name: Any = "", business_no: Any = "") -> str:
@@ -129,6 +197,7 @@ def get_customer_record(user_id: str, customer_key: str) -> Dict[str, Any]:
     record.setdefault("next_date", "")
     record.setdefault("memo", "")
     record.setdefault("timeline", [])
+    record.setdefault("_local_revision", 0)
     return record
 
 
@@ -143,54 +212,84 @@ def upsert_customer_record(
     memo: str = "",
     event_title: str = "CRM 정보 수정",
     event_detail: str = "",
+    *,
+    expected_revision: int | None = None,
+    profile: dict[str, Any] | None = None,
 ) -> Tuple[bool, str]:
-    data = load_crm_data(user_id)
-    customers = data.setdefault("customers", {})
-    record = customers.get(customer_key, {})
-    if not isinstance(record, dict):
-        record = {}
-
-    is_new = not bool(record)
-    record.update({
+    changes = {
         "company_name": company_name,
         "business_no": business_no,
         "status": status or "신규",
         "next_action": next_action or "없음",
         "next_date": str(next_date or ""),
         "memo": memo or "",
-        "updated_at": _now(),
-    })
-    if is_new:
-        record["created_at"] = _now()
+    }
+    if profile is not None:
+        changes["_v44_profile"] = deepcopy(profile)
 
-    timeline = record.setdefault("timeline", [])
-    if event_detail:
-        timeline.insert(0, {
-            "at": _now(),
-            "title": event_title,
-            "detail": event_detail,
-        })
-        record["timeline"] = timeline[:80]
+    def apply(data: dict[str, Any]) -> Tuple[bool, str]:
+        customers = data["customers"]
+        record = customers.get(customer_key, {})
+        if not isinstance(record, dict):
+            raise CrmStorageError("CRM 고객 자료 형식이 올바르지 않아 원본을 보존했습니다.")
+        revision = _record_revision(record)
+        if expected_revision is not None and revision != expected_revision:
+            conflicts = data.setdefault("_local_conflicts", [])
+            if not isinstance(conflicts, list):
+                raise CrmStorageError("CRM 충돌 이력 형식이 올바르지 않아 저장을 중단했습니다.")
+            conflicts.append({
+                "id": uuid.uuid4().hex, "at": _now(),
+                "customer_key": customer_key, "expected_revision": expected_revision,
+                "actual_revision": revision, "attempted_changes": deepcopy(changes),
+                "event_title": event_title, "event_detail": event_detail,
+            })
+            return False, "다른 작업에서 고객 정보가 변경되었습니다. 입력 내용은 충돌 이력에 보관했습니다. 최신 정보를 확인한 후 다시 저장해 주세요."
+        timeline = record.setdefault("timeline", [])
+        if not isinstance(timeline, list):
+            raise CrmStorageError("CRM 상담 이력 형식이 올바르지 않아 원본을 보존했습니다.")
+        safe_changes = deepcopy(changes)
+        if "_v44_profile" in safe_changes:
+            safe_changes["_v44_profile"] = _merge_profile_fields(
+                record.get("_v44_profile", {}), safe_changes["_v44_profile"],
+            )
+        if not record.get("created_at"):
+            record["created_at"] = _now()
+        record.update(safe_changes)
+        record["updated_at"] = _now()
+        record["_local_revision"] = revision + 1
+        record["_sync_state"] = "pending"
+        if event_detail:
+            timeline.insert(0, {"id": uuid.uuid4().hex, "at": _now(), "title": event_title, "detail": event_detail})
+        customers[customer_key] = record
+        return True, "CRM 정보가 저장되었습니다."
 
-    customers[customer_key] = record
-    save_crm_data(user_id, data)
-    return True, "CRM 정보가 저장되었습니다."
+    try:
+        return mutate_crm_data(user_id, apply)
+    except CrmStorageError as exc:
+        return False, str(exc)
 
 
 def append_timeline_event(user_id: str, customer_key: str, title: str, detail: str) -> Tuple[bool, str]:
-    data = load_crm_data(user_id)
-    customers = data.setdefault("customers", {})
-    record = customers.get(customer_key, {})
-    if not isinstance(record, dict):
-        record = {}
-    record.setdefault("status", "신규")
-    timeline = record.setdefault("timeline", [])
-    timeline.insert(0, {"at": _now(), "title": title, "detail": detail})
-    record["timeline"] = timeline[:80]
-    record["updated_at"] = _now()
-    customers[customer_key] = record
-    save_crm_data(user_id, data)
-    return True, "타임라인이 추가되었습니다."
+    def apply(data: dict[str, Any]) -> Tuple[bool, str]:
+        customers = data["customers"]
+        record = customers.get(customer_key, {})
+        if not isinstance(record, dict):
+            raise CrmStorageError("CRM 고객 자료 형식이 올바르지 않아 원본을 보존했습니다.")
+        record.setdefault("status", "신규")
+        timeline = record.setdefault("timeline", [])
+        if not isinstance(timeline, list):
+            raise CrmStorageError("CRM 상담 이력 형식이 올바르지 않아 원본을 보존했습니다.")
+        timeline.insert(0, {"id": uuid.uuid4().hex, "at": _now(), "title": title, "detail": detail})
+        record["updated_at"] = _now()
+        record["_local_revision"] = _record_revision(record) + 1
+        record["_sync_state"] = "pending"
+        customers[customer_key] = record
+        return True, "타임라인이 추가되었습니다."
+
+    try:
+        return mutate_crm_data(user_id, apply)
+    except CrmStorageError as exc:
+        return False, str(exc)
 
 
 def get_status_for_customer(user_id: str, customer_key: str) -> str:

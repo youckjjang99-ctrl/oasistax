@@ -2024,7 +2024,6 @@ def save_consultation_journal(
     title = record.get("consultation_title") or "녹음 상담일지"
     history_title = f"{str(record.get('saved_at', ''))[:10]} 상담 · {title}"
     history_detail = _journal_to_timeline_detail(record)
-    append_timeline_event(user_id, customer_key, history_title, history_detail)
     save_customer_event(
         user_id=user_id,
         business_no=business_no,
@@ -2042,6 +2041,12 @@ def save_consultation_journal(
     status = record.get("crm_status", "") or current_crm.get("status", "상담중")
     memo = record.get("crm_memo", "") or record.get("summary", "")
 
+    profile = get_crm_profile(user_id, customer_key, business_no)
+    updated_profile = {
+        "pipeline_stage": record.get("pipeline_stage", "") or profile.get("pipeline_stage", "초기상담"),
+        "priority": str(profile.get("priority", "3")),
+        "assigned_manager": profile.get("assigned_manager", consultant_name),
+    }
     ok, message = upsert_customer_record(
         user_id,
         customer_key,
@@ -2051,22 +2056,17 @@ def save_consultation_journal(
         next_action,
         next_date,
         memo,
+        event_title=history_title,
+        event_detail=history_detail,
+        expected_revision=int(current_crm.get("_local_revision", 0) or 0),
+        profile=updated_profile,
     )
     if not ok:
-        return False, message
-
-    profile = get_crm_profile(user_id, customer_key, business_no)
-    updated_profile = save_crm_profile(
-        user_id,
-        customer_key,
-        record.get("pipeline_stage", "") or profile.get("pipeline_stage", "초기상담"),
-        str(profile.get("priority", "3")),
-        profile.get("assigned_manager", consultant_name),
-    )
+        return False, "상담일지 원본은 보존했습니다. " + message
 
     updated_crm = get_customer_record(user_id, customer_key)
     updated_crm = merge_profile_into_crm_record(updated_crm, updated_profile)
-    sync_crm_record(user_id, business_no, updated_crm)
+    crm_cloud_ok, crm_cloud_message = sync_crm_record(user_id, business_no, updated_crm)
 
     policy_result = {
         "updated": False,
@@ -2093,6 +2093,8 @@ def save_consultation_journal(
         }
 
     message = "상담일지·CRM·기업히스토리를 저장했습니다."
+    if not crm_cloud_ok:
+        message += " " + crm_cloud_message
     if policy_result.get("message"):
         message += " " + str(policy_result["message"])
     if cloud_save_warning:
@@ -2185,7 +2187,9 @@ def relink_saved_consultation_journals(
                 saved_at = str(record.get("saved_at", "") or "")[:10]
                 history_title = f"{saved_at} 상담 · {title}"
                 history_detail = _journal_to_timeline_detail(record)
-                append_timeline_event(user_id, customer_key, history_title, history_detail)
+                appended, append_message = append_timeline_event(user_id, customer_key, history_title, history_detail)
+                if not appended:
+                    raise RuntimeError(append_message)
                 save_customer_event(
                     user_id=user_id,
                     business_no=business_no,

@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
 from cloud_db import CloudDatabase
+from sales_read_cache import sales_mutation, validated_count_row
 
 
 RPC_FEATURE_READY = "oasis_company_sales_assignment_feature_ready"
@@ -21,7 +22,7 @@ RPC_GET_USER_DB_DASHBOARD = "oasis_get_user_db_dashboard"
 RPC_GET_ASSIGNABLE_DB_INVENTORY_DASHBOARD = (
     "oasis_get_assignable_db_inventory_dashboard"
 )
-RPC_LIST_USER_DB_ASSIGNMENTS = "oasis_list_user_db_assignments"
+RPC_LIST_USER_DB_ASSIGNMENTS = "oasis_list_user_db_assignments_v2"
 RPC_FILTER_BLOCKED = "oasis_filter_blocked_company_uids"
 RPC_RESOLVE_CANDIDATE_UIDS = "oasis_resolve_candidate_company_uids"
 RPC_RECORD_CONTACT = "oasis_record_company_sales_contact"
@@ -249,6 +250,18 @@ _USER_ASSIGNMENT_FIELDS = _ASSIGNMENT_FIELDS | {
     "data_created_ym",
     "source_data",
     "total_count",
+    "latest_contact_result",
+    "latest_contacted_at",
+    "latest_next_contact_at",
+    "current_assignment_contact_count",
+    "contact_summary_loaded",
+}
+_CONTACT_SUMMARY_FIELDS = {
+    "latest_contact_result",
+    "latest_contacted_at",
+    "latest_next_contact_at",
+    "current_assignment_contact_count",
+    "contact_summary_loaded",
 }
 _USER_DB_DASHBOARD_FIELDS = {
     "total_db_count",
@@ -692,6 +705,7 @@ def assignment_feature_ready(
     return ready, "" if ready else _FAILURE_MESSAGES["FEATURE_NOT_READY"]
 
 
+@sales_mutation(inventory=True, admin_safety=True, positive_key="released_count")
 def release_expired_assignments(
     current_user_id: str,
     *,
@@ -828,6 +842,7 @@ def record_company_views(
     }
 
 
+@sales_mutation(inventory=True)
 def claim_company(
     current_user_id: str,
     company_id: Any,
@@ -855,6 +870,7 @@ def claim_company(
     return result
 
 
+@sales_mutation(inventory=True)
 def claim_and_save_company(
     current_user_id: str,
     company_uid: Any,
@@ -1090,7 +1106,7 @@ def get_user_db_dashboard(
     )
     if error:
         return {**error, "metrics": {}}
-    row = _first_row(raw)
+    row = validated_count_row(raw, _USER_DB_DASHBOARD_FIELDS)
     if row is None:
         return {
             "ok": False,
@@ -1101,12 +1117,7 @@ def get_user_db_dashboard(
             "warning": _FAILURE_MESSAGES["MALFORMED_RESPONSE"],
             "fallback_required": False,
         }
-    metrics: dict[str, int] = {}
-    for field in _USER_DB_DASHBOARD_FIELDS:
-        try:
-            metrics[field] = max(0, int(row.get(field) or 0))
-        except (TypeError, ValueError):
-            metrics[field] = 0
+    metrics = {field: row[field] for field in _USER_DB_DASHBOARD_FIELDS}
     return {
         "ok": True,
         "code": "OK",
@@ -1132,7 +1143,7 @@ def get_assignable_db_inventory_dashboard(
     )
     if error:
         return {**error, "metrics": {}}
-    row = _first_row(raw)
+    row = validated_count_row(raw, _ASSIGNABLE_DB_INVENTORY_DASHBOARD_FIELDS)
     if row is None:
         return {
             "ok": False,
@@ -1143,12 +1154,7 @@ def get_assignable_db_inventory_dashboard(
             "warning": _FAILURE_MESSAGES["MALFORMED_RESPONSE"],
             "fallback_required": False,
         }
-    metrics: dict[str, int] = {}
-    for field in _ASSIGNABLE_DB_INVENTORY_DASHBOARD_FIELDS:
-        try:
-            metrics[field] = max(0, int(row.get(field) or 0))
-        except (TypeError, ValueError):
-            metrics[field] = 0
+    metrics = dict(row)
     return {
         "ok": True,
         "code": "OK",
@@ -1185,6 +1191,27 @@ def list_user_db_assignments(
     )
     if error:
         return {**error, "assignments": [], "total_count": 0}
+    if not isinstance(raw, list) or any(
+        not isinstance(row, dict)
+        or not _CONTACT_SUMMARY_FIELDS.issubset(row)
+        or not _valid_contact_summary_row(row)
+        or row.get("contact_summary_loaded") is not True
+        or type(row.get("current_assignment_contact_count")) is not int
+        or row["current_assignment_contact_count"] < 0
+        or type(row.get("total_count")) is not int
+        or row["total_count"] < 0
+        for row in raw
+    ):
+        return {
+            "ok": False,
+            "code": "MALFORMED_RESPONSE",
+            "message": "업체별 최신 연락상태를 확인하지 못했습니다. 다시 조회해 주세요.",
+            "assignment": {},
+            "assignments": [],
+            "total_count": 0,
+            "warning": "최신 연락상태 응답을 검증하지 못했습니다.",
+            "fallback_required": False,
+        }
     assignments = []
     for row in _rows(raw):
         assignment = {
@@ -1209,6 +1236,39 @@ def list_user_db_assignments(
         "warning": "",
         "fallback_required": False,
     }
+
+
+def _valid_contact_summary_row(row: Mapping[str, Any]) -> bool:
+    """Reject unverified/malformed summaries without echoing provider payloads."""
+    if not isinstance(row.get("assignment_id"), str) or not re.fullmatch(
+        r"[A-Za-z0-9_-]{1,80}", row["assignment_id"]
+    ):
+        return False
+    if not isinstance(row.get("company_uid"), str) or not _UID_PATTERN.fullmatch(
+        row["company_uid"]
+    ):
+        return False
+    result = row.get("latest_contact_result")
+    if result is not None and (
+        not isinstance(result, str)
+        or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", result)
+    ):
+        return False
+    for field in ("latest_contacted_at", "latest_next_contact_at"):
+        value = row.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            return False
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.utcoffset() is None:
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+    if result is None:
+        return row.get("latest_contacted_at") is None and row.get("latest_next_contact_at") is None
+    return row.get("latest_contacted_at") is not None
 
 
 def list_blocked_company_uids(
@@ -1506,6 +1566,7 @@ def filter_company_availability(
     }
 
 
+@sales_mutation(inventory=True, may_affect_other_owner=True)
 def record_contact(
     current_user_id: str,
     company_id: Any,
@@ -1607,6 +1668,7 @@ def list_company_contacts(
     }
 
 
+@sales_mutation(inventory=True, may_affect_other_owner=True)
 def release_assignment(
     current_user_id: str,
     company_id: Any,
@@ -1633,6 +1695,7 @@ def release_assignment(
     return _mutation_result(raw, success_message="업체 배정을 해제했습니다.")
 
 
+@sales_mutation()
 def save_user_note(
     current_user_id: str,
     company_uid: Any,
@@ -1899,6 +1962,7 @@ def _admin_mutation(
     return _mutation_result(raw, success_message=success_message, admin=True)
 
 
+@sales_mutation(owner_argument="new_assigned_user_id", inventory=True, admin_safety=True)
 def admin_change_assignee(
     current_user_id: str,
     company_id: Any,
@@ -1922,6 +1986,7 @@ def admin_change_assignee(
     )
 
 
+@sales_mutation(inventory=True, admin_safety=True)
 def admin_release_assignment(
     current_user_id: str,
     company_id: Any,
@@ -1943,6 +2008,7 @@ def admin_release_assignment(
     )
 
 
+@sales_mutation(inventory=True, admin_safety=True)
 def admin_reactivate(
     current_user_id: str,
     company_id: Any,
@@ -1964,6 +2030,7 @@ def admin_reactivate(
     )
 
 
+@sales_mutation(inventory=True, admin_safety=True)
 def admin_permanent_exclude(
     current_user_id: str,
     company_id: Any,
@@ -1985,6 +2052,7 @@ def admin_permanent_exclude(
     )
 
 
+@sales_mutation(inventory=True, admin_safety=True, positive_key="processed_count")
 def admin_review_returned_batch(
     current_user_id: str,
     company_uids: Sequence[Any],
@@ -2108,6 +2176,7 @@ def get_user_limits(
     }
 
 
+@sales_mutation(owner_argument="target_user_id")
 def admin_set_user_limit(
     admin_user_id: str,
     target_user_id: str,
@@ -2177,6 +2246,7 @@ def admin_set_user_limit(
     )
 
 
+@sales_mutation()
 def submit_mobile_db_request(
     current_user_id: str,
     region: Any,
@@ -2356,6 +2426,7 @@ def list_admin_mobile_db_requests(
     }
 
 
+@sales_mutation(inventory=True, requested_owner=True)
 def admin_update_mobile_db_request(
     current_user_id: str,
     request_id: Any,
@@ -2507,6 +2578,7 @@ def _specific_db_request_mutation_result(
     }
 
 
+@sales_mutation()
 def submit_specific_company_db_request(
     current_user_id: str,
     business_no: Any,
@@ -2618,6 +2690,7 @@ def list_admin_specific_company_db_requests(
     }
 
 
+@sales_mutation(inventory=True, requested_owner=True)
 def admin_review_specific_company_db_request(
     current_user_id: str,
     request_id: Any,
@@ -2686,6 +2759,7 @@ def list_admin_daum_mobile_candidates(
     }
 
 
+@sales_mutation(inventory=True, admin_safety=True)
 def admin_review_daum_mobile_candidate(
     current_user_id: str,
     candidate_id: Any,

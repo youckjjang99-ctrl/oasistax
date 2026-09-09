@@ -12,6 +12,7 @@ from typing import Any, Mapping, Sequence
 import uuid
 
 from cloud_db import CloudDatabase
+from sales_read_cache import sales_mutation
 
 
 RPC_FEATURE_READY = "oasis_work_inbox_feature_ready"
@@ -385,6 +386,7 @@ def list_my_sales_followups(
     }
 
 
+@sales_mutation()
 def transition_my_work_task(
     current_user_id: str,
     task_id: str,
