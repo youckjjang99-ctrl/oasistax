@@ -16,6 +16,7 @@ import pandas as pd
 import requests
 import streamlit as st
 from runtime_error_log import safe_public_error
+from sales_read_cache import count_summary, invalidate_sales_reads, scoped_render
 
 import company_sales_assignment as sales_assignments
 import direct_sales_customer_repository as direct_sales_customers
@@ -68,7 +69,7 @@ from prospect_db_repository import (
 )
 from sales_intelligence import analyze_sales_candidate, merge_analysis
 from cloud_sync import sync_crm_record
-from crm import get_customer_record, make_customer_key, upsert_customer_record
+from crm import get_customer_record, make_customer_key, upsert_customer_record, append_timeline_event
 from customer_history import save_customer_event
 
 
@@ -428,7 +429,6 @@ def _assignment_session_id() -> str:
     return str(st.session_state[key])
 
 
-@st.cache_data(ttl=60, max_entries=2, show_spinner=False)
 def _assignment_feature_status() -> tuple[bool, str]:
     return sales_assignments.assignment_feature_ready()
 
@@ -1280,12 +1280,16 @@ def _saved_candidate_frame(
                     row.get("assignment_expires_at")
                 ),
                 "연락횟수": int(row.get("contact_count") or 0),
-                "최근연락일": str(
-                    row.get("last_contacted_at") or ""
-                ).replace("T", " ")[:16],
-                "다음연락일": str(
-                    row.get("next_contact_at") or ""
-                ).replace("T", " ")[:16],
+                "최근연락일": _format_activity_time(
+                    row.get("latest_contacted_at")
+                    if row.get("contact_summary_loaded") is True
+                    else row.get("last_contacted_at")
+                ),
+                "다음연락일": _format_activity_time(
+                    row.get("latest_next_contact_at")
+                    if row.get("contact_summary_loaded") is True
+                    else row.get("next_contact_at")
+                ),
                 "_prospect_id": prospect_id,
                 "_company_uid": company_uid,
                 "_assignment_id": str(
@@ -3651,22 +3655,14 @@ def _set_saved_db_dashboard_page(page_index: int) -> None:
     st.session_state.pop(_ACTIVITY_DIALOG_REQUEST_KEY, None)
 
 
-@st.cache_data(
-    show_spinner=False,
-    ttl=20,
-    max_entries=64,
-)
 def _load_user_db_dashboard(owner_user_id: str) -> dict:
-    ready, ready_message = _assignment_feature_status()
-    if not ready:
-        return {
-            "ok": False,
-            "message": ready_message,
-            "metrics": {},
-            "legacy_fallback": True,
-        }
-    _release_expired_assignments_if_due(owner_user_id)
-    return sales_assignments.get_user_db_dashboard(owner_user_id)
+    def load():
+        ready, ready_message = _assignment_feature_status()
+        if not ready:
+            return {"ok": False, "message": ready_message, "metrics": {}, "legacy_fallback": True}
+        _release_expired_assignments_if_due(owner_user_id)
+        return sales_assignments.get_user_db_dashboard(owner_user_id)
+    return count_summary("user_dashboard", owner_user_id, load)
 
 
 def _load_user_dashboard_assignment_rows(
@@ -3718,19 +3714,14 @@ def _load_user_dashboard_assignment_rows(
     }
 
 
-@st.cache_data(
-    show_spinner=False,
-    ttl=20,
-    max_entries=64,
-)
 def _load_direct_customer_summary(owner_user_id: str) -> dict:
-    return direct_sales_customers.get_direct_customer_summary(owner_user_id)
+    return count_summary("direct_customer_summary", owner_user_id,
+                         lambda: direct_sales_customers.get_direct_customer_summary(owner_user_id))
 
 
-def _clear_saved_db_read_caches() -> None:
+def _clear_saved_db_read_caches(owner_user_id: str = "") -> None:
     """Refresh only the DB reads affected by assignment or contact changes."""
-    _load_user_db_dashboard.clear()
-    _load_direct_customer_summary.clear()
+    invalidate_sales_reads(owner_user_id or st.session_state.get("current_user_id", ""))
 
 
 def _render_saved_db_dashboard(
@@ -3888,7 +3879,7 @@ def _render_saved_db_dashboard(
 
 
 def _load_user_assignment_rows(owner_user_id: str) -> dict:
-    """Load only the current user's assignments through the existing RPC."""
+    """Load current-owner summaries without a global 1,000-history cutoff."""
 
     ready, ready_message = _assignment_feature_status()
     if not ready:
@@ -3899,29 +3890,55 @@ def _load_user_assignment_rows(owner_user_id: str) -> dict:
         }
 
     _release_expired_assignments_if_due(owner_user_id)
-    assignment_result = sales_assignments.list_user_assignments(
-        owner_user_id,
-        limit=1000,
-    )
-    if not assignment_result.get("ok"):
-        return {
-            "ok": False,
-            "message": str(
-                assignment_result.get("message")
-                or "내 영업후보를 불러오지 못했습니다."
-            ),
-            "rows": [],
-        }
-
     rows: list[dict] = []
-    for assignment in assignment_result.get("assignments") or []:
-        row = dict(assignment)
-        row["_assignment_id"] = (
-            row.get("assignment_id") or row.get("id") or ""
+    seen: set[str] = set()
+    offset = 0
+    expected_total: int | None = None
+    while True:
+        assignment_result = sales_assignments.list_user_db_assignments(
+            owner_user_id,
+            dashboard_filter="all",
+            limit=1000,
+            offset=offset,
         )
-        row["id"] = row.get("company_id") or row.get("id")
-        row["memo"] = row.get("own_memo") or row.get("memo") or ""
-        rows.append(row)
+        if not assignment_result.get("ok"):
+            return {
+                "ok": False,
+                "message": str(assignment_result.get("message")
+                    or "내 영업후보를 불러오지 못했습니다."),
+                "rows": [],
+            }
+        page = list(assignment_result.get("assignments") or [])
+        total_count = int(assignment_result.get("total_count") or 0)
+        if expected_total is None:
+            expected_total = total_count
+        if (
+            total_count != expected_total
+            or offset + len(page) > expected_total
+            or (not page and offset < expected_total)
+        ):
+            return {
+                "ok": False,
+                "message": "조회 중 배정목록이 변경되거나 일부를 확인하지 못했습니다. 다시 조회해 주세요.",
+                "rows": [],
+            }
+        for assignment in page:
+            row = dict(assignment)
+            assignment_id = str(row.get("assignment_id") or row.get("id") or "")
+            if not assignment_id or assignment_id in seen:
+                return {
+                    "ok": False,
+                    "message": "조회 중 배정목록이 변경되었습니다. 다시 조회해 주세요.",
+                    "rows": [],
+                }
+            seen.add(assignment_id)
+            row["_assignment_id"] = assignment_id
+            row["id"] = row.get("company_id") or row.get("id")
+            row["memo"] = row.get("own_memo") or row.get("memo") or ""
+            rows.append(row)
+        offset += len(page)
+        if offset >= expected_total:
+            break
     return {
         "ok": True,
         "message": "",
@@ -3975,8 +3992,9 @@ def _show_company_activity_dialog(
         str(source_data.get("discovery_type") or "unknown"),
         "분류 확인 중",
     )
-    contact_status = sales_assignments.assignment_status_label(
-        str(assignment.get("status") or "")
+    contact_status = _contact_progress_label(
+        assignment,
+        _assignment_contact_summary(assignment),
     )
     phone = _assignment_contact_phone(
         assignment,
@@ -3991,6 +4009,12 @@ def _show_company_activity_dialog(
     summary_columns[1].write(contact_status)
     summary_columns[2].caption("연락처")
     summary_columns[2].write(phone)
+    st.caption(
+        "현재 배정의 내 최근 연락: "
+        + _format_activity_time(assignment.get("latest_contacted_at"))
+        + " · 다음 연락: "
+        + _format_activity_time(assignment.get("latest_next_contact_at"))
+    )
     st.divider()
 
     _render_contact_results(
@@ -4281,7 +4305,7 @@ def _render_direct_db_registration_form(
     )
     customer_key = make_customer_key(company_name, formatted_business_no)
     current_crm = get_customer_record(owner_user_id, customer_key)
-    upsert_customer_record(
+    crm_saved, crm_message = upsert_customer_record(
         owner_user_id,
         customer_key,
         company_name=company_name.strip(),
@@ -4292,10 +4316,16 @@ def _render_direct_db_registration_form(
         memo=str(current_crm.get("memo") or registration_memo),
         event_title="직접등록 DB 추가",
         event_detail="영업사원이 계약/등록 DB에서 업체를 등록했습니다.",
+        expected_revision=int(current_crm.get("_local_revision", 0) or 0),
     )
     updated_crm = get_customer_record(owner_user_id, customer_key)
     try:
-        sync_crm_record(owner_user_id, formatted_business_no, updated_crm)
+        if crm_saved:
+            crm_synced, crm_message = sync_crm_record(owner_user_id, formatted_business_no, updated_crm)
+            if not crm_synced:
+                st.warning(crm_message)
+        else:
+            st.warning(crm_message)
     except Exception:
         pass
     try:
@@ -4627,19 +4657,12 @@ def _record_direct_outreach_crm(
     company_name = str(target.get("company_name") or "")
     business_no = str(target.get("business_no") or "")
     customer_key = make_customer_key(company_name, business_no)
-    current = get_customer_record(owner_user_id, customer_key)
-    upsert_customer_record(
-        owner_user_id,
-        customer_key,
-        company_name=company_name,
-        business_no=business_no,
-        status=str(current.get("status") or "신규"),
-        next_action=str(current.get("next_action") or "없음"),
-        next_date=str(current.get("next_date") or ""),
-        memo=str(current.get("memo") or ""),
-        event_title=("카카오톡 발송" if channel == "kakao" else "문자 발송"),
-        event_detail=detail,
+    saved, message = append_timeline_event(
+        owner_user_id, customer_key,
+        ("카카오톡 발송" if channel == "kakao" else "문자 발송"), detail,
     )
+    if not saved:
+        raise RuntimeError(message)
     try:
         sync_crm_record(
             owner_user_id,
@@ -4917,6 +4940,7 @@ def _show_direct_customer_outreach_dialog(
         )
 
 
+@scoped_render("owner_user_id")
 def _render_clean_saved_prospects(
     owner_user_id: str,
     owner_user_name: str = "",
@@ -5053,22 +5077,7 @@ def _render_clean_saved_prospects(
         assignment_mode
         and _saved_db_shows_company_progress(selected_filter)
     )
-    latest_contact_by_uid: dict[str, dict] = {}
-    progress_lookup_failed = False
-    if show_company_progress:
-        try:
-            contact_history_result = sales_assignments.list_company_contacts(
-                owner_user_id,
-                limit=1000,
-            )
-            if contact_history_result.get("ok"):
-                latest_contact_by_uid = _latest_contact_by_company(
-                    list(contact_history_result.get("contacts") or [])
-                )
-            else:
-                progress_lookup_failed = True
-        except Exception:
-            progress_lookup_failed = True
+    latest_contact_by_uid = _assignment_contact_summaries(rows)
 
     frame = _saved_candidate_frame(
         rows,
@@ -5084,11 +5093,6 @@ def _render_clean_saved_prospects(
         st.warning(
             "정규 연락처 상태를 확인하지 못해 기존 공개 연락처만 표시합니다. "
             "안전 확인이 끝날 때까지 보내기 버튼은 사용할 수 없습니다."
-        )
-    if progress_lookup_failed:
-        st.warning(
-            "최신 연락이력을 확인하지 못해 일부 업체는 배정 상태를 기준으로 "
-            "진행상황을 표시합니다."
         )
     if not frame.empty:
         frame["대표전화"] = frame["대표전화"].map(normalize_phone)
@@ -5307,7 +5311,10 @@ def _contact_activity_rows(contacts: list[dict]) -> list[dict]:
             _activity_datetime(
                 row.get("contacted_at") or row.get("created_at")
             )
-            or datetime.min.replace(tzinfo=timezone.utc)
+            or datetime.min.replace(tzinfo=timezone.utc),
+            _activity_datetime(row.get("created_at"))
+            or datetime.min.replace(tzinfo=timezone.utc),
+            str(row.get("id") or ""),
         ),
         reverse=True,
     )
@@ -5383,7 +5390,10 @@ def _latest_contact_by_company(contacts: list[dict]) -> dict[str, dict]:
             _activity_datetime(
                 row.get("contacted_at") or row.get("created_at")
             )
-            or datetime.min.replace(tzinfo=timezone.utc)
+            or datetime.min.replace(tzinfo=timezone.utc),
+            _activity_datetime(row.get("created_at"))
+            or datetime.min.replace(tzinfo=timezone.utc),
+            str(row.get("id") or ""),
         ),
         reverse=True,
     )
@@ -5394,10 +5404,34 @@ def _latest_contact_by_company(contacts: list[dict]) -> dict[str, dict]:
     return latest
 
 
+def _assignment_contact_summary(assignment: dict) -> dict | None:
+    """Use only the server-verified current-assignment summary, not old history."""
+    if assignment.get("contact_summary_loaded") is not True:
+        return None
+    return {
+        "contact_result": assignment.get("latest_contact_result"),
+        "contacted_at": assignment.get("latest_contacted_at"),
+        "next_contact_at": assignment.get("latest_next_contact_at"),
+    }
+
+
+def _assignment_contact_summaries(assignments: list[dict]) -> dict[str, dict]:
+    return {
+        str(row.get("company_uid")): summary
+        for row in assignments
+        if row.get("company_uid")
+        and (summary := _assignment_contact_summary(row)) is not None
+    }
+
+
 def _contact_progress_label(
     assignment: dict,
     latest_contact: dict | None,
 ) -> str:
+    if assignment.get("contact_summary_loaded") is False:
+        return "상태 확인 불가"
+    if latest_contact is None:
+        latest_contact = _assignment_contact_summary(assignment)
     if latest_contact:
         result = str(latest_contact.get("contact_result") or "").strip()
         if result:
@@ -5519,18 +5553,12 @@ def _render_contact_results(
             st.warning("선택한 업체를 확인하지 못했습니다. 다시 선택해 주세요.")
             return
     else:
-        latest_contacts_result = sales_assignments.list_company_contacts(
-            owner_user_id,
-            limit=1000,
-        )
-        latest_contact_by_uid = _latest_contact_by_company(
-            list(latest_contacts_result.get("contacts") or [])
-        )
-        if not latest_contacts_result.get("ok"):
+        if any(row.get("contact_summary_loaded") is not True for row in rows):
             st.warning(
-                latest_contacts_result.get("message")
-                or "최신 연락현황을 불러오지 못해 배정상태로 표시합니다."
+                "업체별 최신 연락현황을 확인하지 못했습니다. 목록을 다시 조회해 주세요."
             )
+            return
+        latest_contact_by_uid = _assignment_contact_summaries(rows)
 
         if st.session_state.pop(_CONTACT_RESULTS_RESET_SELECTION_KEY, False):
             st.session_state.pop(_CONTACT_RESULTS_SELECTION_KEY, None)
@@ -6328,34 +6356,27 @@ def _available_allocation_candidates(
     return available, str(availability.get("warning") or "")
 
 
-@st.cache_data(
-    show_spinner=False,
-    ttl=60,
-    max_entries=64,
-    scope="session",
-)
 def _load_assignable_db_inventory_dashboard(owner_user_id: str) -> dict:
-    ready, ready_message = _assignment_feature_status()
-    if not ready:
-        return {
-            "ok": False,
-            "message": ready_message,
-            "metrics": {},
-        }
-    return sales_assignments.get_assignable_db_inventory_dashboard(owner_user_id)
+    def load():
+        ready, ready_message = _assignment_feature_status()
+        if not ready:
+            return {"ok": False, "message": ready_message, "metrics": {}}
+        return sales_assignments.get_assignable_db_inventory_dashboard(owner_user_id)
+    return count_summary("assignable_inventory", owner_user_id, load, inventory=True)
 
 
-@st.cache_data(
-    show_spinner=False,
-    ttl=30,
-    max_entries=64,
-    scope="session",
-)
+# Compatibility for existing UI callbacks; invalidate only inventory summaries.
+_load_assignable_db_inventory_dashboard.clear = lambda: invalidate_sales_reads(inventory=True)
+
+
 def _load_user_mobile_db_requests(owner_user_id: str) -> dict:
     return sales_assignments.list_user_mobile_db_requests(
         owner_user_id,
         limit=10,
     )
+
+
+_load_user_mobile_db_requests.clear = lambda: None  # Request details are deliberately uncached.
 
 
 def _render_db_request_status_dashboard(metrics: dict) -> None:
@@ -6651,6 +6672,7 @@ def _render_specific_company_db_search(owner_user_id: str) -> None:
                 )
 
 
+@scoped_render("owner_user_id")
 def _render_db_request_home(owner_user_id: str) -> None:
     dashboard_result = _load_assignable_db_inventory_dashboard(owner_user_id)
     if dashboard_result.get("ok"):

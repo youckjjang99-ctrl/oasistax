@@ -67,7 +67,10 @@ def test_company_selection_shows_timeline_before_blank_entry_form() -> None:
     form_at = source.index("with st.form(", query_at)
 
     assert timeline_at < query_at < form_at
-    assert source.count("sales_assignments.list_company_contacts(") == 2
+    # Company-specific history stays fresh; the global 1,000-row summary query
+    # was replaced by the server's per-assignment latest-contact projection.
+    assert source.count("sales_assignments.list_company_contacts(") == 1
+    assert "_assignment_contact_summaries(" in source
     assert "최신순" in source
     assert "일시 (KST)" in source
     assert "상담내용" in source

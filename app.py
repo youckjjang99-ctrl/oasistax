@@ -1528,16 +1528,18 @@ def render_customer_management_page(user_id):
         )
 
     st.markdown("##### CRM 관리")
-    with st.form(key=f"crm_form_{selected_key}"):
+    from crm_editor import editor_guard, editor_saved, reload_editor, show_sync_result
+    editor_token, edit_revision = editor_guard(st, user_id, selected_key, crm_record, "customer")
+    with st.form(key=f"crm_form_{editor_token}"):
         c1, c2, c3 = st.columns([1, 1, 1])
         with c1:
             current_status = crm_record.get("status", "신규")
             status_idx = STATUS_OPTIONS.index(current_status) if current_status in STATUS_OPTIONS else 0
-            new_status = st.selectbox("고객 상태", STATUS_OPTIONS, index=status_idx)
+            new_status = st.selectbox("고객 상태", STATUS_OPTIONS, index=status_idx, key=f"crm_status_{editor_token}")
         with c2:
             current_action = crm_record.get("next_action", "없음")
             action_idx = ACTION_OPTIONS.index(current_action) if current_action in ACTION_OPTIONS else len(ACTION_OPTIONS) - 1
-            new_action = st.selectbox("다음 액션", ACTION_OPTIONS, index=action_idx)
+            new_action = st.selectbox("다음 액션", ACTION_OPTIONS, index=action_idx, key=f"crm_action_{editor_token}")
         with c3:
             from datetime import date, datetime
             raw_next_date = str(crm_record.get("next_date", "") or "")
@@ -1548,7 +1550,7 @@ def render_customer_management_page(user_id):
             selected_next_date = st.date_input(
                 "다음 예정일",
                 value=default_next_date,
-                key=f"crm_next_date_{selected_key}",
+                key=f"crm_next_date_{editor_token}",
             )
             new_next_date = selected_next_date.strftime("%Y-%m-%d") if selected_next_date else ""
 
@@ -1564,6 +1566,7 @@ def render_customer_management_page(user_id):
                 "상담 진행단계",
                 PIPELINE_OPTIONS,
                 index=stage_index,
+                key=f"crm_pipeline_{editor_token}",
             )
         with e2:
             current_priority = str(crm_profile.get("priority", "3"))
@@ -1577,6 +1580,7 @@ def render_customer_management_page(user_id):
                 PRIORITY_OPTIONS,
                 index=priority_index,
                 format_func=lambda value: "★" * int(value),
+                key=f"crm_priority_{editor_token}",
             )
         with e3:
             assigned_manager = st.text_input(
@@ -1586,19 +1590,22 @@ def render_customer_management_page(user_id):
                     or CURRENT_USER_NAME
                     or ""
                 ),
+                key=f"crm_manager_{editor_token}",
             )
 
-        new_memo = st.text_area("상담 메모", value=str(crm_record.get("memo", "") or ""), height=140, placeholder="대표 상담내용, 니즈, 후속조치 등을 기록하세요.")
+        new_memo = st.text_area("상담 메모", value=str(crm_record.get("memo", "") or ""), height=140, placeholder="대표 상담내용, 니즈, 후속조치 등을 기록하세요.", key=f"crm_memo_{editor_token}")
         submitted = st.form_submit_button("CRM 정보 저장", width='stretch')
+        reload_submitted = st.form_submit_button("초안 보관 후 최신본 불러오기", width='stretch')
+
+    if reload_submitted:
+        reload_editor(st, user_id, selected_key, "customer", changes={
+            "status": new_status, "next_action": new_action, "next_date": new_next_date,
+            "memo": new_memo, "_v44_profile": {"pipeline_stage": pipeline_stage,
+                                                "priority": str(priority), "assigned_manager": assigned_manager},
+        })
 
     if submitted:
-        saved_profile = save_crm_profile(
-            user_id,
-            selected_key,
-            pipeline_stage,
-            priority,
-            assigned_manager,
-        )
+        saved_profile = {"pipeline_stage": pipeline_stage, "priority": str(priority), "assigned_manager": assigned_manager}
         detail = (
             f"상태: {new_status} / 진행단계: {pipeline_stage} / "
             f"중요도: {priority} / 담당자: {assigned_manager} / "
@@ -1615,6 +1622,8 @@ def render_customer_management_page(user_id):
             memo=new_memo,
             event_title="CRM 정보 저장",
             event_detail=detail,
+            expected_revision=edit_revision,
+            profile=saved_profile,
         )
         if ok:
             updated_crm = get_customer_record(
@@ -1625,14 +1634,15 @@ def render_customer_management_page(user_id):
                 updated_crm,
                 saved_profile,
             )
-            sync_crm_record(
+            sync_result = sync_crm_record(
                 user_id,
                 selected_biz,
                 updated_crm,
             )
             crm_record = updated_crm
             crm_profile = saved_profile
-            st.success(msg)
+            editor_saved(st, user_id, selected_key, "customer")
+            show_sync_result(st, sync_result)
         else:
             st.error(msg)
 
@@ -1658,12 +1668,12 @@ def render_customer_management_page(user_id):
                         updated_crm,
                         crm_profile,
                     )
-                    sync_crm_record(
+                    sync_result = sync_crm_record(
                         user_id,
                         selected_biz,
                         updated_crm,
                     )
-                    st.success(msg)
+                    show_sync_result(st, sync_result)
                 else:
                     st.error(msg)
 
@@ -2114,27 +2124,14 @@ if active_tab in local_customer_routes:
         if "실패" not in restore_message:
             st.session_state[restore_session_key] = True
 
-if active_tab == "홈":
+if active_tab in {"홈", "기업관리센터", "내 누적 고객DB", "AI 코파일럿"}:
     crm_restore_session_key = f"cloud_crm_restore_{CURRENT_USER_ID}"
-    crm_restore_attempt_key = f"{crm_restore_session_key}_attempted_at"
-    last_attempt = float(
-        st.session_state.get(crm_restore_attempt_key, 0) or 0
-    )
-    if (
-        not st.session_state.get(crm_restore_session_key)
-        and time.monotonic() - last_attempt >= 60
-    ):
-        from cloud_crm_restore import restore_crm_from_cloud
-
-        st.session_state[crm_restore_attempt_key] = time.monotonic()
-        crm_restore_result = restore_crm_from_cloud(CURRENT_USER_ID)
-        st.session_state["cloud_crm_restore_result"] = crm_restore_result
-        restore_message = str(crm_restore_result.get("message", "") or "")
-        if not any(
-            marker in restore_message
-            for marker in ("실패", "설정되지 않아", "사용자 ID가 없습니다")
-        ):
-            st.session_state[crm_restore_session_key] = True
+    from cloud_crm_restore import restore_crm_from_cloud
+    # The owner-scoped persistent TTL avoids redundant reads, without treating
+    # one successful restore as permanent proof that this device is current.
+    crm_restore_result = restore_crm_from_cloud(CURRENT_USER_ID)
+    st.session_state["cloud_crm_restore_result"] = crm_restore_result
+    st.session_state[crm_restore_session_key] = bool(crm_restore_result.get("ok"))
 
 st.markdown(f"""
 <div class="oasis-topbar oasis-topbar-compact">
@@ -2146,6 +2143,11 @@ st.markdown(f"""
     </div>
 </div>
 """, unsafe_allow_html=True)
+
+if active_tab in {"기업관리센터", "내 누적 고객DB", "AI 코파일럿"}:
+    crm_sync_notice = st.session_state.get("cloud_crm_restore_result", {})
+    if not crm_sync_notice.get("ok") and crm_sync_notice.get("status") != "busy":
+        st.warning("클라우드 CRM 최신 변경을 확인하지 못했습니다. 기존 자료와 편집 초안은 보존되어 있습니다.")
 
 if active_tab == "홈":
     restore_notice = st.session_state.get(
@@ -2169,10 +2171,7 @@ if active_tab == "홈":
     crm_restore_message = str(crm_restore_notice.get("message", "") or "")
     crm_restore_ok = bool(
         st.session_state.get(f"cloud_crm_restore_{CURRENT_USER_ID}")
-    ) and not any(
-        marker in crm_restore_message
-        for marker in ("실패", "설정되지 않아", "사용자 ID가 없습니다")
-    )
+    ) and bool(crm_restore_notice.get("ok"))
     render_home_page(
         CURRENT_USER_ID,
         CURRENT_USER_NAME,

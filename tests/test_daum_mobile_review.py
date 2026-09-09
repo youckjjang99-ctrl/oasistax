@@ -13,7 +13,7 @@ MIGRATION = (
     Path(__file__).resolve().parents[1]
     / "supabase"
     / "migrations"
-    / "20260815005450_add_daum_mobile_candidate_review.sql"
+    / "20260815012029_add_daum_mobile_candidate_review.sql"
 )
 SQL = MIGRATION.read_text(encoding="utf-8").lower()
 

@@ -103,3 +103,6 @@ downloads/
 **/consultation_ai_cache.json
 **/consultation_journals.json
 **/consultation_relink_state.json
+
+# Supabase CLI local metadata is not a deployable migration.
+supabase/.temp/

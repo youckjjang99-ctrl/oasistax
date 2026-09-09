@@ -14,7 +14,9 @@ def test_registered_and_contracted_db_are_rendered_in_dashboard():
     table_index = SAVED_SECTION.index("st.dataframe(")
     download_index = SAVED_SECTION.index('"저장된 영업후보 엑셀 다운로드"')
     assert dashboard_index < table_index < download_index
-    assert "get_direct_customer_summary(" in SAVED_SECTION
+    assert "_load_direct_customer_summary(" in SAVED_SECTION
+    summary_loader = SOURCE.split("def _load_direct_customer_summary(", 1)[1].split("\ndef ", 1)[0]
+    assert "get_direct_customer_summary(" in summary_loader
 
 
 def test_combined_contract_registered_db_button_is_removed():

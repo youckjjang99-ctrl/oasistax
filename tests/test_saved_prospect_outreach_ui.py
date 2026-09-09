@@ -172,7 +172,9 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
             prospect.st,
             "dataframe",
             side_effect=capture_table,
-        ):
+        ), patch("sales_read_cache._load_access", return_value=(
+            {"user_id": "owner-1", "status": "approved", "role": "member"}, "ok"
+        )):
             with self.assertRaises(_StopAfterSavedProspectTable):
                 prospect._render_clean_saved_prospects(
                     "owner-1",
@@ -550,10 +552,11 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
         self.assertIn("key=_SAVED_PROSPECT_TABLE_KEY", source)
         self.assertIn('"이력관리": st.column_config.ButtonColumn(', source)
         self.assertIn("_queue_activity_from_button", source)
-        self.assertIn("sales_assignments.list_company_contacts(", source)
+        self.assertIn("_assignment_contact_summaries(rows)", source)
+        self.assertNotIn("sales_assignments.list_company_contacts(", source)
         self.assertIn("latest_contact_by_uid=latest_contact_by_uid", source)
         self.assertIn("_saved_db_shows_company_progress", source)
-        self.assertIn("if show_company_progress:", source)
+        self.assertIn("if show_company_progress", source)
         self.assertIn(
             "CONTACT_STATUS_SAVED_PROSPECT_VISIBLE_COLUMNS",
             source,
@@ -667,7 +670,7 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
         self.assertIn("목록 조회를 중단했습니다", renderer_source)
 
     def test_dashboard_cache_is_cleared_after_related_mutations(self):
-        prospect._load_user_db_dashboard.clear()
+        prospect._clear_saved_db_read_caches("owner-cache-test")
         with patch.object(
             prospect,
             "_assignment_feature_status",
@@ -679,13 +682,15 @@ class SavedProspectOutreachUiTests(unittest.TestCase):
             prospect.sales_assignments,
             "get_user_db_dashboard",
             return_value={"ok": True, "metrics": {"total_count": 1}},
-        ) as dashboard:
+        ) as dashboard, patch("sales_read_cache._load_access", return_value=(
+            {"user_id": "owner-cache-test", "status": "approved", "role": "member"}, "ok"
+        )):
             first = prospect._load_user_db_dashboard("owner-cache-test")
             second = prospect._load_user_db_dashboard("owner-cache-test")
             self.assertEqual(first, second)
             dashboard.assert_called_once()
 
-            prospect._clear_saved_db_read_caches()
+            prospect._clear_saved_db_read_caches("owner-cache-test")
             prospect._load_user_db_dashboard("owner-cache-test")
             self.assertEqual(dashboard.call_count, 2)
 

@@ -4,7 +4,9 @@ import json
 import os
 import re
 import threading
+import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
 
@@ -363,6 +365,41 @@ class CloudDatabase:
 
         data = response.json() if response.text else []
         return data if isinstance(data, list) else []
+
+    def select_crm_sync_page(
+        self, owner_user_id: str, *, since: str | None = None,
+        after: tuple[str, str] | None = None, limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Strict owner-scoped keyset page; an empty list alone means EOF.
+
+        Unlike the general legacy select helper, malformed response envelopes
+        are errors, never evidence that a CRM synchronization is complete.
+        """
+        if not isinstance(owner_user_id, str) or not owner_user_id.strip():
+            raise ValueError("crm_sync_owner_required")
+
+        def timestamp(value: str) -> str:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                raise ValueError("crm_sync_timezone_required")
+            return parsed.astimezone(timezone.utc).isoformat()
+
+        params = {"select": "id,owner_user_id,business_no,crm_data,updated_at,crm_version",
+                  "owner_user_id": f"eq.{owner_user_id}", "order": "updated_at.asc,id.asc",
+                  "limit": str(max(1, min(int(limit), 1000)))}
+        if since is not None:
+            params["updated_at"] = "gte." + timestamp(since)
+        if after is not None:
+            after_at, after_id = timestamp(after[0]), str(uuid.UUID(after[1]))
+            params["or"] = f"(updated_at.gt.{after_at},and(updated_at.eq.{after_at},id.gt.{after_id}))"
+        response = _http_client().get(self._url(TABLE_CRM), headers=self.headers,
+                                      params=params, timeout=self.config.timeout)
+        if not response.ok:
+            raise RuntimeError("crm_sync_read_failed")
+        data = response.json()
+        if not isinstance(data, list) or any(not isinstance(row, dict) for row in data):
+            raise RuntimeError("crm_sync_invalid_envelope")
+        return data
 
     def select_all(
         self,

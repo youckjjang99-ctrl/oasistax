@@ -17,7 +17,7 @@ from cloud_db import (
     TABLE_STOCK,
     normalize_business_no,
 )
-from cloud_sync import sync_customer_snapshots
+from cloud_sync import sync_customer_snapshots, sync_crm_record
 from runtime_error_log import safe_public_error
 from utils import get_user_cumulative_db_path, get_user_dirs
 
@@ -157,8 +157,13 @@ def migrate_user_data(
                 "crm_data": data,
             })
         try:
-            db.upsert(TABLE_CRM, rows, "owner_user_id,business_no")
-            result["crm"] = len(rows)
+            result["crm"] = 0
+            for row in rows:
+                ok, message = sync_crm_record(user_id, row["business_no"], row["crm_data"])
+                if ok:
+                    result["crm"] += 1
+                elif message not in result["errors"]:
+                    result["errors"].append(message)
         except Exception as exc:
             result["errors"].append(_migration_error("CRM", exc))
 

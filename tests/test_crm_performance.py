@@ -126,10 +126,12 @@ class CrmPerformanceTests(unittest.TestCase):
         self.assertIn('[data-stale="true"]', source)
         self.assertIn("opacity: 1 !important", source)
 
-    def test_existing_local_crm_skips_cloud_restore_queries(self):
+    def test_recent_owner_pull_skips_redundant_cloud_queries(self):
         with patch(
             "cloud_crm_restore.load_crm_data",
-            return_value={"customers": {"company:a": {"status": "상담중"}}},
+            return_value={"customers": {"company:a": {"status": "상담중"}},
+                          "_cloud_pull": {"attempted_at": 100, "ok": True}},
+        ), patch("cloud_crm_restore.time.time", return_value=110
         ), patch("cloud_crm_restore.CloudDatabase") as database:
             result = cloud_crm_restore.restore_crm_from_cloud("owner")
         self.assertEqual(result["restored"], 0)
@@ -146,6 +148,8 @@ class CrmPerformanceTests(unittest.TestCase):
         ), patch(
             "cloud_crm_restore.CloudDatabase",
             side_effect=RuntimeError(private_error),
+        ), patch(
+            "cloud_crm_restore.mutate_crm_data",
         ):
             result = cloud_crm_restore.restore_crm_from_cloud("owner")
 

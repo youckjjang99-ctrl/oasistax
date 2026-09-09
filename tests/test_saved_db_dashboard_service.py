@@ -47,7 +47,7 @@ def test_user_db_dashboard_returns_count_only_allowlisted_metrics():
 def test_user_db_list_applies_server_filter_and_pagination():
     database = _FakeDatabase(
         {
-            "oasis_list_user_db_assignments": [
+            "oasis_list_user_db_assignments_v2": [
                 {
                     "assignment_id": "assignment-one",
                     "company_id": "company-one",
@@ -55,6 +55,11 @@ def test_user_db_list_applies_server_filter_and_pagination():
                     "company_name": "테스트 업체",
                     "own_memo": "후속 연락",
                     "total_count": 121,
+                    "contact_summary_loaded": True,
+                    "current_assignment_contact_count": 0,
+                    "latest_contact_result": None,
+                    "latest_contacted_at": None,
+                    "latest_next_contact_at": None,
                     "assigned_user_id": "다른 사용자 노출 금지",
                 }
             ]
@@ -82,7 +87,7 @@ def test_user_db_list_applies_server_filter_and_pagination():
 
 
 def test_user_db_list_rejects_unknown_client_filter():
-    database = _FakeDatabase({"oasis_list_user_db_assignments": []})
+    database = _FakeDatabase({"oasis_list_user_db_assignments_v2": []})
 
     result = list_user_db_assignments(
         "sales-a",
