@@ -439,8 +439,7 @@ def _render_generic_upload(user_id: str, customer: pd.Series, document_type: str
 
 
 def render_enterprise_information_assets(user_id: str, user_name: str = "") -> None:
-    st.divider()
-    st.markdown("### 기업 첨부자료 통합 등록")
+    st.markdown("#### 1. 기업 선택")
     st.caption(
         "등록·분석한 자료는 선택한 기업의 사업자등록번호에 연결되며 "
         "기업컨설팅과 AI 코파일럿에서 자동으로 활용됩니다."
@@ -450,9 +449,23 @@ def render_enterprise_information_assets(user_id: str, user_name: str = "") -> N
     )
     labels, row_map = build_customer_labels(customers)
     if not labels:
-        st.info("먼저 위 크레탑 또는 개인사업자 등록에서 기업 기본정보를 저장해주세요.")
+        st.info("먼저 ‘새 기업 등록’에서 크레탑 PDF 또는 개인사업자 신고서로 기업 기본정보를 저장해 주세요.")
         return
-    selected = st.selectbox("자료를 연결할 기업", labels, key="enterprise_information_asset_customer")
+    # Never silently attach a document to the first company in a long list.
+    preferred = _normalize_business_no(st.session_state.pop("enterprise_information_preferred_business_no", ""))
+    if preferred:
+        matches = [label for label in labels if _normalize_business_no(
+            customers.loc[row_map[label]].get("사업자등록번호", "")
+        ) == preferred]
+        if len(matches) == 1:
+            st.session_state["enterprise_information_asset_customer"] = matches[0]
+    if st.session_state.get("enterprise_information_asset_customer") not in labels:
+        st.session_state.pop("enterprise_information_asset_customer", None)
+    selected = st.selectbox("자료를 연결할 기업", labels, index=None,
+                            placeholder="기업명으로 검색해 선택하세요", key="enterprise_information_asset_customer")
+    if selected is None:
+        st.caption("기업을 선택하면 해당 기업에 필요한 자료만 업로드할 수 있습니다.")
+        return
     customer = customers.loc[row_map[selected]]
     business_no = _normalize_business_no(customer.get("사업자등록번호", ""))
     company_name = _clean(customer.get("업체명", ""))
@@ -463,27 +476,23 @@ def render_enterprise_information_assets(user_id: str, user_name: str = "") -> N
     st.session_state["_oasis_active_company_business_no"] = business_no
     st.session_state["_oasis_active_company_name"] = company_name
 
-    metadata_mtime_ns, metadata_size = _enterprise_source_overview_revision(
-        user_id
-    )
-    overview = _load_enterprise_source_overview_cached(
-        user_id,
-        business_no,
-        company_name,
-        metadata_mtime_ns,
-        metadata_size,
-    )
-    st.dataframe(pd.DataFrame([
-        {"자료": DOCUMENT_TYPES[item], "상태": "등록됨" if overview[item]["available"] else "미등록", "연결 건수": overview[item]["count"]}
-        for item in UPLOAD_DOCUMENT_TYPES
-    ]), hide_index=True, use_container_width=True)
+    if st.toggle("이미 등록한 자료 현황 보기", key="enterprise_information_show_overview"):
+        metadata_mtime_ns, metadata_size = _enterprise_source_overview_revision(user_id)
+        overview = _load_enterprise_source_overview_cached(
+            user_id, business_no, company_name, metadata_mtime_ns, metadata_size,
+        )
+        st.dataframe(pd.DataFrame([
+            {"자료": DOCUMENT_TYPES[item], "상태": "등록됨" if overview[item]["available"] else "미등록", "연결 건수": overview[item]["count"]}
+            for item in UPLOAD_DOCUMENT_TYPES
+        ]), hide_index=True, use_container_width=True)
+    st.markdown("#### 2. 자료 종류 선택·업로드")
     chosen_label = st.selectbox(
         "등록할 자료", [DOCUMENT_TYPES[item] for item in UPLOAD_DOCUMENT_TYPES],
         key="enterprise_information_document_type",
     )
     document_type = next(key for key, label in DOCUMENT_TYPES.items() if label == chosen_label)
-    _render_note_input(user_id, customer, document_type)
-    st.divider()
+    with st.expander("자료 메모 · 선택사항", expanded=False):
+        _render_note_input(user_id, customer, document_type)
 
     if document_type == "consultation_audio":
         from consultation_journal import render_audio_consultation_journal, render_saved_consultation_journals
