@@ -135,7 +135,9 @@ def save_matching_preferences(
         raise ValueError("사업자등록번호가 확인되어야 매칭설정을 저장할 수 있습니다.")
 
     data = _load_all(user_id)
+    current = data.get(key, {})
     record = {
+        **(current if isinstance(current, dict) else {}),
         "사업자등록번호": key,
         "업체명": _safe_text(company_name, 120),
         "매칭키워드": split_keywords(matching_keywords),

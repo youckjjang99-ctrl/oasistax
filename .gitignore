@@ -41,6 +41,7 @@ _update_backups/
 
 # Local test/cache state
 .pytest_cache/
+tmp/
 
 # Customer/runtime artifacts must never be newly added to Git.
 # Existing tracked legacy files are intentionally not removed by this rule.

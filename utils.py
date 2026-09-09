@@ -1369,13 +1369,18 @@ def _find_legacy_customer_matches(
 
     company_key = normalize_company_name(company_name)
     representative_key = normalize_person_name(representative_name)
-    if not company_key:
+    if not company_key or not representative_key or "대표자명" not in df.columns:
         return pd.DataFrame(columns=columns)
 
     mask = df["업체명"].apply(normalize_company_name).eq(company_key)
     if representative_key and "대표자명" in df.columns:
         mask = mask & df["대표자명"].apply(normalize_person_name).eq(
             representative_key
+        )
+    if "사업자등록번호" in df.columns:
+        # A different valid business number is a different company, even if names match.
+        mask = mask & df["사업자등록번호"].map(
+            lambda value: len(re.sub(r"\D", "", str(value or ""))) != 10
         )
     return df.loc[mask].copy()
 
@@ -1424,17 +1429,11 @@ def link_business_no_to_legacy_customer(
     if df.empty or "업체명" not in df.columns:
         return False
 
-    company_key = normalize_company_name(company_name)
-    representative_key = normalize_person_name(representative_name)
-
-    mask = df["업체명"].apply(normalize_company_name).eq(company_key)
-    if representative_key and "대표자명" in df.columns:
-        mask = mask & df["대표자명"].apply(normalize_person_name).eq(
-            representative_key
-        )
-
-    indexes = list(df.index[mask])
-    if not indexes:
+    legacy_matches = _find_legacy_customer_matches(
+        cumulative_path, company_name=company_name, representative_name=representative_name,
+    )
+    indexes = list(legacy_matches.index)
+    if len(indexes) != 1:
         return False
 
     index = indexes[0]
@@ -1461,8 +1460,20 @@ def append_cretop_to_user_customer_db(pdf_path, user_id, manager_name="", duplic
     if error:
         return cumulative_path, 0, error, data, pd.DataFrame()
 
+    # Parser success is not sufficient: never append an empty/OCR-failed company.
+    company_name = str(data.get("업체명") or data.get("기업명") or "").strip()
+    business_digits = re.sub(r"\D", "", str(data.get("사업자등록번호") or data.get("사업자번호") or ""))
+    if not company_name or len(business_digits) != 10:
+        return (
+            cumulative_path, 0,
+            "업체명과 사업자등록번호를 확인할 수 없어 등록하지 않았습니다.",
+            data, pd.DataFrame(),
+        )
+
     columns = get_customer_db_columns()
     row = build_customer_row_from_cretop(data, columns)
+    if "담당자명" in row and manager_name:
+        row["담당자명"] = str(manager_name).strip()
     df_new = pd.DataFrame([row], columns=columns)
     df_new = _normalize_customer_db_frame(df_new, columns)
 
@@ -1616,7 +1627,7 @@ def update_user_customer_record(user_id, row_index, updates):
     return True, f"고객정보 {len(changed)}개 항목을 수정했습니다."
 
 
-def refresh_existing_customer_from_cretop(user_id, extracted_data):
+def refresh_existing_customer_from_cretop(user_id, extracted_data, *, reviewed_fields=None):
     """
     동일 사업자번호의 기존 고객을 찾아 크레탑 추출값으로 갱신한다.
 
@@ -1652,23 +1663,16 @@ def refresh_existing_customer_from_cretop(user_id, extracted_data):
             .eq(business_no)
         )
 
-    if not mask.any() and company_name and "업체명" in df.columns:
-        company_mask = (
-            df["업체명"]
-            .apply(normalize_company_name)
-            .eq(normalize_company_name(company_name))
+    if not mask.any():
+        legacy_matches = _find_legacy_customer_matches(
+            cumulative_path, company_name=company_name, representative_name=representative_name,
         )
-        if representative_name and "대표자명" in df.columns:
-            company_mask = company_mask & (
-                df["대표자명"]
-                .apply(normalize_person_name)
-                .eq(normalize_person_name(representative_name))
-            )
-        mask = company_mask
+        if len(legacy_matches.index) == 1:
+            mask = df.index.isin(legacy_matches.index)
 
     matching_indexes = list(df.index[mask])
-    if not matching_indexes:
-        return False, "동일 고객을 찾지 못해 기존 정보를 갱신하지 못했습니다.", 0
+    if len(matching_indexes) != 1:
+        return False, "동일 고객을 하나로 확인하지 못해 기존 정보를 갱신하지 않았습니다.", 0
 
     row_data = build_customer_row_from_cretop(data, columns)
     index = matching_indexes[0]
@@ -1676,6 +1680,8 @@ def refresh_existing_customer_from_cretop(user_id, extracted_data):
     priority_fields = {
         "사업자등록번호",
         "사업장 소재지",
+        "시도",
+        "시군구",
         "설립일",
         "설립년도",
         "종업원수",
@@ -1696,9 +1702,18 @@ def refresh_existing_customer_from_cretop(user_id, extracted_data):
         "특허보유",
         "상표",
     }
+    # Only the explicit review form may replace these non-empty basic fields.
+    # Existing callers retain their original fill-missing-only behaviour.
+    priority_fields.update(set(reviewed_fields or ()) & {
+        "업체명", "대표자명", "사업자등록번호", "업종명", "사업장 소재지",
+        "법인등록번호", "설립일", "종업원수", "기업유형", "기업규모",
+    })
 
     updated_fields = []
     for column in columns:
+        if column in {"벤처", "이노비즈", "메인비즈", "기업부설연구소", "연구개발전담부서", "특허보유", "상표", "R&D수행"} and data.get(column) in (None, ""):
+            # Row builders' compatibility defaults are not evidence from this report.
+            continue
         new_value = row_data.get(column, "")
         if new_value is None:
             continue
