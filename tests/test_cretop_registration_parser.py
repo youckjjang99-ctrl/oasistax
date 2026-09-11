@@ -99,6 +99,52 @@ def test_unrecognized_certifications_are_unknown_and_explicit_values_preserved()
     assert result["특허보유"] == ""
 
 
+def test_representative_table_header_is_not_a_person_and_cover_is_preserved():
+    text = "대표자명 | 거래비중 | 결산년도 자본금 자산총계 매출액 순이익\n대표자: 예시대표\n"
+    assert worker.extract_identity(text)["대표자명"] == "예시대표"
+    assert worker.extract_identity(text.split("\n대표자:")[0])["대표자명"] == ""
+
+
+@pytest.mark.parametrize("name", ["예시대표 외 1명", "王小明", "Jean O'Neil"])
+def test_representative_guard_preserves_joint_and_international_names(name):
+    assert worker.extract_identity(f"대표자명: {name}")["대표자명"] == name
+
+
+def test_certification_panel_maps_headers_and_statuses_by_column():
+    result = worker.extract_certifications("""
+기술력 기업인증ㆍ산업재산권 현황
+기업인증
+( 벤처 ) ( 이노비즈 ) ( 메인비즈 ) (연구개발전담부서) ( 부설연구소 )
+미인증 인증 인증 인증 미인증
+산업재산권
+주요 주주
+""")
+    assert {key: result[key] for key in ("벤처", "이노비즈", "메인비즈", "연구개발전담부서", "기업부설연구소")} == {
+        "벤처": "N", "이노비즈": "Y", "메인비즈": "Y", "연구개발전담부서": "Y", "기업부설연구소": "N",
+    }
+
+
+@pytest.mark.parametrize("headers,statuses", [
+    ("벤처 이노비즈 메인비즈 부설연구소", "인증 미인증 인증 인증 미인증"),
+    ("벤처 이노비즈 메인비즈 연구개발전담부서 부설연구소", "인증 인증 인증 미인증"),
+    ("벤처 이노비즈 읽기실패 연구개발전담부서 부설연구소", "인증 인증 인증 미인증"),
+])
+def test_incomplete_certification_rows_do_not_shift_or_guess_values(headers, statuses):
+    result = worker.extract_certifications(f"기업인증\n{headers}\n{statuses}\n산업재산권")
+    assert all(result[key] == "" for key in ("벤처", "이노비즈", "메인비즈", "연구개발전담부서", "기업부설연구소"))
+
+
+def test_conflicting_certifications_and_other_companies_are_not_used():
+    assert worker.extract_certifications("기업인증\n이노비즈 인증\n이노비즈 미인증\n산업재산권")["이노비즈"] == ""
+    assert worker.extract_certifications("기업인증\n주요 구매처\n메인비즈 인증")["메인비즈"] == ""
+    assert worker.extract_certifications("기업인증\n벤처 이노비즈 메인비즈\n미인증 인증\n심사 별도정보\n인증")["메인비즈"] == ""
+
+
+def test_certification_last_column_does_not_borrow_first_column_status():
+    result = worker.extract_certifications("벤처 이노비즈 메인비즈\n미인증 인증 인증")
+    assert result["메인비즈"] == "Y"
+
+
 def test_missing_company_financials_never_borrow_peer_sales():
     result = worker.parse_document_text(OVERVIEW + """
 요약 손익계산서 단위: 백만원
@@ -171,6 +217,120 @@ def test_text_pdf_needs_no_ocr(monkeypatch):
     result = worker.extract_document("synthetic.pdf", progress=lambda *args: None)
     assert state["ocr_calls"] == []
     assert result["_extraction"]["method"] == "text"
+
+
+def test_ocr_retries_incomplete_overview_even_when_company_name_was_read(monkeypatch):
+    state = fake_document(monkeypatch, ["", ""])
+    def ocr(document, index, *, psm=6, **kwargs):
+        state["ocr_calls"].append((index, psm))
+        if index == 0:
+            return f"기업명: (주)예시테스트\n사업자번호: {BUSINESS}\n대표자: 예시대표"
+        return OVERVIEW if psm == 4 else f"기업명: (주)예시테스트\n사업자번호: {BUSINESS}"
+    monkeypatch.setattr(worker, "_ocr_pdf_page", ocr)
+    result = worker.extract_document("synthetic.pdf", progress=lambda *args: None)
+    assert (1, 4) in state["ocr_calls"]
+    assert result["법인등록번호"] == CORPORATE
+    assert result["설립일"] == "2026-05-08"
+    assert result["종업원수"] == ""
+
+
+def test_optional_layout_retry_failure_preserves_existing_ocr(monkeypatch):
+    state = fake_document(monkeypatch, [""])
+    def ocr(document, index, *, psm=6, **kwargs):
+        if psm != 6:
+            raise TimeoutError("private source detail")
+        return f"기업명: 예시회사\n사업자번호: {BUSINESS}"
+    monkeypatch.setattr(worker, "_ocr_pdf_page", ocr)
+    result = worker.extract_document("synthetic.pdf", progress=lambda *args: None)
+    assert result["사업자등록번호"] == BUSINESS
+    assert state["closed"] is True
+
+
+CERT_PANEL = "기업인증\n벤처 이노비즈 메인비즈 연구개발전담부서 부설연구소\n미인증 인증 인증 인증 미인증\n산업재산권"
+
+
+def test_ocr_retry_cannot_replace_known_company_with_another_company(monkeypatch):
+    import time
+    original = f"기업명: 다른예시회사\n사업자번호: {BUSINESS}"
+    monkeypatch.setattr(worker, "_ocr_pdf_page", lambda *args, **kwargs: OVERVIEW)
+    assert worker._improve_identity_ocr(None, 1, original, mode="full", deadline=time.monotonic()+30) == original
+
+
+def test_ocr_retry_accepts_equivalent_legal_company_notation(monkeypatch):
+    import time
+    original = f"기업명: 주식회사 예시테스트\n사업자번호: {BUSINESS}"
+    monkeypatch.setattr(worker, "_ocr_pdf_page", lambda *args, **kwargs: OVERVIEW)
+    assert worker._improve_identity_ocr(None, 1, original, mode="full", deadline=time.monotonic()+30) == OVERVIEW
+
+
+def test_ocr_retry_does_not_discard_previously_read_business_number(monkeypatch):
+    import time
+    original = f"기업명: (주)예시테스트\n사업자번호: {BUSINESS}"
+    candidate = OVERVIEW.replace(BUSINESS, "")
+    monkeypatch.setattr(worker, "_ocr_pdf_page", lambda *args, **kwargs: candidate)
+    assert worker._improve_identity_ocr(None, 1, original, mode="full", deadline=time.monotonic()+30) == original
+
+
+def test_conflicting_supplemental_certification_is_unknown_not_overwritten(monkeypatch):
+    import time
+    original = "기업인증\n메인비즈 미인증\n산업재산권"
+    monkeypatch.setattr(worker, "_ocr_pdf_page", lambda *args, **kwargs: CERT_PANEL)
+    evidence, warning = worker._certification_ocr_evidence(None, 0, original, deadline=time.monotonic()+30)
+    assert evidence["메인비즈"] == ""
+    assert warning == "certification_evidence_conflict"
+    assert worker.parse_document_text(original, certification_evidence=evidence)["메인비즈"] == ""
+    assert worker.parse_document_text(original, certification_evidence={"메인비즈":"Y"})["메인비즈"] == ""
+
+
+def test_original_certification_conflict_cannot_be_resolved_by_ocr(monkeypatch):
+    import time
+    original = "기업인증\n메인비즈 인증\n메인비즈 미인증\n산업재산권"
+    monkeypatch.setattr(worker, "_ocr_pdf_page", lambda *args, **kwargs: CERT_PANEL)
+    evidence, warning = worker._certification_ocr_evidence(None, 0, original, deadline=time.monotonic()+30)
+    assert evidence["메인비즈"] == ""
+    assert warning == "certification_evidence_conflict"
+    assert worker.parse_document_text(original, certification_evidence={"메인비즈":"Y"})["메인비즈"] == ""
+
+
+def test_certificate_ocr_supplement_does_not_replace_financial_page(monkeypatch):
+    fake_document(monkeypatch, ["", "", ""])
+    calls = []
+    def ocr(document, index, *, remove_table_borders=False, **kwargs):
+        calls.append((index, remove_table_borders))
+        if index < 2:
+            return OVERVIEW
+        if remove_table_borders:
+            return CERT_PANEL + "\n요약 손익계산서 단위: 백만원\n매출액 999\n요약 현금흐름"
+        return "기업인증\n미인증 인증 인증 인증 미인증\n산업재산권\n요약 손익계산서 단위: 백만원\n매출액 25\n요약 현금흐름"
+    monkeypatch.setattr(worker, "_ocr_pdf_page", ocr)
+    result = worker.extract_document("synthetic.pdf", progress=lambda *args: None)
+    assert (2, True) in calls
+    assert result["매출액"] == 25_000_000
+    assert result["메인비즈"] == result["이노비즈"] == "Y"
+    assert "메인비즈" in result["키워드메모"]
+
+
+def test_unreadable_certificate_ocr_stays_unknown_with_safe_warning(monkeypatch):
+    fake_document(monkeypatch, [""])
+    monkeypatch.setattr(worker, "_ocr_pdf_page", lambda *args, **kwargs: OVERVIEW + "\n기업인증\n미인증 인증 인증 인증 미인증\n산업재산권")
+    result = worker.extract_document("synthetic.pdf", progress=lambda *args: None)
+    assert result["메인비즈"] == result["이노비즈"] == ""
+    assert "certification_ocr_incomplete" in result["_extraction"]["warnings"]
+
+
+def test_blue_outline_removal_preserves_letters_black_status_and_original():
+    from PIL import Image, ImageDraw
+    image = Image.new("RGB", (1000, 1000), "white")
+    draw = ImageDraw.Draw(image)
+    blue = (0, 100, 255)
+    draw.rectangle((100, 100, 220, 125), outline=blue, width=2)
+    draw.rectangle((120, 108, 123, 116), fill=blue)  # small disconnected letter
+    draw.rectangle((130, 138, 140, 150), fill="black")
+    result = worker._remove_blue_table_outlines(image)
+    assert result.getpixel((100, 110)) == (255, 255, 255)
+    assert result.getpixel((121, 110)) == blue
+    assert result.getpixel((135, 140)) == (0, 0, 0)
+    assert image.getpixel((100, 110)) == blue
 
 
 def test_empty_ocr_is_an_error_and_missing_backend_has_safe_code(monkeypatch):
