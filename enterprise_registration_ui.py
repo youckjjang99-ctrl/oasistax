@@ -31,6 +31,15 @@ FINANCIAL_FIELDS = (
 )
 BASIC_FIELDS = ("업체명", "대표자명", "사업자등록번호", "업종명", "사업장 소재지")
 EXTRA_FIELDS = ("법인등록번호", "설립일", "종업원수", "기업유형", "기업규모")
+FINANCIAL_REVIEW_WARNINGS = {"financial_alternate_source", "financial_year_unconfirmed", "financial_source_conflict", "financial_table_ocr_incomplete"}
+
+
+def _basic_information_only(data):
+    result = dict(data)
+    for field in FINANCIAL_FIELDS + ("연매출", "전년도매출", "자본금"):
+        result[field] = ""
+    result["재무연도별"] = []
+    return result
 
 
 def reset_cretop_upload_state(state=None):
@@ -257,6 +266,21 @@ def render_cretop_registration(user_id, user_name, upload_dir):
         st.caption("이미지 문자를 인식한 결과입니다. 업체명과 사업자등록번호를 원본과 확인해 주세요.")
     if metadata.get("warnings"):
         st.warning("일부 페이지는 읽지 못했거나 추가 확인이 필요합니다. 아래 결과를 원본과 비교해 주세요.")
+    if {"representative_conflict", "representative_ocr_uncertain"}.intersection(metadata.get("warnings") or []):
+        st.warning("대표자명 인식 결과가 서로 다르거나 불확실해 자동 입력하지 않았습니다. 원문을 확인해 대표자명을 직접 입력해 주세요. 공란으로 저장하면 기존 대표자명은 유지됩니다.")
+    financial_review_required = bool(FINANCIAL_REVIEW_WARNINGS.intersection(metadata.get("warnings") or []))
+    if "financial_alternate_source" in (metadata.get("warnings") or []):
+        st.warning("표준 요약표 대신 문서의 다른 재무표에서 읽은 값이 있습니다. 표에 따라 금액이 다를 수 있으므로 출처와 원문을 확인해 주세요.")
+    if "financial_year_unconfirmed" in (metadata.get("warnings") or []):
+        st.warning("일부 재무표의 결산연도를 확인하지 못했습니다. 최신년도 자료라고 확정하지 않았습니다.")
+    if "financial_source_conflict" in (metadata.get("warnings") or []):
+        st.warning("재무표 인식 결과가 서로 달라 해당 금액은 자동 반영하지 않았습니다. 원문 확인이 필요합니다.")
+    source_labels = {"summary": "요약표", "detail": "상세표", "alternate": "대체 재무표", "unavailable": "미확인"}
+    for kind, title in (("income", "손익"), ("balance", "재무상태")):
+        source = (metadata.get("financial_sources") or {}).get(kind)
+        if source:
+            years = ", ".join(str(year) for year in source.get("years", [])) or "미확인"
+            st.caption(f"{title} 출처: {source_labels.get(source.get('kind'), '미확인')} · 결산연도: {years} · 아래 금액은 원 단위입니다.")
     if not has_financial_data(data):
         st.info("문서에서 재무정보가 확인되지 않았습니다. 재무값은 공란으로 두고 기본정보만 등록합니다.")
     prefs_key = "cretop_loaded_preferences"
@@ -281,7 +305,7 @@ def render_cretop_registration(user_id, user_name, upload_dir):
                     edits[field] = st.text_input(field + (" *" if field in ("업체명", "사업자등록번호") else ""),
                                                 value=str(data.get(field) or ""), key="cretop_edit_" + field)
         edits["사업장 소재지"] = st.text_input("사업장 소재지", value=str(data.get("사업장 소재지") or ""), key="cretop_edit_사업장 소재지")
-        with st.expander("추가 기업정보·재무·인증정보 확인", expanded=False):
+        with st.expander("추가 기업정보·재무·인증정보 확인", expanded=financial_review_required):
             for field in EXTRA_FIELDS:
                 value = data.get(field)
                 edits[field] = st.text_input(field, value="" if value is None else str(value), key="cretop_edit_" + field)
@@ -289,6 +313,10 @@ def render_cretop_registration(user_id, user_name, upload_dir):
                 {"항목": field, "추출값": "미확인" if data.get(field) in (None, "") else str(data[field])}
                 for field in FINANCIAL_FIELDS + ("벤처", "이노비즈", "메인비즈", "기업부설연구소", "연구개발전담부서", "특허보유", "상표")
             ]), hide_index=True, width="stretch")
+        include_financial = True
+        if financial_review_required and has_financial_data(data):
+            include_financial = st.checkbox("재무표 출처·결산연도·금액을 원문과 확인했으며 재무정보도 함께 저장합니다.", key="cretop_confirm_financial")
+            st.caption("선택하지 않으면 기본정보·인증정보만 저장하고 기존 재무정보는 유지합니다.")
         preferences_values = _matching_fields(preferences) if preferences is not None else None
         confirm = False
         if st.session_state["cretop_needs_confirmation"]:
@@ -306,6 +334,8 @@ def render_cretop_registration(user_id, user_name, upload_dir):
     if validation_error:
         st.error(validation_error)
         return
+    if not include_financial:
+        reviewed = _basic_information_only(reviewed)
     try:
         with st.spinner("확인한 기업정보를 저장하고 있습니다..."):
             result = save_reviewed_registration(user_id, manager.strip(),

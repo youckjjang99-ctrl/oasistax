@@ -285,3 +285,38 @@ def test_app_keeps_both_registration_modes_but_defers_attachment_loading():
     assert branch.count("render_enterprise_information_assets(CURRENT_USER_ID") == 1
     assert "render_personal_business_registration(" in branch
     assert "render_cretop_registration(" in branch
+
+
+def test_uncertain_representative_has_specific_warning_and_can_be_edited(tmp_path, monkeypatch, services):
+    data = {**basic_data(), "대표자명": "", "_extraction": {"warnings": ["representative_conflict"]}}
+    app = make_app(tmp_path, monkeypatch, data)
+    app.button(key="cretop_analyze_button").click().run()
+    assert not app.exception
+    assert any("대표자명 인식 결과" in item.value for item in app.warning)
+    assert app.text_input(key="cretop_edit_대표자명").value == ""
+    app.text_input(key="cretop_edit_대표자명").set_value("검증대표")
+    app.button[-1].click().run()
+    saved = services["append_cretop_to_user_customer_db"].call_args.kwargs["extracted_data"]
+    assert saved["대표자명"] == "검증대표"
+
+
+@pytest.mark.parametrize("approved", [False, True])
+def test_uncertain_financials_require_explicit_review(tmp_path, monkeypatch, services, approved):
+    data = {**basic_data(), "매출액": 100, "연매출": 100, "당기순이익": -5,
+            "재무연도별": [{"연도": 2025, "매출액": 100, "당기순이익": -5}],
+            "_extraction": {"warnings": ["financial_alternate_source", "financial_year_unconfirmed"],
+                            "financial_sources": {"income": {"kind": "alternate", "years": []}}}}
+    app = make_app(tmp_path, monkeypatch, data)
+    app.button(key="cretop_analyze_button").click().run()
+    assert not app.exception
+    assert any("결산연도를 확인하지 못했습니다" in item.value for item in app.warning)
+    assert app.checkbox(key="cretop_confirm_financial").value is False
+    if approved:
+        app.checkbox(key="cretop_confirm_financial").check()
+    app.button[-1].click().run()
+    assert not app.exception
+    saved = services["append_cretop_to_user_customer_db"].call_args.kwargs["extracted_data"]
+    assert saved["매출액"] == (100 if approved else "")
+    assert saved["당기순이익"] == (-5 if approved else "")
+    assert bool(saved["재무연도별"]) is approved
+    assert saved["업체명"] == data["업체명"]
