@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 import time
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 
 
@@ -27,31 +29,68 @@ def regex_first(pattern, text, flags=0):
     return match.group(1).strip() if match else ""
 
 
-def parse_latest_number_from_line(label, block):
-    escaped = re.escape(label)
-    patterns = [
-        rf"(?m)^[ \t]*{escaped}(?:\([^\n]*?\))?[ \t]+([^\n]*)",
-        rf"(?<![가-힣]){escaped}(?:\([^\n]*?\))?[ \t]+([^\n]*)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, block or "")
-        if not match:
+_FINANCIAL_NUMBER = r"[+\-−]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
+_FINANCIAL_CELL = rf"(?:{_FINANCIAL_NUMBER}|\([ \t]*{_FINANCIAL_NUMBER}[ \t]*\)|[-–—])"
+
+
+def _financial_cells(raw):
+    """A separated dash is an empty cell, never the next cell's minus sign."""
+    raw = raw.strip()
+    if not raw:
+        return []
+    if not re.fullmatch(rf"{_FINANCIAL_CELL}(?:[ \t]+{_FINANCIAL_CELL})*", raw):
+        return None
+    cells = []
+    for token in re.findall(_FINANCIAL_CELL, raw):
+        if token in {"-", "–", "—"}:
+            cells.append(None)
             continue
-        # A blank financial row must never borrow a date/amount from the next row.
-        raw_values = match.group(1).strip()
-        if not re.fullmatch(r"(?:-?[ \t]*\d[\d,]*(?:\.\d+)?|[-–—])[ \t]*(?:(?:-?[ \t]*\d[\d,]*(?:\.\d+)?|[-–—])[ \t]*)*", raw_values):
-            continue
-        values = re.findall(r"-?[ \t]*[0-9][0-9,]*(?:\.[0-9]+)?|[-–—]", raw_values)
-        if not values:
-            continue
-        if values[-1] in {"-", "–", "—"}:
+        parenthesized = token.startswith("(")
+        normalized = token.strip("() \t").replace(",", "").replace("−", "-")
+        value = float(normalized)
+        if not math.isfinite(value):
             return None
-        raw = values[-1].replace(" ", "").replace(",", "")
-        try:
-            return float(raw)
-        except ValueError:
-            continue
-    return None
+        cells.append(-abs(value) if parenthesized else value)
+    return cells
+
+
+def _financial_row_evidence(label, block):
+    escaped = re.escape(label)
+    # Account-name annotations are not numeric parentheses denoting losses.
+    suffix = r"(?:\([^()\n]*[가-힣A-Za-z][^()\n]*\))?"
+    patterns = [
+        rf"(?m)^[ \t]*{escaped}{suffix}(?:[ \t]+([^\n]*)|(?=\n|$))",
+        rf"(?<![가-힣]){escaped}{suffix}(?:[ \t]+([^\n]*)|(?=\n|$))",
+    ]
+    valid = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, block or ""):
+            # Ignore unreadable rows, but retain explicit blanks as evidence.
+            values = _financial_cells(match.group(1) or "")
+            if values is not None and values not in valid:
+                valid.append(values)
+    return {"recognized": bool(valid), "conflict": len(valid) > 1,
+            "cells": valid[0] if len(valid) == 1 else None}
+
+
+def _financial_row_cells(label, block):
+    return _financial_row_evidence(label, block)["cells"]
+
+
+def _financial_account_evidence(labels, block):
+    evidence = [_financial_row_evidence(label, block) for label in labels]
+    valid = []
+    for item in evidence:
+        if item["cells"] is not None and item["cells"] not in valid:
+            valid.append(item["cells"])
+    conflict = any(item["conflict"] for item in evidence) or len(valid) > 1
+    return {"recognized": any(item["recognized"] for item in evidence),
+            "conflict": conflict, "cells": valid[0] if len(valid) == 1 and not conflict else None}
+
+
+def parse_latest_number_from_line(label, block):
+    values = _financial_row_cells(label, block)
+    return values[-1] if values else None
 
 
 def extract_block(text, start_heading, end_headings):
@@ -77,12 +116,7 @@ def _find_amount_anywhere(labels, text, unit_multiplier):
     return ""
 
 
-def latest_financial_amount(label, text):
-    """
-    요약표 → 상세표 → 문서 전체 후보계정 순으로 최신 값을 탐색한다.
-    업체별 크레탑 표 제목이나 계정명이 달라도 대응한다.
-    """
-    income_aliases = {
+_INCOME_ALIASES = {
         "매출액": ["매출액", "매출", "영업수익", "수익"],
         "영업이익": ["영업이익", "영업이익(손실)", "영업손익"],
         "당기순이익": [
@@ -94,81 +128,113 @@ def latest_financial_amount(label, text):
             "법인세비용차감후순이익",
             "순이익",
         ],
-    }
-    balance_aliases = {
+}
+_BALANCE_ALIASES = {
         "자산총계": ["자산총계", "자산"],
         "부채총계": ["부채총계", "부채"],
         "자본총계": ["자본총계", "자본"],
-    }
+}
+_STATEMENT_HEADING = r"(?:(?P<prefix>요약|상세|포괄)\s*)?[ \t]*(?P<kind>손익(?:계산서|현황|내역)|재무상태표)"
+_FINANCIAL_END = (
+    r"(?:요약\s*)?(?:현금흐름|재무비율)|자본변동|이익잉여금처분|연혁|"
+    + "|".join(PEER_HEADINGS)
+)
 
-    if label in income_aliases:
-        summary = extract_block(
-            text,
-            r"요약\s*손익계산서",
-            [r"요약\s*현금흐름", r"요약\s*재무비율", r"연혁", r"재무상태표"] + PEER_HEADINGS,
-        )
-        for alias in income_aliases[label]:
-            value = parse_latest_number_from_line(alias, summary)
-            if value is not None:
-                return int(round(value * 1_000_000))
 
-        detail = extract_block(
-            text,
-            r"(?:상세\s*)?손익계산서\s+단위\s*:?\s*천원",
-            [r"현금흐름표", r"자본변동표", r"이익잉여금처분계산서", r"재무비율"] + PEER_HEADINGS,
-        )
-        for alias in income_aliases[label]:
-            value = parse_latest_number_from_line(alias, detail)
-            if value is not None:
-                return int(round(value * 1_000))
+def _financial_unit(block, default=None):
+    unit = re.search(r"단위\s*[:：]?\s*([가-힣]+)", block[:160])
+    if unit:
+        return {"백만원": 1_000_000, "천원": 1_000, "원": 1}.get(unit.group(1))
+    return default
 
-        # CRETOP also includes peers' sales tables. An explicit missing company
-        # statement must not fall through to those unrelated industry amounts.
-        if re.search(r"조회된\s*자료가\s*없습니다|해당\s*자료가\s*없습니다", summary):
-            return ""
 
-        # Alternate statement names are supported, but never search all amounts
-        # in the report: industry/peer tables are not this company's financials.
-        for heading in re.finditer(r"(?:포괄\s*)?손익(?:계산서|현황|내역)", text):
-            tail = text[heading.end():heading.end() + 12000]
-            section = re.split(
-                r"(?:요약\s*)?(?:현금흐름|재무비율|재무상태표)|자본변동|연혁|"
-                r"동종\s*업계|동종\s*업종|업종\s*평균|업계\s*평균|산업\s*평균|"
-                r"산업분석|비교분석|기업순위",
-                tail, maxsplit=1,
-            )[0]
-            unit = re.search(r"단위\s*[:：]?\s*(백만원|천원)", section[:160])
-            if not unit:
-                continue
-            result = _find_amount_anywhere(
-                income_aliases[label], section[unit.end():],
-                1_000_000 if unit.group(1) == "백만원" else 1_000,
-            )
-            if result != "":
-                return result
+def _financial_statement_selection(text, income=True):
+    """Choose one company statement for all accounts; never fill gaps from MY."""
+    aliases = _INCOME_ALIASES if income else _BALANCE_ALIASES
+    headings = list(re.finditer(_STATEMENT_HEADING, text or ""))
+    candidates = []
+    for index, heading in enumerate(headings):
+        if heading.group("kind").startswith("손익") != income:
+            continue
+        end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
+        block = re.split(_FINANCIAL_END, text[heading.end():min(end, heading.end() + 12000)], maxsplit=1)[0]
+        summary = heading.group("prefix") == "요약"
+        unit = _financial_unit(block, 1_000_000 if summary else None)
+        if unit is None:
+            continue
+        priority = 0 if summary else (1 if heading.group("prefix") == "상세" or unit == 1_000 else 2)
+        candidates.append((priority, heading.start(), block, unit))
+    for priority, _, block, unit in sorted(candidates):
+        source = {"block": block, "unit_multiplier": unit, "kind": ("summary", "detail", "alternate")[priority]}
+        if re.search(r"조회된\s*자료가\s*없습니다|해당\s*자료가\s*없습니다", block):
+            return source
+        if any(_financial_account_evidence(names, block)["recognized"] for names in aliases.values()):
+            return source
+    return {"block": "", "unit_multiplier": 1_000_000, "kind": "unavailable"}
 
-    elif label in balance_aliases:
-        summary = extract_block(
-            text,
-            r"요약\s*재무상태표",
-            [r"요약\s*손익계산서", r"요약\s*현금흐름", r"요약\s*재무비율"] + PEER_HEADINGS,
-        )
-        for alias in balance_aliases[label]:
-            value = parse_latest_number_from_line(alias, summary)
-            if value is not None:
-                return int(round(value * 1_000_000))
 
-        detail = extract_block(
-            text,
-            r"재무상태표\s+단위\s*:?\s*천원",
-            [r"손익계산서", r"현금흐름표"] + PEER_HEADINGS,
-        )
-        for alias in balance_aliases[label]:
-            value = parse_latest_number_from_line(alias, detail)
-            if value is not None:
-                return int(round(value * 1_000))
+def _financial_statement_source(text, income=True):
+    source = _financial_statement_selection(text, income)
+    return source["block"], source["unit_multiplier"]
 
-    return ""
+
+def _financial_statement_metadata(text, income=True):
+    """Safe provenance for the extraction UI; never include account amounts."""
+    source = _financial_statement_selection(text, income)
+    columns = _financial_year_columns(source["block"])
+    aliases = _INCOME_ALIASES if income else _BALANCE_ALIASES
+    return {"kind": source["kind"], "unit_multiplier": source["unit_multiplier"],
+            "years": [year for year in (columns or []) if year is not None],
+            "year_columns": columns or [], "year_header_valid": columns is not None,
+            "conflicting_accounts": [key for key, names in aliases.items()
+                                     if _financial_account_evidence(names, source["block"])["conflict"]]}
+
+
+def _financial_year_columns(block):
+    # Only table headers may supply years; amounts such as 2024 are not years.
+    labels = [alias for names in (*_INCOME_ALIASES.values(), *_BALANCE_ALIASES.values()) for alias in names]
+    first_row = re.search(r"(?m)^[ \tⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩIVX0-9.·()]*(?:" + "|".join(map(re.escape, labels)) + r")(?:\(|[ \t\n]|$)", block)
+    header = block[:first_row.start()] if first_row else ""
+    columns = []
+    cell_pattern = r"(?:\d{3,4}(?:[./-]\d{1,2}(?:[./-]\d{1,2})?)?년?|[-–—]|미상|미확인|확인불가|N/A)"
+    for line in header.splitlines():
+        raw = line.strip()
+        label = re.match(r"^(?:구분|계정[ \t]*과목|계정|과목|결산(?:년도|연도|년월일|일)?|기준일|연도|년도)[ \t:：|]*", raw)
+        if label:
+            raw = raw[label.end():]
+        # Preserve explicit empty header columns instead of shifting later years.
+        if not raw or not (label or re.search(r"(?<!\d)20\d{2}(?!\d)", raw)):
+            continue
+        if not re.fullmatch(rf"{cell_pattern}(?:[ \t|]+{cell_pattern})*", raw):
+            return None
+        for token in re.findall(cell_pattern, raw):
+            year = re.match(r"(20\d{2})(?!\d)", token)
+            value = year.group(1) if year and int(year.group(1)) <= datetime.now().year + 1 else None
+            columns.append(value)
+    known = [year for year in columns if year is not None]
+    return columns if len(columns) <= 10 and len(known) == len(set(known)) else None
+
+
+def _financial_years(block):
+    columns = _financial_year_columns(block)
+    return [year for year in columns if year is not None] if columns is not None else None
+
+
+def latest_financial_amount(label, text):
+    aliases = _INCOME_ALIASES if label in _INCOME_ALIASES else _BALANCE_ALIASES
+    if label not in aliases:
+        return ""
+    block, unit = _financial_statement_source(text, income=label in _INCOME_ALIASES)
+    columns = _financial_year_columns(block)
+    if columns is None:
+        return ""
+    years = [year for year in columns if year is not None]
+    values = _financial_account_evidence(aliases[label], block)["cells"]
+    if not values or (columns and (not years or len(values) != len(columns))):
+        return ""
+    value = values[columns.index(max(years))] if years else values[-1]
+    amount = value * unit if value is not None else None
+    return int(round(amount)) if amount is not None and math.isfinite(amount) else ""
 
 
 CERTIFICATION_LABELS = {
@@ -267,34 +333,25 @@ def extract_certifications(text):
 
 
 
-def _extract_row_values(block, aliases, years):
+def _extract_row_values(block, aliases, years, unit_multiplier=1_000_000):
     """요약 재무표에서 계정별 연도 값을 추출한다."""
     if not block or not years:
         return {}
 
-    for alias in aliases:
-        pattern = rf"(?m)^[ \t]*{re.escape(alias)}(?:\([^\n]*?\))?[ \t]+([^\n]+)$"
-        match = re.search(pattern, block)
-        if not match:
+    tokens = _financial_account_evidence(aliases, block)["cells"]
+    # Extra chart values or a missing column must not shift the year mapping.
+    if tokens is None or len(tokens) != len(years):
+        return {}
+    result = {}
+    for year, token in zip(years, tokens):
+        if year is None:
             continue
-
-        tokens = re.findall(r"-?\d[\d,]*(?:\.\d+)?|(?<!\S)-(?!\S)", match.group(1))
-        if len(tokens) < len(years):
+        if token is None:
+            result[str(year)] = None
             continue
-
-        tokens = tokens[-len(years):]
-        result = {}
-        for year, token in zip(years, tokens):
-            if token.strip() == "-":
-                result[str(year)] = None
-                continue
-            try:
-                result[str(year)] = int(round(float(token.replace(",", "")) * 1_000_000))
-            except ValueError:
-                result[str(year)] = None
-        return result
-
-    return {}
+        amount = token * unit_multiplier
+        result[str(year)] = int(round(amount)) if math.isfinite(amount) else None
+    return result
 
 
 def extract_annual_financial_history(text):
@@ -302,35 +359,17 @@ def extract_annual_financial_history(text):
     크레탑 요약 재무상태표·손익계산서의 최근 연도별 값을 반환한다.
     단위는 원이다.
     """
-    income_block = extract_block(
-        text,
-        r"요약\s*손익계산서",
-        [r"요약\s*현금흐름", r"요약\s*재무비율", r"연혁", r"재무상태표"] + PEER_HEADINGS,
-    )
-    balance_block = extract_block(
-        text,
-        r"요약\s*재무상태표",
-        [r"요약\s*손익계산서", r"요약\s*현금흐름", r"요약\s*재무비율"] + PEER_HEADINGS,
-    )
-
-    income_years = []
-    balance_years = []
-
-    for value in re.findall(r"\b(20\d{2})\b", income_block):
-        if value not in income_years:
-            income_years.append(value)
-    for value in re.findall(r"\b(20\d{2})\b", balance_block):
-        if value not in balance_years:
-            balance_years.append(value)
-
-    income_years = income_years[-3:]
-    balance_years = balance_years[-3:]
+    income_block, income_unit = _financial_statement_source(text, income=True)
+    balance_block, balance_unit = _financial_statement_source(text, income=False)
+    income_years = _financial_year_columns(income_block) or []
+    balance_years = _financial_year_columns(balance_block) or []
 
     rows = {
         "매출액": _extract_row_values(
             income_block,
             ["매출액", "매출", "영업수익"],
             income_years,
+            income_unit,
         ),
         "당기순이익": _extract_row_values(
             income_block,
@@ -343,31 +382,35 @@ def extract_annual_financial_history(text):
                 "순이익",
             ],
             income_years,
+            income_unit,
         ),
         "자산총계": _extract_row_values(
             balance_block,
             ["자산총계", "자산"],
             balance_years,
+            balance_unit,
         ),
         "부채총계": _extract_row_values(
             balance_block,
             ["부채총계", "부채"],
             balance_years,
+            balance_unit,
         ),
         "자본총계": _extract_row_values(
             balance_block,
             ["자본총계", "자본"],
             balance_years,
+            balance_unit,
         ),
     }
 
     years = sorted(
-        set(income_years + balance_years),
+        {year for year in income_years + balance_years if year is not None},
         reverse=True,
     )
 
     history = []
-    for year in years:
+    for year in years[:3]:
         if not any(values.get(year) is not None for values in rows.values()):
             continue
         history.append({
@@ -428,13 +471,33 @@ def _valid_representative(value):
             and all(char.isalpha() or char in " .·,()-'’" for char in name))
 
 
+def _representative_resolution(text):
+    """Compare subject cover/overview evidence, never a later trading-party row."""
+    text = normalize_document_text(text)
+    scope = re.split(
+        r"(?m)^[ \t]*(?:주요\s*(?:주주|구매처|판매처)|관계\s*회사|경영진\s*현황|"
+        r"주주\s*현황|요약\s*(?:재무|손익)|MY\s*재무)", text, maxsplit=1,
+    )[0]
+    candidates = {}
+    for match in re.finditer(r"(?<![가-힣A-Za-z])대표자(?:명)?[ \t]*[:：]?[ \t]*(?:\n[ \t]*)?[^\n]*", scope):
+        value = _identity_value(match.group(), "대표자명", "대표자", validator=_valid_representative)
+        if value:
+            candidates.setdefault(re.sub(r"\s+", "", value).casefold(), value)
+    if len(candidates) > 1:
+        return "", "representative_conflict"
+    return next(iter(candidates.values()), ""), ""
+
+
+def _representative_needs_ocr_review(value):
+    # A short isolated Latin token can be damaged Hangul. Do not ban real
+    # international names in text PDFs; require verification only for OCR.
+    return bool(re.fullmatch(r"[A-Z]{2,4}", str(value or "").strip()))
+
+
 def extract_identity(text):
     text = normalize_document_text(text)
     company_name = _identity_value(text, "기업명", "회사명", "업체명")
-    representative = _identity_value(
-        text, "대표자명", "대표자",
-        validator=_valid_representative,
-    )
+    representative, _ = _representative_resolution(text)
     business_raw = _identity_value(text, "사업자등록번호", "사업자번호")
     business_no = regex_first(r"(?<!\d)(\d{3}[ \t]*-[ \t]*\d{2}[ \t]*-[ \t]*\d{5}|\d{10})(?!\d)", business_raw)
     if not business_no:
@@ -450,8 +513,15 @@ def extract_identity(text):
 def has_company_identity(data):
     return bool(data.get("업체명") or re.fullmatch(r"\d{10}", re.sub(r"\D", "", str(data.get("사업자등록번호", "")))))
 
-def parse_document_text(text, *, certification_evidence=None):
+def _financial_evidence_text(text, evidence):
+    # Supplemental OCR is isolated from identity/certification extraction.
+    blocks = [str((evidence or {}).get(kind) or "") for kind in ("income", "balance")]
+    return "\n요약 현금흐름\n".join(block for block in (*blocks, text) if block)
+
+
+def parse_document_text(text, *, certification_evidence=None, financial_evidence=None):
     text = normalize_document_text(text)
+    financial_text = _financial_evidence_text(text, financial_evidence)
     data = extract_identity(text)
     corporate_raw = _identity_value(text, "법인(주민)번호", "법인등록번호")
     data["법인등록번호"] = regex_first(r"(?<!\d)(\d{6}[ \t]*-[ \t]*\d{7}|\d{13})(?!\d)", corporate_raw).replace(" ", "")
@@ -522,14 +592,14 @@ def parse_document_text(text, *, certification_evidence=None):
         industry = re.sub(r"^\([A-Z0-9]+\)[ \t]*", "", _identity_value(text, "표준산업분류(10차)", "표준산업분류(11차)"))
     data["업종명"] = " ".join(industry.split())
 
-    data["매출액"] = latest_financial_amount("매출액", text)
+    data["매출액"] = latest_financial_amount("매출액", financial_text)
     data["연매출"] = data["매출액"]
     data["전년도매출"] = data["매출액"]
-    data["영업이익"] = latest_financial_amount("영업이익", text)
-    data["당기순이익"] = latest_financial_amount("당기순이익", text)
-    data["자산총계"] = latest_financial_amount("자산총계", text)
-    data["부채총계"] = latest_financial_amount("부채총계", text)
-    data["자본총계"] = latest_financial_amount("자본총계", text)
+    data["영업이익"] = latest_financial_amount("영업이익", financial_text)
+    data["당기순이익"] = latest_financial_amount("당기순이익", financial_text)
+    data["자산총계"] = latest_financial_amount("자산총계", financial_text)
+    data["부채총계"] = latest_financial_amount("부채총계", financial_text)
+    data["자본총계"] = latest_financial_amount("자본총계", financial_text)
 
     data.update(extract_certifications(text))
     # A supplemental OCR pass contributes only a verified certification panel,
@@ -562,7 +632,7 @@ def parse_document_text(text, *, certification_evidence=None):
     if data.get("특허보유") == "Y":
         keywords.append("특허")
     data["키워드메모"] = " / ".join(item for item in keywords if item)
-    data["재무연도별"] = extract_annual_financial_history(text)
+    data["재무연도별"] = extract_annual_financial_history(financial_text)
     data["PDF추출일시"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return data
 
@@ -618,11 +688,29 @@ def _remove_blue_table_outlines(image):
     return Image.fromarray(pixels)
 
 
+@lru_cache(maxsize=1)
+def _require_korean_ocr_languages():
+    import pytesseract
+    try:
+        languages = set(pytesseract.get_languages(config=""))
+    except UnicodeDecodeError:
+        # Windows may localize the banner/path in CP949. Language IDs are ASCII;
+        # never disable the required-language check because that banner differs.
+        import subprocess
+        probe = subprocess.run([pytesseract.pytesseract.tesseract_cmd, "--list-langs"],
+                               capture_output=True, timeout=10, check=False)
+        languages = set(probe.stdout.decode("ascii", errors="ignore").splitlines()) if probe.returncode == 0 else set()
+    if not {"kor", "eng"}.issubset(languages):
+        # Tesseract can otherwise silently run English-only after Korean fails.
+        raise pytesseract.TesseractError(1, "required_ocr_language_unavailable")
+
+
 def _ocr_pdf_page(document, index, *, psm=6, timeout=15, remove_table_borders=False):
     import fitz
     import pytesseract
     from PIL import Image, ImageOps
 
+    _require_korean_ocr_languages()
     # 180 dpi keeps table text readable while bounding CPU and image memory.
     pixmap = document[index].get_pixmap(matrix=fitz.Matrix(2.5, 2.5), alpha=False)
     image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
@@ -642,14 +730,17 @@ def _overview_quality(text):
     ))
 
 
-def _improve_identity_ocr(document, index, text, *, mode, deadline):
+def _improve_identity_ocr(document, index, text, *, mode, deadline, review=None):
     """A readable cover must not suppress retries for an unreadable overview."""
     is_overview = bool(re.search(r"기업\s*개요", text)) or (mode == "full" and index == 1)
     score = _overview_quality if is_overview else lambda value: sum(bool(v) for v in extract_identity(value).values())
     target = 8 if is_overview else 3
-    if not (is_overview or index < 2) or score(text) >= target:
+    original_identity = extract_identity(text)
+    uncertain_name = _representative_needs_ocr_review(original_identity.get("대표자명"))
+    if not (is_overview or index < 2) or (score(text) >= target and not uncertain_name):
         return text
     best, best_score = text, score(text)
+    name_evidence = [(text, original_identity.get("대표자명", ""))]
     # PSM4 preserves table rows; PSM3 remains a fallback for cover/column layouts.
     for psm in (4, 3):
         remaining = deadline - time.monotonic()
@@ -660,7 +751,6 @@ def _improve_identity_ocr(document, index, text, *, mode, deadline):
         except Exception:
             # An optional retry must not discard a successfully read page.
             continue
-        original_identity = extract_identity(text)
         candidate_identity = extract_identity(candidate)
         def comparable_name(name):
             return re.sub(r"주식회사|㈜|\(주\)|[\s().·]", "", name).casefold()
@@ -672,11 +762,28 @@ def _improve_identity_ocr(document, index, text, *, mode, deadline):
                                     ("업체명", comparable_name))
         ):
             continue
+        name_evidence.append((candidate, candidate_identity.get("대표자명", "")))
         candidate_score = score(candidate)
         if candidate_score > best_score:
             best, best_score = candidate, candidate_score
-        if best_score >= target:
+        if best_score >= target and not uncertain_name:
             break
+    if uncertain_name:
+        counts = {}
+        for _, name in name_evidence:
+            if name:
+                normalized = re.sub(r"\s+", "", name).casefold()
+                counts[normalized] = counts.get(normalized, 0) + 1
+        supported = [candidate for candidate, name in name_evidence
+                     if name and not _representative_needs_ocr_review(name)
+                     and counts.get(re.sub(r"\s+", "", name).casefold(), 0) >= 2]
+        if supported:
+            best = max(supported, key=score)
+        elif review is not None:
+            review["representative_warning"] = "representative_ocr_uncertain"
+    elif review is not None and len({re.sub(r"\s+", "", name).casefold()
+                                     for _, name in name_evidence if name}) > 1:
+        review["representative_warning"] = "representative_conflict"
     return best
 
 
@@ -713,6 +820,9 @@ def extract_document(pdf_path, mode="full", *, timeout_seconds=230, progress=emi
     page_texts = []
     warnings = []
     certification_evidence = {}
+    financial_evidence = {}
+    financial_conflicts = set()
+    identity_reviews = []
     ocr_pages = 0
     processed_pages = 0
     document = None
@@ -741,9 +851,12 @@ def extract_document(pdf_path, mode="full", *, timeout_seconds=230, progress=emi
                         original_text = text
                         ocr_text = _ocr_pdf_page(document, index, timeout=remaining)
                         ocr_pages += 1
+                        identity_review = {}
                         ocr_text = _improve_identity_ocr(
-                            document, index, ocr_text, mode=mode, deadline=deadline,
+                            document, index, ocr_text, mode=mode, deadline=deadline, review=identity_review,
                         )
+                        if identity_review.get("representative_warning"):
+                            identity_reviews.append(identity_review["representative_warning"])
                         if mode == "full":
                             evidence, warning = _certification_ocr_evidence(
                                 document, index, ocr_text, deadline=deadline,
@@ -756,6 +869,24 @@ def extract_document(pdf_path, mode="full", *, timeout_seconds=230, progress=emi
                                     warnings.append("certification_evidence_conflict")
                                 else:
                                     certification_evidence[key] = value
+                            if re.search(r"요약\s*(?:재무상태표|손익계산서)", ocr_text):
+                                try:
+                                    from cretop_ocr_tables import get_verified_financial_tables
+                                    tables, table_warnings = get_verified_financial_tables(
+                                        document, index, ocr_text, deadline=deadline,
+                                    )
+                                    warnings.extend(table_warnings)
+                                    for kind, block in tables.items():
+                                        if kind not in {"income", "balance"} or kind in financial_conflicts:
+                                            continue
+                                        if kind in financial_evidence and financial_evidence[kind] != block:
+                                            financial_conflicts.add(kind)
+                                            financial_evidence.pop(kind)
+                                            warnings.append("financial_source_conflict")
+                                        else:
+                                            financial_evidence[kind] = block
+                                except Exception:
+                                    warnings.append("financial_table_ocr_incomplete")
                         # Keep any usable embedded text even if OCR is empty or noisy.
                         text = "\n".join(part for part in (original_text, ocr_text) if part.strip())
                 except (ImportError, ModuleNotFoundError):
@@ -774,6 +905,10 @@ def extract_document(pdf_path, mode="full", *, timeout_seconds=230, progress=emi
             if mode == "identity":
                 identity = extract_identity("\n".join(page_texts))
                 if identity.get("업체명") and identity.get("사업자등록번호"):
+                    _, identity_warning = _representative_resolution("\n".join(page_texts))
+                    if identity_reviews or identity_warning:
+                        identity["대표자명"] = ""
+                        warnings.extend(identity_reviews + ([identity_warning] if identity_warning else []))
                     identity["_extraction"] = {
                         "method": "ocr" if ocr_pages else "text", "ocr_pages": ocr_pages,
                         "page_count": total, "processed_pages": processed_pages, "warnings": warnings,
@@ -784,12 +919,40 @@ def extract_document(pdf_path, mode="full", *, timeout_seconds=230, progress=emi
             document.close()
 
     joined = "\n".join(page_texts)
-    result = extract_identity(joined) if mode == "identity" else parse_document_text(joined, certification_evidence=certification_evidence)
+    result = extract_identity(joined) if mode == "identity" else parse_document_text(
+        joined, certification_evidence=certification_evidence, financial_evidence=financial_evidence,
+    )
+    _, identity_warning = _representative_resolution(joined)
+    if identity_reviews or identity_warning:
+        result["대표자명"] = ""
+        warnings.extend(identity_reviews + ([identity_warning] if identity_warning else []))
+    financial_sources = {}
+    if mode == "full":
+        for name, income in (("income", True), ("balance", False)):
+            source = _financial_statement_metadata(_financial_evidence_text(joined, financial_evidence), income=income)
+            source["verified_table_ocr"] = name in financial_evidence
+            financial_sources[name] = source
+            if source.get("conflicting_accounts"):
+                warnings.append("financial_source_conflict")
+            if name in financial_conflicts:
+                source["kind"] = "conflict"
+                for field in (_INCOME_ALIASES if income else _BALANCE_ALIASES):
+                    result[field] = ""
+                    for row in result.get("재무연도별", []):
+                        if field in row:
+                            row[field] = None
+                if income:
+                    result["연매출"] = result["전년도매출"] = ""
+            if source["kind"] == "alternate":
+                warnings.append("financial_alternate_source")
+            if source["kind"] != "unavailable" and not source["years"]:
+                warnings.append("financial_year_unconfirmed")
     if not has_company_identity(result):
         raise CretopExtractionError("ocr_unavailable" if "ocr_unavailable" in warnings else "identity_not_found")
     result["_extraction"] = {
         "method": "ocr" if ocr_pages else "text", "ocr_pages": ocr_pages,
-        "page_count": total, "processed_pages": processed_pages, "warnings": warnings,
+        "page_count": total, "processed_pages": processed_pages, "warnings": list(dict.fromkeys(warnings)),
+        "financial_sources": financial_sources,
     }
     return result
 

@@ -141,8 +141,19 @@ def save_cretop_financial_snapshot(
 ) -> bool:
     """
     Cretop analysis result is saved separately for stock valuation.
-    Existing customer DB is never modified.
+    Missing identity fields preserve the previous identity. Financial amounts
+    and annual rows retain their existing replacement semantics; no year merge
+    is inferred here. Existing customer DB is never modified.
     """
+    from copy import deepcopy
+
+    def known(value):
+        if value is None:
+            return False
+        if isinstance(value, (dict, list)):
+            return bool(value)
+        return str(value).strip().lower() not in {"", "none", "nan", "nat", "<na>", "-", "미확인"}
+
     data = _normalize_financial_snapshot(extracted_data or {})
     business_no = _normalize_business_no(
         data.get("사업자등록번호", data.get("사업자번호", ""))
@@ -151,7 +162,10 @@ def save_cretop_financial_snapshot(
         return False
 
     cache = _load_financial_cache(user_id)
-    cache[business_no] = {
+    existing = cache.get(business_no, {})
+    if not isinstance(existing, dict):
+        return False
+    incoming = {
         "업체명": data.get("업체명", ""),
         "대표자명": data.get("대표자명", ""),
         "사업자등록번호": business_no,
@@ -182,6 +196,10 @@ def save_cretop_financial_snapshot(
         "PDF추출일시": data.get("PDF추출일시", ""),
         "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+    for field in ("업체명", "대표자명", "법인등록번호", "사업장 소재지", "설립일"):
+        if not known(incoming[field]):
+            incoming[field] = deepcopy(existing.get(field)) if known(existing.get(field)) else ""
+    cache[business_no] = incoming
     _save_financial_cache(user_id, cache)
     sync_financial_snapshot(user_id, business_no, cache[business_no])
     return True
