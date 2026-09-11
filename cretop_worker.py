@@ -171,8 +171,64 @@ def latest_financial_amount(label, text):
     return ""
 
 
+CERTIFICATION_LABELS = {
+    "연구개발전담부서": "연구개발전담부서", "기업부설연구소": "기업부설연구소",
+    "부설연구소": "기업부설연구소", "이노비즈": "이노비즈", "메인비즈": "메인비즈",
+    "INNO-BIZ": "이노비즈", "MAIN-BIZ": "메인비즈", "벤처": "벤처",
+}
+CERTIFICATION_STATUS = r"미인증|미보유|해당없음|없음|인증|보유|유|무|Y|N"
+
+
+def _certification_text_values(text):
+    """Read explicit pairs or complete header/value rows, never shift columns."""
+    label_pattern = "|".join(re.escape(key) for key in CERTIFICATION_LABELS)
+    token_pattern = rf"(?P<label>{label_pattern})|(?<![가-힣A-Za-z])(?P<status>{CERTIFICATION_STATUS})(?![가-힣A-Za-z])"
+    tokens = list(re.finditer(token_pattern, text, re.I))
+    values = {}
+    index = 0
+    while index < len(tokens):
+        if not tokens[index].group("label"):
+            index += 1
+            continue
+        headers = []
+        while index < len(tokens) and tokens[index].group("label"):
+            headers.append(tokens[index])
+            index += 1
+        statuses = []
+        while index < len(tokens) and tokens[index].group("status"):
+            statuses.append(tokens[index])
+            index += 1
+        # A missing/unreadable heading or value invalidates the entire group.
+        if len(headers) != len(statuses):
+            continue
+        between = text[headers[-1].end():statuses[0].start()]
+        # Only whitespace and table decoration may separate header and value.
+        if re.search(r"[가-힣A-Za-z0-9]", between):
+            continue
+        if len(headers) > 1 and any(
+            re.search(r"[가-힣A-Za-z0-9]", text[left.end():right.start()])
+            for left, right in zip(headers, headers[1:])
+        ):
+            continue
+        if any(re.search(r"[가-힣A-Za-z0-9]", text[left.end():right.start()])
+               for left, right in zip(statuses, statuses[1:])):
+            continue
+        for header, status in zip(headers, statuses):
+            label = header.group("label")
+            target = CERTIFICATION_LABELS.get(label, CERTIFICATION_LABELS.get(label.upper()))
+            value = "Y" if status.group("status").upper() in {"인증", "보유", "유", "Y"} else "N"
+            # Conflicting explicit values are unconfirmed, not silently overwritten.
+            values.setdefault(target, set()).add(value)
+    return {key: next(iter(found)) if len(found) == 1 else "" for key, found in values.items()}
+
+
+def _certification_block(text):
+    heading = re.search(r"(?m)^[ \t]*기업[ \t]*인증[ \t]*(?:\n|[:：])", text or "")
+    block = (text or "")[heading.end():] if heading else (text or "")
+    return re.split(r"산업재산권|주요\s*주주|관계회사|주요\s*구매처|주요\s*판매처", block)[0]
+
+
 def extract_certifications(text):
-    compact = re.sub(r"\s+", " ", text or "")
     result = {
         "벤처": "",
         "이노비즈": "",
@@ -183,12 +239,9 @@ def extract_certifications(text):
         "상표": "",
     }
 
-    for key in ["벤처", "이노비즈", "메인비즈", "연구개발전담부서", "부설연구소"]:
-        pattern = rf"{key}\s+(미인증|미보유|해당없음|없음|인증|보유|유|무|Y|N)(?=\s|$)"
-        match = re.search(pattern, compact, re.I)
-        if match:
-            target = "기업부설연구소" if key == "부설연구소" else key
-            result[target] = "Y" if match.group(1).upper() in {"인증", "보유", "유", "Y"} else "N"
+    # The overview panel prints all labels first, then all statuses beneath them.
+    # Keep shareholder/customer/peer sections out of the certification evidence.
+    result.update(_certification_text_values(_certification_block(text)))
 
     # Missing/OCR-unreadable certification sections remain unknown.
     property_block = extract_block(
@@ -336,6 +389,10 @@ IDENTITY_LABELS = (
     "본사 소재지", "소재지", "주소", "표준산업분류(10차)", "표준산업분류(11차)",
     "주요제품(상품)", "기업명", "회사명", "업체명", "휴폐업정보", "법인등기정보",
 )
+IDENTITY_TABLE_HEADINGS = (
+    "거래비중", "결산년도", "결산연도", "자본금", "자산총계", "매출액", "순이익",
+    "주요 주주", "주요 구매처", "주요 판매처", "조회된 자료", "기업신용등급",
+)
 
 
 def normalize_document_text(text):
@@ -348,22 +405,36 @@ def normalize_document_text(text):
     return text
 
 
-def _identity_value(text, *labels):
-    stop = "|".join(re.escape(label) for label in IDENTITY_LABELS)
+def _identity_value(text, *labels, validator=None):
+    is_representative = any(label in {"대표자명", "대표자"} for label in labels)
+    boundaries = IDENTITY_LABELS + (IDENTITY_TABLE_HEADINGS if is_representative else ())
+    stop = "|".join(re.escape(label) for label in boundaries)
     for label in labels:
         pattern = rf"(?<![가-힣A-Za-z]){re.escape(label)}[ \t]*[:：]?[ \t]*(?:\n[ \t]*)?([^\n]*)"
         for match in re.finditer(pattern, text):
             value = re.split(rf"(?:^|[ \t]+)(?:{stop})(?=[ \t:：]|$)", match.group(1), maxsplit=1)[0]
             value = value.strip(" \t|:")
-            if value and value not in {"-", "조회된 자료가 없습니다.", "조회된 자료가 없습니다"}:
+            if is_representative and any(heading.replace(" ", "") in re.sub(r"\s+", "", value) for heading in IDENTITY_TABLE_HEADINGS):
+                continue
+            if value and value not in {"-", "조회된 자료가 없습니다.", "조회된 자료가 없습니다"} and (validator is None or validator(value)):
                 return value
     return ""
+
+
+def _valid_representative(value):
+    # Preserve international names and joint representatives, but not table data.
+    name = re.sub(r"\s*(?:외|등)\s*\d+\s*명$", "", value).strip()
+    return (2 <= len(name) <= 70 and any(char.isalpha() for char in name)
+            and all(char.isalpha() or char in " .·,()-'’" for char in name))
 
 
 def extract_identity(text):
     text = normalize_document_text(text)
     company_name = _identity_value(text, "기업명", "회사명", "업체명")
-    representative = _identity_value(text, "대표자명", "대표자")
+    representative = _identity_value(
+        text, "대표자명", "대표자",
+        validator=_valid_representative,
+    )
     business_raw = _identity_value(text, "사업자등록번호", "사업자번호")
     business_no = regex_first(r"(?<!\d)(\d{3}[ \t]*-[ \t]*\d{2}[ \t]*-[ \t]*\d{5}|\d{10})(?!\d)", business_raw)
     if not business_no:
@@ -379,7 +450,7 @@ def extract_identity(text):
 def has_company_identity(data):
     return bool(data.get("업체명") or re.fullmatch(r"\d{10}", re.sub(r"\D", "", str(data.get("사업자등록번호", "")))))
 
-def parse_document_text(text):
+def parse_document_text(text, *, certification_evidence=None):
     text = normalize_document_text(text)
     data = extract_identity(text)
     corporate_raw = _identity_value(text, "법인(주민)번호", "법인등록번호")
@@ -461,6 +532,16 @@ def parse_document_text(text):
     data["자본총계"] = latest_financial_amount("자본총계", text)
 
     data.update(extract_certifications(text))
+    # A supplemental OCR pass contributes only a verified certification panel,
+    # never a replacement of the company/financial text from the primary pass.
+    if certification_evidence:
+        explicit_values = _certification_text_values(_certification_block(text))
+        for key, value in certification_evidence.items():
+            if key not in set(CERTIFICATION_LABELS.values()) or value not in {"Y", "N", ""}:
+                continue
+            original = data.get(key, "")
+            conflicted = key in explicit_values and explicit_values[key] == ""
+            data[key] = "" if conflicted or (original and value and original != value) else value
 
     purpose = regex_first(r"사업목적\s+내용\s+(.+?)\s+종합의견", text, re.S)
     if purpose:
@@ -499,7 +580,45 @@ class CretopExtractionError(RuntimeError):
     """Safe code only; never put document text or customer paths in errors."""
 
 
-def _ocr_pdf_page(document, index, *, psm=6, timeout=15):
+def _remove_blue_table_outlines(image):
+    """Remove large blue capsule outlines only from a disposable OCR image."""
+    import numpy as np
+    from PIL import Image
+
+    pixels = np.array(image)
+    channels = pixels.astype(np.int16)
+    blue = ((channels[:, :, 2] > 150)
+            & (channels[:, :, 2] - channels[:, :, 0] > 40)
+            & (channels[:, :, 2] - channels[:, :, 1] > 20))
+    height, width = blue.shape
+    # Bound the flood-fill work on pages with large coloured backgrounds.
+    if int(blue.sum()) > width * height // 5:
+        return image
+    for start_y, start_x in zip(*np.where(blue)):
+        if not blue[start_y, start_x]:
+            continue
+        stack = [(int(start_y), int(start_x))]
+        component = []
+        blue[start_y, start_x] = False
+        while stack:
+            y, x = stack.pop()
+            component.append((y, x))
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < height and 0 <= nx < width and blue[ny, nx]:
+                    blue[ny, nx] = False
+                    stack.append((ny, nx))
+        ys, xs = zip(*component)
+        box_width, box_height = max(xs) - min(xs) + 1, max(ys) - min(ys) + 1
+        if (width * .025 < box_width < width * .25
+                and height * .007 < box_height < height * .06
+                and box_width / box_height > 2
+                and len(component) / (box_width * box_height) < .35):
+            pixels[np.array(ys), np.array(xs)] = 255
+    return Image.fromarray(pixels)
+
+
+def _ocr_pdf_page(document, index, *, psm=6, timeout=15, remove_table_borders=False):
     import fitz
     import pytesseract
     from PIL import Image, ImageOps
@@ -507,10 +626,82 @@ def _ocr_pdf_page(document, index, *, psm=6, timeout=15):
     # 180 dpi keeps table text readable while bounding CPU and image memory.
     pixmap = document[index].get_pixmap(matrix=fitz.Matrix(2.5, 2.5), alpha=False)
     image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+    if remove_table_borders:
+        image = _remove_blue_table_outlines(image)
     image = ImageOps.autocontrast(ImageOps.grayscale(image))
     return pytesseract.image_to_string(
         image, lang="kor+eng", config=f"--oem 1 --psm {psm}", timeout=timeout,
     ) or ""
+
+
+def _overview_quality(text):
+    data = parse_document_text(text)
+    return sum(bool(data.get(key)) * weight for key, weight in (
+        ("업체명", 1), ("사업자등록번호", 1), ("대표자명", 2),
+        ("법인등록번호", 2), ("설립일", 2), ("기업유형", 1), ("기업규모", 1),
+    ))
+
+
+def _improve_identity_ocr(document, index, text, *, mode, deadline):
+    """A readable cover must not suppress retries for an unreadable overview."""
+    is_overview = bool(re.search(r"기업\s*개요", text)) or (mode == "full" and index == 1)
+    score = _overview_quality if is_overview else lambda value: sum(bool(v) for v in extract_identity(value).values())
+    target = 8 if is_overview else 3
+    if not (is_overview or index < 2) or score(text) >= target:
+        return text
+    best, best_score = text, score(text)
+    # PSM4 preserves table rows; PSM3 remains a fallback for cover/column layouts.
+    for psm in (4, 3):
+        remaining = deadline - time.monotonic()
+        if remaining <= 1:
+            break
+        try:
+            candidate = _ocr_pdf_page(document, index, psm=psm, timeout=min(15, remaining))
+        except Exception:
+            # An optional retry must not discard a successfully read page.
+            continue
+        original_identity = extract_identity(text)
+        candidate_identity = extract_identity(candidate)
+        def comparable_name(name):
+            return re.sub(r"주식회사|㈜|\(주\)|[\s().·]", "", name).casefold()
+        if any(
+            original_identity.get(key)
+            and (not candidate_identity.get(key)
+                 or normalizer(original_identity[key]) != normalizer(candidate_identity[key]))
+            for key, normalizer in (("사업자등록번호", lambda value: re.sub(r"\D", "", value)),
+                                    ("업체명", comparable_name))
+        ):
+            continue
+        candidate_score = score(candidate)
+        if candidate_score > best_score:
+            best, best_score = candidate, candidate_score
+        if best_score >= target:
+            break
+    return best
+
+
+def _certification_ocr_evidence(document, index, text, *, deadline):
+    if not re.search(r"기업\s*인증", text):
+        return {}, ""
+    fields = {"벤처", "이노비즈", "메인비즈", "연구개발전담부서", "기업부설연구소"}
+    existing = _certification_text_values(_certification_block(text))
+    if all(existing.get(key) in {"Y", "N"} for key in fields):
+        return existing, ""
+    remaining = deadline - time.monotonic()
+    if remaining > 1:
+        try:
+            candidate = _ocr_pdf_page(
+                document, index, psm=4, timeout=min(15, remaining), remove_table_borders=True,
+            )
+            values = _certification_text_values(_certification_block(candidate))
+            if all(values.get(key) in {"Y", "N"} for key in fields):
+                conflicts = {key for key in fields if key in existing and existing[key] != values[key]}
+                for key in conflicts:
+                    values[key] = ""
+                return values, "certification_evidence_conflict" if conflicts else ""
+        except Exception:
+            pass
+    return {}, "certification_ocr_incomplete"
 
 
 def extract_document(pdf_path, mode="full", *, timeout_seconds=230, progress=emit_progress):
@@ -521,6 +712,7 @@ def extract_document(pdf_path, mode="full", *, timeout_seconds=230, progress=emi
     total = len(reader.pages)
     page_texts = []
     warnings = []
+    certification_evidence = {}
     ocr_pages = 0
     processed_pages = 0
     document = None
@@ -549,13 +741,21 @@ def extract_document(pdf_path, mode="full", *, timeout_seconds=230, progress=emi
                         original_text = text
                         ocr_text = _ocr_pdf_page(document, index, timeout=remaining)
                         ocr_pages += 1
-                        # Cover/overview recognition can benefit from layout mode 3.
-                        if index < 2 and not has_company_identity(extract_identity(ocr_text)):
-                            remaining = deadline - time.monotonic()
-                            if remaining > 1:
-                                retry = _ocr_pdf_page(document, index, psm=3, timeout=min(15, remaining))
-                                if has_company_identity(extract_identity(retry)):
-                                    ocr_text = retry
+                        ocr_text = _improve_identity_ocr(
+                            document, index, ocr_text, mode=mode, deadline=deadline,
+                        )
+                        if mode == "full":
+                            evidence, warning = _certification_ocr_evidence(
+                                document, index, ocr_text, deadline=deadline,
+                            )
+                            if warning:
+                                warnings.append(warning)
+                            for key, value in evidence.items():
+                                if key in certification_evidence and certification_evidence[key] != value:
+                                    certification_evidence[key] = ""
+                                    warnings.append("certification_evidence_conflict")
+                                else:
+                                    certification_evidence[key] = value
                         # Keep any usable embedded text even if OCR is empty or noisy.
                         text = "\n".join(part for part in (original_text, ocr_text) if part.strip())
                 except (ImportError, ModuleNotFoundError):
@@ -584,7 +784,7 @@ def extract_document(pdf_path, mode="full", *, timeout_seconds=230, progress=emi
             document.close()
 
     joined = "\n".join(page_texts)
-    result = extract_identity(joined) if mode == "identity" else parse_document_text(joined)
+    result = extract_identity(joined) if mode == "identity" else parse_document_text(joined, certification_evidence=certification_evidence)
     if not has_company_identity(result):
         raise CretopExtractionError("ocr_unavailable" if "ocr_unavailable" in warnings else "identity_not_found")
     result["_extraction"] = {

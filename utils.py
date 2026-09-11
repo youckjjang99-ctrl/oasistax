@@ -22,6 +22,31 @@ RESULT_DIR = ROOT_DIR / "results"
 HISTORY_DIR = ROOT_DIR / "history"
 USER_DATA_DIR = ROOT_DIR / "user_data"
 
+CRETOP_CERTIFICATION_FIELDS = (
+    "벤처", "메인비즈", "이노비즈", "기업부설연구소",
+    "연구개발전담부서", "특허보유", "상표", "R&D수행",
+)
+CRETOP_COMPANY_FIELDS = (
+    "업체명", "대표자명", "사업자등록번호", "법인등록번호",
+    "설립일", "설립년도", "종업원수", "상시근로자수", "기업유형", "기업규모",
+) + CRETOP_CERTIFICATION_FIELDS
+
+
+def _with_cretop_company_columns(columns):
+    """Old templates must not discard the fields reviewed at registration."""
+    return list(dict.fromkeys([*columns, *CRETOP_COMPANY_FIELDS]))
+
+
+def _normalize_cretop_certification(value):
+    """Preserve an explicit yes/no without treating missing evidence as no."""
+    text = str(value).strip().lower() if value is not None else ""
+    if text in {"y", "yes", "true", "1", "인증", "보유", "있음"}:
+        return "Y"
+    if text in {"n", "no", "false", "0", "미인증", "미보유", "없음"}:
+        return "N"
+    return ""
+
+
 for folder in [TEMPLATE_DIR, UPLOAD_DIR, RESULT_DIR, HISTORY_DIR, USER_DATA_DIR]:
     folder.mkdir(exist_ok=True)
 
@@ -126,6 +151,7 @@ def make_basic_customer_template_bytes():
         "귀속연도", "법인전환검토점수", "법인전환검토등급"
     ]
 
+    customer_columns = _with_cretop_company_columns(customer_columns)
     sample = pd.DataFrame([{
         "업체명": "예시기업",
         "대표자명": "홍길동",
@@ -425,8 +451,10 @@ CUMULATIVE_META_COLUMNS = ["누적저장일시", "회원ID", "담당자명"]
 def _is_blank_cumulative_value(value) -> bool:
     if value is None:
         return True
+    # String conversion handles scalar NaN/NaT/pd.NA without evaluating the
+    # array returned by pd.isna for a list/dict; explicit zero stays nonblank.
     text = str(value).strip().lower()
-    return text in {"", "nan", "none", "nat"}
+    return text in {"", "nan", "none", "nat", "<na>"}
 
 
 def _normalize_customer_db_frame(df, columns=None):
@@ -458,7 +486,12 @@ def _read_cumulative_customer_db(cumulative_path, columns=None):
 
     for sheet_name in [CUSTOMER_DB_SHEET_NAME, LEGACY_CUMULATIVE_SHEET_NAME]:
         try:
-            df = pd.read_excel(cumulative_path, sheet_name=sheet_name)
+            # Identifiers are text even when a reviewed value has no hyphens;
+            # numeric inference would destroy a corporate number's leading zero.
+            df = pd.read_excel(
+                cumulative_path, sheet_name=sheet_name,
+                dtype={"사업자등록번호": str, "법인등록번호": str},
+            )
             return _normalize_customer_db_frame(df, columns)
         except Exception:
             continue
@@ -1225,11 +1258,11 @@ def get_customer_db_columns():
                 for required_column in required_cretop_columns:
                     if required_column not in cols:
                         cols.append(required_column)
-                return cols
+                return _with_cretop_company_columns(cols)
         except Exception:
             pass
 
-    return [
+    return _with_cretop_company_columns([
         "업체명", "대표자명", "사업자유형", "사업자등록번호", "업종명",
         "사업장 소재지", "설립일", "설립년도", "종업원수",
         "연매출", "전년도매출", "매출액", "영업이익", "당기순이익",
@@ -1247,7 +1280,7 @@ def get_customer_db_columns():
         "종합소득금액", "과세표준", "적용세율", "산출세액", "세액감면",
         "세액공제", "결정세액", "납부환급세액", "기장의무", "신고유형",
         "귀속연도", "법인전환검토점수", "법인전환검토등급"
-    ]
+    ])
 
 
 def build_customer_row_from_cretop(data, columns=None):
@@ -1277,8 +1310,8 @@ def build_customer_row_from_cretop(data, columns=None):
         "키워드메모": ["키워드메모"],
         "주요 사업내용": ["주요 사업내용"],
         "벤처": ["벤처"],
-        "메인비즈": ["메인비즈"],
-        "이노비즈": ["이노비즈"],
+        "메인비즈": ["메인비즈", "MainBiz", "Mainbiz", "MAINBIZ", "mainbiz", "Main-Biz"],
+        "이노비즈": ["이노비즈", "InnoBiz", "Innobiz", "INNOBIZ", "innobiz", "Inno-Biz"],
         "기업부설연구소": ["기업부설연구소"],
         "부설연구소": ["기업부설연구소"],
         "연구소": ["기업부설연구소"],
@@ -1314,22 +1347,29 @@ def build_customer_row_from_cretop(data, columns=None):
         "법인전환검토등급": ["법인전환검토등급"],
     }
 
-    # 기본 복사
+    certification_columns = set(CRETOP_CERTIFICATION_FIELDS) | {
+        "부설연구소", "연구소", "특허", "상표권",
+    }
+    # 기본 복사. 인증은 bool/문자열을 명시적 Y/N/미확인으로 정규화한다.
     for col in columns:
         candidates = alias_map.get(col, [col])
         for key in candidates:
-            if key in data and data.get(key) not in [None, ""]:
+            if col in certification_columns:
+                value = _normalize_cretop_certification(data.get(key))
+                if value:
+                    row[col] = value
+                    break
+                continue
+            if key in data and not _is_blank_cumulative_value(data.get(key)):
                 row[col] = data.get(key)
                 break
 
-    # R&D수행은 연구소/전담부서가 있으면 Y로 보조 판정
+    # Research-unit presence is positive evidence; missing units are not proof
+    # that the company does not perform R&D. Explicit R&D N remains N.
     if "R&D수행" in row and not row.get("R&D수행"):
-        row["R&D수행"] = "Y" if data.get("기업부설연구소") == "Y" or data.get("연구개발전담부서") == "Y" else "N"
-
-    # 기술성 기본값 보정
-    for col in ["벤처", "메인비즈", "이노비즈", "기업부설연구소", "특허보유", "R&D수행"]:
-        if col in row and row[col] == "":
-            row[col] = "N"
+        if any(_normalize_cretop_certification(data.get(field)) == "Y"
+               for field in ("기업부설연구소", "연구개발전담부서")):
+            row["R&D수행"] = "Y"
 
     if "비고" in row:
         row["비고"] = f"크레탑 PDF 자동등록({data.get('PDF추출일시', '')})"
@@ -1676,6 +1716,9 @@ def refresh_existing_customer_from_cretop(user_id, extracted_data, *, reviewed_f
 
     row_data = build_customer_row_from_cretop(data, columns)
     index = matching_indexes[0]
+    # Excel may infer a year as integer while the review form returns text.
+    # Keep mixed scalar values without pandas coercion errors or truncation.
+    df = df.astype(object)
 
     priority_fields = {
         "사업자등록번호",
@@ -1701,6 +1744,7 @@ def refresh_existing_customer_from_cretop(user_id, extracted_data, *, reviewed_f
         "연구개발전담부서",
         "특허보유",
         "상표",
+        "R&D수행",
     }
     # Only the explicit review form may replace these non-empty basic fields.
     # Existing callers retain their original fill-missing-only behaviour.
@@ -1711,20 +1755,16 @@ def refresh_existing_customer_from_cretop(user_id, extracted_data, *, reviewed_f
 
     updated_fields = []
     for column in columns:
-        if column in {"벤처", "이노비즈", "메인비즈", "기업부설연구소", "연구개발전담부서", "특허보유", "상표", "R&D수행"} and data.get(column) in (None, ""):
-            # Row builders' compatibility defaults are not evidence from this report.
+        if column in CRETOP_CERTIFICATION_FIELDS and not row_data.get(column):
+            # Missing/unrecognized evidence (including aliases) cannot erase
+            # an existing certification. Explicit normalized N is still applied.
             continue
         new_value = row_data.get(column, "")
-        if new_value is None:
-            continue
-        if isinstance(new_value, str) and not new_value.strip():
+        if _is_blank_cumulative_value(new_value):
             continue
 
         current_value = df.at[index, column] if column in df.columns else ""
-        current_blank = (
-            current_value is None
-            or str(current_value).strip().lower() in {"", "nan", "none", "nat"}
-        )
+        current_blank = _is_blank_cumulative_value(current_value)
 
         if current_blank or column in priority_fields:
             if str(current_value) != str(new_value):
