@@ -16,20 +16,23 @@ import streamlit as st
 from address_tools import enrich_address_fields
 from cloud_sync import sync_customer_snapshot
 from cretop_runner import run_cretop_worker
+from cretop_worker import valid_company_name
 from customer_history import save_customer_snapshot
 from matching_preferences import INTEREST_OPTIONS, get_matching_preferences, save_matching_preferences
 from runtime_error_log import safe_public_error, write_runtime_error
 from utils import (
     append_cretop_to_user_customer_db, check_user_customer_duplicate,
     get_user_cumulative_db_path,
-    make_upload_filename, normalize_business_no, refresh_existing_customer_from_cretop,
+    make_upload_filename, normalize_business_no, normalize_representative_mobile,
+    refresh_existing_customer_from_cretop,
 )
 
 FINANCIAL_FIELDS = (
     "매출액", "영업이익", "당기순이익", "자산총계", "부채총계", "자본총계",
     "가지급금", "단기대여금", "장기대여금", "가수금",
 )
-BASIC_FIELDS = ("업체명", "대표자명", "사업자등록번호", "업종명", "사업장 소재지")
+BASIC_FIELDS = ("업체명", "대표자명", "대표자 휴대전화", "사업자등록번호", "업종명", "사업장 소재지",
+                "표준산업분류코드", "표준산업분류차수")
 EXTRA_FIELDS = ("법인등록번호", "설립일", "종업원수", "기업유형", "기업규모")
 FINANCIAL_REVIEW_WARNINGS = {"financial_alternate_source", "financial_year_unconfirmed", "financial_source_conflict", "financial_table_ocr_incomplete"}
 
@@ -66,10 +69,18 @@ def prepare_registration_data(original, edits):
     data = dict(original or {})
     for key in BASIC_FIELDS + EXTRA_FIELDS:
         if key in edits:
+            if key == "대표자 휴대전화" and not str(edits[key] or "").strip():
+                continue
             data[key] = str(edits[key] if edits[key] is not None else "").strip()
     data["사업자등록번호"] = normalize_business_no(data.get("사업자등록번호", ""))
     if not str(data.get("업체명") or "").strip():
         return data, "업체명을 확인해 주세요. 빈 기업은 등록하지 않습니다."
+    if not valid_company_name(data.get("업체명")):
+        return data, "업체명에 문서 제목이나 항목명이 들어갔는지 확인하고 실제 업체명을 입력해 주세요."
+    try:
+        data["대표자 휴대전화"] = normalize_representative_mobile(data.get("대표자 휴대전화"))
+    except ValueError as exc:
+        return data, str(exc)
     if len(re.sub(r"\D", "", data["사업자등록번호"])) != 10:
         return data, "사업자등록번호 10자리를 확인해 주세요."
     employee = data.get("종업원수")
@@ -304,6 +315,15 @@ def render_cretop_registration(user_id, user_name, upload_dir):
                 with col:
                     edits[field] = st.text_input(field + (" *" if field in ("업체명", "사업자등록번호") else ""),
                                                 value=str(data.get(field) or ""), key="cretop_edit_" + field)
+        edits["대표자 휴대전화"] = st.text_input(
+            "대표자 휴대전화", value=str(data.get("대표자 휴대전화") or ""),
+            key="cretop_edit_대표자 휴대전화",
+            help="선택 입력입니다. 대표자에게 확인한 번호를 직접 입력하세요. 공란은 기존 번호를 유지합니다.",
+        )
+        for col, field in zip(st.columns(2), ("표준산업분류코드", "표준산업분류차수")):
+            with col:
+                edits[field] = st.text_input(field, value=str(data.get(field) or ""), key="cretop_edit_" + field)
+        st.caption("표준산업분류코드는 크레탑의 산업분류입니다. 세무자료의 주업종코드와 별도로 저장합니다.")
         edits["사업장 소재지"] = st.text_input("사업장 소재지", value=str(data.get("사업장 소재지") or ""), key="cretop_edit_사업장 소재지")
         with st.expander("추가 기업정보·재무·인증정보 확인", expanded=financial_review_required):
             for field in EXTRA_FIELDS:

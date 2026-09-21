@@ -628,6 +628,7 @@ def render_enterprise_management_center(
             basic_rows = [
                 ["업체명", company_name],
                 ["대표자명", _clean(selected_row.get("대표자명", ""))],
+                ["대표자 휴대전화", _clean(selected_row.get("대표자 휴대전화", ""))],
                 [
                     "사업자유형",
                     _clean(selected_row.get("사업자유형", "")),
@@ -643,9 +644,11 @@ def render_enterprise_management_center(
                     ),
                 ],
                 [
-                    "주업종코드",
+                    "주업종코드(세무)",
                     _clean(selected_row.get("주업종코드", "")),
                 ],
+                ["표준산업분류코드", _clean(selected_row.get("표준산업분류코드", ""))],
+                ["표준산업분류차수", _clean(selected_row.get("표준산업분류차수", ""))],
                 [
                     "사업장 소재지",
                     _clean(selected_row.get("사업장 소재지", "")),

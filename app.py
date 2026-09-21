@@ -68,6 +68,7 @@ from utils import (
     check_user_customer_duplicate, link_business_no_to_legacy_customer,
     refresh_existing_customer_from_cretop,
     ensure_user_cumulative_db_format, update_user_customer_record,
+    normalize_representative_mobile,
     count_user_cumulative_rows
 )
 
@@ -1020,6 +1021,21 @@ def format_establishment_years(value):
     return f"{years}년차 · {stage}"
 
 
+def _filter_customer_management_rows(customers, search_keyword):
+    """Keep the all-column search and also match unformatted manual mobiles."""
+    keyword = str(search_keyword or "").strip().lower()
+    if not keyword:
+        return customers.copy()
+    mask = customers.astype(str).apply(
+        lambda col: col.str.lower().str.contains(keyword, na=False)
+    ).any(axis=1)
+    phone_query = "".join(keyword.split()).translate(str.maketrans("", "", "-()"))
+    if phone_query.isdigit() and "대표자 휴대전화" in customers.columns:
+        phone_digits = customers["대표자 휴대전화"].fillna("").astype(str).str.replace(r"\D", "", regex=True)
+        mask |= phone_digits.str.contains(phone_query, regex=False, na=False)
+    return customers.loc[mask].copy()
+
+
 def render_customer_management_page(user_id):
     st.markdown("### 👥 고객관리 CRM")
     st.caption("내 누적 고객DB를 기준으로 고객을 검색하고, 고객 상태·상담메모·다음 액션·타임라인을 관리합니다.")
@@ -1092,13 +1108,7 @@ def render_customer_management_page(user_id):
     with f2:
         status_filter = st.selectbox("상태 필터", ["전체"] + STATUS_OPTIONS)
 
-    filtered = df.copy()
-    if search_keyword.strip():
-        keyword = search_keyword.strip().lower()
-        mask = filtered.astype(str).apply(
-            lambda col: col.str.lower().str.contains(keyword, na=False)
-        ).any(axis=1)
-        filtered = filtered[mask]
+    filtered = _filter_customer_management_rows(df, search_keyword)
 
     if status_filter != "전체":
         filtered = filtered[filtered["CRM상태"] == status_filter]
@@ -1162,8 +1172,11 @@ def render_customer_management_page(user_id):
         st.markdown("##### 기업 기본정보")
         st.write(f"**업체명**: {selected_row.get('업체명', '')}")
         st.write(f"**대표자명**: {selected_row.get('대표자명', '')}")
+        st.write(f"**대표자 휴대전화**: {format_customer_display_value(selected_row.get('대표자 휴대전화', ''))}")
         st.write(f"**사업자등록번호**: {selected_row.get('사업자등록번호', '')}")
         st.write(f"**업종명**: {selected_row.get('업종명', '')}")
+        st.write(f"**표준산업분류코드**: {format_customer_display_value(selected_row.get('표준산업분류코드', ''))}")
+        st.write(f"**표준산업분류차수**: {format_customer_display_value(selected_row.get('표준산업분류차수', ''))}")
         st.write(f"**사업장 소재지**: {selected_row.get('사업장 소재지', '')}")
     with detail_right:
         st.markdown("##### 재무/규모")
@@ -1212,6 +1225,12 @@ def render_customer_management_page(user_id):
                 value=format_customer_display_value(selected_row.get("대표자명", "")),
                 key=f"edit_representative_{selected_idx}",
             )
+            edit_representative_mobile = st.text_input(
+                "대표자 휴대전화",
+                value=format_customer_display_value(selected_row.get("대표자 휴대전화", "")),
+                key=f"edit_representative_mobile_{selected_idx}",
+                help="선택 입력입니다. 공란으로 저장하면 기존 번호를 유지합니다.",
+            )
             edit_business_no = st.text_input(
                 "사업자등록번호",
                 value=format_customer_display_value(selected_row.get("사업자등록번호", "")),
@@ -1221,6 +1240,17 @@ def render_customer_management_page(user_id):
                 "업종명",
                 value=format_customer_display_value(selected_row.get("업종명", "")),
                 key=f"edit_industry_{selected_idx}",
+            )
+            edit_ksic = st.text_input(
+                "표준산업분류코드",
+                value=format_customer_display_value(selected_row.get("표준산업분류코드", "")),
+                key=f"edit_ksic_{selected_idx}",
+            )
+            edit_ksic_revision = st.text_input(
+                "표준산업분류차수",
+                value=format_customer_display_value(selected_row.get("표준산업분류차수", "")),
+                key=f"edit_ksic_revision_{selected_idx}",
+                help="세무자료의 주업종코드는 변경하지 않습니다.",
             )
             edit_address = st.text_area(
                 "사업장 소재지",
@@ -1274,11 +1304,18 @@ def render_customer_management_page(user_id):
                 except ValueError:
                     return text
 
+            try:
+                representative_mobile = normalize_representative_mobile(edit_representative_mobile)
+            except ValueError as exc:
+                st.error(str(exc))
+                return
             update_values = {
                 "업체명": edit_company,
                 "대표자명": edit_representative,
                 "사업자등록번호": edit_business_no,
                 "업종명": edit_industry,
+                "표준산업분류코드": edit_ksic,
+                "표준산업분류차수": edit_ksic_revision,
                 "사업장 소재지": edit_address,
                 "종업원수": parse_numeric_input(edit_employee),
                 "매출액": parse_numeric_input(edit_sales),
@@ -1286,6 +1323,8 @@ def render_customer_management_page(user_id):
                 "당기순이익": parse_numeric_input(edit_net),
                 "설립일": edit_establishment,
             }
+            if representative_mobile:
+                update_values["대표자 휴대전화"] = representative_mobile
             ok, msg = update_user_customer_record(
                 user_id,
                 selected_idx,

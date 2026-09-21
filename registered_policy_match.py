@@ -287,7 +287,10 @@ def _load_registered_customers_from_excel(
         return pd.DataFrame()
 
     try:
-        df = pd.read_excel(cumulative_path, sheet_name="고객DB")
+        df = pd.read_excel(
+            cumulative_path, sheet_name="고객DB",
+            dtype={"대표자 휴대전화": str, "표준산업분류코드": str, "표준산업분류차수": str},
+        )
     except Exception:
         return pd.DataFrame()
 

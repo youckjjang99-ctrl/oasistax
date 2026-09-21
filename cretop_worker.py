@@ -448,41 +448,84 @@ def normalize_document_text(text):
     return text
 
 
-def _identity_value(text, *labels, validator=None):
+def _is_identity_label_line(value):
+    labels = "|".join(re.escape(label) for label in IDENTITY_LABELS)
+    return bool(re.fullmatch(rf"[ \t|*•·-]*(?:{labels})[ \t:：|]*", value))
+
+
+def _starts_with_identity_label(value):
+    value = value.lstrip(" \t|*•·-:：")
+    labels = "|".join(re.escape(label) for label in IDENTITY_LABELS)
+    return bool(re.match(rf"(?:{labels})(?=\s|[:：]|$)", value))
+
+
+def valid_company_name(value):
+    """Reject obvious extraction artifacts, not unfamiliar real company names."""
+    name = str(value or "").strip()
+    if not name or len(name) > 200 or _starts_with_identity_label(name):
+        return False
+    if name.casefold() in {"-", "없음", "미확인", "n/a", "none", "null",
+                           "조회된 자료가 없습니다.", "조회된 자료가 없습니다"}:
+        return False
+    if any(re.match(rf"{re.escape(heading)}(?:[ \t|:]|$)", name)
+           for heading in IDENTITY_TABLE_HEADINGS):
+        return False
+    legal_form = r"주식회사|㈜|\(주\)|（주）"
+    payload = re.sub(legal_form, "", name).strip()
+    return (any(char.isalpha() for char in payload) or bool(re.search(legal_form, name))) and any(char.isalnum() for char in payload)
+
+
+def _identity_values(text, *labels, validator=None):
     is_representative = any(label in {"대표자명", "대표자"} for label in labels)
     boundaries = IDENTITY_LABELS + (IDENTITY_TABLE_HEADINGS if is_representative else ())
     stop = "|".join(re.escape(label) for label in boundaries)
-    for label in labels:
-        pattern = rf"(?<![가-힣A-Za-z]){re.escape(label)}[ \t]*[:：]?[ \t]*(?:\n[ \t]*)?([^\n]*)"
-        for match in re.finditer(pattern, text):
-            value = re.split(rf"(?:^|[ \t]+)(?:{stop})(?=[ \t:：]|$)", match.group(1), maxsplit=1)[0]
-            value = value.strip(" \t|:")
-            if is_representative and any(heading.replace(" ", "") in re.sub(r"\s+", "", value) for heading in IDENTITY_TABLE_HEADINGS):
+    wanted = "|".join(re.escape(label) for label in sorted(labels, key=len, reverse=True))
+    pattern = rf"(?<![가-힣A-Za-z])(?:{wanted})[ \t]*[:：]?[ \t]*([^\n]*)"
+    for match in re.finditer(pattern, text):
+        raw = match.group(1)
+        if not raw.strip():
+            # Some covers extract all labels before all values. Do not give
+            # the first detached value (the company) to the last label (CEO).
+            line_start = text.rfind("\n", 0, match.start()) + 1
+            previous_lines = text[:line_start].rstrip("\n").splitlines()
+            if previous_lines and _is_identity_label_line(previous_lines[-1]):
                 continue
-            if value and value not in {"-", "조회된 자료가 없습니다.", "조회된 자료가 없습니다"} and (validator is None or validator(value)):
-                return value
-    return ""
+            raw = text[match.end() + 1:].partition("\n")[0] if text[match.end():].startswith("\n") else ""
+        if _starts_with_identity_label(raw):
+            continue
+        value = re.split(rf"(?:^|[ \t]+)(?:{stop})(?=[ \t:：]|$)", raw, maxsplit=1)[0]
+        value = value.strip(" \t|:：")
+        if is_representative and any(heading.replace(" ", "") in re.sub(r"\s+", "", value) for heading in IDENTITY_TABLE_HEADINGS):
+            continue
+        if value and value not in {"-", "조회된 자료가 없습니다.", "조회된 자료가 없습니다"} and (validator is None or validator(value)):
+            yield value
+
+
+def _identity_value(text, *labels, validator=None):
+    return next(_identity_values(text, *labels, validator=validator), "")
 
 
 def _valid_representative(value):
     # Preserve international names and joint representatives, but not table data.
     name = re.sub(r"\s*(?:외|등)\s*\d+\s*명$", "", value).strip()
-    return (2 <= len(name) <= 70 and any(char.isalpha() for char in name)
+    return (not _starts_with_identity_label(name)
+            and 2 <= len(name) <= 70 and any(char.isalpha() for char in name)
             and all(char.isalpha() or char in " .·,()-'’" for char in name))
+
+
+def _identity_scope(text):
+    return re.split(
+        r"(?m)^[ \t]*(?:주요\s*(?:주주|구매처|판매처)|관계\s*회사|경영진\s*현황|"
+        r"주주\s*현황|요약\s*(?:재무|손익)|MY\s*재무)", text, maxsplit=1,
+    )[0]
 
 
 def _representative_resolution(text):
     """Compare subject cover/overview evidence, never a later trading-party row."""
-    text = normalize_document_text(text)
-    scope = re.split(
-        r"(?m)^[ \t]*(?:주요\s*(?:주주|구매처|판매처)|관계\s*회사|경영진\s*현황|"
-        r"주주\s*현황|요약\s*(?:재무|손익)|MY\s*재무)", text, maxsplit=1,
-    )[0]
+    scope = _identity_scope(normalize_document_text(text))
     candidates = {}
-    for match in re.finditer(r"(?<![가-힣A-Za-z])대표자(?:명)?[ \t]*[:：]?[ \t]*(?:\n[ \t]*)?[^\n]*", scope):
-        value = _identity_value(match.group(), "대표자명", "대표자", validator=_valid_representative)
-        if value:
-            candidates.setdefault(re.sub(r"\s+", "", value).casefold(), value)
+    for value in _identity_values(scope, "대표자명", "대표자", validator=_valid_representative):
+        candidates.setdefault(re.sub(r"\s+", "", value).casefold(), value)
     if len(candidates) > 1:
         return "", "representative_conflict"
     return next(iter(candidates.values()), ""), ""
@@ -495,8 +538,8 @@ def _representative_needs_ocr_review(value):
 
 
 def extract_identity(text):
-    text = normalize_document_text(text)
-    company_name = _identity_value(text, "기업명", "회사명", "업체명")
+    text = _identity_scope(normalize_document_text(text))
+    company_name = _identity_value(text, "기업명", "회사명", "업체명", validator=valid_company_name)
     representative, _ = _representative_resolution(text)
     business_raw = _identity_value(text, "사업자등록번호", "사업자번호")
     business_no = regex_first(r"(?<!\d)(\d{3}[ \t]*-[ \t]*\d{2}[ \t]*-[ \t]*\d{5}|\d{10})(?!\d)", business_raw)
@@ -511,7 +554,49 @@ def extract_identity(text):
 
 
 def has_company_identity(data):
-    return bool(data.get("업체명") or re.fullmatch(r"\d{10}", re.sub(r"\D", "", str(data.get("사업자등록번호", "")))))
+    return bool(valid_company_name(data.get("업체명")) or re.fullmatch(r"\d{10}", re.sub(r"\D", "", str(data.get("사업자등록번호", "")))))
+
+
+def _industry_value(text, revision):
+    # Descriptions can wrap over multiple lines. Stop before another field or
+    # report section so products, counterparties and financials are not names.
+    fields = IDENTITY_LABELS + IDENTITY_TABLE_HEADINGS + ("주업종코드", "주요제품", "주요상품")
+    field_stop = "|".join(
+        re.escape(field) + ("" if field.endswith(")") else r"(?=\s|[:：]|$)")
+        for field in sorted(fields, key=len, reverse=True)
+    )
+    section_stop = "|".join(PEER_HEADINGS + [
+        r"기업\s*개요", r"기술력", r"기업\s*인증", r"산업\s*재산권",
+        r"사업\s*목적", r"종합\s*의견", r"주요\s*(?:주주|구매처|판매처)",
+        r"관계\s*회사", r"경영진\s*현황", r"주주\s*현황",
+        r"(?:요약\s*)?(?:재무상태표|손익계산서|현금흐름)", r"MY\s*재무",
+    ])
+    label = re.escape(f"표준산업분류({revision})")
+    for match in re.finditer(rf"(?<![가-힣A-Za-z]){label}[ \t]*[:：]?[ \t]*", text):
+        raw = re.split(rf"(?:^|[\s|])[-*•·]?[ \t]*(?:{field_stop})", text[match.end():], maxsplit=1)[0]
+        raw = re.split(rf"(?m)^[ \t]*(?:{section_stop})", raw, maxsplit=1)[0]
+        raw = " ".join(raw.strip(" \t\n|:：").split())
+        if raw and raw not in {"-", "조회된 자료가 없습니다.", "조회된 자료가 없습니다"}:
+            return raw
+    return ""
+
+
+def extract_industry_fields(text):
+    # KSIC is a different classification from the tax-return 주업종코드.
+    # Preserve only the explicit printed code, paired with its own revision/name.
+    text = _identity_scope(normalize_document_text(text))
+    result = {"업종명": "", "표준산업분류코드": "", "표준산업분류차수": ""}
+    for revision in ("11차", "10차"):
+        raw = _industry_value(text, revision)
+        if not raw:
+            continue
+        code = re.match(r"^\(([A-Z]?[0-9]{4,5})\)[ \t]*(.*)$", raw)
+        result["업종명"] = " ".join((code.group(2) if code else raw).split())
+        result["표준산업분류코드"] = code.group(1) if code else ""
+        result["표준산업분류차수"] = revision
+        break
+    return result
+
 
 def _financial_evidence_text(text, evidence):
     # Supplemental OCR is isolated from identity/certification extraction.
@@ -583,14 +668,7 @@ def parse_document_text(text, *, certification_evidence=None, financial_evidence
     )[0].strip()
     data["사업장 소재지"] = address
 
-    industry = regex_first(
-        r"표준산업분류\(10차\)\s+\([A-Z0-9]+\)\s*(.+?)\s+표준산업분류\(11차\)",
-        text,
-        re.S,
-    )
-    if not industry:
-        industry = re.sub(r"^\([A-Z0-9]+\)[ \t]*", "", _identity_value(text, "표준산업분류(10차)", "표준산업분류(11차)"))
-    data["업종명"] = " ".join(industry.split())
+    data.update(extract_industry_fields(text))
 
     data["매출액"] = latest_financial_amount("매출액", financial_text)
     data["연매출"] = data["매출액"]
@@ -904,7 +982,7 @@ def extract_document(pdf_path, mode="full", *, timeout_seconds=230, progress=emi
             progress(index + 1, total, "사업자정보 탐색 중" if mode == "identity" else "문서 섹션 탐색 중")
             if mode == "identity":
                 identity = extract_identity("\n".join(page_texts))
-                if identity.get("업체명") and identity.get("사업자등록번호"):
+                if valid_company_name(identity.get("업체명")) and identity.get("사업자등록번호"):
                     _, identity_warning = _representative_resolution("\n".join(page_texts))
                     if identity_reviews or identity_warning:
                         identity["대표자명"] = ""

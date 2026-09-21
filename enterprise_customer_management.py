@@ -337,6 +337,8 @@ def _customer_directory(
             row.get("사업장 소재지", ""),
             row.get("전화번호", ""),
             row.get("휴대전화", ""),
+            row.get("대표자 휴대전화", ""),
+            _business_digits(row.get("대표자 휴대전화", "")),
             row.get("연락처", ""),
             row.get("담당자", ""),
             row.get("이메일", ""),
@@ -658,7 +660,7 @@ def search_customer_rows(
 
     columns = [
         "업체명", "대표자명", "사업자등록번호", "전화번호",
-        "휴대전화", "연락처", "사업장 소재지", "업종명",
+        "휴대전화", "대표자 휴대전화", "연락처", "사업장 소재지", "업종명",
         "담당자", "이메일",
     ]
     mask = []
@@ -667,7 +669,10 @@ def search_customer_rows(
             str(row.get(column, "") or "")
             for column in columns
         )
-        mask.append(query_key in _normalize_for_search(combined))
+        mobile = _business_digits(row.get("대표자 휴대전화", ""))
+        mobile_query = re.sub(r"[\s()-]", "", str(query or ""))
+        mask.append(query_key in _normalize_for_search(combined) or
+                    bool(mobile_query.isdigit() and mobile_query in mobile))
     return customers.loc[mask].copy()
 
 
@@ -768,6 +773,7 @@ def filter_active_customers(
         "사업자등록번호",
         "전화번호",
         "휴대전화",
+        "대표자 휴대전화",
         "연락처",
         "사업장 소재지",
         "업종명",
@@ -780,9 +786,10 @@ def filter_active_customers(
             str(row.get(column, "") or "")
             for column in search_columns
         )
-        mask.append(
-            query in _normalize_for_search(combined)
-        )
+        mobile = _business_digits(row.get("대표자 휴대전화", ""))
+        mobile_query = re.sub(r"[\s()-]", "", str(search_text or ""))
+        mask.append(query in _normalize_for_search(combined) or
+                    bool(mobile_query.isdigit() and mobile_query in mobile))
     return active_df.loc[mask].copy()
 
 

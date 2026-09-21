@@ -300,6 +300,26 @@ def test_uncertain_representative_has_specific_warning_and_can_be_edited(tmp_pat
     assert saved["대표자명"] == "검증대표"
 
 
+def test_review_mobile_and_ksic_inputs_are_optional_separate_and_saved(tmp_path, monkeypatch, services):
+    mobile = "-".join(("010", "0000", "0000"))
+    data = {**basic_data(), "표준산업분류코드": "C24321", "표준산업분류차수": "11차", "주업종코드": "123456"}
+    app = make_app(tmp_path, monkeypatch, data)
+    app.button(key="cretop_analyze_button").click().run()
+    assert not app.exception
+    assert app.text_input(key="cretop_edit_대표자 휴대전화").value == ""
+    assert app.text_input(key="cretop_edit_표준산업분류코드").value == "C24321"
+    app.text_input(key="cretop_edit_대표자 휴대전화").set_value("+82 " + mobile[1:].replace("-", " "))
+    app.text_input(key="cretop_edit_표준산업분류코드").set_value("C24322")
+    app.button[-1].click().run()
+    assert not app.exception
+    saved = services["append_cretop_to_user_customer_db"].call_args.kwargs["extracted_data"]
+    assert saved["대표자 휴대전화"] == mobile
+    assert saved["표준산업분류코드"] == "C24322"
+    assert saved["표준산업분류차수"] == "11차"
+    assert saved["주업종코드"] == "123456"
+    assert services["sync_customer_snapshot"].call_args.args[1]["대표자 휴대전화"] == mobile
+
+
 @pytest.mark.parametrize("approved", [False, True])
 def test_uncertain_financials_require_explicit_review(tmp_path, monkeypatch, services, approved):
     data = {**basic_data(), "매출액": 100, "연매출": 100, "당기순이익": -5,
