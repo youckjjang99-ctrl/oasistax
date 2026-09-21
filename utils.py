@@ -28,6 +28,7 @@ CRETOP_CERTIFICATION_FIELDS = (
 )
 CRETOP_COMPANY_FIELDS = (
     "업체명", "대표자명", "사업자등록번호", "법인등록번호",
+    "대표자 휴대전화", "표준산업분류코드", "표준산업분류차수",
     "설립일", "설립년도", "종업원수", "상시근로자수", "기업유형", "기업규모",
 ) + CRETOP_CERTIFICATION_FIELDS
 
@@ -446,6 +447,7 @@ def get_user_cumulative_db_path(user_id):
 CUSTOMER_DB_SHEET_NAME = "고객DB"
 LEGACY_CUMULATIVE_SHEET_NAME = "고객DB누적"
 CUMULATIVE_META_COLUMNS = ["누적저장일시", "회원ID", "담당자명"]
+CUMULATIVE_OPTIONAL_COLUMNS = {"대표자 휴대전화", "표준산업분류코드", "표준산업분류차수"}
 
 
 def _is_blank_cumulative_value(value) -> bool:
@@ -455,6 +457,21 @@ def _is_blank_cumulative_value(value) -> bool:
     # array returned by pd.isna for a list/dict; explicit zero stays nonblank.
     text = str(value).strip().lower()
     return text in {"", "nan", "none", "nat", "<na>"}
+
+
+def normalize_representative_mobile(value):
+    """Validate a manually supplied representative mobile, never infer a contact."""
+    from contact_matching import normalize_phone
+
+    if _is_blank_cumulative_value(value):
+        return ""
+    text = str(value).strip()
+    normalized = normalize_phone(text)
+    if not re.fullmatch(r"\+?[0-9][0-9\s().-]*", text) or not re.fullmatch(
+        r"(?:010-\d{4}|01[16789]-\d{3,4})-\d{4}", normalized
+    ):
+        raise ValueError("대표자 휴대전화는 올바른 휴대전화 번호로 입력하거나 공란으로 두세요.")
+    return normalized
 
 
 def _normalize_customer_db_frame(df, columns=None):
@@ -484,17 +501,35 @@ def _read_cumulative_customer_db(cumulative_path, columns=None):
     if not Path(cumulative_path).exists():
         return pd.DataFrame(columns=columns)
 
-    for sheet_name in [CUSTOMER_DB_SHEET_NAME, LEGACY_CUMULATIVE_SHEET_NAME]:
+    try:
+        from openpyxl import load_workbook
+        workbook = load_workbook(cumulative_path, read_only=True, data_only=False)
         try:
+            worksheet, header_row, _ = _existing_customer_sheet_layout(workbook)
+            sheet_name = worksheet.title
+        finally:
+            workbook.close()
+        before = Path(cumulative_path).stat()
+        if sheet_name:
             # Identifiers are text even when a reviewed value has no hyphens;
             # numeric inference would destroy a corporate number's leading zero.
             df = pd.read_excel(
-                cumulative_path, sheet_name=sheet_name,
-                dtype={"사업자등록번호": str, "법인등록번호": str},
+                cumulative_path, sheet_name=sheet_name, header=header_row - 1,
+                dtype={"사업자등록번호": str, "법인등록번호": str,
+                       "대표자 휴대전화": str, "표준산업분류코드": str, "표준산업분류차수": str},
             )
-            return _normalize_customer_db_frame(df, columns)
-        except Exception:
-            continue
+            after = Path(cumulative_path).stat()
+            if (before.st_mtime_ns, before.st_size) != (after.st_mtime_ns, after.st_size):
+                return pd.DataFrame(columns=columns)
+            df = _normalize_customer_db_frame(df, columns)
+            df.attrs["_cumulative_source"] = {
+                "path": str(Path(cumulative_path).resolve()),
+                "revision": (after.st_mtime_ns, after.st_size),
+                "identities": [_cumulative_row_identity(row) for _, row in df.iterrows()],
+            }
+            return df
+    except Exception:
+        pass
     return pd.DataFrame(columns=columns)
 
 
@@ -601,22 +636,131 @@ def _write_dataframe_to_customer_sheet(ws, header_row, df):
             ws.cell(row=r_idx, column=c_idx, value=value)
 
 
+def _existing_customer_sheet_layout(workbook):
+    """Resolve a usable customer sheet without silently replacing an unknown one."""
+    name = next((name for name in (CUSTOMER_DB_SHEET_NAME, LEGACY_CUMULATIVE_SHEET_NAME)
+                 if name in workbook.sheetnames), None)
+    if name is None:
+        raise ValueError("고객DB 시트를 확인하지 못해 원본을 변경하지 않았습니다.")
+    worksheet = workbook[name]
+    header_row = _find_header_row(worksheet)
+    headers = [str(cell.value or "").strip() for cell in worksheet[header_row]]
+    nonblank = [value for value in headers if value]
+    if "업체명" not in headers or len(nonblank) != len(set(nonblank)):
+        raise ValueError("고객DB 헤더를 안전하게 확인하지 못해 원본을 변경하지 않았습니다.")
+    return worksheet, header_row, headers
+
+
+def _cumulative_row_identity(row):
+    company = row.get("업체명", "")
+    business = row.get("사업자등록번호", "")
+    return (
+        "" if _is_blank_cumulative_value(company) else str(company).strip(),
+        "" if _is_blank_cumulative_value(business) else normalize_business_no(business),
+    )
+
+
+def _same_cumulative_cell_value(left, right):
+    if _is_blank_cumulative_value(left) and _is_blank_cumulative_value(right):
+        return True
+    try:
+        if left == right:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return str(left) == str(right)
+
+
+def _patch_existing_customer_workbook(workbook, cached_workbook, cumulative_path, df, columns):
+    """Patch stable row positions; untouched cells, extension columns and sheets stay intact."""
+    source, header_row, headers = _existing_customer_sheet_layout(workbook)
+    cached = cached_workbook[source.title]
+    existing_identities = []
+    for row_number in range(header_row + 1, source.max_row + 1):
+        values = {header: cached.cell(row_number, column).value
+                  for column, header in enumerate(headers, start=1) if header}
+        existing_identities.append(_cumulative_row_identity(values))
+    while existing_identities and existing_identities[-1] == ("", ""):
+        existing_identities.pop()
+    existing_count = len(existing_identities)
+    if (df.empty or len(df) < existing_count or not df.index.is_unique
+            or list(df.index) != list(range(len(df)))):
+        raise ValueError("고객 행이 비었거나 대응을 확인하지 못해 원본을 변경하지 않았습니다.")
+    stat = Path(cumulative_path).stat()
+    token = df.attrs.get("_cumulative_source") or {}
+    trusted = (token.get("path") == str(Path(cumulative_path).resolve())
+               and tuple(token.get("revision", ())) == (stat.st_mtime_ns, stat.st_size)
+               and token.get("identities", [])[:existing_count] == existing_identities)
+    incoming = [_cumulative_row_identity(row) for _, row in df.iterrows()]
+    for index, previous in enumerate(existing_identities):
+        if incoming[index] == previous:
+            continue
+        # A read-then-edit may correct a business number at the same row index.
+        # Moving another existing identity into this row is never an edit.
+        if not trusted or incoming[index] in existing_identities:
+            raise ValueError("기존 고객 행의 순서가 달라 원본을 변경하지 않았습니다.")
+    if source.title == LEGACY_CUMULATIVE_SHEET_NAME:
+        worksheet = workbook.copy_worksheet(source)
+        worksheet.title = CUSTOMER_DB_SHEET_NAME
+    else:
+        worksheet = source
+    for column in columns:
+        if column not in headers:
+            headers.append(column)
+            worksheet.cell(header_row, len(headers)).value = column
+    writable = {column for column in df.columns
+                if column in columns and column not in CUMULATIVE_META_COLUMNS}
+    for index, record in df.iterrows():
+        row_number = header_row + 1 + index
+        for column_number, header in enumerate(headers, start=1):
+            if header not in writable:
+                continue
+            value = record.get(header, "")
+            if _is_blank_cumulative_value(value):
+                value = ""
+            cell = worksheet.cell(row_number, column_number)
+            previous = cached.cell(row_number, column_number).value
+            if cell.data_type == "f" and (
+                _is_blank_cumulative_value(value) or _same_cumulative_cell_value(value, previous)
+            ):
+                continue
+            if not _same_cumulative_cell_value(value, cell.value):
+                cell.value = value
+    for name in ("상시정책자금DB", "고용지원금DB", "코드표", "사용가이드"):
+        if name not in workbook.sheetnames:
+            workbook.create_sheet(name)
+
+
 def _write_cumulative_customer_db(cumulative_path, df, columns=None):
     """
     누적 고객DB를 기존 고객DB 양식과 동일하게 저장한다.
 
     - 고객DB 시트 컬럼/서식 유지
     - 상시정책자금DB/고용지원금DB/코드표/사용가이드 등 나머지 시트 유지
-    - 기존 v2.3~v2.3.1 누적DB의 관리용 컬럼은 제거
+    - 기존 확장열/수식/주석/추가 시트는 삭제하지 않는다.
     """
     columns = columns or get_customer_db_columns()
     df = _normalize_customer_db_frame(df, columns)
 
-    wb = _load_customer_template_workbook()
-    ws, header_row = _prepare_template_customer_sheet(wb, columns)
-    _write_dataframe_to_customer_sheet(ws, header_row, df)
-
     cumulative_path = Path(cumulative_path)
+    if cumulative_path.exists():
+        from openpyxl import load_workbook
+        wb = load_workbook(cumulative_path, data_only=False)
+        cached_workbook = None
+        try:
+            cached_workbook = load_workbook(cumulative_path, data_only=True)
+            _patch_existing_customer_workbook(wb, cached_workbook, cumulative_path, df, columns)
+        except Exception:
+            wb.close()
+            raise
+        finally:
+            if cached_workbook is not None:
+                cached_workbook.close()
+    else:
+        wb = _load_customer_template_workbook()
+        ws, header_row = _prepare_template_customer_sheet(wb, columns)
+        _write_dataframe_to_customer_sheet(ws, header_row, df)
+
     cumulative_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = cumulative_path.with_name(
         f".{cumulative_path.name}.{uuid.uuid4().hex}.tmp"
@@ -676,9 +820,8 @@ def _inspect_cumulative_customer_db_format(
 
         if header_row is None:
             return False, 0
-        if any(column in headers for column in CUMULATIVE_META_COLUMNS):
-            return False, 0
-        if any(column not in headers for column in expected_columns):
+        if any(column not in headers for column in expected_columns
+               if column not in CUMULATIVE_OPTIONAL_COLUMNS):
             return False, 0
 
         company_column = headers.index("업체명") + 1
@@ -715,11 +858,12 @@ def _inspect_cumulative_customer_db_format(
 def ensure_user_cumulative_db_format(user_id):
     """
     기존 v2.3~v2.3.1에서 생성된 고객DB누적.xlsx를
-    현재 고객DB 템플릿 형식으로 강제 변환한다.
+    기존 값과 시트를 보존하며 필요한 고객DB 헤더만 보충한다.
 
     - 고객DB 시트명으로 저장
     - 상시정책자금DB/고용지원금DB/코드표/사용가이드 유지
-    - 누적저장일시/회원ID/담당자명 제거
+    - 원본 확장열과 추가 시트는 보존한다.
+    - 새 선택입력 필드 3개만 없는 경우 조회 시 파일을 변경하지 않는다.
     - 최신 형식이면 파일을 다시 쓰지 않아 읽기 캐시와 파일 mtime을 유지
     """
     cumulative_path = get_user_cumulative_db_path(user_id)
@@ -772,7 +916,10 @@ def append_user_customer_db(
     cumulative_path = get_user_cumulative_db_path(user_id)
     try:
         columns = get_customer_db_columns()
-        df_new = pd.read_excel(uploaded_excel_path, sheet_name=CUSTOMER_DB_SHEET_NAME)
+        df_new = pd.read_excel(
+            uploaded_excel_path, sheet_name=CUSTOMER_DB_SHEET_NAME,
+            dtype={"대표자 휴대전화": str, "표준산업분류코드": str, "표준산업분류차수": str},
+        )
         df_new = _normalize_customer_db_frame(df_new, columns)
         if df_new.empty:
             result = (cumulative_path, 0)
@@ -1080,20 +1227,11 @@ def extract_cretop_identity(pdf_path, max_pages=2):
     if not text.strip():
         return {}, "PDF 앞부분에서 사업자정보를 읽지 못했습니다. " + " / ".join(errors[:2])
 
-    company_name = _regex_first(r"기업명\s+(.+?)\s+영문기업명", text)
-    if not company_name:
-        company_name = _regex_first(r"기업명\s*[:：]\s*(.+?)\s+사업자번호", text)
-
-    business_no = _regex_first(
-        r"사업자번호\s+([0-9]{3}-[0-9]{2}-[0-9]{5})",
-        text,
-    )
-    if not business_no:
-        business_no = _regex_first(r"([0-9]{3}-[0-9]{2}-[0-9]{5})", text)
-
+    from cretop_worker import extract_identity
+    identity = extract_identity(text)
     return {
-        "업체명": company_name,
-        "사업자등록번호": normalize_business_no(business_no),
+        "업체명": identity.get("업체명", ""),
+        "사업자등록번호": identity.get("사업자등록번호", ""),
     }, ""
 
 
@@ -1146,21 +1284,15 @@ def _read_business_numbers_only(cumulative_path):
 
 def extract_cretop_pdf_data(pdf_path):
     """크레탑 기업종합보고서 PDF에서 고객DB 자동입력용 값을 추출한다."""
+    from cretop_worker import extract_identity, extract_industry_fields
+
     text, error = extract_pdf_text(pdf_path)
     if error:
         return {}, error
 
     compact = _compact_text(text)
-    data = {}
-
-    data["업체명"] = _regex_first(r"기업명\s+(.+?)\s+영문기업명", text)
-    if not data["업체명"]:
-        data["업체명"] = _regex_first(r"기업명\s*[:：]\s*(.+?)\s+사업자번호", text, flags=0)
-    data["사업자등록번호"] = _regex_first(r"사업자번호\s+([0-9]{3}-[0-9]{2}-[0-9]{5})", text)
-    if not data["사업자등록번호"]:
-        data["사업자등록번호"] = _regex_first(r"([0-9]{3}-[0-9]{2}-[0-9]{5})", text)
+    data = extract_identity(text)
     data["법인등록번호"] = _regex_first(r"법인\(주민\)번호\s+([0-9\-]+)", text)
-    data["대표자명"] = _regex_first(r"대표자명\s+(.+?)\s+종업원수", text)
     data["종업원수"] = _regex_first(r"종업원수\s+([0-9,]+)\s*명", text)
     data["설립일"] = _regex_first(r"설립년월\s+([0-9]{4}-[0-9]{2}-[0-9]{2})", text)
     data["설립년도"] = data["설립일"][:4] if data.get("설립일") else ""
@@ -1172,8 +1304,7 @@ def extract_cretop_pdf_data(pdf_path):
     import re
     data["사업장 소재지"] = _regex_first(r"주소\s+(.+?)\s+표준산업분류\(10차\)", text, flags=re.S)
     data["사업장 소재지"] = " ".join(data["사업장 소재지"].split())
-    data["업종명"] = _regex_first(r"표준산업분류\(10차\)\s+\([A-Z0-9]+\)\s*(.+?)\s+표준산업분류\(11차\)", text, flags=re.S)
-    data["업종명"] = " ".join(data["업종명"].split())
+    data.update(extract_industry_fields(text))
 
     data["매출액"] = _latest_summary_amount_million("매출액", text)
     data["연매출"] = data["매출액"]
@@ -1503,7 +1634,8 @@ def append_cretop_to_user_customer_db(pdf_path, user_id, manager_name="", duplic
     # Parser success is not sufficient: never append an empty/OCR-failed company.
     company_name = str(data.get("업체명") or data.get("기업명") or "").strip()
     business_digits = re.sub(r"\D", "", str(data.get("사업자등록번호") or data.get("사업자번호") or ""))
-    if not company_name or len(business_digits) != 10:
+    from cretop_worker import valid_company_name
+    if not valid_company_name(company_name) or len(business_digits) != 10:
         return (
             cumulative_path, 0,
             "업체명과 사업자등록번호를 확인할 수 없어 등록하지 않았습니다.",
@@ -1636,6 +1768,17 @@ def update_user_customer_record(user_id, row_index, updates):
     고객관리 화면에서 수정한 값을 누적 고객DB에 반영한다.
     기존 고객DB 서식과 다른 시트는 그대로 유지한다.
     """
+    updates = dict(updates or {})
+    if "대표자 휴대전화" in updates:
+        try:
+            mobile = normalize_representative_mobile(updates["대표자 휴대전화"])
+        except ValueError as exc:
+            return False, str(exc)
+        if mobile:
+            updates["대표자 휴대전화"] = mobile
+        else:
+            # Match cloud lossless merge: blank input never erases a saved number.
+            updates.pop("대표자 휴대전화")
     cumulative_path = get_user_cumulative_db_path(user_id)
     columns = get_customer_db_columns()
     df = _read_cumulative_customer_db(cumulative_path, columns)
@@ -1651,6 +1794,7 @@ def update_user_customer_record(user_id, row_index, updates):
     if row_index not in df.index:
         return False, "수정할 고객을 찾지 못했습니다."
 
+    df = df.astype(object)
     changed = []
     for key, value in (updates or {}).items():
         if key not in columns:
@@ -1663,7 +1807,10 @@ def update_user_customer_record(user_id, row_index, updates):
     if not changed:
         return False, "변경할 항목이 없습니다."
 
-    _write_cumulative_customer_db(cumulative_path, df, columns)
+    try:
+        _write_cumulative_customer_db(cumulative_path, df, columns)
+    except ValueError:
+        return False, "고객DB 원본 보존 확인에 실패해 수정하지 않았습니다."
     return True, f"고객정보 {len(changed)}개 항목을 수정했습니다."
 
 
@@ -1750,6 +1897,7 @@ def refresh_existing_customer_from_cretop(user_id, extracted_data, *, reviewed_f
     # Existing callers retain their original fill-missing-only behaviour.
     priority_fields.update(set(reviewed_fields or ()) & {
         "업체명", "대표자명", "사업자등록번호", "업종명", "사업장 소재지",
+        "대표자 휴대전화", "표준산업분류코드", "표준산업분류차수",
         "법인등록번호", "설립일", "종업원수", "기업유형", "기업규모",
     })
 
