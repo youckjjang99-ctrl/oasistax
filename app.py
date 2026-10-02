@@ -691,6 +691,7 @@ def _navigate_to_main_menu(target: str) -> None:
         "기업 컨설팅": "주요업무",
         "경정청구 영업신청": "주요업무",
         "AI 코파일럿": "주요업무",
+        "AI 방문상담": "주요업무",
         "내 누적 고객DB": "고객관리",
         "실행이력": "고객관리",
         "담당자 통계": "고객관리",
@@ -2019,6 +2020,7 @@ with st.sidebar:
     if SHOW_CLAIM_SALES_APPLICATION_MENU:
         primary_menu["경정청구 영업신청"] = "경정청구 영업신청"
     primary_menu["AI 코파일럿"] = "AI 코파일럿"
+    primary_menu["AI 방문상담"] = "AI 방문상담"
 
     menu_groups = {
         "주요업무": primary_menu,
@@ -2104,6 +2106,7 @@ with st.sidebar:
         "기업 컨설팅": "기업 컨설팅",
         "경정청구 영업신청": "경정청구 영업신청",
         "AI 코파일럿": "AI 코파일럿",
+        "AI 방문상담": "AI 방문상담",
         "내 누적 고객DB": "내 고객DB",
         "실행이력": "실행이력",
         "담당자 통계": "담당자 통계",
@@ -2247,6 +2250,14 @@ elif active_tab == "AI 코파일럿":
     render_copilot_page(
         CURRENT_USER_ID,
         CURRENT_USER_NAME,
+    )
+
+elif active_tab == "AI 방문상담":
+    from voice_calling_ui import render_voice_calling
+
+    render_voice_calling(
+        CURRENT_USER_ID,
+        is_admin_user=CURRENT_USER_IS_ADMIN,
     )
 
 elif active_tab == "내 누적 고객DB":

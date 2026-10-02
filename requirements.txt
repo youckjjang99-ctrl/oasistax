@@ -20,3 +20,5 @@ pytesseract==0.3.13
 reportlab==4.2.5
 opencv-python-headless==4.10.0.84
 msoffcrypto-tool==6.0.0
+twilio==9.11.2
+websockets==17.1
