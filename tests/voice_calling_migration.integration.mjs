@@ -9,6 +9,7 @@ process.on('uncaughtException', error => {
 const { PGlite } = await import(process.env.PGLITE_PACKAGE || '@electric-sql/pglite');
 const db = new PGlite();
 const migration = await readFile(new URL('../supabase/migrations/20261001235500_ai_visit_calling.sql', import.meta.url), 'utf8');
+const carrierMigration = await readFile(new URL('../supabase/migrations/20261003010404_ai_visit_calling_clawops_provider.sql', import.meta.url), 'utf8');
 let checks = 0;
 function check(actual, expected, label) { assert.deepEqual(actual, expected, label); checks++; }
 async function scalar(sql) { return (await db.query(sql)).rows[0].v; }
@@ -76,8 +77,34 @@ check((await action('alice','approve',{job_id:id})).code,'NOT_AUTHORIZED','only 
 check((await action('admin','approve',{job_id:id})).ok,true,'admin approval');
 const claim=await worker('claim');
 check(claim.job.id,id,'atomic claim');
+// Upgrade a real, in-flight legacy Twilio job; repeat the exact new DDL before
+// freezing its clock. Existing rows and audit history must remain unchanged.
+const legacyJob = await scalar(`select to_jsonb(j) v from public.oasis_voice_jobs j where id='${id}'`);
+const legacyEvents = await scalar('select jsonb_agg(to_jsonb(e) order by id) v from public.oasis_voice_events e');
+const legacyPermissions = await scalar('select jsonb_agg(to_jsonb(p) order by id) v from public.oasis_voice_permissions p');
+await db.exec('reset role');
+await db.exec(carrierMigration);
+await db.exec(carrierMigration);
+check(await scalar(`select to_jsonb(j)-'provider' v from public.oasis_voice_jobs j where id='${id}'`),legacyJob,'upgrade preserves in-flight legacy job');
+check(await scalar(`select provider v from public.oasis_voice_jobs where id='${id}'`),'twilio','legacy job defaults to Twilio');
+check(await scalar('select jsonb_agg(to_jsonb(e) order by id) v from public.oasis_voice_events e'),legacyEvents,'upgrade preserves audit history');
+check(await scalar('select jsonb_agg(to_jsonb(p) order by id) v from public.oasis_voice_permissions p'),legacyPermissions,'upgrade preserves consent evidence');
+check(await scalar("select prosecdef v from pg_proc where oid='public.oasis_voice_worker(text,jsonb)'::regprocedure"),false,'worker remains security invoker');
+check(await scalar("select proconfig @> ARRAY['search_path=\"\"'] v from pg_proc where oid='public.oasis_voice_worker(text,jsonb)'::regprocedure"),true,'worker retains empty search path');
+check(await scalar("select has_function_privilege('anon','public.oasis_voice_worker(text,jsonb)','execute') v"),false,'upgrade denies anonymous worker execution');
+check(await scalar("select has_function_privilege('authenticated','public.oasis_voice_worker(text,jsonb)','execute') v"),false,'upgrade denies authenticated worker execution');
+check(await scalar("select has_function_privilege('service_role','public.oasis_voice_worker(text,jsonb)','execute') v"),true,'upgrade preserves worker server grant');
+await db.exec(carrierMigration.replace(/\bnow\(\)/g,'public.voice_test_now()'));
+await db.exec('set role service_role');
+check((await worker('get_job',{job_id:id})).ok,true,'legacy pre-dispatch recheck without call ID');
+check((await worker('get_job',{job_id:id,provider:'clawops'})).code,'PROVIDER_MISMATCH','wrong provider cannot recheck legacy claim');
+const clawSid='clawops:CAfixture_12345678';
+check((await worker('connect',{job_id:id,provider_call_id:clawSid,dispatch_nonce:claim.job.dispatch_nonce})).code,'PROVIDER_MISMATCH','ClawOps cannot bind an unbound Twilio claim');
+check(await scalar(`select provider_call_id v from public.oasis_voice_jobs where id='${id}'`),null,'wrong provider callback has no side effects');
 check((await worker('claim')).code,'BUSY','second worker cannot dispatch same or parallel job');
 const sid='CA'+'1'.repeat(32);
+check((await worker('connect',{job_id:id,provider_call_id:sid,dispatch_nonce:'00000000-0000-4000-8000-000000000099'})).code,'PROVIDER_MISMATCH','wrong nonce rejected before binding');
+check(await scalar(`select provider_call_id v from public.oasis_voice_jobs where id='${id}'`),null,'invalid nonce cannot poison first call ID');
 check((await worker('connect',{job_id:id,provider_call_id:sid,dispatch_nonce:claim.job.dispatch_nonce})).ok,true,'callback can arrive before dispatch return');
 check((await worker('connect',{job_id:id,provider_call_id:sid,dispatch_nonce:claim.job.dispatch_nonce})).code,'PROVIDER_MISMATCH','stream replay rejected');
 check((await worker('mark_dispatched',{job_id:id,provider_call_id:sid})).ok,true,'late dispatch acceptance');
@@ -108,5 +135,95 @@ check((await worker('claim')).code,'BUSY','quarantine stops new calls');
 check((await action('alice','reconcile',{job_id:id,resolution:'confirmed_ended',reason:'test provider evidence'})).code,'NOT_AUTHORIZED','only admin reconciles');
 check((await action('admin','reconcile',{job_id:id,resolution:'confirmed_ended',reason:'test provider evidence'})).ok,true,'human resolution releases global hold');
 check((await action('alice','candidates')).rows.find(x=>x.company_uid===uidA).do_not_call,true,'manual resolution never unsuppresses');
+// A fresh queued job chooses its carrier at claim, never through a callback.
+await db.exec(`update public.oasis_company_sales_assignments set assigned_user_id='alice' where company_uid='${uidC}'`);
+const otherQueued=await action('alice','enqueue',{company_uids:[uidC],request_id:'test-nonallowlisted-c'});
+const otherId=otherQueued.rows[0].id;
+await action('admin','approve',{job_id:otherId});
+await db.exec(`update public.oasis_voice_jobs set created_at='2030-01-06T00:00:00Z' where id='${otherId}'`);
+const clawQueued=await action('bob','enqueue',{company_uids:[uidB],request_id:'test-clawops-request-b'});
+check(clawQueued.ok,true,'ClawOps uses the same permission-gated queue');
+const clawId=clawQueued.rows[0].id;
+check(await scalar(`select provider v from public.oasis_voice_jobs where id='${clawId}'`),'twilio','queued carrier is only a legacy default');
+await action('admin','approve',{job_id:clawId});
+check((await worker('claim',{provider:'unsupported'})).code,'INVALID_INPUT','unsupported carrier never claims');
+check(await scalar(`select status v from public.oasis_voice_jobs where id='${clawId}'`),'approved','invalid carrier leaves queue intact');
+for (const badAllowlist of [null,{},'not-array',[],['+821000000002',null],['+821000000002','invalid'],Array(6).fill('+821000000002')]) {
+ check((await worker('claim',{provider:'clawops',test_phone_allowlist:badAllowlist})).code,'INVALID_INPUT','invalid internal-test allowlist fails closed');
+}
+check((await worker('claim',{provider:'twilio',test_phone_allowlist:['+821000000002']})).code,'INVALID_INPUT','test allowlist is ClawOps-only');
+check((await worker('claim',{provider:'clawops',test_phone_allowlist:['+821000000099']})).code,'EMPTY','test with no matching approved target does not claim others');
+const clawClaim=await worker('claim',{provider:'clawops',test_phone_allowlist:['+821000000002']});
+check(clawClaim.job.id,clawId,'ClawOps claims approved job');
+check(await scalar(`select status v from public.oasis_voice_jobs where id='${otherId}'`),'approved','older nonallowlisted customer stays approved');
+check(await scalar(`select dispatch_at v from public.oasis_voice_jobs where id='${otherId}'`),null,'nonallowlisted customer never dispatched');
+check(clawClaim.job.provider,'clawops','claim fixes carrier before callbacks');
+check((await worker('get_job',{job_id:clawId,provider:'clawops'})).ok,true,'ClawOps pre-dispatch recheck without call ID');
+check((await worker('get_job',{job_id:clawId})).code,'PROVIDER_MISMATCH','implicit Twilio cannot inspect ClawOps dispatch');
+for (const name of ['get_job','connect','status','mark_dispatched','result']) {
+ check((await worker(name,{job_id:clawId,provider_call_id:sid,dispatch_nonce:clawClaim.job.dispatch_nonce})).code,'PROVIDER_MISMATCH',`Twilio ${name} cannot bind ClawOps claim`);
+}
+check((await worker('mark_unknown',{job_id:clawId})).code,'PROVIDER_MISMATCH','wrong carrier cannot quarantine unbound dispatch');
+for (const invalidSid of ['clawops:CAshort','clawops:CA'+'a'.repeat(101),'clawops:CAinvalid.dot','clawops:CAinvalid/value','clawops:CA한글12345678','CAfixture_12345678']) {
+ check((await worker('get_job',{job_id:clawId,provider_call_id:invalidSid})).code,'PROVIDER_MISMATCH','malformed carrier call ID rejected');
+}
+check((await worker('get_job',{job_id:clawId,provider_call_id:clawSid,provider:'twilio'})).code,'PROVIDER_MISMATCH','explicit carrier cannot contradict call namespace');
+const clawPreflight=await worker('get_job',{job_id:clawId,provider_call_id:clawSid});
+check(clawPreflight.ok,true,'signed VoiceML can preflight its proposed call ID');
+check(clawPreflight.job.phone_e164,clawClaim.job.phone_e164,'preflight supplies trusted destination');
+check(await scalar(`select provider_call_id v from public.oasis_voice_jobs where id='${clawId}'`),null,'preflight does not bind proposed call ID');
+check((await worker('connect',{job_id:clawId,provider_call_id:clawSid,dispatch_nonce:'00000000-0000-4000-8000-000000000099'})).code,'PROVIDER_MISMATCH','ClawOps wrong nonce rejected');
+check(await scalar(`select provider_call_id v from public.oasis_voice_jobs where id='${clawId}'`),null,'rejected ClawOps nonce cannot bind');
+await db.exec(`update public.oasis_company_sales_assignments set assigned_user_id='alice' where company_uid='${uidB}'`);
+check((await worker('connect',{job_id:clawId,provider_call_id:clawSid,dispatch_nonce:clawClaim.job.dispatch_nonce})).code,'TARGET_CHANGED','changed target is rechecked at media connect');
+check(await scalar(`select provider_call_id v from public.oasis_voice_jobs where id='${clawId}'`),null,'changed target cannot bind proposed call ID');
+await db.exec(`update public.oasis_company_sales_assignments set assigned_user_id='bob' where company_uid='${uidB}'`);
+check((await worker('connect',{job_id:clawId,provider_call_id:clawSid,dispatch_nonce:clawClaim.job.dispatch_nonce})).ok,true,'ClawOps connects before dispatch return');
+check((await worker('connect',{job_id:clawId,provider_call_id:clawSid,dispatch_nonce:clawClaim.job.dispatch_nonce})).code,'PROVIDER_MISMATCH','ClawOps stream replay rejected');
+check((await worker('mark_dispatched',{job_id:clawId,provider_call_id:clawSid})).ok,true,'ClawOps late dispatch acceptance');
+check((await worker('get_job',{job_id:clawId,provider:'clawops'})).code,'PROVIDER_MISMATCH','bound job requires exact call ID');
+check((await worker('get_job',{job_id:clawId,provider_call_id:'clawops:CAanother_12345678'})).code,'PROVIDER_MISMATCH','different ClawOps call cannot reuse job');
+check((await worker('claim',{provider:'twilio'})).code,'BUSY','carrier switch cannot bypass global concurrency hold');
+const beforeClawLog=await scalar('select count(*)::int v from public.test_contact_logs');
+const clawResult={job_id:clawId,provider_call_id:clawSid,outcome:'not_representative',summary:'Synthetic ClawOps result'};
+check((await worker('result',clawResult)).ok,true,'ClawOps result recorded');
+check((await worker('result',clawResult)).code,'DUPLICATE','ClawOps result replay deduplicated');
+check(await scalar('select count(*)::int v from public.test_contact_logs'),beforeClawLog+1,'ClawOps contact log written once');
+check((await worker('status',{job_id:clawId,provider_call_id:clawSid,status:'completed',sequence_number:3,duration_seconds:120})).ok,true,'ClawOps completion callback');
+check((await worker('status',{job_id:clawId,provider_call_id:clawSid,status:'ringing',sequence_number:1})).ok,true,'ClawOps out-of-order callback harmless');
+check(await scalar(`select status v from public.oasis_voice_jobs where id='${clawId}'`),'completed','ClawOps terminal status does not regress');
+// Normal live claim omits the internal-test filter. Exercise the VoiceML order
+// too: preflight -> bind accepted call -> fetch nonce -> one media connection.
+const normalClaw=await worker('claim',{provider:'clawops'});
+check(normalClaw.job.id,otherId,'normal ClawOps claim without allowlist uses approved queue');
+for (const name of ['mark_failed','mark_unknown']) {
+ await db.exec('begin');
+ check((await worker(name,{job_id:otherId,provider:'clawops'})).ok,true,`${name} works before ClawOps returns a call ID`);
+ check(await scalar(`select status v from public.oasis_voice_jobs where id='${otherId}'`),name==='mark_failed'?'failed':'unknown','pre-ID dispatch outcome persists');
+ await db.exec('rollback');
+}
+const normalClawSid='clawops:CA'+'a'.repeat(100);
+check((await worker('get_job',{job_id:otherId,provider_call_id:normalClawSid})).ok,true,'maximum-length supported ClawOps call ID passes preflight');
+check((await worker('mark_dispatched',{job_id:otherId,provider_call_id:normalClawSid})).ok,true,'VoiceML binds accepted call after target check');
+const normalMedia=await worker('get_job',{job_id:otherId,provider_call_id:normalClawSid});
+check(normalMedia.job.status,'accepted','VoiceML recheck returns accepted job');
+check(normalMedia.job.dispatch_nonce,normalClaw.job.dispatch_nonce,'VoiceML receives original one-use nonce');
+check((await worker('connect',{job_id:otherId,provider_call_id:normalClawSid,dispatch_nonce:normalMedia.job.dispatch_nonce})).ok,true,'VoiceML nonce connects accepted call');
+check((await worker('status',{job_id:otherId,provider_call_id:normalClawSid,status:'completed',duration_seconds:30})).ok,true,'VoiceML call completes');
+// Replaying both migrations in order must preserve new namespaced jobs too.
+const finalJobs=await scalar('select jsonb_agg(to_jsonb(j) order by id) v from public.oasis_voice_jobs j');
+await db.exec('reset role');
+await db.exec(migration);
+await db.exec(carrierMigration);
+check(await scalar('select jsonb_agg(to_jsonb(j) order by id) v from public.oasis_voice_jobs j'),finalJobs,'full migration replay preserves both provider types');
+check(await scalar("select count(*)::int v from pg_class where relname like 'oasis_voice_%' and relkind='r' and relrowsecurity"),4,'both migrations retain all RLS flags');
+check(await scalar("select has_table_privilege('authenticated','public.oasis_voice_jobs','select') v"),false,'carrier column never exposes browser data');
+check(await scalar("select has_table_privilege('service_role','public.oasis_voice_jobs','delete') v"),false,'carrier upgrade never grants delete');
+for (const role of ['anon','authenticated']) {
+ await db.exec(`set role ${role}`);
+ await assert.rejects(db.query("select public.oasis_voice_worker('claim','{}')"),error=>error.code==='42501'); checks++;
+ await assert.rejects(db.query('select provider from public.oasis_voice_jobs'),error=>error.code==='42501'); checks++;
+ await db.exec('reset role');
+}
 await db.close();
-console.log(`PASS ${checks} isolated PostgreSQL checks; exact migration applied twice; no production connection.`);
+console.log(`PASS ${checks} isolated PostgreSQL checks; both exact migrations applied twice plus data-preserving replay; no production connection.`);

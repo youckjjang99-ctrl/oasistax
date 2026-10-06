@@ -14,7 +14,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
-VERSION = "v9.14.0-ai-visit-calling"
+VERSION = "v9.14.2-ai-visit-calling-bulk-dashboard"
 KST = timezone(timedelta(hours=9))
 OUTCOMES = frozenset({"visit_requested", "callback_requested", "declined", "wrong_number", "not_representative", "do_not_call"})
 
@@ -93,6 +93,12 @@ class VoiceSettings:
     stream_ticket_secret: str = ""
     daily_limit: int = 20
     concurrency: int = 1
+    clawops_account_id: str = ""
+    clawops_api_key: str = ""
+    clawops_signing_secret: str = ""
+    clawops_billing_confirmed: bool = False
+    clawops_live_verified: bool = False
+    clawops_test_numbers: tuple[str, ...] = ()
 
     @classmethod
     def from_environment(cls, env: Mapping[str, str] | None = None) -> "VoiceSettings":
@@ -110,6 +116,12 @@ class VoiceSettings:
             stream_ticket_secret=e.get("OASIS_VOICE_STREAM_TICKET_SECRET", ""),
             max_call_seconds=_bounded_int(e, "OASIS_VOICE_MAX_CALL_SECONDS", 180, 60, 300),
             daily_limit=_bounded_int(e, "OASIS_VOICE_DAILY_LIMIT", 20, 1, 100),
+            clawops_account_id=e.get("CLAWOPS_ACCOUNT_ID", ""),
+            clawops_api_key=e.get("CLAWOPS_API_KEY", ""),
+            clawops_signing_secret=e.get("CLAWOPS_WEBHOOK_SIGNING_SECRET", ""),
+            clawops_billing_confirmed=e.get("OASIS_VOICE_CLAWOPS_BILLING_CONFIRMED", "").lower() == "true",
+            clawops_live_verified=e.get("OASIS_VOICE_CLAWOPS_LIVE_VERIFIED", "").lower() == "true",
+            clawops_test_numbers=tuple(x.strip() for x in e.get("OASIS_VOICE_TEST_NUMBERS", "").split(",") if x.strip()),
         )
 
     def readiness(self) -> dict[str, Any]:
@@ -120,17 +132,36 @@ class VoiceSettings:
                       and url.hostname not in {"localhost", "127.0.0.1", "::1"})
         except ValueError:
             url_ok = False
+        provider_ok = (self.provider == "twilio" and bool(re.fullmatch(r"AC[0-9a-fA-F]{32}", self.twilio_account_sid))
+                       and len(self.twilio_auth_token) >= 20)
+        caller_ok = bool(re.fullmatch(r"\+[1-9]\d{7,14}", self.caller_id))
+        extra_checks = []
+        if self.provider == "clawops":
+            provider_ok = bool(re.fullmatch(r"AC[A-Za-z0-9_-]{8,100}", self.clawops_account_id)) and bool(self.clawops_api_key.strip())
+            try:
+                caller_ok = normalize_phone(self.caller_id).startswith("+8270")
+                test_numbers_ok = 1 <= len(self.clawops_test_numbers) <= 5 and all(normalize_phone(x) for x in self.clawops_test_numbers)
+            except ValueError:
+                caller_ok, test_numbers_ok = False, False
+            extra_checks = [
+                {"label": "ClawOps 별도 웹훅 서명키", "ok": len(self.clawops_signing_secret) >= 32},
+                {"label": "외부 음성 연결 과금 조건 확인", "ok": self.clawops_billing_confirmed},
+                {"label": "내부 시험번호 또는 실통화 검증 승인", "ok": self.clawops_live_verified or bool(test_numbers_ok)},
+            ]
         checks = [
             {"label": "실제 발신 활성화", "ok": self.enabled},
-            {"label": "전화 서비스 연결", "ok": self.provider == "twilio" and bool(re.fullmatch(r"AC[0-9a-fA-F]{32}", self.twilio_account_sid)) and len(self.twilio_auth_token) >= 20},
-            {"label": "등록된 발신번호 설정", "ok": bool(re.fullmatch(r"\+[1-9]\d{7,14}", self.caller_id))},
+            {"label": "전화 서비스 연결", "ok": provider_ok},
+            {"label": "등록된 발신번호 설정", "ok": caller_ok},
             {"label": "HTTPS 음성 서버 주소", "ok": url_ok},
             {"label": "음성 AI API 연결 설정", "ok": bool(self.openai_api_key and self.realtime_model and self.realtime_voice)},
             {"label": "전용 보안키 설정", "ok": len(self.stream_ticket_secret) >= 32},
-        ]
+        ] + extra_checks
         ready = all(c["ok"] for c in checks)
         return {"ready": ready, "enabled": self.enabled, "checks": checks,
-                "message": "설정 확인 완료 · 별도 승인된 대상만 발신합니다." if ready else "실제 발신 중지 · 전화 서비스와 필수 설정이 필요합니다."}
+                "provider": self.provider,
+                "test_only": self.provider == "clawops" and not self.clawops_live_verified,
+                "message": ("내부 시험 모드 · 지정한 시험번호에만 발신합니다." if self.provider == "clawops" and not self.clawops_live_verified
+                            else "설정 확인 완료 · 별도 승인된 대상만 발신합니다.") if ready else "실제 발신 중지 · 전화 서비스와 필수 설정이 필요합니다."}
 
 
 def _safe_fact(value: Any, limit: int = 120) -> str:

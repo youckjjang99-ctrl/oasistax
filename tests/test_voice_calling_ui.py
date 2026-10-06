@@ -22,6 +22,7 @@ class FakeStreamlit:
         self.buttons = []
         self.messages = []
         self.session_state = {}
+        self.column_config = type("ColumnConfig", (), {"CheckboxColumn": staticmethod(lambda *_args, **_kwargs: {})})
 
     def __enter__(self):
         return self
@@ -32,6 +33,11 @@ class FakeStreamlit:
     def expander(self, *_args, **_kwargs):
         return self
 
+    form = expander
+
+    def columns(self, count):
+        return [self] * (count if isinstance(count, int) else len(count))
+
     def button(self, label, **kwargs):
         self.buttons.append((label, kwargs))
         return self.clicked == label and not kwargs.get("disabled")
@@ -39,8 +45,16 @@ class FakeStreamlit:
     def multiselect(self, *_args, **_kwargs):
         return self.selected
 
-    def text_input(self, *_args, **_kwargs):
-        return ""
+    form_submit_button = button
+
+    def checkbox(self, *_args, **kwargs):
+        return kwargs.get("value", False)
+
+    def data_editor(self, rows, **_kwargs):
+        return [{**row, "선택": index < len(self.selected)} for index, row in enumerate(rows)]
+
+    def text_input(self, *_args, **kwargs):
+        return kwargs.get("value", "")
 
     def dataframe(self, *_args, **_kwargs):
         pass
@@ -122,20 +136,33 @@ class VoiceCallingUiTests(unittest.TestCase):
 
     def test_queue_rejects_missing_consent_before_repository(self):
         repo = FakeRepository()
-        screen = FakeStreamlit(clicked="선택 업체 AI 방문상담 대기에 넣기", selected=["fixture:one"])
+        screen = FakeStreamlit(clicked="선택 1개 업체 캠페인 저장", selected=["fixture:one"])
         ui._render_targets(screen, repo, "owner-a", [self.candidate(permission_valid=False)], True, False)
         self.assertEqual(repo.calls, [])
         self.assertTrue(any("동의 확인" in text for text in screen.messages))
 
     def test_valid_selection_queues_without_dialing(self):
         repo = FakeRepository()
-        screen = FakeStreamlit(clicked="선택 업체 AI 방문상담 대기에 넣기", selected=["fixture:one"])
+        screen = FakeStreamlit(clicked="선택 1개 업체 캠페인 저장", selected=["fixture:one"])
         ui._render_targets(screen, repo, "owner-a", [self.candidate()], True, False)
         self.assertEqual(len(repo.calls), 1)
         actor, action, payload = repo.calls[0]
-        self.assertEqual((actor, action), ("owner-a", "enqueue"))
+        self.assertEqual((actor, action), ("owner-a", "create_campaign"))
         self.assertEqual(payload["company_uids"], ["fixture:one"])
+        self.assertTrue(payload["name"])
         self.assertTrue(payload["request_id"])
+
+    def test_campaign_jobs_never_receive_individual_approval_controls(self):
+        repo = FakeRepository()
+        screen = FakeStreamlit(clicked="이 요청 발신 승인")
+        ui._render_queue(screen, repo, "admin", [{"id": "job-one", "campaign_id": "campaign-one", "status": "queued"}], True, True)
+        self.assertEqual(repo.calls, [])
+        self.assertFalse(any(label == "이 요청 발신 승인" for label, _ in screen.buttons))
+
+    def test_admin_batch_limit_allows_100_not_101(self):
+        rows = [self.candidate(company_uid=f"fixture:{i}") for i in range(101)]
+        self.assertEqual(ui.validate_selection([row["company_uid"] for row in rows[:100]], rows, require_eligible=True, max_selection=100), "")
+        self.assertIn("100", ui.validate_selection([row["company_uid"] for row in rows], rows, require_eligible=True, max_selection=100))
 
     def test_app_menu_wires_lazy_renderer_and_authorized_actor(self):
         source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")

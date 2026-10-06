@@ -1,4 +1,4 @@
-"""Separate, authenticated Twilio <-> OpenAI Realtime media service.
+"""Separate, authenticated Twilio/ClawOps <-> OpenAI Realtime media service.
 
 Run with ``uvicorn voice_calling_gateway:app --host 0.0.0.0 --port $PORT``.
 It does not dial calls, expose transcripts, or modify the tax-claim gateway.
@@ -22,7 +22,7 @@ from websockets.asyncio.client import connect
 
 from voice_calling import VoiceSettings, build_realtime_session, opening_greeting, validate_outcome
 from voice_calling_provider import (
-    SID_RE, TwilioVoiceProvider, canonical_job_id, validate_twilio_signature,
+    SID_RE, create_voice_provider, canonical_job_id, validate_twilio_signature,
     verify_stream_ticket,
 )
 
@@ -233,7 +233,8 @@ class CallBridge:
                         return
             elif kind == "dtmf" and event.get("dtmf", {}).get("digit") == "9":
                 # Keypad opt-out works independently of model understanding.
-                await self._downstream({"event": "clear", "streamSid": self.stream_sid})
+                # Save an already-received withdrawal before any socket write:
+                # the caller may hang up immediately after pressing the key.
                 try:
                     result = await self._save_result({"outcome": "do_not_call", "visit_at": "", "address": "",
                                                      "summary": "키패드 수신거부", "customer_confirmed": True},
@@ -242,6 +243,10 @@ class CallBridge:
                         raise BridgeProtocolError("DO_NOT_CALL_SAVE_FAILED")
                 except Exception:
                     raise BridgeProtocolError("DO_NOT_CALL_SAVE_FAILED") from None
+                try:
+                    await self._downstream({"event": "clear", "streamSid": self.stream_sid})
+                except Exception:
+                    pass  # The opt-out is durable; transport cleanup follows.
                 self.finished.set()
                 return
             elif kind == "stop":
@@ -343,7 +348,7 @@ def _default_upstream(config: VoiceSettings):
 def create_app(config: VoiceSettings | None = None, repository: Any = None,
                provider: Any = None, upstream_connect: Callable | None = None) -> FastAPI:
     settings = config or VoiceSettings.from_environment()
-    call_provider = provider or TwilioVoiceProvider(settings)
+    call_provider = provider or create_voice_provider(settings)
     connector = upstream_connect or _default_upstream
     active: set[asyncio.Task] = set()
 
@@ -375,6 +380,8 @@ def create_app(config: VoiceSettings | None = None, repository: Any = None,
             canonical_job_id(job_id)
         except ValueError:
             raise HTTPException(404, "Not found") from None
+        if settings.provider != "twilio":
+            raise HTTPException(403, "Forbidden")
         if request.url.query or request.headers.get("content-type", "").split(";")[0].strip() != "application/x-www-form-urlencoded":
             raise HTTPException(400, "Invalid request")
         content = bytearray()
@@ -421,7 +428,7 @@ def create_app(config: VoiceSettings | None = None, repository: Any = None,
         except ValueError:
             await websocket.close(code=1008)
             return
-        if (not settings.readiness().get("ready") or websocket.url.query
+        if (settings.provider != "twilio" or not settings.readiness().get("ready") or websocket.url.query
                 or not validate_twilio_signature(settings, f"/voice/media/{job_id}", {},
                                                  websocket.headers.get("x-twilio-signature", ""), websocket=True)):
             await websocket.close(code=1008)
@@ -501,6 +508,9 @@ def create_app(config: VoiceSettings | None = None, repository: Any = None,
             if task is not None:
                 active.discard(task)
 
+    # Separate wire protocol; the established realtime bridge remains shared.
+    from voice_calling_clawops_gateway import register_clawops_routes
+    register_clawops_routes(app, settings, get_repository, call_provider, connector, active)
     return app
 
 

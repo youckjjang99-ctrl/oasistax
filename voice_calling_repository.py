@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 _ACTIONS = {"candidates", "list_jobs", "list_permissions", "grant_permission", "revoke_permission", "do_not_call", "enqueue", "approve", "cancel", "confirm_visit", "reconcile"}
+_CAMPAIGN_ACTIONS = {"create_campaign", "list_campaigns", "campaign_jobs", "campaign_stats", "start_campaign", "pause_campaign", "cancel_campaign", "legacy_jobs"}
 _WORKER_ACTIONS = {"claim", "get_job", "connect", "mark_dispatched", "mark_unknown", "mark_failed", "status", "result", "bridge_error"}
 _MESSAGES = {
     "OK": "처리되었습니다.", "EMPTY": "발신 대기 작업이 없습니다.",
@@ -19,6 +20,7 @@ _MESSAGES = {
     "APPOINTMENT_CONFLICT": "같은 담당자의 방문 일정이 겹칩니다. 일정을 다시 협의해 주세요.",
     "INVALID_RESULT": "방문 의향·장소·정확한 일시를 확인해 주세요.",
     "PROVIDER_MISMATCH": "통화 결속정보가 일치하지 않아 중단했습니다.",
+    "CAMPAIGN_NOT_RUNNING": "발신 묶음이 일시정지 또는 취소되어 추가 발신을 중단했습니다.",
 }
 
 
@@ -45,9 +47,10 @@ class VoiceRepository:
             return {"ok": False, "code": "NOT_READY", "message": _MESSAGES["NOT_READY"]}
 
     def action(self, actor: str, action: str, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        if not actor or action not in _ACTIONS:
+        if not actor or action not in _ACTIONS | _CAMPAIGN_ACTIONS:
             return {"ok": False, "code": "INVALID_INPUT", "message": _MESSAGES["INVALID_INPUT"]}
-        return self._call("oasis_voice_action", {"p_current_user_id": actor, "p_action": action, "p_payload": dict(payload or {})})
+        rpc = "oasis_voice_campaign_action" if action in _CAMPAIGN_ACTIONS else "oasis_voice_action"
+        return self._call(rpc, {"p_current_user_id": actor, "p_action": action, "p_payload": dict(payload or {})})
 
     def worker(self, action: str, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
         if action not in _WORKER_ACTIONS:

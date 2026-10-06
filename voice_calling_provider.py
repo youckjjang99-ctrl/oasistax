@@ -33,6 +33,15 @@ ACCOUNT_RE = re.compile(r"AC[0-9a-fA-F]{32}\Z")
 E164_RE = re.compile(r"\+[1-9]\d{7,14}\Z")
 
 
+def create_voice_provider(config: Any):
+    if config.provider == "clawops":
+        from voice_calling_clawops import ClawOpsVoiceProvider
+        return ClawOpsVoiceProvider(config)
+    if config.provider == "twilio":
+        return TwilioVoiceProvider(config)
+    raise ValueError("UNSUPPORTED_VOICE_PROVIDER")
+
+
 def canonical_job_id(value: Any) -> str:
     try:
         parsed = str(uuid.UUID(str(value)))

@@ -161,3 +161,33 @@ def test_repository_preserves_actor_for_authoritative_rpc_check():
             assert params["p_current_user_id"] == "alice"
             return {"ok": True, "rows": []}
     assert VoiceRepository(DB()).action("alice", "candidates")["ok"]
+
+
+@pytest.mark.parametrize("action", ["create_campaign", "list_campaigns", "campaign_jobs", "campaign_stats", "start_campaign", "pause_campaign", "cancel_campaign", "legacy_jobs"])
+def test_campaign_repository_routes_to_authorized_campaign_rpc(action):
+    class DB:
+        def rpc(self, function, params):
+            assert function == "oasis_voice_campaign_action"
+            assert params == {"p_current_user_id": "alice", "p_action": action, "p_payload": {"request_id": "synthetic-request"}}
+            return {"ok": True, "rows": []}
+    assert VoiceRepository(DB()).action("alice", action, {"request_id": "synthetic-request"})["ok"]
+
+
+def test_campaign_rpc_failure_does_not_fall_back_to_legacy_mutation():
+    class DB:
+        calls = 0
+        def rpc(self, function, params):
+            self.calls += 1
+            assert function == "oasis_voice_campaign_action"
+            raise RuntimeError("private provider details")
+    db = DB()
+    result = VoiceRepository(db).action("alice", "start_campaign", {})
+    assert result["code"] == "NOT_READY" and db.calls == 1
+    assert "private provider" not in str(result)
+
+
+def test_repository_rejects_unknown_campaign_action_before_cloud_access():
+    class DB:
+        def rpc(self, *args):
+            raise AssertionError("unknown action must not reach RPC")
+    assert VoiceRepository(DB()).action("alice", "auto_retry_all_calls")["code"] == "INVALID_INPUT"

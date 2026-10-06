@@ -286,7 +286,8 @@ def test_failed_optout_is_quarantined_and_ends_call_without_further_pitch():
             ws.send_json(start_message())
             receive_audio_and_ack(ws)
             ws.send_json({"event": "dtmf", "streamSid": STREAM_ID, "dtmf": {"digit": "9"}})
-            assert ws.receive_json()["event"] == "clear"
+            # Persistence precedes transport writes. A failed withdrawal save
+            # quarantines the job and closes immediately, without further audio.
             with pytest.raises(WebSocketDisconnect):
                 ws.receive_json()
     assert provider.hung_up == [CALL_ID]
