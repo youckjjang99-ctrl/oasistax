@@ -6,14 +6,17 @@ from streamlit.testing.v1 import AppTest
 import voice_calling
 
 
-def dashboard(monkeypatch, *, admin=True, ready=False, count=2, source_only=False, duplicate_uid=False):
-    monkeypatch.setattr(voice_calling.VoiceSettings, "from_environment", classmethod(lambda cls: SimpleNamespace(readiness=lambda: {"ready": ready, "checks": [], "provider": "clawops", "test_only": True})))
+def dashboard(monkeypatch, *, admin=True, ready=False, count=2, source_only=False, duplicate_uid=False, view="관리자 설정", report="통화 결과·방문 요청", test_only=False):
+    monkeypatch.setattr(voice_calling.VoiceSettings, "from_environment", classmethod(lambda cls: SimpleNamespace(enabled=ready, daily_limit=20, clawops_test_numbers=("+82" + "10" + "0000" + "0000",), readiness=lambda: {"ready": ready, "enabled": ready, "checks": [], "provider": "clawops", "test_only": test_only})))
     script = '''
 import streamlit as st
 import voice_calling_repository
 st.session_state.setdefault("mutations", [])
 st.session_state.setdefault("reads", [])
 st.session_state.setdefault("repository_created", 0)
+st.session_state.setdefault("oasis_voice_visit_page_fixture-actor", INITIAL_VIEW)
+st.session_state.setdefault("oasis_voice_visit_management_fixture-actor", "전체 업체·동의 관리")
+st.session_state.setdefault("oasis_voice_visit_report_section_fixture-actor", INITIAL_REPORT)
 class FakeRepository:
     def __init__(self):
         st.session_state["repository_created"] += 1
@@ -44,6 +47,8 @@ class FakeRepository:
             more = offset + limit < len(rows)
             return {"ok": True, "rows": rows[offset:offset+limit], "has_more":more, "next_cursor":{"offset":offset+limit} if more else None}
         if action == "legacy_jobs":
+            if st.session_state.get("manual_results"):
+                return {"ok":True, "rows":[{"id":"manual-job", "company_uid":None, "target_kind":"manual", "purpose":"customer_guidance", "company_name":"Synthetic manual company", "status":"queued", "safe_error_code":"APPROVAL_EXPIRED", "phone_masked":"***-****-0001", "created_at":"2030-01-01T01:00:00Z"}], "has_more":False}
             return {"ok":True, "rows":[{"id":"fixture-job", "company_name":"Synthetic legacy company", "status":"queued", "created_at":"2030-01-07T01:00:00Z"}], "has_more":False}
         if action == "list_campaigns":
             return {"ok": True, "rows": [{"id":"fixture-campaign", "name":"Synthetic campaign", "status":st.session_state.get("campaign_status", "draft"), "total":1, "queued":1}], "has_more":False}
@@ -52,6 +57,10 @@ class FakeRepository:
         if action == "campaign_jobs":
             return {"ok":True, "rows":[{"id":"campaign-job", "campaign_id":"fixture-campaign", "company_name":"Synthetic company", "status":"queued"}], "has_more":False}
         st.session_state["mutations"].append((actor, action, payload))
+        if action == "filtered_campaign":
+            return {"ok":True,"campaign_id":"filtered-fixture","requested_count":payload["requested_count"],"created_count":min(payload["requested_count"], 8)}
+        if action == "manual_call":
+            return {"ok":True,"job_id":"manual-fixture","created_count":1}
         if action == "create_campaign":
             return {"ok":True,"campaign_id":"new-fixture","created_count":len(payload["company_uids"]),"skipped_count":0,"skipped":[]}
         if action == "start_campaign":
@@ -60,13 +69,13 @@ class FakeRepository:
         if action == "pause_campaign":
             st.session_state["campaign_status"] = "paused"
             return {"ok":True}
-        if action in {"grant_permission", "do_not_call"}:
+        if action in {"grant_permission", "do_not_call", "revoke_permission", "approve", "cancel"}:
             return {"ok":True}
         raise AssertionError("Unexpected mutation")
 voice_calling_repository.VoiceRepository=FakeRepository
 from voice_calling_ui import render_voice_calling
 render_voice_calling("fixture-actor", is_admin_user=ADMIN)
-'''.replace("COUNT", str(count)).replace("ADMIN", str(admin)).replace("SOURCE_ONLY", str(source_only)).replace("DUPLICATE_UID", str(duplicate_uid))
+'''.replace("COUNT", str(count)).replace("ADMIN", str(admin)).replace("SOURCE_ONLY", str(source_only)).replace("DUPLICATE_UID", str(duplicate_uid)).replace("INITIAL_VIEW", repr(view)).replace("INITIAL_REPORT", repr(report))
     return AppTest.from_string(script).run(timeout=30)
 
 
@@ -79,10 +88,9 @@ def checkbox(app, prefix):
 
 
 def test_real_page_renders_and_disables_unconfigured_approval(monkeypatch):
-    app = dashboard(monkeypatch)
+    app = dashboard(monkeypatch, view="결과보고", report="캠페인 진행 관리")
     assert not app.exception
-    assert len(app.tabs) == 5
-    assert button(app, "이 요청 발신 승인").disabled
+    assert not app.tabs
     assert button(app, "캠페인 자동발신 시작 / 재개").disabled
     assert any(item.value == "1건" for item in app.metric)
     assert app.session_state["mutations"] == []
@@ -238,7 +246,7 @@ def test_timeout_recovery_filter_submit_queries_only_new_conditions_once(monkeyp
 
 
 def test_start_requires_explicit_confirmation_and_admin_readiness(monkeypatch):
-    app = dashboard(monkeypatch, ready=True)
+    app = dashboard(monkeypatch, ready=True, view="결과보고", report="캠페인 진행 관리")
     button(app, "캠페인 자동발신 시작 / 재개").click().run()
     assert app.session_state["mutations"] == []
     assert any("시작 확인란" in item.value for item in app.warning)
@@ -270,3 +278,111 @@ def test_catalog_failure_disables_auto_refresh_without_repeating_query(monkeypat
     assert button(app, "전체 DB 검색 적용")
     assert not app.dataframe and not app.tabs
     assert app.session_state["mutations"] == []
+
+
+def test_simple_bulk_page_has_five_filters_count_and_no_eager_reads(monkeypatch):
+    app = dashboard(monkeypatch, view="대량 전화걸기")
+    assert not app.exception and not app.tabs and not app.dataframe and not app.metric
+    assert [item.label for item in app.selectbox] == ["사업자 구분", "전화번호 유형", "기업 발굴유형"]
+    assert [item.label for item in app.text_input] == ["지역", "업종"]
+    assert app.number_input[0].value == 1000
+    assert button(app, "전화걸기").disabled
+    assert app.session_state["reads"] == app.session_state["mutations"] == []
+
+
+def test_bulk_requires_approval_and_submits_once_with_stable_retry_key(monkeypatch):
+    app = dashboard(monkeypatch, view="대량 전화걸기", ready=True)
+    button(app, "전화걸기").click().run()
+    assert app.session_state["mutations"] == []
+    assert any("승인란" in item.value for item in app.warning)
+    next(item for item in app.selectbox if item.label == "사업자 구분").set_value("corporate")
+    next(item for item in app.selectbox if item.label == "전화번호 유형").set_value("mobile")
+    next(item for item in app.text_input if item.label == "지역").set_value("Synthetic region")
+    app.number_input[0].set_value(12)
+    checkbox(app, "대상 조건·통화 비용").check()
+    button(app, "전화걸기").click().run()
+    assert not app.exception
+    calls = app.session_state["mutations"]
+    assert len(calls) == 1 and calls[0][1] == "filtered_campaign"
+    payload = calls[0][2]
+    assert payload["requested_count"] == 12 and payload["approval_confirmed"] is True
+    assert payload["filters"]["business_type"] == "corporate" and payload["filters"]["phone_type"] == "mobile"
+    assert payload["filters"]["region"] == "Synthetic region"
+    assert any("접수" in item.value for item in app.success)
+    assert any("4건" in item.value for item in app.warning)
+    button(app, "전화걸기").click().run()
+    assert app.session_state["mutations"][-1][2]["request_id"] == payload["request_id"]
+    assert app.session_state["reads"] == []
+
+
+def test_test_only_disables_bulk_without_any_repository_mutation(monkeypatch):
+    app = dashboard(monkeypatch, view="대량 전화걸기", ready=True, test_only=True)
+    assert button(app, "전화걸기").disabled
+    assert app.session_state["mutations"] == app.session_state["reads"] == []
+
+
+def fill_manual(app):
+    next(item for item in app.text_input if item.label == "업체명 / 시험 수신자").set_value("Synthetic manual company")
+    next(item for item in app.text_input if item.label == "전화번호").set_value("010" + "0000" + "0000")
+    next(item for item in app.text_input if item.label == "동의 증빙 참조").set_value("synthetic-consent-reference")
+    checkbox(app, "입력한 번호의 수신자").check()
+    checkbox(app, "통화 비용과 발신 대상").check()
+
+
+def test_manual_requires_recipient_consent_and_preserves_idempotency(monkeypatch):
+    app = dashboard(monkeypatch, view="개별 전화걸기", ready=True)
+    button(app, "개별 전화걸기").click().run()
+    assert app.session_state["mutations"] == []
+    fill_manual(app)
+    button(app, "개별 전화걸기").click().run()
+    assert not app.exception
+    calls = app.session_state["mutations"]
+    assert len(calls) == 1 and calls[0][1] == "manual_call"
+    payload = calls[0][2]
+    assert payload["consent_confirmed"] and payload["approval_confirmed"]
+    assert payload["purpose"] == "test" and "company_uid" not in payload
+    button(app, "개별 전화걸기").click().run()
+    assert app.session_state["mutations"][-1][2]["request_id"] == payload["request_id"]
+    assert app.session_state["reads"] == []
+
+
+def test_manual_customer_guidance_is_rejected_in_test_only_mode(monkeypatch):
+    app = dashboard(monkeypatch, view="개별 전화걸기", ready=True, test_only=True)
+    fill_manual(app)
+    next(item for item in app.radio if item.label == "통화 목적").set_value("customer_guidance")
+    button(app, "개별 전화걸기").click().run()
+    assert not app.exception
+    assert app.session_state["mutations"] == []
+    assert any("시험 모드" in item.value for item in app.warning)
+
+
+def test_results_dont_read_catalog_and_manual_requests_remain_manageable(monkeypatch):
+    app = dashboard(monkeypatch, view="결과보고", report="개별·이전 요청 관리", ready=True)
+    app.session_state["manual_results"] = True
+    app.session_state["catalog_error"] = "SEARCH_TIMEOUT"
+    app.run()
+    assert not app.exception
+    assert "catalog" not in [action for action, _payload in app.session_state["reads"]]
+    assert any("개별 고객 안내" in str(item.value) for item in app.dataframe)
+    assert any("***-****-0001" in str(item.value) for item in app.dataframe)
+    assert any("***-****-0001" in item.value and "2030-01-01 10:00" in item.value for item in app.caption)
+    button(app, "이 요청 발신 승인").click().run()
+    assert app.session_state["mutations"][-1][1:] == ("approve", {"job_id":"manual-job"})
+    next(item for item in app.text_input if item.label == "처리 근거").set_value("synthetic-withdrawal")
+    checkbox(app, "수신자의 중단 요청").check().run()
+    button(app, "개별 연락처 수신거부").click().run()
+    assert app.session_state["mutations"][-1][1] == "do_not_call"
+    assert app.session_state["mutations"][-1][2]["job_id"] == "manual-job"
+    button(app, "개별 전화 동의 철회").click().run()
+    assert app.session_state["mutations"][-1][1] == "revoke_permission"
+
+
+def test_main_navigation_lazily_opens_results_not_catalog(monkeypatch):
+    app = dashboard(monkeypatch, view="대량 전화걸기")
+    assert app.session_state["reads"] == []
+    next(item for item in app.radio if item.label == "화면").set_value("결과보고").run()
+    assert not app.exception and not app.tabs
+    assert "catalog" not in [action for action, _payload in app.session_state["reads"]]
+    before = len(app.session_state["reads"])
+    next(item for item in app.radio if item.label == "화면").set_value("개별 전화걸기").run()
+    assert len(app.session_state["reads"]) == before

@@ -92,6 +92,19 @@ def blocked_reason_label(row: Mapping[str, Any]) -> str:
     return BLOCKED_REASON_LABELS.get(code, "발신 조건 확인 필요")
 
 
+def excluded_counts_summary(value: Any) -> str:
+    """Show fixed labels/counts, never echo provider errors or customer IDs."""
+    if not isinstance(value, Mapping):
+        return ""
+    counts: dict[str, int] = {}
+    for code, count in value.items():
+        number = safe_count(count)
+        if number:
+            label = BLOCKED_REASON_LABELS.get(str(code).upper(), "기타 발신 조건 미충족")
+            counts[label] = counts.get(label, 0) + number
+    return " · ".join(f"{label} {count:,}건" for label, count in counts.items())
+
+
 def employee_label(value: Any, *, change: bool = False) -> str:
     if value is None or value == "" or isinstance(value, bool):
         return "미확인"

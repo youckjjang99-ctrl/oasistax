@@ -93,6 +93,33 @@ class VoiceCallingUiTests(unittest.TestCase):
         self.assertEqual(ui.masked_phone(None), "없음")
         self.assertEqual(ui.masked_phone("unknown"), "***-****-****")
 
+    def test_job_contact_uses_only_masked_field_never_raw_phone_fallback(self):
+        raw = "+82" + "10" + "0000" + "1234"
+        row = {"target_kind": "manual", "phone_masked": "***-****-0001", "phone": raw, "phone_e164": raw}
+        display = ui.job_display([row])[0]
+        self.assertEqual(display["발신 연락처"], "***-****-0001")
+        self.assertNotIn(raw, str(display))
+        self.assertNotIn("1234", str(display))
+        self.assertEqual(ui.job_display([{**row, "phone_masked": None}])[0]["발신 연락처"], "미확인")
+
+    def test_manual_suppression_shows_masked_target_and_request_time(self):
+        screen = FakeStreamlit()
+        labels = []
+        def expander(label, **_kwargs):
+            labels.append(label)
+            return screen
+        screen.expander = expander
+        repo = FakeRepository()
+        ui._render_manual_controls(screen, repo, "admin", [
+            {"id": "one", "target_kind": "manual", "company_name": "Synthetic same name", "phone_masked": "***-****-0001", "created_at": "2030-01-01T01:00:00Z"},
+            {"id": "two", "target_kind": "manual", "company_name": "Synthetic same name", "phone_masked": "***-****-0002", "created_at": "2030-01-01T02:00:00Z"},
+        ], True)
+        self.assertIn("***-****-0001", labels[0])
+        self.assertIn("***-****-0002", labels[1])
+        self.assertTrue(any("***-****-0001" in text and "2030-01-01 10:00" in text for text in screen.messages))
+        self.assertTrue(any("***-****-0002" in text and "2030-01-01 11:00" in text for text in screen.messages))
+        self.assertEqual(repo.calls, [])
+
     def test_selection_requires_ownership_scope_consent_phone_and_no_dnc(self):
         good = self.candidate()
         self.assertEqual(ui.validate_selection(["fixture:one"], [good], require_eligible=True), "")
@@ -110,6 +137,15 @@ class VoiceCallingUiTests(unittest.TestCase):
         first = ui.enqueue_request_key(state, "owner-a", ["b", "a"])
         self.assertEqual(first, ui.enqueue_request_key(state, "owner-a", ["a", "b", "b"]))
         self.assertNotEqual(first, ui.enqueue_request_key(state, "owner-b", ["a", "b"]))
+
+    def test_launch_key_is_stable_and_never_stores_plaintext_manual_contact(self):
+        state = {}
+        payload = {"company_name": "synthetic-sensitive-name", "phone": "synthetic-phone", "purpose": "test"}
+        first = ui.launch_request_key(state, "actor", "manual", payload)
+        self.assertEqual(first, ui.launch_request_key(state, "actor", "manual", dict(reversed(list(payload.items())))))
+        self.assertNotIn("synthetic-sensitive-name", str(state))
+        self.assertNotIn("synthetic-phone", str(state))
+        self.assertNotEqual(first, ui.launch_request_key(state, "actor", "manual", {**payload, "purpose": "customer_guidance"}))
 
     def test_metrics_only_count_loaded_scope(self):
         metrics = ui.scoped_metrics([self.candidate(), self.candidate(company_uid="fixture:two", permission_valid=False)], [{"status": "pending_approval"}, {"status": "completed", "outcome": "visit_requested"}])

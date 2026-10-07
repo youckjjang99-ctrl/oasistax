@@ -1,4 +1,4 @@
-from voice_calling_dashboard import campaign_display, campaign_status_label, duration_label, filtered_candidates, merged_selection, safe_count, selection_limit, skipped_summary, select_current_page, row_key, default_catalog_filters, employee_label, blocked_reason_label
+from voice_calling_dashboard import campaign_display, campaign_status_label, duration_label, filtered_candidates, merged_selection, safe_count, selection_limit, skipped_summary, select_current_page, row_key, default_catalog_filters, employee_label, blocked_reason_label, excluded_counts_summary
 
 
 def test_selection_caps_and_merge_survive_hidden_pages():
@@ -60,3 +60,9 @@ def test_skipped_summary_only_uses_safe_labels_and_counts():
     result = skipped_summary([{"code": "DO_NOT_CALL", "company_uid": "private"}, {"code": "DO_NOT_CALL"}, {"code": "some secret error"}])
     assert result == "수신거부 2건 · 상태 재확인 필요 1건"
     assert "private" not in result and "secret" not in result
+
+
+def test_excluded_counts_hide_untrusted_keys_and_invalid_counts():
+    result = excluded_counts_summary({"DO_NOT_CALL": 2, "private error": 1, "NO_PHONE": -1})
+    assert result == "수신거부 2건 · 기타 발신 조건 미충족 1건"
+    assert excluded_counts_summary("private error") == ""

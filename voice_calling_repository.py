@@ -5,6 +5,7 @@ from typing import Any, Mapping
 
 _ACTIONS = {"candidates", "list_jobs", "list_permissions", "grant_permission", "revoke_permission", "do_not_call", "enqueue", "approve", "cancel", "confirm_visit", "reconcile"}
 _CATALOG_ACTIONS = {"catalog"}
+_LAUNCH_ACTIONS = {"filtered_campaign": "oasis_voice_filtered_campaign", "manual_call": "oasis_voice_manual_call"}
 _CAMPAIGN_ACTIONS = {"create_campaign", "list_campaigns", "campaign_jobs", "campaign_stats", "start_campaign", "pause_campaign", "cancel_campaign", "legacy_jobs"}
 _WORKER_ACTIONS = {"claim", "get_job", "connect", "mark_dispatched", "mark_unknown", "mark_failed", "status", "result", "bridge_error"}
 _MESSAGES = {
@@ -24,6 +25,10 @@ _MESSAGES = {
     "INVALID_RESULT": "방문 의향·장소·정확한 일시를 확인해 주세요.",
     "PROVIDER_MISMATCH": "통화 결속정보가 일치하지 않아 중단했습니다.",
     "CAMPAIGN_NOT_RUNNING": "발신 묶음이 일시정지 또는 취소되어 추가 발신을 중단했습니다.",
+    "NO_ELIGIBLE_TARGETS": "조건에 맞는 발신 가능 업체가 없습니다. 배정·번호별 동의·수신거부 상태를 확인해 주세요.",
+    "IDEMPOTENCY_CONFLICT": "이미 접수된 요청과 입력 내용이 다릅니다. 새 요청으로 다시 확인해 주세요.",
+    "CAMPAIGN_CREATE_FAILED": "발신 묶음을 저장하지 못했습니다. 같은 요청으로 다시 확인해 주세요.",
+    "APPROVAL_EXPIRED": "발신 승인이 만료되었습니다. 결과보고에서 확인 후 다시 승인해 주세요.",
 }
 
 
@@ -50,8 +55,10 @@ class VoiceRepository:
             return {"ok": False, "code": "NOT_READY", "message": _MESSAGES["NOT_READY"]}
 
     def action(self, actor: str, action: str, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        if not actor or action not in _ACTIONS | _CAMPAIGN_ACTIONS | _CATALOG_ACTIONS:
+        if not actor or action not in _ACTIONS | _CAMPAIGN_ACTIONS | _CATALOG_ACTIONS | _LAUNCH_ACTIONS.keys():
             return {"ok": False, "code": "INVALID_INPUT", "message": _MESSAGES["INVALID_INPUT"]}
+        if action in _LAUNCH_ACTIONS:
+            return self._call(_LAUNCH_ACTIONS[action], {"p_current_user_id": actor, "p_payload": dict(payload or {})})
         if action in _CATALOG_ACTIONS:
             # Read-only catalog has its own authoritative, current-admin check.
             # Never fall back to assigned-only candidates or mutate source rows.
