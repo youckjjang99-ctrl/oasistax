@@ -8,6 +8,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class NavigationVisibilityTests(unittest.TestCase):
+    def test_ai_visit_menu_and_direct_route_are_admin_only(self):
+        source = (ROOT / "app.py").read_text(encoding="utf-8")
+        self.assertIn('if CURRENT_USER_IS_ADMIN:\n        primary_menu["AI 방문상담"]', source)
+        route = source.split('elif active_tab == "AI 방문상담":', 1)[1].split("elif active_tab", 1)[0]
+        self.assertIn("if not CURRENT_USER_IS_ADMIN:", route)
+        self.assertIn("관리자 전용", route)
+        self.assertIn("else:\n        from voice_calling_ui import render_voice_calling", route)
+
     def test_sidebar_does_not_repeat_selected_group_badges(self):
         source = (ROOT / "app.py").read_text(encoding="utf-8")
 

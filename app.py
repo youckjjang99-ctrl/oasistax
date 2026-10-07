@@ -2020,7 +2020,8 @@ with st.sidebar:
     if SHOW_CLAIM_SALES_APPLICATION_MENU:
         primary_menu["경정청구 영업신청"] = "경정청구 영업신청"
     primary_menu["AI 코파일럿"] = "AI 코파일럿"
-    primary_menu["AI 방문상담"] = "AI 방문상담"
+    if CURRENT_USER_IS_ADMIN:
+        primary_menu["AI 방문상담"] = "AI 방문상담"
 
     menu_groups = {
         "주요업무": primary_menu,
@@ -2253,12 +2254,15 @@ elif active_tab == "AI 코파일럿":
     )
 
 elif active_tab == "AI 방문상담":
-    from voice_calling_ui import render_voice_calling
+    if not CURRENT_USER_IS_ADMIN:
+        st.warning("AI 방문상담은 관리자 전용 기능입니다.")
+    else:
+        from voice_calling_ui import render_voice_calling
 
-    render_voice_calling(
-        CURRENT_USER_ID,
-        is_admin_user=CURRENT_USER_IS_ADMIN,
-    )
+        render_voice_calling(
+            CURRENT_USER_ID,
+            is_admin_user=CURRENT_USER_IS_ADMIN,
+        )
 
 elif active_tab == "내 누적 고객DB":
     render_cumulative_db_page(CURRENT_USER_ID)

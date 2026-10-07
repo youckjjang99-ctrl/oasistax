@@ -4,12 +4,15 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 _ACTIONS = {"candidates", "list_jobs", "list_permissions", "grant_permission", "revoke_permission", "do_not_call", "enqueue", "approve", "cancel", "confirm_visit", "reconcile"}
+_CATALOG_ACTIONS = {"catalog"}
 _CAMPAIGN_ACTIONS = {"create_campaign", "list_campaigns", "campaign_jobs", "campaign_stats", "start_campaign", "pause_campaign", "cancel_campaign", "legacy_jobs"}
 _WORKER_ACTIONS = {"claim", "get_job", "connect", "mark_dispatched", "mark_unknown", "mark_failed", "status", "result", "bridge_error"}
 _MESSAGES = {
     "OK": "처리되었습니다.", "EMPTY": "발신 대기 작업이 없습니다.",
     "NOT_AUTHORIZED": "접근 권한 또는 현재 담당자를 확인해 주세요.",
     "INVALID_INPUT": "입력값을 확인해 주세요.", "NOT_READY": "전화상담 DB 연결·마이그레이션을 확인해 주세요.",
+    "SEARCH_TIMEOUT": "검색 시간이 초과되었습니다. 지역·연락처 유형 등 조건을 좁힌 뒤 다시 조회해 주세요.",
+    "INVALID_CURSOR": "검색 조건이나 페이지 정보가 변경되었습니다. 첫 페이지부터 다시 조회해 주세요.",
     "CONSENT_REQUIRED": "유효한 전화 안내 동의 근거가 필요합니다.",
     "TARGET_CHANGED": "담당자·연락처·수신거부 상태가 바뀌어 중단했습니다.",
     "DO_NOT_CALL": "수신거부 또는 연락제외된 대상입니다.",
@@ -47,8 +50,12 @@ class VoiceRepository:
             return {"ok": False, "code": "NOT_READY", "message": _MESSAGES["NOT_READY"]}
 
     def action(self, actor: str, action: str, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        if not actor or action not in _ACTIONS | _CAMPAIGN_ACTIONS:
+        if not actor or action not in _ACTIONS | _CAMPAIGN_ACTIONS | _CATALOG_ACTIONS:
             return {"ok": False, "code": "INVALID_INPUT", "message": _MESSAGES["INVALID_INPUT"]}
+        if action in _CATALOG_ACTIONS:
+            # Read-only catalog has its own authoritative, current-admin check.
+            # Never fall back to assigned-only candidates or mutate source rows.
+            return self._call("oasis_voice_catalog", {"p_current_user_id": actor, "p_payload": dict(payload or {})})
         rpc = "oasis_voice_campaign_action" if action in _CAMPAIGN_ACTIONS else "oasis_voice_action"
         return self._call(rpc, {"p_current_user_id": actor, "p_action": action, "p_payload": dict(payload or {})})
 

@@ -14,7 +14,9 @@ from zoneinfo import ZoneInfo
 
 from voice_calling_dashboard import (
     METRIC_LABELS, campaign_display, campaign_status_label, duration_label,
-    filtered_candidates, merged_selection, safe_count, selection_limit, skipped_summary,
+    merged_selection, safe_count, selection_limit, skipped_summary,
+    BUSINESS_TYPE_LABELS, PHONE_TYPE_LABELS, DISCOVERY_TYPE_LABELS,
+    blocked_reason_label, default_catalog_filters, employee_label, row_key, select_current_page,
 )
 
 
@@ -87,10 +89,21 @@ def candidate_display(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
     return [
         {
             "업체": str(row.get("company_name") or "업체명 없음"),
-            "연락처": masked_phone(row.get("phone_masked") or row.get("phone")),
-            "전화 동의": "확인됨" if row.get("permission_valid") else "등록 필요",
+            "사업자 구분": BUSINESS_TYPE_LABELS.get(str(row.get("business_type") or "unknown"), "미확인"),
+            "지역": str(row.get("region") or "미확인"),
+            "고용인원": employee_label(row.get("employee_count")),
+            "고용 증감": employee_label(row.get("employment_change"), change=True),
+            "업종": str(row.get("industry") or "미확인"),
+            "휴대폰": masked_phone(row.get("mobile_phone_masked")),
+            "일반전화": masked_phone(row.get("landline_phone_masked")),
+            "발신 연락처": masked_phone(row.get("phone_masked") or row.get("phone")),
+            "발굴유형": DISCOVERY_TYPE_LABELS.get(str(row.get("discovery_type") or "unknown"), "미확인"),
+            "발신번호 동의": "확인됨" if row.get("permission_valid") else ("연결 필요" if not row.get("company_uid") else "등록 필요"),
             "발신 가능": "접수 가능" if _eligible(row) else "확인 필요",
-            "수신거부": "연락 금지" if row.get("do_not_call") else "-",
+            "발신 제한 사유": "-" if _eligible(row) else blocked_reason_label(row),
+            "발신번호 수신거부": "연락 금지" if row.get("do_not_call") else ("없음" if row.get("company_uid") and row.get("phone_masked") and row.get("do_not_call") is False else "미확인"),
+            "고용 비교기간": (str(row["previous_period"])[:10] + " → " + str(row["current_period"])[:10]) if row.get("previous_period") and row.get("current_period") else "미확인",
+            "주소": str(row.get("address") or "미확인"),
         }
         for row in rows
     ]
@@ -98,7 +111,8 @@ def candidate_display(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
 
 def _eligible(row: Mapping[str, Any]) -> bool:
     return bool(
-        row.get("permission_valid")
+        row.get("company_uid")
+        and row.get("permission_valid")
         and row.get("phone_masked")
         and row.get("eligible", True)
         and not row.get("do_not_call")
@@ -148,7 +162,7 @@ def validate_selection(ids: Sequence[str], candidates: Sequence[Mapping[str, Any
         return "업체를 선택해 주세요."
     if len(selected) > max_selection:
         return f"한 번에 최대 {max_selection}개 업체까지 선택해 주세요."
-    by_id = {str(row.get("company_uid") or ""): row for row in candidates}
+    by_id = {row_key(row): row for row in candidates}
     if any(item not in by_id for item in selected):
         return "목록이 변경되었습니다. 새로고침한 후 선택해 주세요."
     if require_eligible and any(not _eligible(by_id[item]) for item in selected):
@@ -176,11 +190,63 @@ def _notice(st: Any, result: Mapping[str, Any], success: str) -> None:
         st.error("요청을 반영하지 못했습니다. 동의·담당 배정·진행 상태를 확인하고 새로고침해 주세요.")
 
 
+def _clear_candidate_selection(state: MutableMapping[str, Any], actor: str) -> None:
+    state[_PREFIX + "bulk_selected_" + actor] = []
+    state[_PREFIX + "bulk_candidates_" + actor] = {}
+    state[_PREFIX + "bulk_revision_" + actor] = safe_count(state.get(_PREFIX + "bulk_revision_" + actor)) + 1
+    state.pop(_PREFIX + "queue_request", None)
+
+
+def _reset_catalog_page(state: MutableMapping[str, Any], actor: str) -> None:
+    # Callback executes before catalog I/O, even when the next request recovers.
+    _clear_candidate_selection(state, actor)
+    state[_PREFIX + "candidate_page_" + actor] = 0
+    state[_PREFIX + "candidate_cursors_" + actor] = [None]
+
+
+def _apply_catalog_filters(state: MutableMapping[str, Any], actor: str) -> None:
+    """Commit form values before the fragment queries, not after an old query."""
+    current = state.get(_PREFIX + "catalog_filters_" + actor, default_catalog_filters())
+    updated = {}
+    for field, widget, allowed in (
+        ("business_type", "business", BUSINESS_TYPE_LABELS),
+        ("phone_type", "phone", PHONE_TYPE_LABELS),
+        ("discovery_type", "discovery", DISCOVERY_TYPE_LABELS),
+    ):
+        value = state.get(_PREFIX + "filter_" + widget + "_" + actor, current[field])
+        updated[field] = value if value in allowed else "all"
+    for field in ("query", "region", "industry"):
+        updated[field] = str(state.get(_PREFIX + "filter_" + field + "_" + actor, current[field]) or "").strip()[:100]
+    state.pop(_PREFIX + "catalog_failure_" + actor, None)
+    if dict(current) != updated:
+        _reset_catalog_page(state, actor)
+        state[_PREFIX + "catalog_filters_" + actor] = updated
+        state[_PREFIX + "notice"] = "전체 DB 검색 조건을 적용했습니다. 첫 페이지부터 표시하며 이전 선택을 해제했습니다."
+
+
+def _render_catalog_filters(st: Any, actor: str, filters: Mapping[str, str]) -> None:
+    with st.form(_PREFIX + "catalog_filters_form_" + actor):
+        first, second, third = st.columns(3)
+        first.selectbox("사업자 구분", list(BUSINESS_TYPE_LABELS), index=list(BUSINESS_TYPE_LABELS).index(filters["business_type"]), format_func=BUSINESS_TYPE_LABELS.get, key=_PREFIX + "filter_business_" + actor)
+        second.selectbox("연락처 보유 유형", list(PHONE_TYPE_LABELS), index=list(PHONE_TYPE_LABELS).index(filters["phone_type"]), format_func=PHONE_TYPE_LABELS.get, key=_PREFIX + "filter_phone_" + actor)
+        third.selectbox("기업 발굴유형", list(DISCOVERY_TYPE_LABELS), index=list(DISCOVERY_TYPE_LABELS).index(filters["discovery_type"]), format_func=DISCOVERY_TYPE_LABELS.get, key=_PREFIX + "filter_discovery_" + actor)
+        name_column, region_column, industry_column = st.columns(3)
+        name_column.text_input("업체명 검색 (전체 DB)", value=filters["query"], max_chars=100, key=_PREFIX + "filter_query_" + actor)
+        region_column.text_input("지역", value=filters["region"], max_chars=100, placeholder="예: 서울 / 경기", key=_PREFIX + "filter_region_" + actor)
+        industry_column.text_input("업종", value=filters["industry"], max_chars=100, key=_PREFIX + "filter_industry_" + actor)
+        st.form_submit_button("전체 DB 검색 적용", type="primary", on_click=_apply_catalog_filters, args=(st.session_state, actor))
+    st.caption("조건은 현재 100개가 아닌 전체 DB에서 서버로 검색합니다. 조건을 변경해 적용하면 첫 페이지로 이동하고 이전 선택을 해제합니다. 번호 유형은 보유 여부 필터이며 실제 발신번호를 바꾸지 않습니다.")
+
+
 def render_voice_calling(current_user_id: str, is_admin_user: bool = False) -> None:
     import streamlit as st
 
     if not current_user_id:
         st.warning("로그인 후 이용해 주세요.")
+        return
+    if not is_admin_user:
+        _clear_candidate_selection(st.session_state, current_user_id)
+        st.warning("AI 방문상담은 관리자 전용 기능입니다.")
         return
     st.markdown("### AI 방문상담 대시보드")
     st.caption("① 업체 선택  →  ② 캠페인 저장  →  ③ 관리자 시작 승인  →  ④ 서버가 순차 발신  →  ⑤ 방문 희망 확인")
@@ -190,6 +256,10 @@ def render_voice_calling(current_user_id: str, is_admin_user: bool = False) -> N
     skipped_notice = st.session_state.pop(_PREFIX + "skipped_notice", "")
     if skipped_notice:
         st.warning("접수 제외 사유: " + str(skipped_notice))
+    if st.session_state.pop(_PREFIX + "stop_refresh_" + current_user_id, False):
+        # Set widget state before rendering it; fragments cannot mutate an already
+        # rendered toggle. A one-use error result avoids retrying the failed query.
+        st.session_state[_PREFIX + "auto_refresh_" + current_user_id] = False
     automatic_refresh = st.toggle("진행 현황 자동 새로고침 (10초)", value=False, key=_PREFIX + "auto_refresh_" + current_user_id)
     st.caption("화면을 닫아도 실행 중인 서버 작업자는 승인 유효기간·운영 시간·한도 안에서 처리합니다. 자동 새로고침은 표시만 갱신하며 발신을 시작하지 않습니다.")
 
@@ -201,6 +271,12 @@ def render_voice_calling(current_user_id: str, is_admin_user: bool = False) -> N
 
 
 def _render_dashboard(st: Any, current_user_id: str, is_admin_user: bool) -> None:
+    # A fragment may rerun independently of its parent page. Fail closed here too.
+    if not current_user_id or not is_admin_user:
+        if current_user_id:
+            _clear_candidate_selection(st.session_state, current_user_id)
+        st.warning("AI 방문상담은 관리자 전용 기능입니다.")
+        return
     from voice_calling import OBJECTION_RESPONSES, SAMPLE_DIALOGUE, VoiceSettings
     from voice_calling_repository import VoiceRepository
 
@@ -212,15 +288,45 @@ def _render_dashboard(st: Any, current_user_id: str, is_admin_user: bool) -> Non
     except Exception:
         repo = None
     page_key = _PREFIX + "candidate_page_" + current_user_id
-    page = int(st.session_state.get(page_key, 0))
+    cursor_key = _PREFIX + "candidate_cursors_" + current_user_id
+    cursors = st.session_state.get(cursor_key, [None])
+    if not isinstance(cursors, list) or not cursors:
+        cursors = [None]
+    page = min(safe_count(st.session_state.get(page_key)), len(cursors) - 1)
+    filters = st.session_state.get(_PREFIX + "catalog_filters_" + current_user_id, default_catalog_filters())
     job_page_key = _PREFIX + "job_page_" + current_user_id
     job_page = int(st.session_state.get(job_page_key, 0))
-    candidates_result = _action(repo, current_user_id, "candidates", {"limit": 100, "offset": page * 100})
+    candidates_result = st.session_state.pop(_PREFIX + "catalog_failure_" + current_user_id, None)
+    if candidates_result is None:
+        candidates_result = _action(repo, current_user_id, "catalog", {"limit": 100, "cursor": cursors[page], **filters})
+    # Authoritative DB gate, including role changes while a Streamlit session lives.
+    if not candidates_result.get("ok"):
+        _clear_candidate_selection(st.session_state, current_user_id)
+        if st.session_state.get(_PREFIX + "auto_refresh_" + current_user_id):
+            st.session_state[_PREFIX + "stop_refresh_" + current_user_id] = True
+            st.session_state[_PREFIX + "catalog_failure_" + current_user_id] = {"ok": False, "code": candidates_result.get("code")}
+            st.rerun()
+        if candidates_result.get("code") in {"NOT_AUTHORIZED", "ADMIN_REQUIRED"}:
+            st.warning("관리자 권한을 확인하지 못했습니다. 다시 로그인해 주세요. 이전 선택은 해제했습니다.")
+            return
+        if candidates_result.get("code") == "SEARCH_TIMEOUT":
+            st.warning("전체 DB 검색 시간이 초과되었습니다. 업체명·지역·업종 조건을 좁혀 다시 검색해 주세요. 이전 선택은 해제했습니다.")
+        else:
+            st.warning("전체 업체 목록을 불러오지 못했습니다. 조건을 바꾸거나 첫 페이지부터 다시 조회해 주세요. 계속 실패하면 저장소·마이그레이션 상태 확인이 필요합니다. 이전 선택은 해제했습니다.")
+        st.caption("오류 발생 시 자동 새로고침은 중단됩니다. 조건을 좁혀 수동으로 다시 검색해 주세요.")
+        _render_catalog_filters(st, current_user_id, filters)
+        st.button("첫 페이지부터 다시 조회", key=_PREFIX + "catalog_recover_" + current_user_id,
+                  on_click=_reset_catalog_page, args=(st.session_state, current_user_id))
+        return
     jobs_result = _action(repo, current_user_id, "legacy_jobs", {"limit": 100, "offset": job_page * 100})
     campaigns_page_key = _PREFIX + "campaign_page_" + current_user_id
     campaigns_page = int(st.session_state.get(campaigns_page_key, 0))
     campaigns_result = _action(repo, current_user_id, "list_campaigns", {"limit": 25, "offset": campaigns_page * 25})
     stats_result = _action(repo, current_user_id, "campaign_stats")
+    if any(result.get("code") in {"NOT_AUTHORIZED", "ADMIN_REQUIRED"} for result in (jobs_result, campaigns_result, stats_result)):
+        _clear_candidate_selection(st.session_state, current_user_id)
+        st.warning("관리자 권한이 변경되었거나 확인되지 않았습니다. 다시 로그인해 주세요.")
+        return
     candidates, jobs = _rows(candidates_result), _rows(jobs_result)
     if not candidates_result.get("ok") or not jobs_result.get("ok"):
         st.warning("전화상담 데이터 연결을 확인하지 못했습니다. 아래 상담안은 확인할 수 있으며, 데이터 연결 전에는 접수할 수 없습니다.")
@@ -248,12 +354,15 @@ def _render_dashboard(st: Any, current_user_id: str, is_admin_user: bool) -> Non
     with preparation:
         _render_preparation(st, readiness)
     with targets:
+        _render_catalog_filters(st, current_user_id, filters)
         _render_targets(st, repo, current_user_id, candidates, bool(candidates_result.get("ok") and campaigns_result.get("ok")), is_admin_user, selection_scope=str(page))
+        st.caption(f"검색 결과 {page + 1}페이지 · 한 페이지 최대 100개 · 커서 기준으로 이전/다음 목록을 조회합니다.")
         previous, following = st.columns(2)
         if previous.button("이전 대상 목록", disabled=page == 0, key=_PREFIX + "previous"):
             st.session_state[page_key] = max(0, page - 1)
             st.rerun()
-        if following.button("다음 대상 목록", disabled=not candidates_result.get("has_more"), key=_PREFIX + "next"):
+        if following.button("다음 대상 목록", disabled=not candidates_result.get("has_more") or candidates_result.get("next_cursor") is None, key=_PREFIX + "next"):
+            st.session_state[cursor_key] = cursors[:page + 1] + [candidates_result["next_cursor"]]
             st.session_state[page_key] = page + 1
             st.rerun()
     with queue:
@@ -296,32 +405,33 @@ def _render_preparation(st: Any, readiness: Mapping[str, Any]) -> None:
     st.caption("아래는 설정 유무·형식 검사입니다. 실제 회선 개통, 국내 발신번호 표시 및 음성 품질은 본인 테스트 번호로 별도 확인해야 합니다.")
     for check in readiness.get("checks", []):
         st.write(("✅ " if check.get("ok") else "○ ") + str(check.get("label") or "설정 확인"))
-    st.markdown("1. 발신 가능한 회선과 번호를 개설합니다.\n2. 관리자에게 서버 연결·발신 한도 설정을 요청합니다.\n3. 동의 근거가 등록된 내 영업DB를 선택해 캠페인을 저장합니다.\n4. 관리자가 캠페인 시작을 승인하면 작업자가 운영 시간·일일 한도 안에서 순차 발신합니다.")
+    st.markdown("1. 발신 가능한 회선과 번호를 개설합니다.\n2. 서버 연결·발신 한도 설정을 확인합니다.\n3. 전체 업체 목록 중 영업DB 연결·담당 배정·연락처·동의 확인이 완료된 업체로 캠페인을 저장합니다.\n4. 관리자가 캠페인 시작을 승인하면 작업자가 운영 시간·일일 한도 안에서 순차 발신합니다.")
     st.caption("API 키와 발신 보안키는 서버 환경변수에서 관리하며 이 화면에는 표시하지 않습니다. 방문 일정은 고객의 희망 일정이며 전문가가 확인한 뒤 확정됩니다.")
 
 
 def _render_targets(st: Any, repo: Any, actor: str, candidates: list[dict[str, Any]], connected: bool, admin: bool, *, selection_scope: str = "0") -> None:
-    st.caption(("관리자는 배정된 영업DB를 조회할 수 있습니다. " if admin else "현재 담당 중인 영업DB를 표시합니다. ") + "공개 연락처의 수집 여부와 전화 안내 동의 근거는 별도로 관리합니다.")
+    if not admin:
+        st.warning("AI 방문상담은 관리자 전용 기능입니다.")
+        return
+    st.caption("전체 원천업체와 연결된 영업DB를 조회합니다. 번호가 없거나 구분이 미확인인 업체도 기본 목록에 포함합니다. 조회·선택만으로 담당 배정이나 전화 안내 동의를 만들지 않습니다.")
     maximum = selection_limit(admin)
     selected_key = _PREFIX + "bulk_selected_" + actor
     cache_key = _PREFIX + "bulk_candidates_" + actor
     revision_key = _PREFIX + "bulk_revision_" + actor
     cache = dict(st.session_state.get(cache_key, {}))
-    cache.update({str(row["company_uid"]): row for row in candidates if row.get("company_uid")})
+    cache.update({row_key(row): row for row in candidates if row_key(row)})
     selected = [str(uid) for uid in st.session_state.get(selected_key, [])]
     # Retain only selected rows and the current page, not an unbounded client copy.
-    cache = {uid: row for uid, row in cache.items() if uid in selected or any(str(item.get("company_uid")) == uid for item in candidates)}
+    current_keys = {row_key(row) for row in candidates}
+    cache = {uid: row for uid, row in cache.items() if uid in selected or uid in current_keys}
     st.session_state[cache_key] = cache
     if not candidates:
-        st.info("표시할 내 영업DB가 없습니다. 담당 배정 및 저장소 연결 상태를 확인해 주세요.")
-    search_column, filter_column = st.columns([3, 2])
-    search = search_column.text_input("업체명 검색 (현재 100개 목록)", key=_PREFIX + "search_" + actor, placeholder="업체명을 입력해 주세요")
-    eligible_only = filter_column.checkbox("발신 가능 업체만 보기", value=False, key=_PREFIX + "eligible_only_" + actor)
-    visible = filtered_candidates(candidates, search, eligible_only, _eligible)
-    visible_ids = [str(row.get("company_uid") or "") for row in visible]
+        st.info("검색 조건에 맞는 업체가 없습니다. 검색 조건을 바꿔 다시 조회해 주세요.")
+    visible = [row for row in candidates if row_key(row)]
+    visible_ids = [row_key(row) for row in visible]
     select_column, clear_column = st.columns(2)
-    if select_column.button("현재 목록 발신 가능 업체 전체선택", disabled=not connected or not any(_eligible(row) for row in visible), key=_PREFIX + "select_all_" + actor):
-        selected = list(dict.fromkeys(selected + [str(row["company_uid"]) for row in visible if _eligible(row) and row.get("company_uid")]))[:maximum]
+    if select_column.button("현재 페이지 전체선택 · 기존 선택 교체", disabled=not connected or not visible, key=_PREFIX + "select_all_" + actor):
+        selected = select_current_page(visible, limit=maximum)
         st.session_state[selected_key] = selected
         st.session_state[revision_key] = safe_count(st.session_state.get(revision_key)) + 1
         st.rerun()
@@ -333,31 +443,45 @@ def _render_targets(st: Any, repo: Any, actor: str, candidates: list[dict[str, A
         table = [{"선택": uid in selected, **display} for uid, display in zip(visible_ids, candidate_display(visible))]
         fingerprint = hashlib.sha256("\n".join(visible_ids).encode()).hexdigest()[:12]
         edited = st.data_editor(
-            table, hide_index=True, width="stretch", num_rows="fixed",
-            disabled=["업체", "연락처", "전화 동의", "발신 가능", "수신거부"],
-            column_config={"선택": st.column_config.CheckboxColumn("선택", help="동의가 확인된 업체만 캠페인에 접수할 수 있습니다.", default=False)},
+            table, hide_index=True, width="stretch", height=500, num_rows="fixed",
+            disabled=[column for column in table[0] if column != "선택"],
+            column_config={
+                "선택": st.column_config.CheckboxColumn("선택", width="small", help="선택만으로 배정·동의·발신이 실행되지 않습니다. 발신 조건을 충족한 연결 업체만 캠페인에 접수할 수 있습니다.", default=False),
+                **{label: st.column_config.TextColumn(label, width="small") for label in ("사업자 구분", "고용인원", "고용 증감", "발굴유형", "발신 가능")},
+                **{label: st.column_config.TextColumn(label, width="medium") for label in ("업체", "지역", "업종", "휴대폰", "일반전화", "발신 연락처", "발신 제한 사유", "고용 비교기간", "발신번호 동의", "발신번호 수신거부")},
+                "주소": st.column_config.TextColumn("주소", width="large"),
+            },
             key=_PREFIX + "editor_" + actor + "_" + selection_scope + "_" + fingerprint + "_" + str(st.session_state.get(revision_key, 0)),
         )
         edited_rows = edited.to_dict("records") if hasattr(edited, "to_dict") else edited
         selected = merged_selection(selected, visible_ids, [uid for uid, row in zip(visible_ids, edited_rows) if row.get("선택")])
         st.session_state[selected_key] = selected
-    elif candidates:
-        st.info("현재 목록에서 조건에 맞는 업체가 없습니다. 검색어를 바꾸거나 다음 목록을 확인해 주세요.")
-    st.caption(f"현재 목록 {len(candidates)}개 · 표시 {len(visible)}개 · 선택 {len(selected)}/{maximum}개. 다른 페이지의 선택도 유지됩니다. 전체선택은 한도 안의 발신 가능 업체만 추가합니다.")
+    selected_rows = [cache[uid] for uid in selected if uid in cache]
+    linked_uids = list(dict.fromkeys(str(row["company_uid"]) for row in selected_rows if row.get("company_uid")))
+    ready_rows = [row for row in selected_rows if _eligible(row)]
+    ready_uids = list(dict.fromkeys(str(row["company_uid"]) for row in ready_rows))
+    all_linked = bool(selected) and len(selected_rows) == len(selected) and all(row.get("company_uid") for row in selected_rows)
+    blocked_count = len(selected_rows) - len(ready_rows)
+    st.caption(f"현재 페이지 {len(visible)}개 · 선택 {len(selected)}/{maximum}개 · 발신 가능 {len(ready_uids)}개 업체 (중복 제외). 수동 선택은 페이지 간 유지되지만 전체선택은 이전 선택을 현재 페이지로 교체합니다.")
+    st.caption("휴대폰·일반전화는 확보 현황이며, ‘발신 연락처’가 실제 전화 대상입니다. 고용 증감은 원천자료의 비교 기준이며 미확인을 0명으로 간주하지 않습니다. 넓은 표는 좌우로 이동해 확인해 주세요.")
+    if blocked_count:
+        st.warning(f"선택한 행 중 {blocked_count}개는 발신 조건을 충족하지 않아 이번 캠페인 접수에서 제외됩니다. 표의 발신 제한 사유를 확인해 주세요.")
     if len(selected) > maximum:
         st.warning(f"한 번에 최대 {maximum}개 업체까지 선택해 주세요. 초과한 선택을 해제해야 접수할 수 있습니다.")
     with st.form(_PREFIX + "campaign_create_" + actor):
         campaign_name = st.text_input("캠페인 이름", value=datetime.now(SEOUL).strftime("%m/%d 방문상담"), max_chars=80, help="예: 경기 제조업 · 1차 방문상담")
         st.caption("저장만으로 전화가 걸리지 않습니다. 관리자가 캠페인을 시작하면 개별 클릭 없이 서버가 순차 발신합니다. 실패·결과 불명확 건은 자동 재발신하지 않습니다.")
-        submit_campaign = st.form_submit_button(f"선택 {len(selected)}개 업체 캠페인 저장", type="primary", disabled=not connected or not selected or len(selected) > maximum)
+        submit_campaign = st.form_submit_button(f"발신 가능 {len(ready_uids)}개 업체 캠페인 저장", type="primary", disabled=not connected or not ready_uids or len(selected) > maximum)
     if submit_campaign:
-        error = validate_selection(selected, list(cache.values()), require_eligible=True, max_selection=maximum)
+        error = validate_selection(selected, list(cache.values()), require_eligible=False, max_selection=maximum)
+        if not error:
+            error = validate_selection([row_key(row) for row in ready_rows], list(cache.values()), require_eligible=True, max_selection=maximum)
         if error:
             st.warning(error)
         elif not campaign_name.strip():
             st.warning("캠페인 이름을 입력해 주세요.")
         else:
-            result = _action(repo, actor, "create_campaign", {"name": campaign_name.strip(), "company_uids": selected, "request_id": enqueue_request_key(st.session_state, actor, selected)})
+            result = _action(repo, actor, "create_campaign", {"name": campaign_name.strip(), "company_uids": ready_uids, "request_id": enqueue_request_key(st.session_state, actor, ready_uids)})
             if result.get("ok"):
                 st.session_state[_PREFIX + "skipped_notice"] = skipped_summary(result.get("skipped"))
                 st.session_state[selected_key] = []
@@ -366,6 +490,9 @@ def _render_targets(st: Any, repo: Any, actor: str, candidates: list[dict[str, A
             _notice(st, result, f"캠페인을 저장했습니다. 접수 {safe_count(result.get('created_count'))}건 · 제외 {safe_count(result.get('skipped_count'))}건. ‘자동발신 캠페인’에서 관리자 시작 승인 후 발신됩니다.")
     with st.expander("전화 안내 동의 근거 등록 / 수신거부"):
         st.caption("동의가 확보된 업체는 근거를 한 번 입력해 선택 업체에 함께 등록할 수 있습니다. 수신거부 업체는 동의 등록만으로 다시 발신할 수 없습니다.")
+        st.caption("아래 작업은 표의 ‘발신 연락처’에 적용됩니다. 원천 휴대폰·일반전화 전체에 대한 동의나 수신거부로 간주하지 않습니다.")
+        if selected and not all_linked:
+            st.info("영업DB에 연결되지 않은 원천업체가 선택되어 있습니다. 동의·수신거부 등록은 연결된 업체만 선택한 뒤 사용할 수 있습니다. 먼저 기존 DB발굴·고객등록 절차에서 담당 배정과 연락처를 확인해 주세요.")
         if admin:
             with st.form(_PREFIX + "permission_form"):
                 basis = st.selectbox("동의 유형", ["explicit_consent", "callback_request"], format_func=lambda item: {"explicit_consent": "전화 안내 수신동의", "callback_request": "고객이 요청한 재통화"}[item])
@@ -374,19 +501,19 @@ def _render_targets(st: Any, repo: Any, actor: str, candidates: list[dict[str, A
                 consent_day = st.date_input("동의 확인일", value=datetime.now(SEOUL).date(), max_value=datetime.now(SEOUL).date())
                 expiry = st.date_input("이번 발신에 적용할 동의 유효 종료일", value=datetime.now(SEOUL).date() + timedelta(days=30), min_value=datetime.now(SEOUL).date())
                 confirmed = st.checkbox("선택 업체의 전화 안내 동의 근거를 확인했습니다.")
-                submit = st.form_submit_button("선택 업체 동의 근거 일괄 등록", disabled=not connected or not selected)
+                submit = st.form_submit_button("선택 업체 동의 근거 일괄 등록", disabled=not connected or not all_linked or len(selected) > maximum)
             if submit:
                 error = validate_selection(selected, list(cache.values()), require_eligible=False, max_selection=maximum)
-                if error or not confirmed or not source.strip() or not evidence.strip():
+                if error or not all_linked or not confirmed or not source.strip() or not evidence.strip():
                     st.warning(error or "동의 출처·증빙 참조번호를 입력하고 확인란을 선택해 주세요.")
                 else:
-                    result = _action(repo, actor, "grant_permission", {"company_uids": selected, "kind": basis, "evidence_ref": source.strip() + " / " + evidence.strip(), "granted_at": datetime.combine(consent_day, time.min, SEOUL).isoformat(), "expires_at": datetime.combine(expiry, time.max, SEOUL).isoformat()})
+                    result = _action(repo, actor, "grant_permission", {"company_uids": linked_uids, "kind": basis, "evidence_ref": source.strip() + " / " + evidence.strip(), "granted_at": datetime.combine(consent_day, time.min, SEOUL).isoformat(), "expires_at": datetime.combine(expiry, time.max, SEOUL).isoformat()})
                     _notice(st, result, "선택 업체의 전화 안내 동의 근거를 저장했습니다.")
         else:
             st.info("동의 근거 일괄 등록은 관리자에게 요청해 주세요.")
         block_reason = st.text_input("수신거부 처리 사유", key=_PREFIX + "dnc_reason", placeholder="고객이 전화 안내 중단 요청")
-        if st.button("선택 업체 수신거부 등록", disabled=not connected or not selected or len(selected) > maximum or not block_reason.strip(), key=_PREFIX + "dnc"):
-            outcomes = [_action(repo, actor, "do_not_call", {"company_uid": uid, "reason": block_reason.strip()}) for uid in selected]
+        if st.button("선택 업체·발신 연락처 수신거부 등록", disabled=not connected or not all_linked or len(selected) > maximum or not block_reason.strip(), key=_PREFIX + "dnc"):
+            outcomes = [_action(repo, actor, "do_not_call", {"company_uid": uid, "reason": block_reason.strip()}) for uid in linked_uids]
             if all(result.get("ok") for result in outcomes):
                 _notice(st, {"ok": True}, "선택 업체의 수신거부를 등록했습니다. 대기 중 요청도 서버에서 다시 확인합니다.")
             else:

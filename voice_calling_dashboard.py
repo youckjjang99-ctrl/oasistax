@@ -56,7 +56,56 @@ def skipped_summary(rows: Any) -> str:
 
 
 def selection_limit(admin: bool) -> int:
-    return 100 if admin else 30
+    return 100 if admin else 0
+
+
+def select_current_page(rows: Sequence[Mapping[str, Any]], *, limit: int = 100) -> list[str]:
+    """Replace, never silently keep the first hundred selections from old pages."""
+    return list(dict.fromkeys(row_key(row) for row in rows if row_key(row)))[:max(0, limit)]
+
+
+def row_key(row: Mapping[str, Any]) -> str:
+    return str(row.get("row_id") or row.get("company_uid") or "")
+
+
+BUSINESS_TYPE_LABELS = {"all": "전체", "individual": "개인사업자", "corporate": "법인사업자", "unknown": "미확인"}
+PHONE_TYPE_LABELS = {"all": "전체 · 번호 없음 포함", "mobile": "휴대폰 보유", "landline": "일반전화 보유", "both": "휴대폰·일반전화 모두 보유", "none": "번호 없음"}
+DISCOVERY_TYPE_LABELS = {"all": "전체", "employment_growth": "고용인원 증가", "new": "신규업체", "other": "그 외 업체", "unknown": "미확인"}
+BLOCKED_REASON_LABELS = {
+    **SKIP_LABELS,
+    "READY": "-", "ELIGIBLE": "-", "OK": "-",
+    "SOURCE_ONLY": "영업DB 저장·담당 배정 필요", "NOT_PREPARED": "영업DB 저장·담당 배정 필요",
+    "SOURCE_NOT_LINKED": "영업DB 연결·담당 배정 필요",
+    "IDENTITY_CONFLICT": "업체 연결 충돌 확인 필요", "TARGET_NOT_READY": "발신 연락처·담당 배정 확인 필요",
+    "PROSPECT_REQUIRED": "영업DB 저장 필요", "ASSIGNMENT_REQUIRED": "담당 배정 필요",
+    "NO_ASSIGNMENT": "담당 배정 필요", "CONTACT_REQUIRED": "연락처 확인 필요",
+    "NO_VERIFIED_CONTACT": "검증 연락처 필요", "PHONE_MISSING": "발신 가능한 번호 없음",
+    "CLOSED": "폐업 · 발신 제외", "PERMANENTLY_EXCLUDED": "영구 제외",
+    "MIGRATION_CONFLICT": "담당 배정 충돌 확인 필요", "RECENT_CALL": "최근 연락·중복 여부 확인 필요",
+}
+
+
+def blocked_reason_label(row: Mapping[str, Any]) -> str:
+    if row.get("eligible"):
+        return "-"
+    code = str(row.get("blocked_reason") or "").upper()
+    return BLOCKED_REASON_LABELS.get(code, "발신 조건 확인 필요")
+
+
+def employee_label(value: Any, *, change: bool = False) -> str:
+    if value is None or value == "" or isinstance(value, bool):
+        return "미확인"
+    try:
+        number = int(value)
+    except (ValueError, TypeError, OverflowError):
+        return "미확인"
+    if not change and number < 0:
+        return "미확인"
+    return f"{number:+,}명" if change and number else f"{number:,}명"
+
+
+def default_catalog_filters() -> dict[str, str]:
+    return {"query": "", "region": "", "industry": "", "business_type": "all", "phone_type": "all", "discovery_type": "all"}
 
 
 def safe_count(value: Any) -> int:
