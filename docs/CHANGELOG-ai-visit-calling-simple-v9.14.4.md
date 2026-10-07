@@ -1,6 +1,6 @@
 # v9.14.4 — AI 방문상담 간단 발신·개별 입력
 
-2026-10-07 / 사용자 배포 승인, 로컬 및 격리 호스팅 DB 검증.
+2026-10-07 / 로컬·격리 호스팅 검증, 운영 SQL 및 CRM 단독 배포 완료.
 
 ## 변경
 
@@ -65,5 +65,17 @@ UI 57개와 launch 53개 부분 검증은 전체 Python 수치에 포함되므�
 - 운영 보안 Advisor WARN/ERROR 0건. 서버 전용 기본 거부 INFO 98개는 원래 97개에 신규 스냅샷 1개가 추가된 것입니다.
 - Railway 운영 환경에서 실제 발신·ClawOps 결제 승인·live 검증 플래그는 모두 false임을 확인했습니다. 값이나 비밀키를 파일에 저장하지 않았고 플래그를 변경하지 않았습니다.
 - main은 기존 `b9eb3eaa3754ace9ff53762c4939c46fab599d98`와 같습니다. 실행 중 수집기를 보호하기 위해 작업 브랜치 push 및 CRM 서비스 한정 직접 배포를 사용하며 main에는 병합하지 않습니다. 다른 main 재배포 전에는 PR 통합이 필요합니다.
+
+## CRM 단독 배포 결과
+
+- 코드 커밋 `c15da11e3d5d6890afb83a0336e5a5863d0e0227`을 작업 브랜치에 push했고 Privacy Guard CI가 통과했습니다. 변경 파일 21개이며 고객자료·비밀키를 포함하지 않습니다.
+- Railway CRM 배포 **`b523d725-0203-463b-89cb-bcbaebcb4201` SUCCESS / 인스턴스 RUNNING**. 운영 공개 health는 HTTP 200 / `ok`입니다. v9.14.4 소스·공개 자산 611개를 허용목록으로 복사하고 SHA256을 대조한 뒤 지정 CRM 서비스에만 업로드했습니다.
+- 배포 후 운영 REST의 일반 계정 거부 5개·관리자 무효 입력 거부 2개·목록 조회 4개를 다시 통과했습니다. RPC 관측 응답은 약 95~514ms였지만 소량 읽기 결과이며 대량 발신 성능 수치가 아닙니다.
+- 배포 후 고객/CRM/영업후보/연락처/연락기록/문서/원천 건수는 위와 같고 voice jobs/events/permissions/campaigns/manual_targets/suppressions 모두 0건입니다. 실제 전화나 유료 음성 세션을 생성하지 않았습니다.
+- 수집기 3개와 기존 인증 게이트웨이의 배포 ID는 배포 전과 같습니다. license 수집기와 인증 게이트웨이는 RUNNING입니다. 기존 전화 수집기 2개의 CRASHED 상태는 이번 배포 전부터 존재한 별도 항목이며 이 작업에서 변경하지 않았습니다.
+- 실제 발신·결제 승인·live 검증 플래그는 false를 유지하고, 일일 한도 1 및 전용 voice worker/gateway 미구성 상태를 자동으로 바꾸지 않았습니다. 화면 배포 완료와 실발신 준비 완료는 구분합니다.
+- UI는 합성 데이터로 PC/390px 모바일에서 확인했습니다. 이번 운영 스모크는 health 및 서버 REST 경로이며 로그인된 관리자 실화면/실제 전화 품질 검증을 했다고 간주하지 않습니다.
+- [PR #111](https://github.com/youckjjang99-ctrl/oasistax/pull/111)은 draft로 유지하며 main 미병합입니다. 수집 작업이 끝난 뒤 main 통합을 별도 진행해야 합니다.
+- 덮어쓰기 소스 패치 `OASIS_CRM_v9.14.4_deployment_verified_patch.zip`: 21개 변경 파일만 포함, 상위 포장 폴더 없음, ZIP 무결성 통과, SHA256 `c1f6fa57693401810434c5608a1c9d31c71d508d627c6c010caa0f4393b30ee0`. ZIP은 배포 직전 검증본이며 이 배포 결과 문단은 후속 Git 기록입니다.
 
 SQL·RLS·사용법·롤백·Git 명령은 [적용 안내](ai-visit-calling-simple-v9.14.4.md), 파일 목록은 [패치 목록](ai-visit-calling-simple-files-v9.14.4.md)을 참고합니다.
