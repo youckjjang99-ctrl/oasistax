@@ -57,7 +57,7 @@ def _financial_cells(raw):
 def _financial_row_evidence(label, block):
     escaped = re.escape(label)
     # Account-name annotations are not numeric parentheses denoting losses.
-    suffix = r"(?:\([^()\n]*[가-힣A-Za-z][^()\n]*\))?"
+    suffix = r"(?:\([ \t]*\*[ \t]*\)|\([^()\n]*[가-힣A-Za-z][^()\n]*\))*"
     patterns = [
         rf"(?m)^[ \t]*{escaped}{suffix}(?:[ \t]+([^\n]*)|(?=\n|$))",
         rf"(?<![가-힣]){escaped}{suffix}(?:[ \t]+([^\n]*)|(?=\n|$))",
@@ -137,6 +137,7 @@ _BALANCE_ALIASES = {
 _STATEMENT_HEADING = r"(?:(?P<prefix>요약|상세|포괄)\s*)?[ \t]*(?P<kind>손익(?:계산서|현황|내역)|재무상태표)"
 _FINANCIAL_END = (
     r"(?:요약\s*)?(?:현금흐름|재무비율)|자본변동|이익잉여금처분|연혁|"
+    r"(?m:^[ \t]*(?:기업\s*개요|주요\s*(?:주주|거래처|구매처|판매처)|관계회사|그래프|차트)(?=[ \t\n:：]|$))|"
     + "|".join(PEER_HEADINGS)
 )
 
@@ -191,26 +192,63 @@ def _financial_statement_metadata(text, income=True):
 
 
 def _financial_year_columns(block):
-    # Only table headers may supply years; amounts such as 2024 are not years.
+    # PDF content streams may put a visually topmost header after its rows.
+    # Only an explicitly labelled header can be recovered from that position;
+    # unlabeled numbers in the account body must never become year columns.
+    block = re.split(_FINANCIAL_END + r"|\f", block or "", maxsplit=1)[0]
     labels = [alias for names in (*_INCOME_ALIASES.values(), *_BALANCE_ALIASES.values()) for alias in names]
     first_row = re.search(r"(?m)^[ \tⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩIVX0-9.·()]*(?:" + "|".join(map(re.escape, labels)) + r")(?:\(|[ \t\n]|$)", block)
     header = block[:first_row.start()] if first_row else ""
-    columns = []
     cell_pattern = r"(?:\d{3,4}(?:[./-]\d{1,2}(?:[./-]\d{1,2})?)?년?|[-–—]|미상|미확인|확인불가|N/A)"
+    header_label = r"^(?:구분|계정[ \t]*과목|계정명|계정|과목|결산(?:년도|연도|년월일|일)?|기준일|연도|년도)[ \t:：|]*"
+
+    def parse_cells(raw):
+        if not re.fullmatch(rf"{cell_pattern}(?:[ \t|]+{cell_pattern})*", raw):
+            return None
+        columns = []
+        for token in re.findall(cell_pattern, raw):
+            year = re.fullmatch(r"(20\d{2})(?:[./-](\d{1,2})(?:[./-](\d{1,2}))?)?년?", token)
+            value = None
+            if year:
+                number = int(year.group(1))
+                if number > datetime.now().year + 1:
+                    return None
+                try:
+                    datetime(number, int(year.group(2) or 1), int(year.group(3) or 1))
+                except ValueError:
+                    return None
+                value = year.group(1)
+            columns.append(value)
+        known = [year for year in columns if year is not None]
+        return columns if len(columns) <= 10 and len(known) == len(set(known)) else None
+
+    columns = []
     for line in header.splitlines():
         raw = line.strip()
-        label = re.match(r"^(?:구분|계정[ \t]*과목|계정|과목|결산(?:년도|연도|년월일|일)?|기준일|연도|년도)[ \t:：|]*", raw)
+        label = re.match(header_label, raw)
         if label:
             raw = raw[label.end():]
         # Preserve explicit empty header columns instead of shifting later years.
         if not raw or not (label or re.search(r"(?<!\d)20\d{2}(?!\d)", raw)):
             continue
-        if not re.fullmatch(rf"{cell_pattern}(?:[ \t|]+{cell_pattern})*", raw):
+        parsed = parse_cells(raw)
+        if parsed is None:
             return None
-        for token in re.findall(cell_pattern, raw):
-            year = re.match(r"(20\d{2})(?!\d)", token)
-            value = year.group(1) if year and int(year.group(1)) <= datetime.now().year + 1 else None
-            columns.append(value)
+        columns.extend(parsed)
+
+    if first_row:
+        for line in block[first_row.start():].splitlines():
+            raw = line.strip()
+            label = re.match(header_label, raw)
+            if not label:
+                continue
+            raw = raw[label.end():].strip()
+            if not raw:
+                continue
+            parsed = parse_cells(raw)
+            if parsed is None or (columns and columns != parsed):
+                return None
+            columns = parsed
     known = [year for year in columns if year is not None]
     return columns if len(columns) <= 10 and len(known) == len(set(known)) else None
 
