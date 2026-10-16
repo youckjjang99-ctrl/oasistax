@@ -3,6 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
+import time
+from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -21,6 +24,10 @@ BIZINFO_METADATA_PATH = ROOT_DIR / "data" / "bizinfo_metadata.json"
 EXTERNAL_CACHE_PATH = ROOT_DIR / "data" / "external_policy_programs.json"
 EXTERNAL_METADATA_PATH = ROOT_DIR / "data" / "external_policy_metadata.json"
 DEFAULT_REFRESH_HOURS = 24
+DISPLAY_CACHE_SECONDS = 30.0
+_DISPLAY_CACHE_LOCK = threading.RLock()
+_DISPLAY_CACHE: dict[str, Any] | None = None
+_DISPLAY_LAST_GOOD: dict[str, Any] | None = None
 
 
 def _clean(value: Any) -> str:
@@ -286,6 +293,124 @@ def load_repository_records() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     }
 
 
+def _display_source_fingerprint() -> tuple[tuple[Any, ...], ...]:
+    """Public policy files only; never include customer or credential files."""
+    fingerprints = []
+    for path in (
+        SEED_PATH, LOCAL_CACHE_PATH, BIZINFO_CACHE_PATH,
+        BIZINFO_METADATA_PATH, EXTERNAL_CACHE_PATH, EXTERNAL_METADATA_PATH,
+        REFRESH_STATE_PATH,
+    ):
+        try:
+            stat = path.stat()
+            fingerprints.append(
+                (str(path.resolve()), stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+            )
+        except OSError:
+            fingerprints.append((str(path.resolve()), None, None, None))
+    return tuple(fingerprints)
+
+
+def clear_repository_display_cache() -> None:
+    global _DISPLAY_CACHE, _DISPLAY_LAST_GOOD
+    with _DISPLAY_CACHE_LOCK:
+        _DISPLAY_CACHE = None
+        _DISPLAY_LAST_GOOD = None
+
+
+def load_repository_records_for_display(
+    *, force: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Read public policy data without running synchronization writes on navigation.
+
+    Scheduled/explicit synchronization retains ``load_repository_records`` and
+    its existing writes. UI reads briefly reuse successful snapshots, return
+    detached data, and retry cloud failures on the very next call. File changes
+    invalidate the snapshot immediately, including newly downloaded notices.
+    """
+    global _DISPLAY_CACHE, _DISPLAY_LAST_GOOD
+    cloud_enabled = cloud_is_configured()
+    fingerprint = _display_source_fingerprint()
+    identity = (tuple(item[0] for item in fingerprint), cloud_enabled)
+    cache_key = (fingerprint, cloud_enabled)
+    with _DISPLAY_CACHE_LOCK:
+        now = time.monotonic()
+        if (
+            not force
+            and _DISPLAY_CACHE is not None
+            and _DISPLAY_CACHE["key"] == cache_key
+            and now < _DISPLAY_CACHE["expires_at"]
+        ):
+            return deepcopy(_DISPLAY_CACHE["value"])
+
+        seed_rows = _seed_records()
+        scheduled_rows = _scheduled_cache_records()
+        cached = _load_json(LOCAL_CACHE_PATH, [])
+        cached_rows = [
+            _normalize_record(row)
+            for row in (cached if isinstance(cached, list) else [])
+            if isinstance(row, dict)
+        ]
+        cloud_rows: list[dict[str, Any]] = []
+        cloud_failed = False
+        source = "앱 내부 정책DB"
+        if cloud_enabled:
+            try:
+                cloud_rows = [
+                    _normalize_record(row)
+                    for row in CloudDatabase().select(
+                        TABLE_POLICY_REPOSITORY,
+                        filters={"active": "true"},
+                        order="updated_at.desc",
+                        limit=5000,
+                    )
+                    if isinstance(row, dict)
+                ]
+                source = "Supabase 내부 정책DB"
+            except Exception:
+                cloud_failed = True
+                source = "클라우드 조회 지연, 마지막 정상·로컬 DB 사용"
+
+        fallback_rows = []
+        if (
+            cloud_failed
+            and _DISPLAY_LAST_GOOD is not None
+            and _DISPLAY_LAST_GOOD["identity"] == identity
+        ):
+            fallback_rows = _DISPLAY_LAST_GOOD["rows"]
+        combined = {
+            row["record_id"]: row
+            for row in fallback_rows + cached_rows + cloud_rows + seed_rows + scheduled_rows
+            if row.get("record_id")
+        }
+        rows = [
+            row for row in combined.values()
+            if row.get("active") and row.get("title")
+        ]
+        status = {
+            "source": "내부 통합 정책DB",
+            "status": "정상" if rows else "자료없음",
+            "message": (
+                f"{source} · 새벽동기화 {len(scheduled_rows)}건 · "
+                f"내부 초기자료 {len(seed_rows)}건"
+            ),
+            "count": len(rows),
+        }
+        value = (rows, status)
+        # Never let a failed cloud read suppress the next retry, even after a
+        # forced refresh of a previously warm snapshot.
+        if cloud_failed:
+            _DISPLAY_CACHE = None
+        else:
+            _DISPLAY_LAST_GOOD = {"identity": identity, "rows": deepcopy(rows)}
+            _DISPLAY_CACHE = {
+                "key": cache_key,
+                "expires_at": time.monotonic() + DISPLAY_CACHE_SECONDS,
+                "value": deepcopy(value),
+            }
+        return deepcopy(value)
+
+
 def _flatten_json(value: Any) -> list[dict[str, Any]]:
     result = []
     def visit(node: Any) -> None:
@@ -340,6 +465,7 @@ def fetch_bizinfo_records() -> tuple[list[dict[str, Any]], dict[str, Any]]:
 
 
 def refresh_repository(force: bool = False) -> dict[str, Any]:
+    clear_repository_display_cache()
     rows, _ = load_repository_records()
     sync = scheduled_sync_status()
     bizinfo = sync.get("bizinfo", {})
@@ -355,7 +481,7 @@ def refresh_repository(force: bool = False) -> dict[str, Any]:
     }
 
 def repository_status() -> dict[str, Any]:
-    rows, status = load_repository_records()
+    rows, status = load_repository_records_for_display()
     state = _load_json(REFRESH_STATE_PATH, {})
     counts = {}
     for row in rows:

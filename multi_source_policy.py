@@ -18,7 +18,7 @@ from utils import ROOT_DIR, get_user_dirs
 from employee_status import employee_matching_context
 from matching_preferences import save_policy_recommendations
 from integrated_policy_repository import (
-    load_repository_records,
+    load_repository_records_for_display,
     refresh_repository,
     repository_status,
 )
@@ -389,7 +389,7 @@ def _candidate_excel_files() -> list[Path]:
 
 
 def load_local_sources() -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    repository_rows, status = load_repository_records()
+    repository_rows, status = load_repository_records_for_display()
     records: list[dict[str, Any]] = []
     for row in repository_rows:
         raw = row.get("raw_data", {})
@@ -458,7 +458,7 @@ def load_local_sources() -> tuple[list[dict[str, Any]], dict[str, Any]]:
 
 
 def load_bizinfo_source() -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    repository_rows, status = load_repository_records()
+    repository_rows, status = load_repository_records_for_display()
     bizinfo_rows = [
         row
         for row in repository_rows

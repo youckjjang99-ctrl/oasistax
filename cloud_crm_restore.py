@@ -8,7 +8,7 @@ import time
 from typing import Any
 import uuid
 
-from cloud_db import CloudDatabase, TABLE_CUSTOMERS, cloud_is_configured
+from cloud_db import CloudDatabase, cloud_is_configured
 from crm import load_crm_data, make_customer_key, mutate_crm_data
 from crm_cloud_merge import merge_cloud_record, valid_snapshot
 from crm_enhancements import _load_all as load_legacy_profiles
@@ -112,6 +112,16 @@ def restore_crm_from_cloud(user_id: str, *, force: bool = False,
             cursor = (str(rows[-1]["updated_at"]), str(rows[-1]["id"]))
             # A server-imposed smaller row limit means short pages are not EOF.
 
+        # Fetch only identities whose remote and local snapshots both lack a
+        # name. Never issue one customer-table request for every pulled row.
+        missing_names = []
+        for row in rows:
+            existing = local["customers"].get(make_customer_key(business_no=row["business_no"]), {})
+            if (not row["crm_data"].get("company_name")
+                    and not (isinstance(existing, dict) and existing.get("company_name"))):
+                missing_names.append(row["business_no"])
+        customer_names = database.select_customer_names(user_id, missing_names) if missing_names else {}
+
         profiles = load_legacy_profiles(user_id)
         prepared, keys = [], set()
         for row in rows:
@@ -125,10 +135,7 @@ def restore_crm_from_cloud(user_id: str, *, force: bool = False,
             if not remote.get("company_name"):
                 name = existing.get("company_name", "") if isinstance(existing, dict) else ""
                 if not name:
-                    names = database.select(TABLE_CUSTOMERS,
-                        filters={"owner_user_id": user_id, "business_no": row["business_no"]},
-                        columns="company_name", limit=1)
-                    name = str(names[0].get("company_name") or "") if names else ""
+                    name = customer_names.get(row["business_no"], "")
                 if name:
                     remote["company_name"] = name
             remote.setdefault("updated_at", row["updated_at"])

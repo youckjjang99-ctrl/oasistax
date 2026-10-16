@@ -401,6 +401,66 @@ class CloudDatabase:
             raise RuntimeError("crm_sync_invalid_envelope")
         return data
 
+    def select_customer_names(
+        self, owner_user_id: str, business_nos: list[str],
+    ) -> dict[str, str]:
+        """Read only requested owner-scoped names in bounded, exact-key batches.
+
+        A short server page is not proof of EOF. Duplicate identities or rows
+        outside the requested owner/key scope fail closed before the caller
+        can apply a CRM checkpoint or associate a name with another company.
+        """
+        if not isinstance(owner_user_id, str) or not owner_user_id.strip():
+            raise ValueError("customer_names_owner_required")
+        if not isinstance(business_nos, list) or any(
+            not isinstance(value, str) or not value.strip() for value in business_nos
+        ):
+            raise ValueError("customer_names_keys_invalid")
+        requested = list(dict.fromkeys(business_nos))
+        names: dict[str, str] = {}
+        for start in range(0, len(requested), 100):
+            batch = requested[start:start + 100]
+            batch_keys = set(batch)
+            quoted = ",".join(
+                '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+                for value in batch
+            )
+            offset = 0
+            seen: set[str] = set()
+            while True:
+                response = _http_client().get(
+                    self._url(TABLE_CUSTOMERS), headers=self.headers,
+                    params={
+                        "select": "owner_user_id,business_no,company_name",
+                        "owner_user_id": f"eq.{owner_user_id}",
+                        "business_no": f"in.({quoted})",
+                        "order": "id.asc", "limit": str(len(batch)),
+                        "offset": str(offset),
+                    },
+                    timeout=self.config.timeout,
+                )
+                if not response.ok:
+                    raise RuntimeError("customer_names_read_failed")
+                rows = response.json()
+                if not isinstance(rows, list) or len(rows) > len(batch):
+                    raise RuntimeError("customer_names_invalid_envelope")
+                if not rows:
+                    break
+                for row in rows:
+                    if (not isinstance(row, dict)
+                            or row.get("owner_user_id") != owner_user_id
+                            or not isinstance(row.get("business_no"), str)
+                            or row.get("business_no") not in batch_keys
+                            or not isinstance(row.get("company_name"), (str, type(None)))):
+                        raise RuntimeError("customer_names_scope_unconfirmed")
+                    key = row["business_no"]
+                    if key in seen:
+                        raise RuntimeError("customer_names_ambiguous_identity")
+                    seen.add(key)
+                    names[key] = row.get("company_name") or ""
+                offset += len(rows)
+        return names
+
     def select_all(
         self,
         table: str,
