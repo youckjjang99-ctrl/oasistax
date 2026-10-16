@@ -8,6 +8,7 @@ import hashlib
 import math
 import re
 import shutil
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pandas as pd
@@ -35,6 +36,65 @@ BASIC_FIELDS = ("업체명", "대표자명", "대표자 휴대전화", "사업�
                 "표준산업분류코드", "표준산업분류차수")
 EXTRA_FIELDS = ("법인등록번호", "설립일", "종업원수", "기업유형", "기업규모")
 FINANCIAL_REVIEW_WARNINGS = {"financial_alternate_source", "financial_year_unconfirmed", "financial_source_conflict", "financial_table_ocr_incomplete"}
+FINANCIAL_HISTORY_FIELDS = ("매출액", "당기순이익", "자산총계", "부채총계", "자본총계")
+
+
+def _extraction_warning_messages(metadata):
+    """Describe review needs without treating every warning as a page failure."""
+    codes = {str(code) for code in (metadata.get("warnings") or [])}
+    messages = []
+    read_failures = {"analysis_time_limit", "ocr_unavailable"}
+    page_failures = {code for code in codes if re.fullmatch(r"page_\d+_ocr_failed", code)}
+    if "analysis_time_limit" in codes:
+        messages.append("PDF 분석 시간이 초과되어 일부 페이지를 끝까지 확인하지 못했습니다. 아래 결과를 원본과 비교해 주세요.")
+    if "ocr_unavailable" in codes:
+        messages.append("이미지형 페이지를 읽는 문자 인식 기능을 사용할 수 없어 일부 내용을 확인하지 못했습니다. 원본 PDF를 확인해 주세요.")
+    if page_failures:
+        messages.append("일부 이미지 페이지의 문자 인식에 실패했습니다. 아래 결과를 원본과 비교해 주세요.")
+    processed, total = metadata.get("processed_pages"), metadata.get("page_count")
+    if (isinstance(processed, int) and not isinstance(processed, bool)
+            and isinstance(total, int) and not isinstance(total, bool)
+            and 0 <= processed < total and not codes.intersection(read_failures) and not page_failures):
+        messages.append(f"전체 {total}페이지 중 {processed}페이지를 확인했습니다. 미처리 페이지의 내용을 원본과 비교해 주세요.")
+
+    review_messages = {
+        "financial_alternate_source": "표준 요약표 대신 문서의 다른 재무표에서 읽은 값이 있습니다. 표에 따라 금액이 다를 수 있으므로 출처와 원문을 확인해 주세요.",
+        "financial_year_unconfirmed": "일부 재무표의 결산연도를 확인하지 못했습니다. 최신년도 자료라고 확정하지 않았습니다.",
+        "financial_source_conflict": "재무표 인식 결과가 서로 달라 해당 금액은 자동 반영하지 않았습니다. 원문 확인이 필요합니다.",
+        "financial_table_ocr_incomplete": "재무표의 일부 항목을 문자 인식으로 확인하지 못했습니다. 결산연도와 금액을 원문에서 확인해 주세요.",
+        "certification_evidence_conflict": "인증정보 인식 결과가 서로 달라 해당 항목은 자동 확정하지 않았습니다. 인증 여부를 원문과 확인해 주세요.",
+        "certification_ocr_incomplete": "인증정보의 일부 항목을 문자 인식으로 확인하지 못했습니다. 인증 여부를 원문과 확인해 주세요.",
+    }
+    representative_codes = {"representative_conflict", "representative_ocr_uncertain"}
+    if codes.intersection(representative_codes):
+        messages.append("대표자명 인식 결과가 서로 다르거나 불확실해 자동 입력하지 않았습니다. 원문을 확인해 대표자명을 직접 입력해 주세요. 공란으로 저장하면 기존 대표자명은 유지됩니다.")
+    messages.extend(message for code, message in review_messages.items() if code in codes)
+    known = read_failures | page_failures | representative_codes | set(review_messages)
+    if codes - known:
+        messages.append("추출 결과 중 추가 검토가 필요한 항목이 있습니다. 아래 결과를 원본과 비교해 주세요.")
+    return messages
+
+
+def _format_financial_preview_value(value):
+    """Keep missing, zero and negative values distinct without changing data."""
+    if isinstance(value, bool) or value is None:
+        return "미확인"
+    try:
+        number = Decimal(str(value).replace(",", "").strip())
+    except (InvalidOperation, ValueError):
+        return "미확인"
+    if not number.is_finite():
+        return "미확인"
+    return format(number, ",.0f") if number == number.to_integral_value() else format(number, ",f").rstrip("0").rstrip(".")
+
+
+def _financial_history_preview(data):
+    """Show up to three explicitly dated financial rows, newest first."""
+    rows = [row for row in (data.get("재무연도별") or [])
+            if isinstance(row, dict) and re.fullmatch(r"20\d{2}", str(row.get("연도", "")))]
+    return [{"연도": str(row["연도"]),
+             **{field: _format_financial_preview_value(row.get(field)) for field in FINANCIAL_HISTORY_FIELDS}}
+            for row in sorted(rows, key=lambda row: int(row["연도"]), reverse=True)[:3]]
 
 
 def _basic_information_only(data):
@@ -275,23 +335,18 @@ def render_cretop_registration(user_id, user_name, upload_dir):
     metadata = data.get("_extraction") or {}
     if metadata.get("ocr_pages"):
         st.caption("이미지 문자를 인식한 결과입니다. 업체명과 사업자등록번호를 원본과 확인해 주세요.")
-    if metadata.get("warnings"):
-        st.warning("일부 페이지는 읽지 못했거나 추가 확인이 필요합니다. 아래 결과를 원본과 비교해 주세요.")
-    if {"representative_conflict", "representative_ocr_uncertain"}.intersection(metadata.get("warnings") or []):
-        st.warning("대표자명 인식 결과가 서로 다르거나 불확실해 자동 입력하지 않았습니다. 원문을 확인해 대표자명을 직접 입력해 주세요. 공란으로 저장하면 기존 대표자명은 유지됩니다.")
+    for warning in _extraction_warning_messages(metadata):
+        st.warning(warning)
     financial_review_required = bool(FINANCIAL_REVIEW_WARNINGS.intersection(metadata.get("warnings") or []))
-    if "financial_alternate_source" in (metadata.get("warnings") or []):
-        st.warning("표준 요약표 대신 문서의 다른 재무표에서 읽은 값이 있습니다. 표에 따라 금액이 다를 수 있으므로 출처와 원문을 확인해 주세요.")
-    if "financial_year_unconfirmed" in (metadata.get("warnings") or []):
-        st.warning("일부 재무표의 결산연도를 확인하지 못했습니다. 최신년도 자료라고 확정하지 않았습니다.")
-    if "financial_source_conflict" in (metadata.get("warnings") or []):
-        st.warning("재무표 인식 결과가 서로 달라 해당 금액은 자동 반영하지 않았습니다. 원문 확인이 필요합니다.")
     source_labels = {"summary": "요약표", "detail": "상세표", "alternate": "대체 재무표", "unavailable": "미확인"}
     for kind, title in (("income", "손익"), ("balance", "재무상태")):
         source = (metadata.get("financial_sources") or {}).get(kind)
         if source:
             years = ", ".join(str(year) for year in source.get("years", [])) or "미확인"
             st.caption(f"{title} 출처: {source_labels.get(source.get('kind'), '미확인')} · 결산연도: {years} · 아래 금액은 원 단위입니다.")
+            unit = {1: "원", 1_000: "천원", 1_000_000: "백만원"}.get(source.get("unit_multiplier"))
+            if unit and unit != "원":
+                st.caption(f"{title} 원문 단위: {unit} · 원 단위로 환산해 표시합니다. 요약표의 반올림 정밀도는 그대로 유지합니다.")
     if not has_financial_data(data):
         st.info("문서에서 재무정보가 확인되지 않았습니다. 재무값은 공란으로 두고 기본정보만 등록합니다.")
     prefs_key = "cretop_loaded_preferences"
@@ -329,6 +384,10 @@ def render_cretop_registration(user_id, user_name, upload_dir):
             for field in EXTRA_FIELDS:
                 value = data.get(field)
                 edits[field] = st.text_input(field, value="" if value is None else str(value), key="cretop_edit_" + field)
+            history = _financial_history_preview(data)
+            if history:
+                st.caption("최근 3개 결산연도 재무정보 · 원 단위")
+                st.dataframe(pd.DataFrame(history), hide_index=True, width="stretch")
             st.dataframe(pd.DataFrame([
                 {"항목": field, "추출값": "미확인" if data.get(field) in (None, "") else str(data[field])}
                 for field in FINANCIAL_FIELDS + ("벤처", "이노비즈", "메인비즈", "기업부설연구소", "연구개발전담부서", "특허보유", "상표")

@@ -340,3 +340,136 @@ def test_uncertain_financials_require_explicit_review(tmp_path, monkeypatch, ser
     assert saved["당기순이익"] == (-5 if approved else "")
     assert bool(saved["재무연도별"]) is approved
     assert saved["업체명"] == data["업체명"]
+
+
+@pytest.mark.parametrize("code,expected", [
+    ("financial_year_unconfirmed", "결산연도를 확인하지 못했습니다"),
+    ("financial_alternate_source", "다른 재무표에서 읽은 값"),
+    ("financial_source_conflict", "재무표 인식 결과가 서로 달라"),
+    ("financial_table_ocr_incomplete", "재무표의 일부 항목"),
+    ("representative_conflict", "대표자명 인식 결과"),
+    ("representative_ocr_uncertain", "대표자명 인식 결과"),
+    ("certification_evidence_conflict", "인증정보 인식 결과가 서로 달라"),
+    ("certification_ocr_incomplete", "인증정보의 일부 항목"),
+])
+def test_review_warning_does_not_claim_pages_were_unreadable(code, expected):
+    messages = ui._extraction_warning_messages({
+        "warnings": [code], "processed_pages": 8, "page_count": 8,
+    })
+    assert len(messages) == 1
+    assert expected in messages[0]
+    assert "페이지" not in messages[0]
+
+
+@pytest.mark.parametrize("metadata,expected", [
+    ({"warnings": ["analysis_time_limit"], "processed_pages": 3, "page_count": 8}, "분석 시간이 초과"),
+    ({"warnings": ["ocr_unavailable"]}, "문자 인식 기능을 사용할 수 없어"),
+    ({"warnings": ["page_3_ocr_failed", "page_5_ocr_failed"]}, "이미지 페이지의 문자 인식에 실패"),
+    ({"warnings": [], "processed_pages": 3, "page_count": 8}, "전체 8페이지 중 3페이지"),
+])
+def test_actual_page_processing_failure_has_specific_warning(metadata, expected):
+    messages = ui._extraction_warning_messages(metadata)
+    assert len(messages) == 1
+    assert expected in messages[0]
+
+
+def test_unknown_extraction_warning_requests_review_without_exposing_raw_code():
+    code = "unrecognized_internal_detail"
+    messages = ui._extraction_warning_messages({"warnings": [code]})
+    assert len(messages) == 1
+    assert "추가 검토" in messages[0]
+    assert "페이지" not in messages[0]
+    assert code not in messages[0]
+
+
+def test_financial_warning_in_app_does_not_claim_page_failure(tmp_path, monkeypatch, services):
+    data = {**basic_data(), "매출액": 100,
+            "_extraction": {"warnings": ["financial_year_unconfirmed"],
+                            "page_count": 8, "processed_pages": 8}}
+    app = make_app(tmp_path, monkeypatch, data)
+    app.button(key="cretop_analyze_button").click().run()
+    assert not app.exception
+    assert any("결산연도를 확인하지 못했습니다" in item.value for item in app.warning)
+    assert not any("페이지" in item.value for item in app.warning)
+    assert app.checkbox(key="cretop_confirm_financial").value is False
+
+
+@pytest.mark.parametrize("code,expected", [
+    ("financial_table_ocr_incomplete", "재무표의 일부 항목"),
+    ("certification_evidence_conflict", "인증정보 인식 결과가 서로 달라"),
+    ("certification_ocr_incomplete", "인증정보의 일부 항목"),
+])
+def test_specific_ocr_review_warning_is_rendered(tmp_path, monkeypatch, services, code, expected):
+    data = {**basic_data(), "매출액": 100, "_extraction": {"warnings": [code]}}
+    app = make_app(tmp_path, monkeypatch, data)
+    app.button(key="cretop_analyze_button").click().run()
+    assert not app.exception
+    assert any(expected in item.value for item in app.warning)
+    if code == "financial_table_ocr_incomplete":
+        assert app.checkbox(key="cretop_confirm_financial").value is False
+
+
+@pytest.mark.parametrize("value,expected", [
+    (None, "미확인"), ("", "미확인"), ("-", "미확인"), (True, "미확인"),
+    (float("nan"), "미확인"), (float("inf"), "미확인"),
+    (0, "0"), (0.0, "0"), (-1500.0, "-1,500"), ("1,250.50", "1,250.5"),
+])
+def test_financial_preview_keeps_unknown_zero_and_negative_distinct(value, expected):
+    assert ui._format_financial_preview_value(value) == expected
+
+
+def test_financial_history_preview_is_dated_latest_three_and_read_only():
+    rows = [
+        {"연도": "2022", "매출액": 10},
+        {"연도": "2024", "매출액": 0, "당기순이익": -1500.0},
+        {"연도": 2025, "매출액": 1234567, "자산총계": None},
+        {"연도": "2023", "매출액": "-"},
+        {"연도": None, "매출액": 999},
+    ]
+    preview = ui._financial_history_preview({"재무연도별": rows})
+    assert [row["연도"] for row in preview] == ["2025", "2024", "2023"]
+    assert preview[0]["매출액"] == "1,234,567"
+    assert preview[0]["자산총계"] == "미확인"
+    assert preview[1]["매출액"] == "0"
+    assert preview[1]["당기순이익"] == "-1,500"
+    assert preview[2]["매출액"] == "미확인"
+    assert rows[0]["연도"] == "2022"
+    assert rows[1]["당기순이익"] == -1500.0
+    assert rows[2]["매출액"] == 1234567
+
+
+def test_financial_history_table_and_existing_field_table_both_render(tmp_path, monkeypatch, services):
+    data = {**basic_data(), "매출액": 1234567, "벤처": "N", "재무연도별": [
+        {"연도": "2023", "매출액": None},
+        {"연도": "2025", "매출액": 1234567, "당기순이익": -1500.0},
+        {"연도": "2024", "매출액": 0, "당기순이익": 0},
+    ]}
+    app = make_app(tmp_path, monkeypatch, data)
+    app.button(key="cretop_analyze_button").click().run()
+    assert not app.exception
+    assert len(app.dataframe) == 2
+    history = app.dataframe[0].value
+    assert history["연도"].tolist() == ["2025", "2024", "2023"]
+    assert history["매출액"].tolist() == ["1,234,567", "0", "미확인"]
+    assert history["당기순이익"].tolist() == ["-1,500", "0", "미확인"]
+    flat = app.dataframe[1].value.set_index("항목")
+    assert flat.loc["벤처", "추출값"] == "N"
+    assert flat.loc["매출액", "추출값"] == "1234567"
+
+
+def test_financial_preview_explains_original_units_without_changing_amounts(tmp_path, monkeypatch, services):
+    data = {**basic_data(), "매출액": 123000000, "_extraction": {
+        "warnings": [], "financial_sources": {
+            "income": {"kind": "summary", "years": ["2025"], "unit_multiplier": 1000000},
+            "balance": {"kind": "detail", "years": ["2025"], "unit_multiplier": 1000},
+        },
+    }}
+    app = make_app(tmp_path, monkeypatch, data)
+    app.button(key="cretop_analyze_button").click().run()
+    assert not app.exception
+    assert any("손익 원문 단위: 백만원" in item.value for item in app.caption)
+    assert any("재무상태 원문 단위: 천원" in item.value for item in app.caption)
+    assert not app.warning
+    assert not any(item.key == "cretop_confirm_financial" for item in app.checkbox)
+    flat = app.dataframe[0].value.set_index("항목")
+    assert flat.loc["매출액", "추출값"] == "123000000"
