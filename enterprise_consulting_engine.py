@@ -75,9 +75,6 @@ def reconcile_enterprise_consulting_context(
             planned_amount=str(preferences.get("투자예정금액", "") or ""),
             planned_timing=str(preferences.get("투자예정시기", "") or ""),
         )
-    else:
-        preferences = get_matching_preferences(user_id, business_no)
-
     history_checked = 0
     for journal in context.get("journals", []) or []:
         if not isinstance(journal, dict):

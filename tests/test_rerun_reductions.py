@@ -20,7 +20,7 @@ class RerunReductionTests(unittest.TestCase):
     def test_enterprise_crm_save_reuses_fresh_record_without_second_rerun(self):
         source = _function_source(
             "enterprise_center.py",
-            "render_enterprise_management_center",
+            "_render_enterprise_company_details",
         )
         self.assertNotIn("st.rerun()", source)
         self.assertIn("crm_record = updated_crm", source)

@@ -489,6 +489,84 @@ def render_enterprise_management_center(
                     selected_row=selected_row,
                 )
 
+    _render_enterprise_company_details(
+        user_id,
+        user_name,
+        selected_row,
+        expected_role=str(st.session_state.get("current_user_role", "") or ""),
+    )
+
+
+def _current_enterprise_row(
+    customers: pd.DataFrame, selected_row: pd.Series,
+) -> pd.Series | None:
+    """Resolve a fresh owner-scoped row without company-name-only matching."""
+    for column in ("_customer_id", "_company_uid", "사업자등록번호"):
+        value = _clean(selected_row.get(column, ""))
+        if not value or column not in customers.columns:
+            continue
+        normalize = _normalize_business_no if column == "사업자등록번호" else _clean
+        normalized = normalize(value)
+        if not normalized:
+            continue
+        matches = customers.loc[customers[column].map(normalize) == normalized]
+        return matches.iloc[0] if len(matches) == 1 else None
+    # Legacy rows without a stable key are reused only on an exact row match.
+    matches = [row for _, row in customers.iterrows() if row.equals(selected_row)]
+    return matches[0] if len(matches) == 1 else None
+
+
+@st.fragment
+def _render_enterprise_company_details(
+    user_id: str,
+    user_name: str,
+    selected_row: pd.Series,
+    *,
+    expected_role: str,
+) -> None:
+    """Rerender company tools without rerunning the sidebar/customer selector.
+
+    Fragments bypass app.py on widget interaction, so keep the same session
+    validation and incremental CRM pull here. Never cache authorization or
+    close over a mutable CRM snapshot from the initial full-app render.
+    """
+    from auth import check_login
+    from cloud_crm_restore import restore_crm_from_cloud
+
+    if (
+        not check_login()
+        or str(st.session_state.get("current_user_id", "") or "") != user_id
+        or str(st.session_state.get("current_user_role", "") or "") != expected_role
+    ):
+        st.rerun(scope="app")
+        return
+    if st.session_state.pop("_enterprise_full_app_navigation_v9148", False):
+        st.rerun(scope="app")
+        return
+
+    # A fragment may remain mounted for a long time. Keep the existing 45s
+    # owner-scoped customer freshness and archive filtering on internal clicks,
+    # without rebuilding the company search/selectbox or the main sidebar.
+    fresh_customers = load_registered_customers(
+        get_user_cumulative_db_path(user_id), owner_user_id=user_id,
+    )
+    fresh_customers = filter_active_customers(
+        user_id=user_id, customers=fresh_customers, search_text="",
+    )
+    current_row = _current_enterprise_row(fresh_customers, selected_row)
+    if current_row is None:
+        st.warning("업체 정보나 접근 상태가 변경되었습니다. 기업 목록을 새로고침한 뒤 다시 선택해주세요.")
+        if st.button("기업 목록 새로고침", key="enterprise_refresh_selection_v9148"):
+            st.rerun(scope="app")
+        return
+    selected_row = current_row
+
+    crm_restore_result = restore_crm_from_cloud(user_id)
+    st.session_state["cloud_crm_restore_result"] = crm_restore_result
+    st.session_state[f"cloud_crm_restore_{user_id}"] = bool(crm_restore_result.get("ok"))
+    if not crm_restore_result.get("ok") and crm_restore_result.get("status") != "busy":
+        st.warning("클라우드 CRM 최신 변경을 확인하지 못했습니다. 기존 자료와 편집 초안은 보존되어 있습니다.")
+
     company_name = _clean(selected_row.get("업체명", ""))
     business_no = _normalize_business_no(
         selected_row.get("사업자등록번호", "")
@@ -559,6 +637,9 @@ def render_enterprise_management_center(
         st.session_state["_oasis_copilot_company_name"] = company_name
         st.session_state["sidebar_menu_group_v1020"] = "주요업무"
         st.session_state["active_main_menu_v1020"] = "AI 코파일럿"
+        # Widget callbacks run before the fragment. Request one full-app rerun
+        # at the guard above so the main route and sidebar change together.
+        st.session_state["_enterprise_full_app_navigation_v9148"] = True
 
     st.button(
         "이 기업 AI 코파일럿으로 분석하기",
@@ -792,13 +873,14 @@ def render_enterprise_management_center(
             from enterprise_documents import (
                 DOCUMENT_TYPES,
                 UPLOAD_DOCUMENT_TYPES,
-                load_enterprise_source_overview,
+                get_enterprise_source_overview_for_display,
             )
 
-            source_overview = load_enterprise_source_overview(
+            source_overview = get_enterprise_source_overview_for_display(
                 user_id,
                 business_no,
                 company_name,
+                document_context=document_context,
             )
             st.markdown("#### 연결된 기업자료")
             st.dataframe(

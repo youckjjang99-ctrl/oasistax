@@ -2408,11 +2408,12 @@ def render_employee_status(
                 )
                 st.rerun()
 
-    latest = get_latest_employee_status(
+    versions = load_employee_versions(
         user_id,
         business_no,
         company_name,
     )
+    latest = versions[0] if versions else {}
     if not latest:
         st.info(
             "저장된 직원현황이 없습니다."
@@ -2461,11 +2462,6 @@ def render_employee_status(
         company_address=company_address,
     )
 
-    versions = load_employee_versions(
-        user_id,
-        business_no,
-        company_name,
-    )
     if len(versions) > 1:
         with st.expander(
             f"이전 명부 업로드 이력 {len(versions) - 1}건",

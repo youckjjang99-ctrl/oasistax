@@ -316,8 +316,12 @@ def load_enterprise_document_context(
 
 def load_enterprise_source_overview(
     user_id: str, business_no: str, company_name: str = "",
+    *, document_context: dict[str, Any] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    context = load_enterprise_document_context(user_id, business_no, company_name)
+    context = (
+        document_context if document_context is not None
+        else load_enterprise_document_context(user_id, business_no, company_name)
+    )
     try:
         from consultation_journal import load_company_consultation_context
         journals = load_company_consultation_context(user_id, business_no, company_name=company_name, limit=20)
@@ -361,6 +365,7 @@ def _load_enterprise_source_overview_cached(
     company_name: str,
     metadata_mtime_ns: int,
     metadata_size: int,
+    _document_context: dict[str, Any] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Reuse the expensive multi-source overview during short UI reruns."""
     del metadata_mtime_ns, metadata_size
@@ -368,6 +373,7 @@ def _load_enterprise_source_overview_cached(
         user_id,
         business_no,
         company_name,
+        document_context=_document_context,
     )
 
 
@@ -377,6 +383,23 @@ def _enterprise_source_overview_revision(user_id: str) -> tuple[int, int]:
         return int(stat.st_mtime_ns), int(stat.st_size)
     except OSError:
         return 0, 0
+
+
+def get_enterprise_source_overview_for_display(
+    user_id: str, business_no: str, company_name: str = "",
+    *, document_context: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Short-lived session/owner/company-scoped counts, not access decisions.
+
+    The file revision invalidates document uploads immediately; other sources
+    retain the existing eight-second overview TTL. Reuse the document context
+    already read by the company view instead of parsing it a second time.
+    """
+    revision = _enterprise_source_overview_revision(user_id)
+    return _load_enterprise_source_overview_cached(
+        user_id, business_no, company_name, *revision,
+        _document_context=document_context,
+    )
 
 
 def _render_note_input(user_id: str, customer: pd.Series, document_type: str) -> None:

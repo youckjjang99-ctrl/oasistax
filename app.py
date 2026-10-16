@@ -2166,7 +2166,7 @@ if active_tab in local_customer_routes:
         if "실패" not in restore_message:
             st.session_state[restore_session_key] = True
 
-if active_tab in {"홈", "기업관리센터", "내 누적 고객DB", "AI 코파일럿"}:
+if active_tab in {"홈", "내 누적 고객DB", "AI 코파일럿"}:
     crm_restore_session_key = f"cloud_crm_restore_{CURRENT_USER_ID}"
     from cloud_crm_restore import restore_crm_from_cloud
     # The owner-scoped persistent TTL avoids redundant reads, without treating
@@ -2186,7 +2186,7 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-if active_tab in {"기업관리센터", "내 누적 고객DB", "AI 코파일럿"}:
+if active_tab in {"내 누적 고객DB", "AI 코파일럿"}:
     crm_sync_notice = st.session_state.get("cloud_crm_restore_result", {})
     if not crm_sync_notice.get("ok") and crm_sync_notice.get("status") != "busy":
         st.warning("클라우드 CRM 최신 변경을 확인하지 못했습니다. 기존 자료와 편집 초안은 보존되어 있습니다.")
