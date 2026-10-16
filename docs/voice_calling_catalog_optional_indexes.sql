@@ -1,0 +1,50 @@
+-- OPTIONAL OPERATIONS NOTES ONLY: every statement below is commented out.
+-- Not part of the v9.14.3 migration runner; DO NOT execute without separate
+-- operator approval, storage/headroom review and staging EXPLAIN verification.
+-- No customer rows or production indexes were changed for this proposal.
+--
+-- 2026-10-06 observed source count: 2,285,734 rows, table+indexes about 2,865 MiB.
+-- Source-page EXPLAIN ANALYZE (101 rows, aggregate output only, NOT whole RPC):
+--   all:         54.797 ms, primary-key Index Scan
+--   corporate: 1228.810 ms, primary-key Index Scan, 6,093 rejected rows
+--   individual:   0.533 ms, primary-key Index Scan (warm cache)
+--   mobile:       3.886 ms, existing mobile partial Index Scan
+-- A nonexistent substring + mobile + province query still estimates 35,937
+-- mobile entries to inspect. Without mobile/region, a rare search can scan all
+-- rows. LIMIT 101 does not bound the number of rows inspected.
+-- Times are a single observation, not a latency guarantee or a capacity test.
+--
+-- Core migration creates no source index, avoiding an unapproved full-size
+-- index build and collector write amplification. Catalogue is keyset-paged,
+-- uses dynamic constant predicates, and joins saved prospects AFTER page 101.
+-- The small saved-prospect link join uses current expressions/provenance OR;
+-- re-evaluate it if the saved table grows well beyond the observed 1,112 rows.
+--
+-- Verify pg_trgm location before specifying its operator class:
+-- SELECT extname, extnamespace::regnamespace FROM pg_extension WHERE extname='pg_trgm';
+-- SELECT indexname,indexdef FROM pg_indexes
+--  WHERE schemaname='public' AND tablename='oasis_employment_contacts';
+--
+-- Option A: company-name substring search. Build only after pg_trgm is approved
+-- and installed. Replace extensions.gin_trgm_ops with its ACTUAL schema.
+-- CREATE INDEX CONCURRENTLY oasis_voice_catalog_name_trgm
+-- ON public.oasis_employment_contacts USING gin (company_name extensions.gin_trgm_ops);
+--
+-- Option B: province-code + keyset browse. Current region OR predicates may
+-- still need a dedicated province-code-only fast path to exploit this fully.
+-- CREATE INDEX CONCURRENTLY oasis_voice_catalog_region_key
+-- ON public.oasis_employment_contacts (province_code,contact_key);
+--
+-- Never put CONCURRENTLY in a transaction/migration wrapper. Each build reads
+-- the large source table and consumes CPU/I/O/disk; it avoids a long blocking
+-- write lock but is NOT zero-impact. IF NOT EXISTS is not sufficient after a
+-- failed concurrent build: check pg_index.indisvalid and index definition.
+-- Do not automatically drop/rebuild an invalid or similarly named user index.
+-- Rollback of optional indexes needs separate operator review; core feature
+-- rollback does not require deleting any source/customer data.
+--
+-- RPC config sets statement_timeout=15s and catches SQLSTATE 57014 as the safe
+-- SEARCH_TIMEOUT code. Actual hosted PostgREST cancellation remains to be
+-- verified in isolated staging (PGlite/direct SQL does not prove HTTP timing).
+-- https://supabase.com/docs/guides/database/postgres/timeouts
+-- https://supabase.com/docs/guides/database/query-optimization

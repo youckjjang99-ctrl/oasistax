@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import threading
 import time
 from contextlib import asynccontextmanager
 from copy import deepcopy
@@ -143,9 +144,16 @@ class FakeRepository:
 class FakeProvider:
     def __init__(self):
         self.hung_up = []
+        self.hangup_done = threading.Event()
 
     def hangup(self, call_id):
         self.hung_up.append(call_id)
+        self.hangup_done.set()
+
+    def wait_for_hangup(self):
+        # Media closes before REST hangup. Keep TestClient's ASGI lifespan alive
+        # until synthetic cleanup completes; a missing hangup still fails.
+        assert self.hangup_done.wait(timeout=5), "Synthetic hangup did not complete"
 
 
 class FakeUpstream:
@@ -531,6 +539,7 @@ def test_voiceml_ticket_then_unsigned_socket_roundtrip_uses_clawops_wire_contrac
             receive_audio_and_ack(ws)
             with pytest.raises(WebSocketDisconnect):
                 ws.receive_json()
+            provider.wait_for_hangup()
     assert provider.hung_up == [PROVIDER_CALL_ID]
     assert len(connector.connections) == 1
     upstream = connector.connections[0]
@@ -561,6 +570,7 @@ def test_dtmf_nine_persists_optout_then_hangs_up_and_replay_cannot_open_ai():
                        for action, payload in repo.calls)
             with pytest.raises(WebSocketDisconnect):
                 ws.receive_json()
+            provider.wait_for_hangup()
         with client.websocket_connect(MEDIA_PATH) as ws:
             ws.send_json(start_message(ticket=ticket))
             with pytest.raises(WebSocketDisconnect):
@@ -587,6 +597,7 @@ def test_failed_optout_quarantines_and_never_resumes_pitch():
             ws.send_json({"event": "dtmf", "dtmf": {"digit": "9"}})
             with pytest.raises(WebSocketDisconnect):
                 ws.receive_json()
+            provider.wait_for_hangup()
     assert provider.hung_up == [PROVIDER_CALL_ID]
     assert connector.connections[0].response_count == 1
     assert any(action == "bridge_error" and payload["error_code"] == "DO_NOT_CALL_SAVE_FAILED"
@@ -613,6 +624,7 @@ def test_authenticated_media_cannot_change_identity_or_restart_stream(case):
             ws.send_json(event)
             with pytest.raises(WebSocketDisconnect):
                 ws.receive_json()
+            provider.wait_for_hangup()
     assert provider.hung_up == [PROVIDER_CALL_ID]
     assert connector.connections[0].closed
     assert any(action == "bridge_error" and payload["error_code"] == "MEDIA_PROTOCOL_ERROR"
@@ -628,6 +640,7 @@ def test_valid_stop_closes_model_and_hangs_up_bound_phone_call():
             ws.send_json(stop_message())
             with pytest.raises(WebSocketDisconnect):
                 ws.receive_json()
+            provider.wait_for_hangup()
     assert provider.hung_up == [PROVIDER_CALL_ID]
     assert connector.connections[0].closed
     assert not any(action == "bridge_error" for action, _ in repo.calls)

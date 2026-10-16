@@ -191,3 +191,49 @@ def test_repository_rejects_unknown_campaign_action_before_cloud_access():
         def rpc(self, *args):
             raise AssertionError("unknown action must not reach RPC")
     assert VoiceRepository(DB()).action("alice", "auto_retry_all_calls")["code"] == "INVALID_INPUT"
+
+
+def test_catalog_uses_separate_readonly_rpc_and_preserves_filters():
+    payload = {"limit": 100, "cursor": {"source": "employment", "key": "fixture"},
+               "business_type": "corporate", "phone_type": "mobile", "query": "Synthetic"}
+    class DB:
+        def rpc(self, function, params):
+            assert function == "oasis_voice_catalog"
+            assert params == {"p_current_user_id": "fixture-admin", "p_payload": payload}
+            return {"ok": True, "rows": [], "has_more": False, "next_cursor": None}
+    assert VoiceRepository(DB()).action("fixture-admin", "catalog", payload)["ok"]
+
+
+def test_catalog_permission_failure_does_not_fall_back_to_old_list():
+    class DB:
+        calls = 0
+        def rpc(self, function, params):
+            self.calls += 1
+            assert function == "oasis_voice_catalog"
+            return {"ok": False, "code": "NOT_AUTHORIZED"}
+    db = DB()
+    result = VoiceRepository(db).action("fixture-member", "catalog")
+    assert result["code"] == "NOT_AUTHORIZED" and not result["ok"]
+    assert db.calls == 1
+
+
+def test_catalog_exception_never_leaks_details_or_uses_partial_old_results():
+    class DB:
+        calls = 0
+        def rpc(self, function, params):
+            self.calls += 1
+            raise RuntimeError("private customer payload and credential")
+    db = DB()
+    result = VoiceRepository(db).action("fixture-admin", "catalog")
+    assert result["code"] == "NOT_READY" and not result["ok"]
+    assert db.calls == 1 and "private" not in str(result)
+
+
+@pytest.mark.parametrize("code", ["SEARCH_TIMEOUT", "INVALID_CURSOR"])
+def test_catalog_recoverable_errors_keep_safe_specific_code(code):
+    class DB:
+        def rpc(self, function, params):
+            return {"ok": False, "code": code, "message": "private raw diagnostic"}
+    result = VoiceRepository(DB()).action("fixture-admin", "catalog")
+    assert result["code"] == code and not result["ok"]
+    assert "private" not in result["message"]

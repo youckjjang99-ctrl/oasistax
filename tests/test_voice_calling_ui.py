@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import date
 import unittest
 
 import voice_calling_ui as ui
@@ -22,7 +23,7 @@ class FakeStreamlit:
         self.buttons = []
         self.messages = []
         self.session_state = {}
-        self.column_config = type("ColumnConfig", (), {"CheckboxColumn": staticmethod(lambda *_args, **_kwargs: {})})
+        self.column_config = type("ColumnConfig", (), {"CheckboxColumn": staticmethod(lambda *_args, **_kwargs: {}), "TextColumn": staticmethod(lambda *_args, **_kwargs: {})})
 
     def __enter__(self):
         return self
@@ -56,6 +57,12 @@ class FakeStreamlit:
     def text_input(self, *_args, **kwargs):
         return kwargs.get("value", "")
 
+    def selectbox(self, _label, values, **kwargs):
+        return values[kwargs.get("index", 0)]
+
+    def date_input(self, *_args, **kwargs):
+        return kwargs.get("value", date(2030, 1, 1))
+
     def dataframe(self, *_args, **_kwargs):
         pass
 
@@ -79,12 +86,39 @@ class VoiceCallingUiTests(unittest.TestCase):
     def test_contact_display_never_exposes_full_phone_or_raw_rpc_fields(self):
         row = self.candidate(phone_masked="", phone="+82" + "10" + "0000" + "0000", secret="do-not-render", evidence_ref="private")
         display = ui.candidate_display([row])[0]
-        self.assertEqual(display["연락처"], "***-****-0000")
+        self.assertEqual(display["발신 연락처"], "***-****-0000")
         self.assertNotIn("secret", display)
         self.assertNotIn("evidence_ref", display)
         self.assertNotIn("+82", str(display))
         self.assertEqual(ui.masked_phone(None), "없음")
         self.assertEqual(ui.masked_phone("unknown"), "***-****-****")
+
+    def test_job_contact_uses_only_masked_field_never_raw_phone_fallback(self):
+        raw = "+82" + "10" + "0000" + "1234"
+        row = {"target_kind": "manual", "phone_masked": "***-****-0001", "phone": raw, "phone_e164": raw}
+        display = ui.job_display([row])[0]
+        self.assertEqual(display["발신 연락처"], "***-****-0001")
+        self.assertNotIn(raw, str(display))
+        self.assertNotIn("1234", str(display))
+        self.assertEqual(ui.job_display([{**row, "phone_masked": None}])[0]["발신 연락처"], "미확인")
+
+    def test_manual_suppression_shows_masked_target_and_request_time(self):
+        screen = FakeStreamlit()
+        labels = []
+        def expander(label, **_kwargs):
+            labels.append(label)
+            return screen
+        screen.expander = expander
+        repo = FakeRepository()
+        ui._render_manual_controls(screen, repo, "admin", [
+            {"id": "one", "target_kind": "manual", "company_name": "Synthetic same name", "phone_masked": "***-****-0001", "created_at": "2030-01-01T01:00:00Z"},
+            {"id": "two", "target_kind": "manual", "company_name": "Synthetic same name", "phone_masked": "***-****-0002", "created_at": "2030-01-01T02:00:00Z"},
+        ], True)
+        self.assertIn("***-****-0001", labels[0])
+        self.assertIn("***-****-0002", labels[1])
+        self.assertTrue(any("***-****-0001" in text and "2030-01-01 10:00" in text for text in screen.messages))
+        self.assertTrue(any("***-****-0002" in text and "2030-01-01 11:00" in text for text in screen.messages))
+        self.assertEqual(repo.calls, [])
 
     def test_selection_requires_ownership_scope_consent_phone_and_no_dnc(self):
         good = self.candidate()
@@ -103,6 +137,15 @@ class VoiceCallingUiTests(unittest.TestCase):
         first = ui.enqueue_request_key(state, "owner-a", ["b", "a"])
         self.assertEqual(first, ui.enqueue_request_key(state, "owner-a", ["a", "b", "b"]))
         self.assertNotEqual(first, ui.enqueue_request_key(state, "owner-b", ["a", "b"]))
+
+    def test_launch_key_is_stable_and_never_stores_plaintext_manual_contact(self):
+        state = {}
+        payload = {"company_name": "synthetic-sensitive-name", "phone": "synthetic-phone", "purpose": "test"}
+        first = ui.launch_request_key(state, "actor", "manual", payload)
+        self.assertEqual(first, ui.launch_request_key(state, "actor", "manual", dict(reversed(list(payload.items())))))
+        self.assertNotIn("synthetic-sensitive-name", str(state))
+        self.assertNotIn("synthetic-phone", str(state))
+        self.assertNotEqual(first, ui.launch_request_key(state, "actor", "manual", {**payload, "purpose": "customer_guidance"}))
 
     def test_metrics_only_count_loaded_scope(self):
         metrics = ui.scoped_metrics([self.candidate(), self.candidate(company_uid="fixture:two", permission_valid=False)], [{"status": "pending_approval"}, {"status": "completed", "outcome": "visit_requested"}])
@@ -136,21 +179,49 @@ class VoiceCallingUiTests(unittest.TestCase):
 
     def test_queue_rejects_missing_consent_before_repository(self):
         repo = FakeRepository()
-        screen = FakeStreamlit(clicked="선택 1개 업체 캠페인 저장", selected=["fixture:one"])
-        ui._render_targets(screen, repo, "owner-a", [self.candidate(permission_valid=False)], True, False)
+        screen = FakeStreamlit(clicked="발신 가능 0개 업체 캠페인 저장", selected=["fixture:one"])
+        ui._render_targets(screen, repo, "admin", [self.candidate(permission_valid=False)], True, True)
         self.assertEqual(repo.calls, [])
-        self.assertTrue(any("동의 확인" in text for text in screen.messages))
+        self.assertTrue(any("발신 조건" in text for text in screen.messages))
 
     def test_valid_selection_queues_without_dialing(self):
         repo = FakeRepository()
-        screen = FakeStreamlit(clicked="선택 1개 업체 캠페인 저장", selected=["fixture:one"])
-        ui._render_targets(screen, repo, "owner-a", [self.candidate()], True, False)
+        screen = FakeStreamlit(clicked="발신 가능 1개 업체 캠페인 저장", selected=["fixture:one"])
+        ui._render_targets(screen, repo, "admin", [self.candidate()], True, True)
         self.assertEqual(len(repo.calls), 1)
         actor, action, payload = repo.calls[0]
-        self.assertEqual((actor, action), ("owner-a", "create_campaign"))
+        self.assertEqual((actor, action), ("admin", "create_campaign"))
         self.assertEqual(payload["company_uids"], ["fixture:one"])
         self.assertTrue(payload["name"])
         self.assertTrue(payload["request_id"])
+
+    def test_private_target_renderer_blocks_non_admin_before_any_mutation(self):
+        repo = FakeRepository()
+        screen = FakeStreamlit(clicked="발신 가능 1개 업체 캠페인 저장", selected=["fixture:one"])
+        ui._render_targets(screen, repo, "member", [self.candidate()], True, False)
+        self.assertEqual(repo.calls, [])
+        self.assertEqual(screen.buttons, [])
+        self.assertIn("관리자 전용", screen.messages[0])
+
+    def test_fragment_direct_entry_blocks_non_admin_before_repository(self):
+        from unittest.mock import patch
+        screen = FakeStreamlit()
+        with patch("voice_calling_repository.VoiceRepository", side_effect=AssertionError("Must not instantiate")):
+            ui._render_dashboard(screen, "member", False)
+        self.assertIn("관리자 전용", screen.messages[0])
+
+    def test_source_row_missing_company_uid_cannot_become_eligible(self):
+        self.assertFalse(ui._eligible(self.candidate(row_id="source:1", company_uid=None)))
+
+    def test_rich_display_preserves_unknown_and_negative_employment(self):
+        row = self.candidate(row_id="source:1", company_uid=None, business_type="unknown", employee_count=None, employment_change=-3, industry="Synthetic", discovery_type="employment_growth", blocked_reason="SOURCE_NOT_LINKED", eligible=False)
+        display = ui.candidate_display([row])[0]
+        self.assertEqual(display["사업자 구분"], "미확인")
+        self.assertEqual(display["고용인원"], "미확인")
+        self.assertEqual(display["고용 증감"], "-3명")
+        self.assertEqual(display["발굴유형"], "고용인원 증가")
+        self.assertIn("연결", display["발신 제한 사유"])
+        self.assertEqual(display["발신번호 수신거부"], "미확인")
 
     def test_campaign_jobs_never_receive_individual_approval_controls(self):
         repo = FakeRepository()
@@ -168,10 +239,12 @@ class VoiceCallingUiTests(unittest.TestCase):
         source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
         self.assertIn('"AI 방문상담": "주요업무"', source)
         self.assertIn('primary_menu["AI 방문상담"]', source)
+        self.assertIn('if CURRENT_USER_IS_ADMIN:\n        primary_menu["AI 방문상담"]', source)
         route = source.split('elif active_tab == "AI 방문상담":', 1)[1].split("elif active_tab", 1)[0]
         self.assertIn("from voice_calling_ui import render_voice_calling", route)
         self.assertIn("CURRENT_USER_ID", route)
         self.assertIn("CURRENT_USER_IS_ADMIN", route)
+        self.assertIn("if not CURRENT_USER_IS_ADMIN:", route)
 
 
 if __name__ == "__main__":

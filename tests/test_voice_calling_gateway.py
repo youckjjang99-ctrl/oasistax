@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import threading
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from urllib.parse import urlencode
@@ -66,9 +67,16 @@ class FakeRepository:
 class FakeProvider:
     def __init__(self):
         self.hung_up = []
+        self.hangup_done = threading.Event()
 
     def hangup(self, sid):
         self.hung_up.append(sid)
+        self.hangup_done.set()
+
+    def wait_for_hangup(self):
+        # Media closes before REST hangup. Keep TestClient's ASGI lifespan alive
+        # until synthetic cleanup completes; a missing hangup still fails.
+        assert self.hangup_done.wait(timeout=5), "Synthetic hangup did not complete"
 
 
 class FakeUpstream:
@@ -220,6 +228,7 @@ def test_media_roundtrip_barge_in_result_and_cleanup():
             receive_audio_and_ack(ws)
             with pytest.raises(WebSocketDisconnect):
                 ws.receive_json()
+            provider.wait_for_hangup()
     assert provider.hung_up == [CALL_ID]
     assert connector.connections[0].closed
     sent = connector.connections[0].sent
@@ -243,6 +252,7 @@ def test_keypad_optout_and_replayed_stream_cannot_connect_twice():
             assert ws.receive_json()["event"] == "clear"
             with pytest.raises(WebSocketDisconnect):
                 ws.receive_json()
+            provider.wait_for_hangup()
         with connect_socket(client) as ws:
             ws.send_json(start_message())
             with pytest.raises(WebSocketDisconnect):
@@ -262,6 +272,7 @@ def test_duration_limit_hangs_up_and_closes_upstream():
             receive_audio_and_ack(ws)
             with pytest.raises(WebSocketDisconnect):
                 ws.receive_json()
+            provider.wait_for_hangup()
     assert provider.hung_up == [CALL_ID]
     assert connector.connections[0].closed
     assert any(action == "bridge_error" and payload["error_code"] == "CALL_TIME_LIMIT" for action, payload in repo.calls)
@@ -274,6 +285,7 @@ def test_disconnect_cancels_both_pumps_and_hangs_up():
             ws.send_json(start_message())
             receive_audio_and_ack(ws)
             ws.close()
+            provider.wait_for_hangup()
     assert provider.hung_up == [CALL_ID]
     assert connector.connections[0].closed
 
@@ -290,6 +302,7 @@ def test_failed_optout_is_quarantined_and_ends_call_without_further_pitch():
             # quarantines the job and closes immediately, without further audio.
             with pytest.raises(WebSocketDisconnect):
                 ws.receive_json()
+            provider.wait_for_hangup()
     assert provider.hung_up == [CALL_ID]
     assert any(action == "bridge_error" and payload["error_code"] == "DO_NOT_CALL_SAVE_FAILED" for action, payload in repo.calls)
     assert connector.connections[0].response_count == 1
@@ -307,6 +320,7 @@ def test_model_connection_failure_still_ends_authenticated_phone_leg():
             ws.send_json(start_message())
             with pytest.raises(WebSocketDisconnect):
                 ws.receive_json()
+            provider.wait_for_hangup()
     assert provider.hung_up == [CALL_ID]
     assert any(action == "bridge_error" and payload["error_code"] == "VOICE_BRIDGE_ERROR" for action, payload in repo.calls)
     assert "Sensitive" not in str(repo.calls)
