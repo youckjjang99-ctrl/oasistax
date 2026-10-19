@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from copy import deepcopy
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,18 @@ LAW_BASE_DATE = "2026-07-13"
 CAPITALIZATION_RATE_DEFAULT = 0.10
 NAV_FLOOR_RATE_DEFAULT = 0.80
 MAX_SHAREHOLDER_PREMIUM_DEFAULT = 0.20
+GOODWILL_DISCOUNT_FACTOR = 3.7908  # Source workbook: 영업권!B25 (5 years, 10%).
+GOODWILL_LAW_BASE_DATE = "2026-10-16"
+GOODWILL_MODE_LABELS = {
+    "auto": "자동계산(엑셀 기준)",
+    "manual": "수동입력(기존 방식)",
+    "excluded": "불산입(검토 후 적용)",
+}
+GOODWILL_STATE_KEYS = (
+    "stock_goodwill_mode",
+    "stock_goodwill_acquired_intangible_remaining",
+    "stock_goodwill_exclusion_reason",
+)
 
 
 def _safe_number(value: Any) -> float | None:
@@ -36,7 +49,8 @@ def _safe_number(value: Any) -> float | None:
     if text.lower() in {"", "none", "nan", "nat", "-"}:
         return None
     try:
-        return float(text)
+        number = float(text)
+        return number if math.isfinite(number) else None
     except (TypeError, ValueError):
         return None
 
@@ -457,6 +471,69 @@ def _record_label(record: dict[str, Any]) -> str:
     return f"{name} · 기준일 {base_date} · 저장 {saved_at}"
 
 
+def calculate_goodwill(
+    annual_rows: list[dict[str, Any]],
+    equity_before_goodwill: Any,
+    acquired_intangible_remaining: Any = 0,
+) -> dict[str, Any]:
+    """Reference workbook's base goodwill sheet, using whole-company income.
+
+    Tax-adjusted inputs and inclusion eligibility remain a professional review.
+    Negative equity requires manual review rather than an unverified tax rule.
+    """
+    if len(annual_rows) != 3:
+        raise ValueError("영업권 자동계산에는 최근 3개년 순손익액이 필요합니다.")
+    incomes, years = [], []
+    for row in annual_rows:
+        income = _safe_number(row.get("adjusted_net_income"))
+        year = _safe_number(row.get("year"))
+        if income is None:
+            raise ValueError("영업권 자동계산에 필요한 3개년 순손익액을 확인해주세요.")
+        if year is None or not year.is_integer() or not 1900 <= year <= 9999:
+            raise ValueError("영업권 계산 연도를 최근 연도부터 정확히 입력해주세요.")
+        incomes.append(income)
+        years.append(int(year))
+    if years != [years[0], years[0] - 1, years[0] - 2]:
+        raise ValueError("영업권 계산은 최근 연도부터 연속된 3개년 순서여야 합니다.")
+    equity = _safe_number(equity_before_goodwill)
+    remaining = _safe_number(acquired_intangible_remaining)
+    if equity is None:
+        raise ValueError("영업권 가산 전 조정 순자산가액을 확인해주세요.")
+    if equity < 0:
+        raise ValueError(
+            "영업권 가산 전 자기자본이 음수입니다. 세무 검토 후 수동입력 또는 불산입을 선택해주세요."
+        )
+    if remaining is None or remaining < 0:
+        raise ValueError("매입 무체재산권 미상각잔액을 0 이상의 금액으로 입력해주세요.")
+    raw_weighted_income = sum(value * weight for value, weight in zip(incomes, (3, 2, 1))) / 6
+    # §59(3) incorporates §56(1)'s negative weighted-income floor.
+    weighted_income = max(raw_weighted_income, 0.0)
+    excess_earnings = weighted_income * 0.5 - equity * 0.1
+    discounted_value = excess_earnings * GOODWILL_DISCOUNT_FACTOR
+    amount = max(discounted_value - remaining, 0.0)
+    if not all(math.isfinite(value) for value in (raw_weighted_income, excess_earnings, discounted_value, amount)):
+        raise ValueError("영업권 계산 금액이 허용 범위를 벗어났습니다.")
+    warnings = []
+    if raw_weighted_income < 0:
+        warnings.append("순손익 가중평균액이 음수여서 영업권 계산에는 0원을 적용했습니다.")
+    return {
+        "raw_weighted_income": raw_weighted_income,
+        "weighted_income": weighted_income,
+        "equity_before_goodwill": equity,
+        "excess_earnings": excess_earnings,
+        "discounted_value": discounted_value,
+        "acquired_intangible_remaining": remaining,
+        "amount": amount,
+        "discount_factor": GOODWILL_DISCOUNT_FACTOR,
+        "normal_return_rate": 0.1,
+        "income_rate": 0.5,
+        "years": 5,
+        "formula_version": "excel-base-v1",
+        "law_base_date": GOODWILL_LAW_BASE_DATE,
+        "warnings": warnings,
+    }
+
+
 def calculate_stock_valuation(inputs: dict[str, Any]) -> dict[str, Any]:
     current_shares = _safe_number(inputs.get("current_shares"))
     if not current_shares or current_shares <= 0:
@@ -508,7 +585,8 @@ def calculate_stock_valuation(inputs: dict[str, Any]) -> dict[str, Any]:
     if capitalization_rate <= 0:
         raise ValueError("순손익가치 환원율은 0보다 커야 합니다.")
 
-    weighted_per_share_income = weighted_sum / 6
+    raw_weighted_per_share_income = weighted_sum / 6
+    weighted_per_share_income = max(raw_weighted_per_share_income, 0.0)
     earnings_value_per_share = weighted_per_share_income / capitalization_rate
 
     total_assets = _safe_number(inputs.get("total_assets"))
@@ -521,19 +599,32 @@ def calculate_stock_valuation(inputs: dict[str, Any]) -> dict[str, Any]:
     asset_deductions = _safe_number(inputs.get("asset_deductions")) or 0
     liability_additions = _safe_number(inputs.get("liability_additions")) or 0
     liability_deductions = _safe_number(inputs.get("liability_deductions")) or 0
-    goodwill = _safe_number(inputs.get("goodwill")) or 0
     other_adjustments = _safe_number(inputs.get("other_adjustments")) or 0
 
     adjusted_assets = total_assets + asset_additions - asset_deductions
     adjusted_liabilities = (
         total_liabilities + liability_additions - liability_deductions
     )
-    adjusted_net_assets = (
-        adjusted_assets
-        - adjusted_liabilities
-        + goodwill
-        + other_adjustments
-    )
+    net_assets_before_goodwill = adjusted_assets - adjusted_liabilities + other_adjustments
+    goodwill_mode = inputs.get("goodwill_mode", "manual")
+    goodwill_details = None
+    if goodwill_mode == "auto":
+        goodwill_details = calculate_goodwill(
+            annual_rows,
+            net_assets_before_goodwill,
+            inputs.get("goodwill_acquired_intangible_remaining", 0),
+        )
+        goodwill = goodwill_details["amount"]
+    elif goodwill_mode == "excluded":
+        if not str(inputs.get("goodwill_exclusion_reason") or "").strip():
+            raise ValueError("영업권 불산입을 선택한 검토 사유를 입력해주세요.")
+        goodwill = 0.0
+    elif goodwill_mode == "manual":
+        goodwill = _safe_number(inputs.get("goodwill")) or 0
+    else:
+        raise ValueError("영업권 계산 방식을 다시 선택해주세요.")
+    raw_adjusted_net_assets = net_assets_before_goodwill + goodwill
+    adjusted_net_assets = max(raw_adjusted_net_assets, 0.0)
     nav_per_share = adjusted_net_assets / current_shares
 
     valuation_type = inputs.get("valuation_type", "일반법인(3:2)")
@@ -569,10 +660,16 @@ def calculate_stock_valuation(inputs: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "annual_details": annual_details,
+        "raw_weighted_per_share_income": raw_weighted_per_share_income,
         "weighted_per_share_income": weighted_per_share_income,
         "earnings_value_per_share": earnings_value_per_share,
         "adjusted_assets": adjusted_assets,
         "adjusted_liabilities": adjusted_liabilities,
+        "net_assets_before_goodwill": net_assets_before_goodwill,
+        "goodwill": goodwill,
+        "goodwill_mode": goodwill_mode,
+        "goodwill_details": goodwill_details,
+        "raw_adjusted_net_assets": raw_adjusted_net_assets,
         "adjusted_net_assets": adjusted_net_assets,
         "nav_per_share": nav_per_share,
         "earnings_weight": earnings_weight,
@@ -584,6 +681,40 @@ def calculate_stock_valuation(inputs: dict[str, Any]) -> dict[str, Any]:
         "final_value_per_share": final_value_per_share,
         "total_equity_value": total_equity_value,
     }
+
+
+def _matching_stock_result(inputs: dict[str, Any]) -> dict[str, Any] | None:
+    """Never pair an old result with a different company or new input values."""
+    if st.session_state.get("stock_last_inputs") != inputs:
+        return None
+    return st.session_state.get("stock_last_result")
+
+
+def _build_stock_record(
+    inputs: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    record_id: str,
+    saved_by: str,
+    saved_at: str,
+) -> dict[str, Any]:
+    if calculate_stock_valuation(inputs) != result:
+        raise ValueError("입력값과 평가결과가 다릅니다. 주가평가를 다시 계산해주세요.")
+    record = deepcopy(inputs)
+    record.update({
+        "record_id": record_id,
+        "business_no": _normalize_business_no(inputs.get("business_no", "")),
+        "goodwill_manual": inputs.get("goodwill"),
+        "goodwill": result["goodwill"],
+        "goodwill_mode": result["goodwill_mode"],
+        "goodwill_details": deepcopy(result["goodwill_details"]),
+        "result": deepcopy(result),
+        "saved_by": saved_by,
+        "saved_at": saved_at,
+        "law_base_date": LAW_BASE_DATE,
+        "goodwill_law_base_date": GOODWILL_LAW_BASE_DATE,
+    })
+    return record
 
 
 def _registry_cache_path(user_id: str) -> Path:
@@ -808,6 +939,7 @@ def _capture_stock_financial_inputs() -> dict[str, Any]:
         "stock_liability_deductions",
         "stock_goodwill",
         "stock_other_adjustments",
+        *GOODWILL_STATE_KEYS,
     ]
     for index in range(1, 4):
         keys.extend([
@@ -828,6 +960,8 @@ def _restore_stock_financial_inputs(values: dict[str, Any]) -> None:
 
 
 def _apply_loaded_record(record: dict[str, Any]) -> None:
+    st.session_state.pop("stock_last_result", None)
+    st.session_state.pop("stock_last_inputs", None)
     st.session_state["stock_loaded_record_id"] = record.get("record_id", "")
     st.session_state["stock_company_name"] = record.get("company_name", "")
     st.session_state["stock_business_no"] = record.get("business_no", "")
@@ -838,8 +972,8 @@ def _apply_loaded_record(record: dict[str, Any]) -> None:
         "valuation_date",
         date.today().isoformat(),
     )
-    st.session_state["stock_current_shares"] = record.get("current_shares", "")
-    st.session_state["stock_par_value"] = record.get("par_value", "")
+    st.session_state["stock_current_shares"] = _format_number(record.get("current_shares"))
+    st.session_state["stock_par_value"] = _format_number(record.get("par_value"))
     st.session_state["stock_capital"] = _format_number(record.get("capital"))
     st.session_state["stock_authorized_shares"] = _format_number(
         record.get("authorized_shares")
@@ -866,7 +1000,9 @@ def _apply_loaded_record(record: dict[str, Any]) -> None:
         MAX_SHAREHOLDER_PREMIUM_DEFAULT,
     )
 
-    for index, row in enumerate(record.get("annual_rows", [])[:3], start=1):
+    saved_rows = record.get("annual_rows", [])[:3]
+    for index in range(1, 4):
+        row = saved_rows[index - 1] if index <= len(saved_rows) else {}
         st.session_state[f"stock_year_{index}"] = str(row.get("year", "") or "")
         st.session_state[f"stock_net_income_{index}"] = _format_number(
             row.get("adjusted_net_income")
@@ -886,6 +1022,16 @@ def _apply_loaded_record(record: dict[str, Any]) -> None:
         "other_adjustments",
     ]:
         st.session_state[f"stock_{key}"] = _format_number(record.get(key))
+    # Legacy saved evaluations must never silently acquire an automatic amount.
+    mode = record.get("goodwill_mode", "manual")
+    st.session_state["stock_goodwill_mode"] = mode if mode in GOODWILL_MODE_LABELS else "manual"
+    st.session_state["stock_goodwill"] = _format_number(
+        record.get("goodwill_manual", record.get("goodwill"))
+    )
+    st.session_state["stock_goodwill_acquired_intangible_remaining"] = _format_number(
+        record.get("goodwill_acquired_intangible_remaining", 0)
+    )
+    st.session_state["stock_goodwill_exclusion_reason"] = record.get("goodwill_exclusion_reason", "")
 
 
 def _find_stock_customer_row(
@@ -946,6 +1092,7 @@ def _clear_stock_customer_state() -> None:
         "stock_liability_deductions",
         "stock_goodwill",
         "stock_other_adjustments",
+        *GOODWILL_STATE_KEYS,
         "stock_last_registry_data",
         "stock_registry_restored_key",
         "stock_last_result",
@@ -1390,9 +1537,9 @@ def render_stock_valuation_page(
                 placeholder="회수불능자산, 평가차감 등",
             )
             goodwill_text = st.text_input(
-                "영업권 평가액(원)",
+                "영업권 수동 평가액(원)",
                 key="stock_goodwill",
-                placeholder="해당하는 경우 입력",
+                placeholder="수동입력 모드에서만 반영",
             )
 
         with n2:
@@ -1413,6 +1560,43 @@ def render_stock_valuation_page(
                 "기타 순자산 조정(원)",
                 key="stock_other_adjustments",
                 placeholder="가산은 양수, 차감은 음수",
+            )
+
+        with st.expander("영업권 자동계산 · 수동입력 설정", expanded=True):
+            if "stock_goodwill_mode" not in st.session_state:
+                st.session_state["stock_goodwill_mode"] = "auto"
+            goodwill_mode = st.selectbox(
+                "영업권 반영 방식",
+                list(GOODWILL_MODE_LABELS),
+                format_func=GOODWILL_MODE_LABELS.get,
+                key="stock_goodwill_mode",
+            )
+            st.caption(
+                "자동계산: MAX((3개년 회사 전체 순손익 가중평균 × 50% − "
+                "영업권 가산 전 조정 순자산 × 10%) × 3.7908 − 매입 무체재산권 잔액, 0). "
+                "최신 연도부터 3:2:1 가중, 5년·10% 할인계수는 원본 엑셀과 같습니다."
+            )
+            _ensure_text_state("stock_goodwill_acquired_intangible_remaining", "0")
+            acquired_intangible_text = st.text_input(
+                "순자산에 이미 포함된 영업권 해당 매입 무체재산권 미상각잔액(원)",
+                key="stock_goodwill_acquired_intangible_remaining",
+                help="해당 없음은 0원. 자동계산 모드에서만 반영하며, 일반 무형자산 전체를 입력하지 않습니다.",
+            )
+            _ensure_text_state("stock_goodwill_exclusion_reason", "")
+            goodwill_exclusion_reason = st.text_input(
+                "영업권 불산입 검토 사유",
+                key="stock_goodwill_exclusion_reason",
+                placeholder="불산입 모드에서 필수 입력",
+            )
+            st.caption(
+                "위 잔액의 기본 0원은 '해당 없음' 가정입니다. 매입 무체재산권이 있으면 확인해 수정하세요. "
+                "수동 평가액은 수동입력 모드에서만, 불산입 사유는 불산입 모드에서만 사용합니다. "
+                "변경사항은 '주가평가 계산'을 눌러 반영합니다."
+            )
+            st.warning(
+                "자동계산은 상담용 참고값입니다. 업력 3년 미만·휴폐업·계속 결손·부동산 비중 등 "
+                "영업권 불산입 요건은 별도 검토하고, 해당하면 불산입을 선택하세요. "
+                "평가유형의 '순자산가치만 적용'만으로 영업권을 자동 제외하지 않습니다."
             )
 
         st.markdown("### 4. 법령 적용 설정")
@@ -1534,6 +1718,9 @@ def render_stock_valuation_page(
             "liability_additions": _safe_number(liability_additions_text),
             "liability_deductions": _safe_number(liability_deductions_text),
             "goodwill": _safe_number(goodwill_text),
+            "goodwill_mode": goodwill_mode,
+            "goodwill_acquired_intangible_remaining": _safe_number(acquired_intangible_text),
+            "goodwill_exclusion_reason": goodwill_exclusion_reason,
             "other_adjustments": _safe_number(other_adjustments_text),
             "capitalization_rate": cap_rate_pct / 100,
             "nav_floor_rate": nav_floor_pct / 100,
@@ -1578,14 +1765,16 @@ def render_stock_valuation_page(
                 "순손익가치와 순자산가치를 계산하고 있습니다."
             )
             result = calculate_stock_valuation(inputs)
-            st.session_state["stock_last_result"] = result
-            st.session_state["stock_last_inputs"] = inputs
+            st.session_state["stock_last_result"] = deepcopy(result)
+            st.session_state["stock_last_inputs"] = deepcopy(inputs)
             calculation_status.update(
                 label="주가평가가 완료되었습니다.",
                 state="complete",
                 expanded=False,
             )
         except ValueError as exc:
+            st.session_state.pop("stock_last_result", None)
+            st.session_state.pop("stock_last_inputs", None)
             calculation_status.update(
                 label="주가평가를 완료하지 못했습니다.",
                 state="error",
@@ -1593,6 +1782,8 @@ def render_stock_valuation_page(
             )
             st.error(str(exc))
         except Exception as exc:
+            st.session_state.pop("stock_last_result", None)
+            st.session_state.pop("stock_last_inputs", None)
             calculation_status.update(
                 label="주가평가 중 오류가 발생했습니다.",
                 state="error",
@@ -1601,10 +1792,17 @@ def render_stock_valuation_page(
             st.error(safe_public_error(exc, "주가평가 중 오류가 발생했습니다."))
 
     if result is None:
-        result = st.session_state.get("stock_last_result")
+        result = _matching_stock_result(inputs)
+        if result is None and st.session_state.get("stock_last_result"):
+            st.info("입력값이 변경되었습니다. 다시 계산하면 평가결과를 저장할 수 있습니다.")
 
     if result:
         st.markdown("### 5. 평가결과")
+        if result["raw_weighted_per_share_income"] < 0 or result["raw_adjusted_net_assets"] < 0:
+            st.warning(
+                "음수인 순손익 가중평균 또는 최종 조정 순자산에는 세법상 0원 하한을 적용했습니다. "
+                "영업권·결손 및 평가유형 적용 요건을 별도 검토해주세요."
+            )
         c1, c2, c3 = st.columns(3)
         c1.metric(
             "1주당 순손익가치",
@@ -1636,6 +1834,8 @@ def render_stock_valuation_page(
         summary_rows = [
             ["순손익 가중평균액(1주당)", result["weighted_per_share_income"]],
             ["순손익가치 환원 후(1주당)", result["earnings_value_per_share"]],
+            ["영업권 가산 전 조정 순자산", result["net_assets_before_goodwill"]],
+            ["이번 평가에 가산한 영업권", result["goodwill"]],
             ["조정 순자산가액", result["adjusted_net_assets"]],
             ["순자산가치(1주당)", result["nav_per_share"]],
             ["법인유형 가중평균액(1주당)", result["weighted_value"]],
@@ -1657,6 +1857,30 @@ def render_stock_valuation_page(
             use_container_width=True,
         )
 
+        st.caption(f"영업권 반영 방식: {GOODWILL_MODE_LABELS[result['goodwill_mode']]}")
+        goodwill_details = result.get("goodwill_details")
+        if goodwill_details:
+            with st.expander("영업권 계산 근거", expanded=False):
+                goodwill_rows = [
+                    ["3개년 순손익 가중평균(회사 전체)", goodwill_details["weighted_income"]],
+                    ["영업권 가산 전 자기자본", goodwill_details["equity_before_goodwill"]],
+                    ["연간 초과이익", goodwill_details["excess_earnings"]],
+                    ["5년 할인액(계수 3.7908)", goodwill_details["discounted_value"]],
+                    ["중복 가산 방지용 매입 무체재산권 잔액", goodwill_details["acquired_intangible_remaining"]],
+                    ["순자산에 추가 가산할 영업권", goodwill_details["amount"]],
+                ]
+                goodwill_df = pd.DataFrame(goodwill_rows, columns=["항목", "금액"])
+                goodwill_df["금액"] = goodwill_df["금액"].map(lambda value: f"{value:,.0f}원")
+                st.dataframe(goodwill_df, hide_index=True, use_container_width=True)
+                for warning in goodwill_details["warnings"]:
+                    st.warning(warning)
+                st.caption(
+                    "5년·10%의 정밀 현가계수는 약 3.790787이지만, "
+                    "원본 엑셀과 비교할 수 있도록 3.7908을 사용합니다. "
+                    "매입 무체재산권 원래 금액은 기존 자산에 유지하고 중복 가산분만 차감합니다."
+                )
+
+        st.caption("저장은 마지막으로 성공한 계산의 입력값·영업권·결과를 함께 보존합니다.")
         save_label = (
             "수정 저장"
             if st.session_state.get("stock_loaded_record_id")
@@ -1672,40 +1896,13 @@ def render_stock_valuation_page(
             loaded_id = st.session_state.get("stock_loaded_record_id", "")
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            record = {
-                "record_id": loaded_id or datetime.now().strftime(
-                    "%Y%m%d%H%M%S%f"
-                ),
-                "company_name": company_name,
-                "business_no": _normalize_business_no(business_no),
-                "corporate_no": corporate_no,
-                "address": address,
-                "establishment": establishment,
-                "valuation_date": valuation_date,
-                "current_shares": inputs["current_shares"],
-                "par_value": inputs["par_value"],
-                "capital": inputs.get("capital"),
-                "authorized_shares": inputs.get("authorized_shares"),
-                "share_classes": inputs.get("share_classes", []),
-                "valuation_type": valuation_type,
-                "annual_rows": annual_rows,
-                "total_assets": inputs["total_assets"],
-                "total_liabilities": inputs["total_liabilities"],
-                "asset_additions": inputs["asset_additions"],
-                "asset_deductions": inputs["asset_deductions"],
-                "liability_additions": inputs["liability_additions"],
-                "liability_deductions": inputs["liability_deductions"],
-                "goodwill": inputs["goodwill"],
-                "other_adjustments": inputs["other_adjustments"],
-                "capitalization_rate": inputs["capitalization_rate"],
-                "nav_floor_rate": inputs["nav_floor_rate"],
-                "premium_exempt": inputs["premium_exempt"],
-                "premium_rate": inputs["premium_rate"],
-                "result": result,
-                "saved_by": user_name,
-                "saved_at": now,
-                "law_base_date": LAW_BASE_DATE,
-            }
+            record = _build_stock_record(
+                st.session_state["stock_last_inputs"],
+                result,
+                record_id=loaded_id or datetime.now().strftime("%Y%m%d%H%M%S%f"),
+                saved_by=user_name,
+                saved_at=now,
+            )
 
             replaced = False
             for idx, saved_record in enumerate(records):
@@ -1734,12 +1931,21 @@ def render_stock_valuation_page(
 - 가중평균액이 순자산가치의 **80%**보다 낮으면 80% 하한 적용
 - 순손익가치 환원율 기본값: **10%**
 - 최대주주 할증: 적용대상인 경우 기본 **20%**, 중소기업 등 제외요건은 별도 확인
-- 업력·휴폐업·결손 등 사유로 순자산가치만 적용하는 경우는 사용자가 선택
+- 시행령 제54조제4항 요건을 검토하여 순자산가치만 적용하는 경우는 사용자가 선택
+- 순손익 가중평균과 영업권 가산 후 최종 순자산가액이 음수이면 각각 0원 하한 적용
+- 영업권 자동계산 검토 기준일: {GOODWILL_LAW_BASE_DATE}. 회사 전체 순손익을 사용하며 신규 영업권 자체를 자기자본에 다시 넣지 않습니다.
+- 기본 엑셀 `영업권` 시트의 3:2:1 가중, 50%, 10%, 5년 계수 3.7908을 적용합니다. `영업권3`의 다른 수식은 사용하지 않습니다.
+- 순손익 가중평균이 음수이면 영업권 계산에는 0원 적용. 자기자본이 음수인 경우 자동계산을 차단하고 별도 검토를 요청합니다.
+- 영업권 불산입 대상 여부는 자동 확정하지 않습니다. 불산입 모드는 사유를 함께 기록하며 기존 수동입력도 유지합니다.
 
 **참고 법령**
 - 상속세 및 증여세법 제63조
 - 상속세 및 증여세법 시행령 제54조·제55조·제56조·제59조
 - 국가법령정보센터: https://www.law.go.kr
+- [영업권 산식·회사 전체 순손익: 시행령 제59조](https://www.law.go.kr/법령/상속세및증여세법시행령/제59조)
+- [영업권 가산 제외: 시행령 제55조](https://www.law.go.kr/법령/상속세및증여세법시행령/제55조)
+- [순손익: 시행령 제56조](https://www.law.go.kr/법령/상속세및증여세법시행령/제56조)
+- [현가 할인 방법: 시행규칙 제16조](https://www.law.go.kr/법령/상속세및증여세법시행규칙/제16조)
 
 이 계산은 상담용 사전평가입니다. 실제 신고평가는 평가기준일의 법령,
 세법상 순손익 조정, 자산·부채 시가조정, 영업권, 최대주주 할증 제외요건을
