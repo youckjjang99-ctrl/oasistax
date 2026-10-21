@@ -906,6 +906,7 @@ def append_user_customer_db(
     manager_name="",
     *,
     return_saved_rows=False,
+    raise_on_error=False,
 ):
     """
     v3.5.2:
@@ -967,6 +968,10 @@ def append_user_customer_db(
         return result
 
     except Exception:
+        if raise_on_error:
+            # Upload UI needs to distinguish an I/O failure from a legitimate
+            # zero-new-row duplicate result. Legacy callers retain their tuple.
+            raise
         result = (cumulative_path, 0)
         if return_saved_rows:
             return (*result, pd.DataFrame(columns=get_customer_db_columns()))

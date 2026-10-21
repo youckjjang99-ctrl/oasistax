@@ -93,10 +93,16 @@ select {
 #MainMenu,
 footer,
 [data-testid="stDecoration"],
-[data-testid="stStatusWidget"],
 .stDeployButton {
     display: none !important;
     visibility: hidden !important;
+}
+
+/* Keep Streamlit's actual running/upload indicator visible. Local task cards
+   describe analysis and save stages; this also covers browser file transfer. */
+[data-testid="stStatusWidget"] {
+    visibility: visible !important;
+    color: var(--oasis-blue-700);
 }
 
 .block-container {

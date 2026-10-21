@@ -3,6 +3,7 @@ import os
 import html
 import shutil
 import time
+import hashlib
 import pandas as pd
 from pathlib import Path
 from runtime_error_log import (
@@ -12,6 +13,7 @@ from runtime_error_log import (
 )
 
 from ui import apply_oasis_ui
+from upload_progress import UploadProgress, render_upload_ready
 from address_tools import (
     enrich_address_fields,
     repair_user_customer_addresses,
@@ -1753,6 +1755,75 @@ def render_cumulative_db_page(user_id):
         )
 
 
+def _process_customer_excel_upload(uploaded, user_id, manager_name, upload_dir):
+    """Process once per owner/file/manager in this session, not on every rerun."""
+    from customer_asset_storage import store_private_customer_asset
+
+    receipt_key = f"_customer_excel_upload_receipt:{user_id}"
+    with UploadProgress(f"excel-upload:{user_id}", "고객 Excel 업로드",
+                        steps=("파일 확인", "양식 검증", "고객 저장", "보관 확인")) as task:
+        content = uploaded.getvalue()
+        fingerprint = hashlib.sha256(content).hexdigest()
+        previous = st.session_state.get(receipt_key) or {}
+        if (previous.get("fingerprint") == fingerprint
+                and previous.get("manager") == manager_name
+                and Path(previous.get("path", "")).is_file()):
+            finish = task.warning if previous.get("warnings") else task.complete
+            finish("이미 처리한 파일입니다.", "저장 결과를 다시 표시합니다. 같은 파일을 중복 저장하지 않았습니다.")
+            return previous
+        path = Path(upload_dir) / make_upload_filename(uploaded.name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        task.step("양식 검증", "시트명과 필수 열을 확인합니다.")
+        valid, errors, warnings = validate_customer_workbook(path)
+        if errors or not valid:
+            task.error("Excel 양식을 확인해 주세요.", "고객DB에는 반영하지 않았습니다. 아래 오류 항목을 확인해 주세요.")
+            return {"valid": False, "errors": errors, "warnings": warnings}
+        task.step("고객 저장", "누적 고객DB에 저장하고 클라우드 동기화를 확인합니다.")
+        _, saved_rows, saved_customer_rows = append_user_customer_db(
+            path, user_id, manager_name=manager_name, return_saved_rows=True, raise_on_error=True,
+        )
+        receipt = {"valid": True, "fingerprint": fingerprint, "manager": manager_name,
+                   "path": str(path), "saved_rows": saved_rows, "errors": [],
+                   "warnings": list(warnings), "cloud_checked": False}
+        # Record local success before auxiliary cloud work, so a failed upload
+        # cannot cause a repeat append when the user clicks another widget.
+        st.session_state[receipt_key] = receipt
+        try:
+            summary = sync_customer_snapshots(
+                user_id, saved_customer_rows.to_dict(orient="records"),
+                source="excel_upload", manager_name=manager_name,
+            )
+            receipt["cloud_checked"] = not any(summary.get(key) for key in ("queued", "skipped", "failed"))
+            if not receipt["cloud_checked"]:
+                receipt["warnings"].append("누적DB에 보존했으며 일부 고객의 클라우드 동기화는 확인이 필요합니다.")
+        except Exception as exc:
+            write_runtime_error("customer_excel_sync", exc)
+            receipt["warnings"].append("고객은 로컬에 저장됐지만 클라우드 동기화 결과는 확인되지 않았습니다.")
+        task.step("보관 확인", "업로드 원본의 비공개 클라우드 보관 상태를 확인합니다.")
+        try:
+            asset = store_private_customer_asset(
+                path, owner_user_id=user_id, asset_type="customer_upload",
+                source_type="customer_registration",
+            )
+            if asset.degraded:
+                receipt["warnings"].append("업로드 원본은 로컬에 보존했으며 비공개 클라우드 보관은 재확인이 필요합니다.")
+        except Exception as exc:
+            write_runtime_error("customer_excel_asset", exc)
+            receipt["warnings"].append("업로드 원본은 로컬에 보존했으며 클라우드 보관 결과를 확인하지 못했습니다.")
+        st.session_state[receipt_key] = receipt
+        finish = task.warning if receipt["warnings"] else task.complete
+        finish("고객 Excel 처리 완료" if not receipt["warnings"] else "고객 저장 완료 · 일부 확인 필요",
+               f"누적DB {saved_rows}건 저장. 아래 보관·동기화 안내를 확인해 주세요.")
+        return receipt
+
+
+def _reset_income_tax_upload_state():
+    for key in ("income_tax_parsed", "income_tax_error", "income_tax_pdf_path",
+                "income_tax_selected_businesses"):
+        st.session_state.pop(key, None)
+
+
 def render_personal_business_registration(user_id, user_name, upload_dir):
     from corporate_conversion_analyzer import analyze_corporate_conversion
     from income_tax_return_parser import parse_income_tax_return
@@ -1769,6 +1840,7 @@ def render_personal_business_registration(user_id, user_name, upload_dir):
         "종합소득세 신고서 PDF 업로드",
         type=["pdf"],
         key="income_tax_pdf_uploader",
+        on_change=_reset_income_tax_upload_state,
     )
     if uploaded is None:
         st.info(
@@ -1777,32 +1849,38 @@ def render_personal_business_registration(user_id, user_name, upload_dir):
         )
         return
 
+    render_upload_ready(uploaded)
+
     if st.button(
         "종합소득세 신고서 분석하기",
         key="income_tax_analyze_button",
         width='stretch',
     ):
-        save_name = make_upload_filename(uploaded.name).replace(
-            "업로드고객DB_", "종합소득세신고서_"
-        )
-        save_path = Path(upload_dir) / save_name
-        uploaded.seek(0)
-        with open(save_path, "wb") as destination:
-            shutil.copyfileobj(uploaded, destination, length=1024 * 1024)
-
-        with st.status("종합소득세 신고서를 분석하고 있습니다.", expanded=True) as status:
-            status.write("사업소득명세서를 찾고 사업자등록번호별로 분리합니다.")
-            parsed, error = parse_income_tax_return(save_path)
-            if error:
-                status.update(label="신고서 분석이 중단되었습니다.", state="error")
-            else:
-                status.write(
-                    f"등록 가능한 사업장 {len(parsed.get('businesses', []))}개를 찾았습니다."
+        _reset_income_tax_upload_state()
+        try:
+            with UploadProgress(f"income-analysis:{user_id}", "신고서 분석",
+                                steps=("파일 확인", "사업장 분석", "검토 준비")) as task:
+                save_name = make_upload_filename(uploaded.name).replace(
+                    "업로드고객DB_", "종합소득세신고서_"
                 )
-                status.update(label="신고서 분석이 완료되었습니다.", state="complete")
-        st.session_state["income_tax_parsed"] = parsed
-        st.session_state["income_tax_error"] = error
-        st.session_state["income_tax_pdf_path"] = str(save_path)
+                save_path = Path(upload_dir) / save_name
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                uploaded.seek(0)
+                with open(save_path, "wb") as destination:
+                    shutil.copyfileobj(uploaded, destination, length=1024 * 1024)
+                task.step("사업장 분석", "사업소득명세서를 찾고 사업자등록번호별로 분리합니다.")
+                parsed, error = parse_income_tax_return(save_path)
+                st.session_state["income_tax_parsed"] = parsed
+                st.session_state["income_tax_error"] = error
+                st.session_state["income_tax_pdf_path"] = str(save_path)
+                task.step("검토 준비", "분석 결과는 아직 고객DB에 등록되지 않았습니다.")
+                if error:
+                    task.error("신고서 분석이 중단되었습니다.", "아래 안내를 확인한 뒤 다시 분석해 주세요.")
+                else:
+                    task.complete("신고서 분석 완료 · 등록 전", f"사업장 {len(parsed.get('businesses', []))}개를 확인했습니다. 아래에서 등록할 사업장을 선택해 주세요.")
+        except Exception as exc:
+            write_runtime_error("income_tax_upload_analysis", exc)
+            st.session_state["income_tax_error"] = safe_public_error(exc, "신고서 분석을 완료하지 못했습니다. 파일을 확인한 뒤 다시 시도해 주세요.")
 
     error = st.session_state.get("income_tax_error", "")
     parsed = st.session_state.get("income_tax_parsed", {}) or {}
@@ -1924,54 +2002,55 @@ def render_personal_business_registration(user_id, user_name, upload_dir):
         width='stretch',
     ):
         messages = []
-        added_count = 0
-        for index in selected_indexes:
-            business = dict(businesses[index])
-            missing_fields = _registration_missing_fields(business)
-            if missing_fields:
-                messages.append(
-                    f"{business.get('업체명', '사업장')}: "
-                    f"필수항목 누락으로 등록 차단({', '.join(missing_fields)})"
+        added_count = updated_count = failed_count = pending_count = 0
+        with UploadProgress(f"income-save:{user_id}", "선택 사업장 등록",
+                            steps=("사업장 저장", "결과 확인")) as task:
+            for position, index in enumerate(selected_indexes, 1):
+                task.step("사업장 저장", f"{position}/{len(selected_indexes)}개 사업장의 저장·동기화를 처리합니다.")
+                business = dict(businesses[index])
+                missing_fields = _registration_missing_fields(business)
+                if missing_fields:
+                    failed_count += 1
+                    messages.append("필수항목 누락으로 등록을 차단했습니다.")
+                    continue
+                analysis = analyses[index]
+                business["법인전환검토점수"] = analysis["score"]
+                business["법인전환검토등급"] = analysis["grade"]
+                business["키워드메모"] = (
+                    f"개인사업자 / 업종코드 {business.get('주업종코드', '')} / "
+                    f"법인전환 {analysis['grade']} {analysis['score']}점"
                 )
-                continue
-            analysis = analyses[index]
-            business["법인전환검토점수"] = analysis["score"]
-            business["법인전환검토등급"] = analysis["grade"]
-            business["키워드메모"] = (
-                f"개인사업자 / 업종코드 {business.get('주업종코드', '')} / "
-                f"법인전환 {analysis['grade']} {analysis['score']}점"
-            )
-            try:
-                _, saved_count, message, saved_data, _ = (
-                    append_income_tax_business_to_user_customer_db(
-                        business,
-                        user_id,
+                locally_saved = False
+                try:
+                    _, saved_count, message, saved_data, _ = append_income_tax_business_to_user_customer_db(
+                        business, user_id, manager_name=manager_name.strip() or user_name,
+                    )
+                    if not saved_data:
+                        failed_count += 1
+                        messages.append(message)
+                        continue
+                    locally_saved = True
+                    added_count += saved_count
+                    updated_count += int(not saved_count)
+                    messages.append(message)
+                    save_customer_snapshot(user_id, saved_data, source="income_tax_return")
+                    cloud_ok, _ = sync_customer_snapshot(
+                        user_id, saved_data, source="income_tax_registration",
                         manager_name=manager_name.strip() or user_name,
                     )
-                )
-                added_count += saved_count
-                messages.append(message)
-                save_customer_snapshot(user_id, saved_data, source="income_tax_return")
-                sync_customer_snapshot(
-                    user_id,
-                    saved_data,
-                    source="income_tax_registration",
-                    manager_name=manager_name.strip() or user_name,
-                )
-            except Exception as exc:
-                write_runtime_error(
-                    "income_tax_business_registration",
-                    exc,
-                    {"business_no": business.get("사업자등록번호", "")},
-                )
-                messages.append(
-                    f"{business.get('업체명', '사업장')}: "
-                    + safe_public_error(exc, "등록 중 오류가 발생했습니다.")
-                )
-        st.success(
-            f"선택 사업장 처리가 완료되었습니다. 신규 {added_count}건, "
-            f"기존자료 갱신 {len(selected_indexes) - added_count}건"
-        )
+                    if not cloud_ok:
+                        pending_count += 1
+                except Exception as exc:
+                    pending_count += int(locally_saved)
+                    failed_count += int(not locally_saved)
+                    write_runtime_error("income_tax_business_registration", exc)
+                    messages.append(safe_public_error(exc, "일부 등록·연결 처리를 완료하지 못했습니다."))
+            task.step("결과 확인")
+            summary = f"신규 {added_count}건 · 기존자료 처리 {updated_count}건 · 실패 {failed_count}건 · 동기화/연결 확인 {pending_count}건"
+            if failed_count or pending_count:
+                task.warning("사업장 등록 결과 · 일부 확인 필요", summary)
+            else:
+                task.complete("선택 사업장 등록 완료", summary)
         for message in messages:
             st.write(f"- {message}")
 
@@ -2690,69 +2769,26 @@ elif active_tab == "통합 정책자금 매칭":
             st.warning("담당자명을 입력해주세요.")
             st.stop()
 
-        uploaded_save_name = make_upload_filename(uploaded_file.name)
-        uploaded_save_path = USER_UPLOAD_DIR / uploaded_save_name
-
+        render_upload_ready(uploaded_file, action_hint="양식 확인과 고객 저장을 자동으로 시작합니다.")
         try:
-            with open(uploaded_save_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-
-            is_valid, validation_errors, validation_warnings = validate_customer_workbook(
-                uploaded_save_path
+            upload_receipt = _process_customer_excel_upload(
+                uploaded_file, CURRENT_USER_ID,
+                manager_name.strip() or CURRENT_USER_NAME, USER_UPLOAD_DIR,
             )
-
-            if validation_errors:
+            if not upload_receipt.get("valid"):
                 st.error("업로드한 고객DB 양식에 문제가 있습니다.")
-                for err in validation_errors:
+                for err in upload_receipt.get("errors", []):
                     st.write(f"- {err}")
                 st.info("파일명은 바꿔도 되지만, 시트명과 컬럼명은 변경하면 안 됩니다.")
                 st.stop()
-
-            if validation_warnings:
-                with st.expander("양식 확인 경고"):
-                    for warn in validation_warnings:
-                        st.write(f"- {warn}")
-
-            cumulative_path, saved_rows, saved_customer_rows = append_user_customer_db(
-                uploaded_save_path,
-                CURRENT_USER_ID,
-                manager_name=manager_name.strip() or CURRENT_USER_NAME,
-                return_saved_rows=True,
-            )
-            customer_sync_summary = sync_customer_snapshots(
-                CURRENT_USER_ID,
-                saved_customer_rows.to_dict(orient="records"),
-                source="excel_upload",
-                manager_name=manager_name.strip() or CURRENT_USER_NAME,
-            )
+            uploaded_save_path = Path(upload_receipt["path"])
+            uploaded_save_name = uploaded_save_path.name
+            saved_rows = upload_receipt["saved_rows"]
             from customer_asset_storage import store_private_customer_asset
-
-            upload_asset_status = store_private_customer_asset(
-                uploaded_save_path,
-                owner_user_id=CURRENT_USER_ID,
-                asset_type="customer_upload",
-                source_type="customer_registration",
-            )
-            if upload_asset_status.degraded:
-                st.warning(
-                    "업로드 원본은 로컬에 보존했으며 비공개 클라우드 보관은 재확인이 필요합니다."
-                )
-            cumulative_path, _, _ = ensure_user_cumulative_db_format(CURRENT_USER_ID)
-
+            for warning in upload_receipt.get("warnings", []):
+                st.warning(warning)
             st.session_state.latest_upload_file = str(uploaded_save_path)
-            if saved_rows:
-                st.success(f"업로드 완료: {uploaded_save_name} / 누적DB {saved_rows}건 저장")
-                if (
-                    customer_sync_summary.get("queued")
-                    or customer_sync_summary.get("skipped")
-                    or customer_sync_summary.get("failed")
-                ):
-                    st.warning(
-                        "고객 원본은 누적DB에 보존됐으며 식별 불가 또는 대기 중인 "
-                        "일부 행은 클라우드 통합 완료로 집계하지 않았습니다."
-                    )
-            else:
-                st.success(f"업로드 완료: {uploaded_save_name}")
+            st.caption(f"누적DB 저장 {saved_rows}건 · 같은 파일은 화면 전환 시 다시 저장하지 않습니다.")
 
             if st.button("정책자금 매칭 실행", width='stretch'):
                 with st.spinner("정책자금과 고용지원금을 분석 중입니다..."):
@@ -2806,11 +2842,14 @@ elif active_tab == "통합 정책자금 매칭":
 
         except PermissionError:
             append_run_history(
-                uploaded_save_name, "", "실패", "고객DB 파일 열림",
+                uploaded_file.name, "", "실패", "고객DB 파일 열림",
                 manager_name=manager_name if "manager_name" in locals() else "",
                 user_id=CURRENT_USER_ID
             )
             st.error("고객DB.xlsx 파일이 열려 있어 업로드할 수 없습니다. 엑셀 파일을 닫고 다시 시도해주세요.")
+        except Exception as exc:
+            write_runtime_error("customer_excel_upload", exc)
+            st.error(safe_public_error(exc, "업로드 처리를 완료하지 못했습니다. 기존 고객자료는 삭제하지 않았습니다."))
 
     if st.session_state.latest_result_file and os.path.exists(st.session_state.latest_result_file):
         show_company_preview(st.session_state.latest_result_file)

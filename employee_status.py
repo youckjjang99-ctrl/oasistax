@@ -23,6 +23,8 @@ from customer_history import save_customer_event
 from document_preprocessor import preprocess_document
 from encrypted_excel_reader import decrypt_excel_bytes
 from employment_support_2026 import render_employment_support_analysis
+from runtime_error_log import safe_public_error
+from upload_progress import UploadProgress, render_upload_feedback, render_upload_ready
 from utils import get_user_dirs
 
 TABLE_EMPLOYEE_ROSTERS = "oasis_employee_rosters"
@@ -2026,6 +2028,9 @@ def render_employee_status(
         f"employee_roster_review_"
         f"{_company_key(business_no, company_name)}"
     )
+    feedback_key = f"employee-roster:{user_id}:{business_no or company_name}"
+    if allow_upload:
+        render_upload_feedback(feedback_key)
 
     uploaded_files = []
     if allow_upload:
@@ -2040,6 +2045,7 @@ def render_employee_status(
                 "암호화된 근로자 고용정보 현황(.xls/.xlsx)도 그대로 선택할 수 있습니다."
             ),
         )
+        render_upload_ready(uploaded_files)
 
     if uploaded_files and st.button(
         "AI 비전 분석 후 검수표 만들기",
@@ -2047,178 +2053,190 @@ def render_employee_status(
         use_container_width=True,
         key=f"employee_roster_analyze_{business_no or company_name}",
     ):
-        progress = st.progress(0, text="가입자명부 분석을 준비하고 있습니다.")
-        image_files: list[tuple[str, bytes]] = []
-        conventional_rows: list[dict[str, Any]] = []
-        parse_files: list[dict[str, Any]] = []
-        failures: list[dict[str, str]] = []
-
-        for uploaded in uploaded_files:
-            suffix = Path(uploaded.name).suffix.lower()
-            data = uploaded.getvalue()
-            if suffix in VISION_IMAGE_SUFFIXES:
-                image_files.append((uploaded.name, data))
-                continue
+        with UploadProgress(
+            feedback_key, "가입자명부 분석",
+            steps=("파일 확인", "명부 읽기", "내용 분석", "검수표 준비"),
+        ) as task:
             try:
-                employees, parse_info = parse_roster(
-                    uploaded.name,
-                    data,
-                )
-                conventional_rows.extend(
-                    _employees_to_review_rows(
-                        employees,
-                        start_sequence=len(conventional_rows) + 1,
-                    )
-                )
-                parse_files.append(
-                    {
-                        "filename": uploaded.name,
-                        "method": parse_info.get("method", ""),
-                        "employee_count": len(employees),
-                        "status": "success",
-                    }
-                )
-            except Exception as exc:
-                failures.append(
-                    {
-                        "filename": uploaded.name,
-                        "error": str(exc),
-                    }
-                )
+                task.step("파일 확인", "선택한 파일을 확인하고 검수표를 준비하고 있습니다.")
+                image_files: list[tuple[str, bytes]] = []
+                conventional_rows: list[dict[str, Any]] = []
+                parse_files: list[dict[str, Any]] = []
+                failures: list[dict[str, str]] = []
 
-        vision_result: dict[str, Any] = {}
-        vision_rows: list[dict[str, Any]] = []
-        if image_files:
-            progress.progress(
-                0.25,
-                text=f"이미지 {len(image_files)}장을 AI 비전으로 분석하고 있습니다.",
-            )
-            try:
-                vision_result = _extract_roster_with_ai_vision(image_files)
-                vision_rows = _vision_result_to_review_rows(vision_result)
-                parse_files.extend(
-                    {
-                        "filename": filename,
-                        "method": "openai_vision_structured",
-                        "status": "success",
-                    }
-                    for filename, _ in image_files
-                )
-            except Exception as vision_exc:
-                st.warning(
-                    f"AI 비전 분석에 실패해 기존 OCR로 보조 분석합니다: "
-                    f"{vision_exc}"
-                )
-                for filename, data in image_files:
+                for file_index, uploaded in enumerate(uploaded_files, start=1):
+                    task.step("명부 읽기", f"명부 파일을 읽고 있습니다. ({file_index}/{len(uploaded_files)}개)")
+                    suffix = Path(uploaded.name).suffix.lower()
+                    data = uploaded.getvalue()
+                    if suffix in VISION_IMAGE_SUFFIXES:
+                        image_files.append((uploaded.name, data))
+                        continue
                     try:
-                        employees, parse_info = parse_roster(filename, data)
-                        vision_rows.extend(
+                        employees, parse_info = parse_roster(
+                            uploaded.name,
+                            data,
+                        )
+                        conventional_rows.extend(
                             _employees_to_review_rows(
                                 employees,
-                                start_sequence=len(vision_rows) + 1,
+                                start_sequence=len(conventional_rows) + 1,
                             )
                         )
                         parse_files.append(
                             {
-                                "filename": filename,
-                                "method": "ocr_fallback",
+                                "filename": uploaded.name,
+                                "method": parse_info.get("method", ""),
                                 "employee_count": len(employees),
-                                "status": "fallback",
-                                "parse_info": parse_info,
+                                "status": "success",
                             }
                         )
                     except Exception as exc:
                         failures.append(
                             {
-                                "filename": filename,
-                                "error": str(exc),
+                                "filename": uploaded.name,
+                                "error": safe_public_error(exc, "명부 파일을 읽지 못했습니다."),
                             }
                         )
 
-        all_rows = [*vision_rows, *conventional_rows]
-        deduped_rows: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for row in all_rows:
-            identity = (
-                f"{re.sub('[^0-9]', '', str(row.get('사업장관리번호', '') or ''))}|"
-                f"{str(row.get('사업장명', '') or '').strip()}|"
-                f"{_clean_review_name(row.get('성명', ''))}|"
-                f"{_clean_birth_six(row.get('생년월일6자리', ''))}"
-            )
-            if identity in seen:
-                continue
-            seen.add(identity)
-            deduped_rows.append(row)
+                vision_result: dict[str, Any] = {}
+                vision_rows: list[dict[str, Any]] = []
+                task.step("내용 분석", "추출한 직원 정보를 확인하고 있습니다.")
+                if image_files:
+                    task.step("내용 분석", f"이미지 {len(image_files)}장을 AI 비전으로 분석하고 있습니다.")
+                    try:
+                        vision_result = _extract_roster_with_ai_vision(image_files)
+                        vision_rows = _vision_result_to_review_rows(vision_result)
+                        parse_files.extend(
+                            {
+                                "filename": filename,
+                                "method": "openai_vision_structured",
+                                "status": "success",
+                            }
+                            for filename, _ in image_files
+                        )
+                    except Exception as vision_exc:
+                        st.warning(safe_public_error(
+                            vision_exc, "AI 비전 분석에 실패해 기존 OCR로 보조 분석합니다.",
+                        ))
+                        for filename, data in image_files:
+                            try:
+                                employees, parse_info = parse_roster(filename, data)
+                                vision_rows.extend(
+                                    _employees_to_review_rows(
+                                        employees,
+                                        start_sequence=len(vision_rows) + 1,
+                                    )
+                                )
+                                parse_files.append(
+                                    {
+                                        "filename": filename,
+                                        "method": "ocr_fallback",
+                                        "employee_count": len(employees),
+                                        "status": "fallback",
+                                        "parse_info": parse_info,
+                                    }
+                                )
+                            except Exception as exc:
+                                failures.append(
+                                    {
+                                        "filename": filename,
+                                        "error": safe_public_error(exc, "이미지 명부를 읽지 못했습니다."),
+                                    }
+                                )
 
-        if not deduped_rows:
-            progress.empty()
-            st.error("직원행을 만들지 못했습니다.")
-            for failure in failures:
-                st.caption(
-                    f"{failure['filename']}: {failure['error']}"
-                )
-        else:
-            expected_count = int(
-                vision_result.get(
-                    "total_expected_employee_count",
-                    0,
-                )
-                or sum(
-                    int(
-                        workplace.get(
-                            "expected_employee_count",
+                task.step("검수표 준비", "중복 직원을 확인하고 편집 가능한 검수표를 만들고 있습니다.")
+                all_rows = [*vision_rows, *conventional_rows]
+                deduped_rows: list[dict[str, Any]] = []
+                seen: set[str] = set()
+                for row in all_rows:
+                    identity = (
+                        f"{re.sub('[^0-9]', '', str(row.get('사업장관리번호', '') or ''))}|"
+                        f"{str(row.get('사업장명', '') or '').strip()}|"
+                        f"{_clean_review_name(row.get('성명', ''))}|"
+                        f"{_clean_birth_six(row.get('생년월일6자리', ''))}"
+                    )
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    deduped_rows.append(row)
+
+                if not deduped_rows:
+                    task.error("직원행을 만들지 못했습니다.", detail="파일 형식과 내용을 확인한 후 다시 분석해 주세요.")
+                    for failure in failures:
+                        st.caption(
+                            f"{failure['filename']}: {failure['error']}"
+                        )
+                else:
+                    expected_count = int(
+                        vision_result.get(
+                            "total_expected_employee_count",
                             0,
                         )
-                        or 0
+                        or sum(
+                            int(
+                                workplace.get(
+                                    "expected_employee_count",
+                                    0,
+                                )
+                                or 0
+                            )
+                            for workplace in (
+                                vision_result.get("workplaces", []) or []
+                            )
+                            if isinstance(workplace, dict)
+                        )
                     )
-                    for workplace in (
-                        vision_result.get("workplaces", []) or []
-                    )
-                    if isinstance(workplace, dict)
-                )
-            )
-            try:
-                from enterprise_documents import register_enterprise_document_bytes
+                    attachment_saved = True
+                    try:
+                        from enterprise_documents import register_enterprise_document_bytes
 
-                for uploaded in uploaded_files:
-                    register_enterprise_document_bytes(
-                        user_id,
-                        business_no,
-                        company_name,
-                        "employee_roster",
-                        uploaded.name,
-                        uploaded.getvalue(),
-                        customer_id=customer_id,
-                        analysis_summary=(
-                            f"4대보험 가입자명부에서 직원 {len(deduped_rows)}명을 "
-                            "분석했습니다."
+                        for uploaded in uploaded_files:
+                            register_enterprise_document_bytes(
+                                user_id,
+                                business_no,
+                                company_name,
+                                "employee_roster",
+                                uploaded.name,
+                                uploaded.getvalue(),
+                                customer_id=customer_id,
+                                analysis_summary=(
+                                    f"4대보험 가입자명부에서 직원 {len(deduped_rows)}명을 "
+                                    "분석했습니다."
+                                ),
+                                extracted_fields={
+                                    "employee_count": len(deduped_rows),
+                                    "expected_count": expected_count,
+                                },
+                            )
+                    except Exception:
+                        # 검토표와 기존 직원현황 저장 흐름은 첨부 연결 오류와 무관하게 유지합니다.
+                        attachment_saved = False
+                    st.session_state[state_key] = {
+                        "rows": deduped_rows,
+                        "expected_count": expected_count,
+                        "vision_result": vision_result,
+                        "parse_files": parse_files,
+                        "failures": failures,
+                        "filename": (
+                            uploaded_files[0].name
+                            if len(uploaded_files) == 1
+                            else f"AI검수_다중업로드_{len(uploaded_files)}개파일"
                         ),
-                        extracted_fields={
-                            "employee_count": len(deduped_rows),
-                            "expected_count": expected_count,
-                        },
-                    )
-            except Exception:
-                # 검토표와 기존 직원현황 저장 흐름은 첨부 연결 오류와 무관하게 유지합니다.
-                pass
-            st.session_state[state_key] = {
-                "rows": deduped_rows,
-                "expected_count": expected_count,
-                "vision_result": vision_result,
-                "parse_files": parse_files,
-                "failures": failures,
-                "filename": (
-                    uploaded_files[0].name
-                    if len(uploaded_files) == 1
-                    else f"AI검수_다중업로드_{len(uploaded_files)}개파일"
-                ),
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-            }
-            progress.progress(1.0, text="AI 분석 완료 · 검수표를 확인해주세요.")
-            st.success(
-                f"검수 대상 직원 {len(deduped_rows)}명을 추출했습니다. "
-                "아래 표를 확인·수정한 뒤 저장하세요."
-            )
+                        "created_at": datetime.now().isoformat(timespec="seconds"),
+                    }
+                    if failures or not attachment_saved:
+                        task.warning(
+                            f"직원 {len(deduped_rows)}명의 검수표를 준비했지만 일부 자료는 추가 확인이 필요합니다.",
+                            detail="아래 검수표와 읽지 못한 파일 목록을 확인하세요. 직원현황은 아직 저장 전입니다."
+                            if attachment_saved else "검수표는 유지했습니다. 첨부자료 연결은 완료하지 못했습니다. 직원현황은 아직 저장 전입니다.",
+                        )
+                    else:
+                        task.complete(
+                            f"검수 대상 직원 {len(deduped_rows)}명을 추출했습니다.",
+                            detail="아래 표를 확인·수정한 뒤 저장하세요. 직원현황은 아직 저장 전입니다.",
+                        )
+            except Exception as exc:
+                task.error(safe_public_error(exc, "가입자명부 분석을 완료하지 못했습니다."))
 
     pending = st.session_state.get(state_key) if allow_upload else None
     if isinstance(pending, dict) and pending.get("rows"):
@@ -2393,20 +2411,34 @@ def render_employee_status(
                         timespec="seconds"
                     ),
                 }
-                _, message = save_employee_roster(
-                    user_id,
-                    business_no,
-                    company_name,
-                    pending.get("filename", "AI비전_가입자명부"),
-                    employees,
-                    parse_info,
-                )
-                st.session_state.pop(state_key, None)
-                st.success(
-                    f"검수 완료한 직원 {len(employees)}명을 "
-                    f"{message}했습니다."
-                )
-                st.rerun()
+                with UploadProgress(
+                    feedback_key, "직원현황 저장", steps=("검수 결과 확인", "직원현황 저장"),
+                ) as task:
+                    try:
+                        task.step("직원현황 저장", "검수한 직원정보를 저장하고 있습니다.")
+                        _, message = save_employee_roster(
+                            user_id,
+                            business_no,
+                            company_name,
+                            pending.get("filename", "AI비전_가입자명부"),
+                            employees,
+                            parse_info,
+                        )
+                        st.session_state.pop(state_key, None)
+                        if "Supabase" in message:
+                            task.complete(
+                                f"검수 완료한 직원 {len(employees)}명을 저장했습니다.",
+                                detail=message, persist=True,
+                            )
+                        else:
+                            task.warning(
+                                f"검수 완료한 직원 {len(employees)}명을 로컬에 저장했습니다.",
+                                detail="클라우드 저장은 확인되지 않았습니다. 원본 자료를 별도로 보관해 주세요.", persist=True,
+                            )
+                    except Exception as exc:
+                        task.error(safe_public_error(exc, "직원현황을 저장하지 못했습니다. 검수표는 유지됩니다."))
+                    else:
+                        st.rerun()
 
     versions = load_employee_versions(
         user_id,
