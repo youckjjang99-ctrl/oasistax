@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import uuid
 from copy import deepcopy
 from datetime import date, datetime
 from pathlib import Path
@@ -10,7 +12,8 @@ from typing import Any
 
 import pandas as pd
 import streamlit as st
-from runtime_error_log import safe_public_error
+from runtime_error_log import safe_public_error, write_runtime_error
+from upload_progress import UploadProgress, render_upload_feedback, render_upload_ready
 
 from cloud_sync import (
     sync_financial_snapshot,
@@ -722,14 +725,26 @@ def _registry_cache_path(user_id: str) -> Path:
     return dirs["base"] / "registry_cache.json"
 
 
-def _load_registry_cache(user_id: str) -> dict[str, Any]:
+class RegistryCacheReadError(RuntimeError):
+    """Block writes when an existing registry source cannot be safely read."""
+
+
+def _load_registry_cache(user_id: str, *, strict: bool = False) -> dict[str, Any]:
     path = _registry_cache_path(user_id)
     if not path.exists():
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
+        if not isinstance(data, dict) or any(not isinstance(item, dict) for item in data.values()):
+            if strict:
+                raise RegistryCacheReadError("기존 등기정보 형식을 확인하지 못해 덮어쓰지 않았습니다.")
+            return {}
+        return data
+    except RegistryCacheReadError:
+        raise
+    except Exception as exc:
+        if strict:
+            raise RegistryCacheReadError("기존 등기정보를 읽지 못해 덮어쓰지 않았습니다.") from exc
         return {}
 
 
@@ -793,24 +808,44 @@ def _save_registry_cache(
     user_id: str,
     business_no: str,
     data: dict[str, Any],
+    *,
+    storage_result: dict[str, Any] | None = None,
 ) -> str:
-    cache = _load_registry_cache(user_id)
+    cache = _load_registry_cache(user_id, strict=True)
     key = _resolve_registry_business_no(user_id, business_no, data)
     if not key:
         return ""
 
+    # A partial extraction must never erase previously confirmed registry values.
+    merged = dict(cache.get(key, {}) or {})
+    merged.update({
+        field: value for field, value in dict(data or {}).items()
+        if value not in (None, "", [], {})
+    })
     cache[key] = {
-        **dict(data or {}),
+        **merged,
         "사업자등록번호": key,
         "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     path = _registry_cache_path(user_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(
         json.dumps(cache, ensure_ascii=False, indent=2, default=str),
         encoding="utf-8",
     )
-    sync_registry_snapshot(user_id, key, cache[key])
+    os.replace(temporary, path)
+    try:
+        result = sync_registry_snapshot(user_id, key, cache[key])
+        cloud_saved = bool(isinstance(result, tuple) and result and result[0])
+    except Exception as exc:
+        write_runtime_error("registry_snapshot_sync", exc)
+        cloud_saved = False
+    if storage_result is not None:
+        storage_result.update({
+            "cloud_saved": cloud_saved,
+            "registry_data": dict(cache[key]),
+        })
     return key
 
 
@@ -839,11 +874,12 @@ def _apply_registry_data(data: dict[str, Any]) -> None:
     ) or st.session_state.get("stock_par_value", "")
     st.session_state["stock_capital"] = _format_number(
         data.get("자본금")
-    )
+    ) or st.session_state.get("stock_capital", "")
     st.session_state["stock_authorized_shares"] = _format_number(
         data.get("발행할주식총수")
-    )
-    st.session_state["stock_share_classes"] = data.get("주식종류", [])
+    ) or st.session_state.get("stock_authorized_shares", "")
+    if data.get("주식종류"):
+        st.session_state["stock_share_classes"] = data["주식종류"]
 
 
 def _restore_registry_for_business(
@@ -857,7 +893,11 @@ def _restore_registry_for_business(
     if not key:
         return {}
 
-    cache = _load_registry_cache(user_id)
+    try:
+        cache = _load_registry_cache(user_id, strict=True)
+    except RegistryCacheReadError:
+        st.warning("기존 등기정보 파일을 확인하지 못해 자동 복원을 중단했습니다. 원본은 그대로 보존했으며 관리자 확인이 필요합니다.")
+        return {}
     local = cache.get(key, {})
     cloud = load_registry_snapshot(
         user_id,
@@ -1173,6 +1213,48 @@ def _load_stock_customer_context(
     return selected_row
 
 
+def _registry_identity_error(data: dict[str, Any], selected_row: Any) -> str:
+    """Do not attach an unrelated company's registry to the selected customer."""
+    from registry_runner import registry_result_error
+
+    error = registry_result_error(data)
+    if error:
+        return error
+
+    def digits(value: Any) -> str:
+        return re.sub(r"[^0-9]", "", str(value or ""))
+
+    def company_key(value: Any) -> str:
+        text = re.sub(r"주식회사|유한회사|유한책임회사|\(주\)|\(유\)", "", str(value or ""))
+        return _normalize_company_name(text)
+
+    current_corporate = digits(selected_row.get("법인등록번호", ""))
+    incoming_corporate = digits(data.get("법인등록번호", ""))
+    current_business = digits(selected_row.get("사업자등록번호", ""))
+    incoming_business = digits(data.get("사업자등록번호", ""))
+    business_match = bool(
+        len(current_business) == len(incoming_business) == 10
+        and current_business == incoming_business
+    )
+    if len(current_business) == len(incoming_business) == 10 and current_business != incoming_business:
+        return "선택한 기업과 등기자료의 사업자등록번호가 다릅니다. 올바른 기업·파일을 선택해주세요."
+    if len(current_corporate) == len(incoming_corporate) == 13:
+        if current_corporate != incoming_corporate:
+            return "선택한 기업과 등기자료의 법인등록번호가 다릅니다. 기존 정보는 변경하지 않았습니다."
+        return ""  # Same corporation can have a historical company name.
+    current_name = company_key(selected_row.get("업체명", ""))
+    incoming_name = company_key(data.get("법인명", ""))
+    if current_name and incoming_name and current_name != incoming_name:
+        return "선택한 기업과 등기자료의 법인명이 다릅니다. 기업 선택 또는 원본을 확인해주세요."
+    if business_match or (current_name and incoming_name and current_name == incoming_name):
+        return ""
+    return (
+        "선택한 기업과 등기자료가 같은 법인인지 확인할 식별정보가 부족합니다. "
+        "등록 기업의 법인등록번호를 보완하거나 법인명이 읽히는 원본 PDF로 다시 시도해주세요. "
+        "기존 정보는 변경하지 않았습니다."
+    )
+
+
 def _render_registry_upload(
     user_id: str,
     selected_row: pd.Series | None,
@@ -1214,6 +1296,8 @@ def _render_registry_upload(
         if restored:
             st.session_state["stock_last_registry_data"] = restored
 
+    progress_key = f"registry_upload:{user_id}:{restore_key}"
+    render_upload_feedback(progress_key, ui=st)
     registry_pdf = st.file_uploader(
         "법인 등기사항증명서 PDF",
         type=["pdf"],
@@ -1224,6 +1308,8 @@ def _render_registry_upload(
         "법인명, 법인등록번호, 본점소재지, 설립일, 자본금, "
         "발행주식총수, 1주의 금액 등을 자동 추출합니다."
     )
+    if registry_pdf is not None:
+        render_upload_ready(registry_pdf, ui=st)
 
     if registry_pdf is not None and st.button(
         "등기자료 분석·등록",
@@ -1231,79 +1317,86 @@ def _render_registry_upload(
         use_container_width=True,
         disabled=not has_customer_context,
     ):
-        dirs = get_user_dirs(user_id)
-        registry_path = (
-            dirs["uploads"]
-            / f"등기자료_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-        )
-        registry_pdf.seek(0)
-        with open(registry_path, "wb") as output:
-            output.write(registry_pdf.read())
-
         from registry_runner import run_registry_worker
-
-        with st.spinner("등기자료에서 자본금과 주식정보를 찾고 있습니다..."):
-            registry_data, registry_error = run_registry_worker(
-                registry_path,
-                timeout=90,
-            )
-
-        if registry_error:
-            st.error(registry_error)
-        else:
-            preserved_financial_inputs = _capture_stock_financial_inputs()
-            _apply_registry_data(registry_data)
-            _restore_stock_financial_inputs(preserved_financial_inputs)
-            saved_registry_business_no = _save_registry_cache(
-                user_id,
-                current_business_no,
-                registry_data,
-            )
-            if saved_registry_business_no:
-                registry_data = {
-                    **dict(registry_data),
-                    "사업자등록번호": saved_registry_business_no,
-                }
+        completed = False
+        with UploadProgress(
+            progress_key, "등기자료 분석·등록 중",
+            steps=("파일 확인", "등기정보 분석", "기업 연결·저장", "등록 완료"), ui=st,
+        ) as task:
+            try:
+                task.step("파일 확인", "선택한 파일을 확인하고 안전하게 보관하고 있습니다.")
+                content = registry_pdf.getvalue()
+                if not content or b"%PDF-" not in content[:1024]:
+                    task.error("읽을 수 있는 PDF 파일을 선택해주세요.", "기존 등기정보와 재무 입력값은 변경하지 않았습니다.")
+                    return
+                dirs = get_user_dirs(user_id)
+                dirs["uploads"].mkdir(parents=True, exist_ok=True)
+                registry_path = dirs["uploads"] / (
+                    f"등기자료_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.pdf"
+                )
+                registry_path.write_bytes(content)
+                task.step("등기정보 분석", "법인명·자본금·주식정보를 추출하고 있습니다. 최대 90초가 걸릴 수 있습니다.")
+                registry_data, registry_error = run_registry_worker(registry_path, timeout=90)
+                registry_error = registry_error or _registry_identity_error(registry_data, selected_row)
+                if registry_error:
+                    task.error(registry_error, "기업·등기정보는 변경하지 않았습니다. 파일을 확인한 뒤 다시 시도해주세요.")
+                    return
+                task.step("기업 연결·저장", "분석 결과를 현재 기업에 연결하고 저장 상태를 확인하고 있습니다.")
+                storage_result: dict[str, Any] = {}
+                saved_registry_business_no = _save_registry_cache(
+                    user_id, current_business_no, registry_data, storage_result=storage_result,
+                )
+                if not saved_registry_business_no:
+                    task.error("분석 결과를 현재 기업과 안전하게 연결하지 못했습니다.", "기업을 다시 선택한 후 재시도해주세요. 기존 정보는 유지됩니다.")
+                    return
+                registry_data = dict(storage_result.get("registry_data") or registry_data)
+                registry_data["사업자등록번호"] = saved_registry_business_no
+                preserved_financial_inputs = _capture_stock_financial_inputs()
+                _apply_registry_data(registry_data)
+                _restore_stock_financial_inputs(preserved_financial_inputs)
                 st.session_state["stock_last_registry_data"] = registry_data
-                st.session_state["stock_registry_restored_key"] = (
-                    saved_registry_business_no
-                )
-                issued = _format_number(
-                    registry_data.get("발행주식총수")
-                )
+                st.session_state["stock_registry_restored_key"] = saved_registry_business_no
+                issued = _format_number(registry_data.get("발행주식총수"))
                 if issued:
                     for index in range(1, 4):
                         share_key = f"stock_shares_{index}"
                         if not st.session_state.get(share_key):
                             st.session_state[share_key] = issued
+                attachment_saved = True
                 try:
                     from enterprise_documents import register_existing_enterprise_document
 
                     register_existing_enterprise_document(
-                        registry_path,
-                        user_id=user_id,
+                        registry_path, user_id=user_id,
                         business_no=saved_registry_business_no,
                         company_name=current_company_name,
                         document_type="corporate_registry",
-                        customer_id=str(
-                            selected_row.get("_customer_id", "") or ""
-                        ),
+                        customer_id=str(selected_row.get("_customer_id", "") or ""),
                         analysis_summary="법인 등기사항증명서 분석을 완료했습니다.",
-                        extracted_fields=dict(registry_data or {}),
+                        extracted_fields=dict(registry_data),
                     )
-                except Exception:
-                    # 등기 분석 결과와 기존 캐시는 유지하고 첨부자료 연결만
-                    # 다음 등록 시 다시 시도할 수 있도록 합니다.
-                    pass
-                st.success(
-                    "등기자료를 현재 기업과 연결해 저장했습니다. "
-                    "기존 당기순이익과 재무 입력값은 유지됩니다."
+                    from enterprise_documents import _load_enterprise_source_overview_cached
+                    _load_enterprise_source_overview_cached.clear()
+                except Exception as exc:
+                    write_runtime_error("registry_document_link", exc)
+                    attachment_saved = False
+                detail = "기존 당기순이익과 재무 입력값은 유지했습니다. 기업컨설팅의 주가평가에서 등기정보를 확인할 수 있습니다."
+                if not storage_result.get("cloud_saved"):
+                    detail += " 분석 결과는 로컬에 보관했으며 클라우드 동기화 상태를 확인해야 합니다."
+                if not attachment_saved:
+                    detail += " 첨부자료·기업히스토리 연결은 완료하지 못했습니다. 같은 파일로 다시 등록할 수 있습니다."
+                if storage_result.get("cloud_saved") and attachment_saved:
+                    task.complete("등기자료 분석·등록이 완료되었습니다.", detail, persist=True)
+                else:
+                    task.warning("등기정보는 보관했지만 일부 저장을 확인해야 합니다.", detail, persist=True)
+                completed = True
+            except Exception as exc:
+                write_runtime_error("registry_upload", exc)
+                task.error(
+                    safe_public_error(exc, "등기자료 분석·등록을 완료하지 못했습니다."),
+                    "원본과 기존 재무정보는 삭제하지 않았습니다. 파일을 그대로 두고 다시 시도해주세요.",
                 )
-            else:
-                st.warning(
-                    "등기자료는 분석했지만 현재 기업과 안전하게 연결하지 "
-                    "못했습니다. 기업컨설팅에서 업체를 다시 선택해주세요."
-                )
+        if completed:
             st.rerun()
 
 def _render_stock_history(user_id: str) -> None:

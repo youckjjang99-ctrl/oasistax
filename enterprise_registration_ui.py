@@ -21,6 +21,7 @@ from cretop_worker import valid_company_name
 from customer_history import save_customer_snapshot
 from matching_preferences import INTEREST_OPTIONS, get_matching_preferences, save_matching_preferences
 from runtime_error_log import safe_public_error, write_runtime_error
+from upload_progress import UploadProgress, render_upload_ready
 from utils import (
     append_cretop_to_user_customer_db, check_user_customer_duplicate,
     get_user_cumulative_db_path,
@@ -290,17 +291,21 @@ def render_cretop_registration(user_id, user_name, upload_dir):
         manager = st.text_input("담당자명", value=user_name or "", key="cretop_manager_name")
     if uploaded is None:
         return
+    render_upload_ready(uploaded)
     if st.button("PDF 분석하기", type="primary", key="cretop_analyze_button", width="stretch"):
         reset_cretop_upload_state()
         try:
-            path = Path(upload_dir) / make_upload_filename(uploaded.name).replace("업로드고객DB_", "크레탑PDF_")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            uploaded.seek(0)
-            with path.open("wb") as destination:
-                shutil.copyfileobj(uploaded, destination, length=1024 * 1024)
-            with path.open("rb") as source:
-                digest = hashlib.file_digest(source, "sha256").hexdigest()
-            with st.status("문서를 분석하고 있습니다. 이미지 PDF는 문자 인식에 시간이 걸릴 수 있습니다.", expanded=True) as status:
+            with UploadProgress(f"cretop-analysis:{user_id}", "크레탑 PDF 분석",
+                                steps=("파일 확인", "문서 분석", "검토 준비")) as task:
+                task.step("파일 확인", "파일을 안전하게 보관하고 분석 준비를 합니다. 아직 고객정보는 변경하지 않습니다.")
+                path = Path(upload_dir) / make_upload_filename(uploaded.name).replace("업로드고객DB_", "크레탑PDF_")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                uploaded.seek(0)
+                with path.open("wb") as destination:
+                    shutil.copyfileobj(uploaded, destination, length=1024 * 1024)
+                with path.open("rb") as source:
+                    digest = hashlib.file_digest(source, "sha256").hexdigest()
+                task.step("문서 분석", "이미지 PDF는 문자 인식에 시간이 걸릴 수 있습니다. 최대 4분 이내에 분석 결과 또는 시간초과 안내를 표시합니다.")
                 st.write("분석 중에는 고객정보가 저장되거나 변경되지 않습니다.")
                 # One full parse avoids reading/OCRing the identity pages twice.
                 data, error, logs = run_cretop_worker(path, mode="full", timeout=240)
@@ -314,8 +319,11 @@ def render_cretop_registration(user_id, user_name, upload_dir):
                 st.session_state["cretop_extracted_data"] = data
                 st.session_state["cretop_extract_error"] = error
                 st.session_state["cretop_analysis_logs"] = logs[-20:]
-                status.update(label="기본정보 확인이 필요합니다." if error else "분석 완료 · 아직 등록 전입니다.",
-                              state="error" if error else "complete", expanded=bool(error))
+                task.step("검토 준비", "확인 가능한 정보를 아래 입력칸에 준비합니다.")
+                if error:
+                    task.warning("기본정보 확인이 필요합니다.", "아래 안내를 확인해 주세요. 고객정보는 아직 저장하지 않았습니다.")
+                else:
+                    task.complete("분석 완료 · 아직 등록 전입니다.", "아래 정보를 확인한 뒤 ‘확인한 기업정보 저장’을 눌러 등록하세요.")
         except Exception as exc:
             write_runtime_error("cretop_analysis", exc)
             st.session_state["cretop_extract_error"] = safe_public_error(exc, "PDF 분석을 완료하지 못했습니다. 파일을 확인해 주세요.")
@@ -416,10 +424,19 @@ def render_cretop_registration(user_id, user_name, upload_dir):
     if not include_financial:
         reviewed = _basic_information_only(reviewed)
     try:
-        with st.spinner("확인한 기업정보를 저장하고 있습니다..."):
+        with UploadProgress(f"cretop-save:{user_id}", "기업정보 등록",
+                            steps=("기업정보 저장", "결과 확인")) as task:
+            task.step("기업정보 저장", "중복 여부를 재확인하고 검토한 정보와 자료를 연결합니다.")
             result = save_reviewed_registration(user_id, manager.strip(),
                                                 Path(st.session_state["cretop_pdf_save_path"]), reviewed,
                                                 confirm_update=confirm)
+            task.step("결과 확인", "로컬 보존과 클라우드 저장 결과를 구분해 확인합니다.")
+            if not result.get("saved"):
+                task.warning("등록 확인이 필요합니다.", result.get("message", "아래 안내를 확인해 주세요."))
+            elif result.get("warnings") or not result.get("cloud_saved"):
+                task.warning("기업정보 저장 · 일부 확인 필요", "등록 결과와 동기화 안내를 확인해 주세요.")
+            else:
+                task.complete("기업정보 저장 완료", "클라우드 저장 결과를 확인했습니다.")
         if result.get("needs_confirmation"):
             st.session_state["cretop_needs_confirmation"] = True
             st.rerun()

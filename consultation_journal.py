@@ -14,6 +14,7 @@ from typing import Any
 import requests
 import streamlit as st
 from runtime_error_log import safe_public_error, write_runtime_error
+from upload_progress import UploadProgress, render_upload_feedback, render_upload_ready
 
 from cloud_sync import sync_crm_record
 from cloud_db import CloudDatabase, cloud_is_configured
@@ -2498,12 +2499,15 @@ def render_audio_consultation_journal(
             help="커피머신·주변 대화가 큰 경우 사용합니다. 음성이 다소 건조해질 수 있습니다.",
         )
 
+    feedback_key = f"consultation-audio:{user_id}:{business_no}"
+    render_upload_feedback(feedback_key)
     uploaded = st.file_uploader(
         "상담 녹음파일",
         type=SUPPORTED_AUDIO_TYPES,
         key=f"consultation_audio_{business_no}",
         help="mp3, mp4, mpeg, mpga, m4a, wav, webm 지원",
     )
+    render_upload_ready(uploaded)
 
     st.info(
         "비용·시간 절감 모드: 동일 녹음은 기존 결과를 재사용하고, "
@@ -2653,9 +2657,9 @@ def render_audio_consultation_journal(
 
         st.session_state[running_key] = True
 
-        with st.status(
-            "녹음파일 상담일지를 생성하고 있습니다.",
-            expanded=True,
+        with UploadProgress(
+            feedback_key, "녹음파일 상담일지 생성",
+            steps=("파일 확인", "전처리 확인", "음성 녹취", "상담 분석", "녹음 보관", "초안 준비"),
         ) as generation_status:
             progress = st.progress(0)
             stage_message = st.empty()
@@ -2669,6 +2673,7 @@ def render_audio_consultation_journal(
                 audio_bytes = pending_job["audio_bytes"]
                 filename = pending_job["filename"]
 
+                generation_status.step("파일 확인", "녹음파일의 내용을 확인하고 있습니다.")
                 progress.progress(0.03)
                 stage_message.info(
                     "1단계 · 녹음파일을 확인하고 있습니다."
@@ -2685,6 +2690,7 @@ def render_audio_consultation_journal(
                 }
 
                 progress.progress(0.08)
+                generation_status.step("전처리 확인", "캐시와 음성 전처리 조건을 확인하고 있습니다.")
                 stage_message.info(
                     "2단계 · 캐시와 음성 전처리 조건을 확인하고 있습니다."
                 )
@@ -2695,6 +2701,7 @@ def render_audio_consultation_journal(
                     name: str,
                 ) -> None:
                     ratio = index / max(total, 1)
+                    generation_status.step("음성 녹취", f"음성을 녹취하고 있습니다. ({index}/{total} 구간)")
                     visible_progress = 0.12 + (ratio * 0.53)
                     progress.progress(
                         min(visible_progress, 0.65)
@@ -2704,6 +2711,7 @@ def render_audio_consultation_journal(
                         f"({index}/{total} 구간)"
                     )
 
+                generation_status.step("음성 녹취", "녹취 결과를 준비하고 있습니다.")
                 transcript, transcript_cached, transcript_cache_key = (
                     transcribe_audio_with_cache(
                         user_id,
@@ -2746,6 +2754,7 @@ def render_audio_consultation_journal(
                     )
 
                 progress.progress(0.72)
+                generation_status.step("상담 분석", "상담주제와 고객 니즈를 분석하고 있습니다.")
                 stage_message.info(
                     "4단계 · 상담주제와 고객 니즈를 분석하고 있습니다."
                 )
@@ -2768,6 +2777,7 @@ def render_audio_consultation_journal(
                 )
 
                 progress.progress(0.88)
+                generation_status.step("녹음 보관", "녹음파일의 클라우드 보관을 확인하고 있습니다.")
                 stage_message.info(
                     "5단계 · 녹음파일을 클라우드에 보관하고 있습니다."
                 )
@@ -2842,6 +2852,7 @@ def render_audio_consultation_journal(
                     )
 
                 progress.progress(0.96)
+                generation_status.step("초안 준비", "상담일지 초안을 화면에 준비하고 있습니다.")
                 stage_message.info(
                     "6단계 · 상담일지 초안을 화면에 준비하고 있습니다."
                 )
@@ -2876,11 +2887,16 @@ def render_audio_consultation_journal(
                     )
 
                 stage_message.success(completion_message)
-                generation_status.update(
-                    label="상담일지 초안 생성 완료",
-                    state="complete",
-                    expanded=True,
-                )
+                if audio_storage_result.get("stored"):
+                    generation_status.complete(
+                        "상담일지 초안 생성 완료", detail=completion_message, persist=True,
+                    )
+                else:
+                    generation_status.warning(
+                        "상담일지 초안은 준비됐지만 녹음파일의 클라우드 보관은 완료하지 못했습니다.",
+                        detail="초안은 아래에서 확인할 수 있습니다. 원본 녹음파일은 별도로 보관해 주세요.",
+                        persist=True,
+                    )
 
                 st.session_state.pop(job_key, None)
                 st.session_state[running_key] = False
@@ -2916,11 +2932,7 @@ def render_audio_consultation_journal(
                 stage_message.error(
                     "상담일지 생성이 중단되었습니다."
                 )
-                generation_status.update(
-                    label="상담일지 생성 실패",
-                    state="error",
-                    expanded=True,
-                )
+                generation_status.error("상담일지 생성 실패", detail=error_message)
 
                 st.error(error_message)
 
@@ -3264,21 +3276,31 @@ def render_audio_consultation_journal(
                 ),
             }
         )
-        ok, message = save_consultation_journal(
-            user_id,
-            customer_key,
-            company_name,
-            business_no,
-            consultant_name,
-            edited,
-            current_crm,
-        )
-        if ok:
-            st.success(message)
-            st.session_state.pop(journal_key, None)
-            st.rerun()
-        else:
-            st.error(message)
+        with UploadProgress(
+            feedback_key, "상담일지 및 CRM 저장", steps=("초안 확인", "상담일지 저장"),
+        ) as save_status:
+            try:
+                save_status.step("상담일지 저장", "확인한 상담일지와 CRM 이력을 저장하고 있습니다.")
+                ok, message = save_consultation_journal(
+                    user_id,
+                    customer_key,
+                    company_name,
+                    business_no,
+                    consultant_name,
+                    edited,
+                    current_crm,
+                )
+                if ok:
+                    save_status.complete(message, persist=True)
+                    st.session_state.pop(journal_key, None)
+                    st.rerun()
+                else:
+                    save_status.error(message, detail="상담일지 초안은 유지했습니다. 확인한 후 다시 저장해 주세요.")
+            except Exception as exc:
+                save_status.error(_safe_logged_error(
+                    "consultation_journal.save_ui", exc,
+                    "상담일지 저장을 완료하지 못했습니다. 초안은 유지됩니다.",
+                ))
 
     cloud_audio_rows = list_company_audio(
         user_id,

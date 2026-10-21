@@ -12,6 +12,7 @@ from typing import Any
 import streamlit as st
 from pypdf import PdfReader
 from runtime_error_log import safe_public_error
+from upload_progress import UploadProgress, render_upload_feedback, render_upload_ready
 
 from document_preprocessor import (
     document_quality,
@@ -378,6 +379,8 @@ def render_articles_review(
     allow_upload: bool = True,
 ) -> None:
     st.markdown("#### 정관 AI 검토")
+    feedback_key = f"articles:{user_id}:{business_no or company_name}"
+    render_upload_feedback(feedback_key)
     uploaded = None
     if allow_upload:
         st.caption(
@@ -392,6 +395,7 @@ def render_articles_review(
             ],
             key=f"articles_upload_{business_no or company_name}",
         )
+        render_upload_ready(uploaded)
 
     if uploaded is not None and st.button(
         "정관 분석 실행",
@@ -399,31 +403,23 @@ def render_articles_review(
         use_container_width=True,
         key=f"articles_analyze_{business_no or company_name}",
     ):
-        progress = st.progress(
-            0,
-            text="정관 텍스트를 확인하고 있습니다.",
-        )
+        with UploadProgress(
+            feedback_key, "정관 분석·등록",
+            steps=("파일 확인", "문자 인식", "조항 분석", "결과 저장"),
+        ) as task:
+            try:
+                task.step("파일 확인", "정관 파일의 내용을 확인하고 있습니다.")
+                content = uploaded.getvalue()
+                if not content:
+                    raise ValueError("선택한 파일이 비어 있습니다.")
 
-        def update_ocr_progress(
-            current: int,
-            total: int,
-            message: str = "",
-        ) -> None:
-            progress.progress(
-                min(current / max(total, 1), 1.0),
-                text=message or (
-                    f"문서 전처리·OCR 진행 중 · "
-                    f"{current}/{total}페이지"
-                ),
-            )
+                def update_ocr_progress(current: int, total: int, message: str = "") -> None:
+                    task.step("문자 인식", message or f"문서 전처리·OCR 진행 중 · {current}/{total}페이지")
 
-        try:
-            with st.spinner(
-                "정관 조항을 추출하고 분석하고 있습니다..."
-            ):
+                task.step("문자 인식", "스캔 문서는 문자 인식에 시간이 걸릴 수 있습니다.")
                 text, extraction = extract_articles_text(
                     uploaded.name,
-                    uploaded.getvalue(),
+                    content,
                     progress_callback=update_ocr_progress,
                 )
                 quality = extraction.get("quality", {}) or {}
@@ -437,10 +433,12 @@ def render_articles_review(
                         "해상도가 더 높은 원본 또는 다른 스캔본을 사용해주세요."
                     )
 
+                task.step("조항 분석", "정관 조항과 검토 항목을 비교하고 있습니다.")
                 analysis = analyze_articles(
                     text,
                     extraction=extraction,
                 )
+                task.step("결과 저장", "분석 결과와 기업 첨부자료를 연결하고 있습니다.")
                 save_articles_review(
                     user_id,
                     business_no,
@@ -448,6 +446,7 @@ def render_articles_review(
                     uploaded.name,
                     analysis,
                 )
+                attachment_saved = True
                 try:
                     from enterprise_documents import register_enterprise_document_bytes
 
@@ -457,7 +456,7 @@ def render_articles_review(
                         company_name,
                         "articles",
                         uploaded.name,
-                        uploaded.getvalue(),
+                        content,
                         customer_id=customer_id,
                         analysis_summary="정관 AI 검토를 완료했습니다.",
                         extracted_fields={
@@ -470,18 +469,18 @@ def render_articles_review(
                     )
                 except Exception:
                     # 정관 분석 결과는 이미 안전하게 저장됐으므로 유지합니다.
-                    pass
-                progress.progress(
-                    1.0,
-                    text="정관 분석 완료",
-                )
-
-            st.success(
-                "정관 분석과 기업히스토리 저장을 완료했습니다."
-            )
-            st.rerun()
-        except Exception as exc:
-            st.error(safe_public_error(exc, "정관 분석에 실패했습니다."))
+                    attachment_saved = False
+                if attachment_saved:
+                    task.complete("정관 분석과 기업히스토리 저장을 완료했습니다.", persist=True)
+                else:
+                    task.warning(
+                        "정관 분석 결과는 저장했지만 첨부자료 연결은 완료하지 못했습니다.",
+                        detail="분석 결과는 보존했습니다. 첨부자료 연결은 다시 등록해 주세요.", persist=True,
+                    )
+            except Exception as exc:
+                task.error(safe_public_error(exc, "정관 분석에 실패했습니다."))
+            else:
+                st.rerun()
 
     review = get_latest_articles_review(
         user_id,

@@ -15,6 +15,7 @@ import streamlit as st
 from customer_history import save_customer_event
 from registered_policy_match import build_customer_labels, load_registered_customers
 from runtime_error_log import safe_public_error
+from upload_progress import UploadProgress, render_upload_feedback, render_upload_ready
 from utils import get_user_cumulative_db_path, get_user_dirs
 
 
@@ -428,25 +429,37 @@ def _render_generic_upload(user_id: str, customer: pd.Series, document_type: str
 
     business_no = _normalize_business_no(customer.get("사업자등록번호", ""))
     company_name = _clean(customer.get("업체명", ""))
+    feedback_key = f"enterprise-document:{user_id}:{business_no}:{document_type}"
+    render_upload_feedback(feedback_key)
     uploaded = st.file_uploader(
         f"{DOCUMENT_TYPES[document_type]} 파일 업로드",
         type=["pdf", "hwp", "docx", "txt", "png", "jpg", "jpeg", "webp", "tif", "tiff"],
         key=f"enterprise_doc_upload_{document_type}_{business_no}",
     )
+    render_upload_ready(uploaded)
     if uploaded is None or not st.button(
         "파일 분석·등록", type="primary", use_container_width=True,
         key=f"enterprise_doc_analyze_{document_type}_{business_no}",
     ):
         return
-    try:
-        with st.spinner("문서를 분석하고 해당 기업에 연결하고 있습니다..."):
+    with UploadProgress(
+        feedback_key, f"{DOCUMENT_TYPES[document_type]} 분석·등록",
+        steps=("파일 확인", "문자 인식", "자료 분석", "기업 연결"),
+    ) as task:
+        try:
+            task.step("파일 확인", "파일의 내용을 확인하고 있습니다.")
             content = uploaded.getvalue()
+            if not content:
+                raise ValueError("선택한 파일이 비어 있습니다.")
+            task.step("문자 인식", "스캔 문서는 문자 인식에 시간이 걸릴 수 있습니다.")
             text, extraction = extract_articles_text(uploaded.name, content)
             if len(re.sub(r"\s+", "", text)) < 20:
                 raise ValueError("문서에서 분석 가능한 내용을 충분히 읽지 못했습니다.")
+            task.step("자료 분석", "자료에서 기업정보를 확인하고 있습니다.")
             analysis = (analyze_rnd_certificate_text(text)
                         if document_type == "rnd_certificate"
                         else analyze_tax_adjustment_text(text))
+            task.step("기업 연결", "원본 파일과 분석 결과를 선택한 기업에 연결하고 있습니다.")
             register_enterprise_document_bytes(
                 user_id, business_no, company_name, document_type, uploaded.name, content,
                 customer_id=_clean(customer.get("_customer_id", "")),
@@ -454,11 +467,15 @@ def _render_generic_upload(user_id: str, customer: pd.Series, document_type: str
                 analysis_summary=analysis.get("summary", ""),
                 extracted_fields={**analysis, "extraction_method": extraction.get("method", "")},
             )
-        _load_enterprise_source_overview_cached.clear()
-        st.success("파일 원본과 분석 결과를 해당 기업에 연결해 저장했습니다.")
-        st.rerun()
-    except Exception as exc:
-        st.error(safe_public_error(exc, "기업자료 분석·등록에 실패했습니다."))
+            _load_enterprise_source_overview_cached.clear()
+            task.complete(
+                "파일 원본과 분석 결과를 해당 기업에 연결해 저장했습니다.",
+                detail="기업 첨부자료 목록에서 원본과 분석 결과를 확인할 수 있습니다.", persist=True,
+            )
+        except Exception as exc:
+            task.error(safe_public_error(exc, "기업자료 분석·등록에 실패했습니다."))
+        else:
+            st.rerun()
 
 
 def render_enterprise_information_assets(user_id: str, user_name: str = "") -> None:
