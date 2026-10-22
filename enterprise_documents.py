@@ -162,9 +162,12 @@ def register_enterprise_document_bytes(
         "extracted_fields": dict(extracted_fields or {}),
         "uploaded_at": saved_at,
     })
-    save_customer_event(
+    analysis_revision = hashlib.sha256(json.dumps(
+        extracted_fields or {}, sort_keys=True, ensure_ascii=False, default=str,
+    ).encode("utf-8")).hexdigest()[:12]
+    history_result = save_customer_event(
         user_id, normalized, company_name,
-        event_id=f"enterprise-document-{record_id}",
+        event_id=f"enterprise-document-{record_id}-{analysis_revision}",
         event_title=f"{DOCUMENT_TYPES[document_type]} 등록",
         event_detail=analysis_summary or note or "기업 첨부자료를 등록했습니다.",
         occurred_at=saved_at,
@@ -177,8 +180,11 @@ def register_enterprise_document_bytes(
             "추출정보": dict(extracted_fields or {}),
             "파일명": safe_name,
             "자료ID": record_id,
+            "분석버전": analysis_revision,
         },
+        return_status=True,
     )
+    saved["history_storage_status"] = (history_result or {}).get("storage_status", {})
     return saved
 
 
@@ -242,27 +248,8 @@ def _money_value(raw: str, unit: str) -> int | None:
 
 
 def analyze_tax_adjustment_text(text: str) -> dict[str, Any]:
-    source = re.sub(r"[\u00a0\t]+", " ", str(text or ""))
-    fields: dict[str, Any] = {}
-    for label in [
-        "당기순이익", "자산총계", "부채총계", "자본총계", "과세표준",
-        "산출세액", "결정세액", "세액공제", "연구개발비",
-    ]:
-        match = re.search(
-            rf"{re.escape(label)}[^\d\-\(]{{0,30}}([-+]?\(?\d[\d,]*(?:\.\d+)?\)?)\s*(억원|백만원|천원|원)?",
-            source,
-        )
-        if match:
-            value = _money_value(match.group(1), match.group(2) or "")
-            if value is not None:
-                fields[label] = value
-    years = sorted(set(re.findall(r"(?:19|20)\d{2}", source)), reverse=True)[:3]
-    return {
-        "recognized": bool(re.search(r"세무조정|법인세.*신고|조정계산서", source)),
-        "years": years, "financial_fields": fields,
-        "summary": (f"세무조정계산서에서 {len(fields)}개 재무·세무 항목을 확인했습니다."
-                    if fields else "세무조정계산서를 등록했으나 자동 추출할 금액 항목은 확인이 필요합니다."),
-    }
+    from tax_adjustment_valuation import analyze_tax_adjustment_text as analyze
+    return analyze(text)
 
 
 def analyze_rnd_certificate_text(text: str) -> dict[str, Any]:
@@ -289,10 +276,45 @@ def analyze_rnd_certificate_text(text: str) -> dict[str, Any]:
 
 def load_enterprise_document_context(
     user_id: str, business_no: str, company_name: str = "",
+    *, include_remote_tax: bool = False,
 ) -> dict[str, Any]:
     normalized = _normalize_business_no(business_no)
     records = [dict(item) for item in _load_records(user_id)
                if _normalize_business_no(item.get("business_no", "")) == normalized]
+    if include_remote_tax:
+        # Read shared history only when the tax-review panel is explicitly opened.
+        # Do not add an extra cloud query to ordinary navigation.
+        from customer_history import get_customer_history
+        positions = {str(item.get("record_id", "")): index for index, item in enumerate(records)}
+        for event in get_customer_history(user_id, normalized):
+            if _normalize_business_no(event.get("business_no", "")) != normalized:
+                continue
+            data = event.get("data", {})
+            if not isinstance(data, dict) or data.get("문서유형") != "tax_adjustment":
+                continue
+            record_id = str(data.get("자료ID", ""))
+            if not record_id:
+                continue
+            fields = data.get("추출정보", {})
+            if not isinstance(fields, dict):
+                continue
+            remote_record = {
+                "record_id": record_id, "business_no": normalized,
+                "document_type": "tax_adjustment", "document_label": "세무조정계산서",
+                "filename": str(data.get("파일명", "")),
+                "uploaded_at": str(event.get("captured_at", "")),
+                "extracted_fields": fields, "local_path": "",
+            }
+            if record_id in positions:
+                index = positions[record_id]
+                # A newer analysis from another device must not be hidden by an
+                # older local copy. Preserve the local original, not stale fields.
+                existing = records[index]
+                if remote_record["uploaded_at"].replace("T", " ") > str(existing.get("uploaded_at", "")).replace("T", " "):
+                    records[index] = {**existing, **remote_record, "local_path": existing.get("local_path", "")}
+            else:
+                positions[record_id] = len(records)
+                records.append(remote_record)
     records.sort(key=lambda item: str(item.get("uploaded_at", "")), reverse=True)
     latest_by_type: dict[str, dict[str, Any]] = {}
     for item in records:
@@ -424,20 +446,119 @@ def _render_note_input(user_id: str, customer: pd.Series, document_type: str) ->
         st.rerun()
 
 
-def _render_generic_upload(user_id: str, customer: pd.Series, document_type: str) -> None:
-    from articles_review import extract_articles_text
+class EnterpriseDocumentValidationError(ValueError):
+    """A fixed, public validation message with no source-document values."""
 
+
+def process_enterprise_document_batch(
+    user_id: str, customer: pd.Series, document_type: str, files: list,
+    *, on_progress=None,
+) -> list[dict[str, Any]]:
+    """Process files independently; preserve earlier successes on a later failure."""
+    from articles_review import extract_articles_text
     business_no = _normalize_business_no(customer.get("사업자등록번호", ""))
     company_name = _clean(customer.get("업체명", ""))
+    if not business_no:
+        raise EnterpriseDocumentValidationError("자료를 연결할 기업의 사업자등록번호를 먼저 확인해 주세요.")
+    if not files or len(files) > 20:
+        raise EnterpriseDocumentValidationError("한 번에 1~20개 파일을 선택해 주세요.")
+    results, seen = [], set()
+    total_bytes = 0
+    for index, uploaded in enumerate(files, 1):
+        filename = _safe_filename(getattr(uploaded, "name", "document"))
+        item = {"filename": filename, "status": "failed", "storage": "", "message": ""}
+        def progress(stage, detail=""):
+            if on_progress:
+                on_progress(index, len(files), stage, detail)
+        try:
+            progress("파일 확인", f"{index}/{len(files)} · {filename}")
+            content = uploaded.getvalue()
+            if not content:
+                raise EnterpriseDocumentValidationError("파일이 비어 있습니다.")
+            if len(content) > 50 * 1024 * 1024:
+                raise EnterpriseDocumentValidationError("파일당 50MB 이하로 선택해 주세요.")
+            total_bytes += len(content)
+            if total_bytes > 200 * 1024 * 1024:
+                raise EnterpriseDocumentValidationError("한 번에 처리하는 파일의 합계는 200MB 이하로 선택해 주세요.")
+            digest = hashlib.sha256(content).hexdigest()
+            if digest in seen:
+                item.update(status="duplicate", message="이번 묶음에서 같은 내용의 파일을 이미 처리했습니다.")
+                results.append(item)
+                continue
+            seen.add(digest)
+            progress("문자 인식", f"{index}/{len(files)} · {filename} · 문서를 읽고 있습니다.")
+            def page_progress(page, count, message):
+                progress("문자 인식", f"{index}/{len(files)} · {filename} · {page}/{count}쪽 · {message}")
+            text, extraction = extract_articles_text(uploaded.name, content, progress_callback=page_progress)
+            if len(re.sub(r"\s+", "", text)) < 20:
+                raise EnterpriseDocumentValidationError("분석 가능한 문자를 충분히 읽지 못했습니다. 원본 또는 선명한 스캔본을 확인해 주세요.")
+            progress("자료 분석", f"{index}/{len(files)} · {filename} · 연도와 세무 항목 확인")
+            analysis = (analyze_rnd_certificate_text(text) if document_type == "rnd_certificate"
+                        else analyze_tax_adjustment_text(text))
+            numbers = analysis.get("business_numbers", [])
+            if numbers and business_no not in {_normalize_business_no(value) for value in numbers}:
+                raise EnterpriseDocumentValidationError("선택한 기업과 문서의 사업자등록번호가 다릅니다. 연결 기업을 다시 확인해 주세요.")
+            progress("기업 연결", f"{index}/{len(files)} · {filename} · 원본과 분석 결과 저장")
+            record = register_enterprise_document_bytes(
+                user_id, business_no, company_name, document_type, uploaded.name, content,
+                customer_id=_clean(customer.get("_customer_id", "")),
+                note=st.session_state.get(f"enterprise_doc_note_{document_type}_{business_no}", ""),
+                analysis_summary=analysis.get("summary", ""),
+                extracted_fields={**analysis, "extraction_method": extraction.get("method", "")},
+            )
+            storage, storage_message = "local", "로컬 원본·분석 결과 저장"
+            if isinstance(record, dict) and record.get("local_path"):
+                from customer_asset_storage import store_private_customer_asset
+                try:
+                    stored = store_private_customer_asset(
+                        record["local_path"], owner_user_id=user_id,
+                        asset_type="enterprise_document", customer_id=_clean(customer.get("_customer_id", "")) or None,
+                        source_type=f"enterprise_document:{document_type}", source_id=record["record_id"],
+                    )
+                    history_saved = bool(record.get("history_storage_status", {}).get("cloud_saved"))
+                    if stored.cloud_saved and stored.metadata_saved and history_saved:
+                        storage, storage_message = "cloud", "클라우드 원본 보관 확인 · 분석 결과는 기업 히스토리에서 확인"
+                    elif stored.cloud_saved and stored.metadata_saved:
+                        storage, storage_message = "warning", "클라우드 원본 보관 확인 · 분석이력 클라우드 저장은 확인 필요"
+                    elif stored.cloud_enabled:
+                        storage, storage_message = "warning", "로컬 보존 완료 · 클라우드 원본 보관 미완료"
+                except Exception:
+                    storage, storage_message = "warning", "로컬 보존 완료 · 클라우드 원본 보관 확인 필요"
+            review = not analysis.get("recognized") or bool(analysis.get("warnings"))
+            item.update(
+                status="review" if review else "saved", storage=storage,
+                message=storage_message + (" · 추출 항목을 직접 확인해 주세요." if review else ""),
+                record_id=record.get("record_id", "") if isinstance(record, dict) else "",
+            )
+        except Exception as exc:
+            item["message"] = str(exc) if isinstance(exc, EnterpriseDocumentValidationError) else safe_public_error(exc, "기업자료 분석·등록에 실패했습니다.")
+        results.append(item)
+    return results
+
+
+def _render_generic_upload(user_id: str, customer: pd.Series, document_type: str) -> None:
+    business_no = _normalize_business_no(customer.get("사업자등록번호", ""))
     feedback_key = f"enterprise-document:{user_id}:{business_no}:{document_type}"
     render_upload_feedback(feedback_key)
     uploaded = st.file_uploader(
         f"{DOCUMENT_TYPES[document_type]} 파일 업로드",
         type=["pdf", "hwp", "docx", "txt", "png", "jpg", "jpeg", "webp", "tif", "tiff"],
+        accept_multiple_files=True,
+        max_upload_size=50,
         key=f"enterprise_doc_upload_{document_type}_{business_no}",
     )
     render_upload_ready(uploaded)
-    if uploaded is None or not st.button(
+    files = list(uploaded) if isinstance(uploaded, (list, tuple)) else ([uploaded] if uploaded else [])
+    result_key = feedback_key + ":results"
+    previous = st.session_state.get(result_key, [])
+    if previous:
+        st.caption("최근 파일별 처리 결과")
+        st.dataframe(pd.DataFrame([
+            {"파일": row["filename"], "결과": {"saved": "등록 완료", "review": "등록됨·검토 필요", "failed": "실패", "duplicate": "중복 제외"}[row["status"]], "안내": row["message"]}
+            for row in previous
+        ]), hide_index=True, use_container_width=True)
+    st.caption("여러 연도·분할 파일을 한 번에 선택할 수 있습니다. 최대 20개, 파일당 50MB, 합계 200MB입니다. 등록만으로 주가평가 값을 변경하지 않습니다.")
+    if not files or not st.button(
         "파일 분석·등록", type="primary", use_container_width=True,
         key=f"enterprise_doc_analyze_{document_type}_{business_no}",
     ):
@@ -447,31 +568,20 @@ def _render_generic_upload(user_id: str, customer: pd.Series, document_type: str
         steps=("파일 확인", "문자 인식", "자료 분석", "기업 연결"),
     ) as task:
         try:
-            task.step("파일 확인", "파일의 내용을 확인하고 있습니다.")
-            content = uploaded.getvalue()
-            if not content:
-                raise ValueError("선택한 파일이 비어 있습니다.")
-            task.step("문자 인식", "스캔 문서는 문자 인식에 시간이 걸릴 수 있습니다.")
-            text, extraction = extract_articles_text(uploaded.name, content)
-            if len(re.sub(r"\s+", "", text)) < 20:
-                raise ValueError("문서에서 분석 가능한 내용을 충분히 읽지 못했습니다.")
-            task.step("자료 분석", "자료에서 기업정보를 확인하고 있습니다.")
-            analysis = (analyze_rnd_certificate_text(text)
-                        if document_type == "rnd_certificate"
-                        else analyze_tax_adjustment_text(text))
-            task.step("기업 연결", "원본 파일과 분석 결과를 선택한 기업에 연결하고 있습니다.")
-            register_enterprise_document_bytes(
-                user_id, business_no, company_name, document_type, uploaded.name, content,
-                customer_id=_clean(customer.get("_customer_id", "")),
-                note=st.session_state.get(f"enterprise_doc_note_{document_type}_{business_no}", ""),
-                analysis_summary=analysis.get("summary", ""),
-                extracted_fields={**analysis, "extraction_method": extraction.get("method", "")},
+            outcomes = process_enterprise_document_batch(
+                user_id, customer, document_type, files,
+                on_progress=lambda index, count, stage, detail: task.step(stage, detail),
             )
+            st.session_state[result_key] = outcomes
             _load_enterprise_source_overview_cached.clear()
-            task.complete(
-                "파일 원본과 분석 결과를 해당 기업에 연결해 저장했습니다.",
-                detail="기업 첨부자료 목록에서 원본과 분석 결과를 확인할 수 있습니다.", persist=True,
-            )
+            counts = {status: sum(row["status"] == status for row in outcomes) for status in ("saved", "review", "failed", "duplicate")}
+            detail = f"등록 {counts['saved'] + counts['review']}개 · 검토 필요 {counts['review']}개 · 실패 {counts['failed']}개 · 중복 제외 {counts['duplicate']}개. 파일별 결과표를 확인해 주세요."
+            if counts["failed"] == len(outcomes):
+                task.error("기업자료 분석·등록에 실패했습니다.", detail, persist=True)
+            elif counts["failed"] or counts["review"] or any(row["storage"] != "cloud" for row in outcomes if row["status"] != "duplicate"):
+                task.warning("파일을 해당 기업에 연결해 저장했습니다. 일부 확인이 필요합니다.", detail, persist=True)
+            else:
+                task.complete("파일 원본과 분석 결과를 해당 기업에 연결해 저장했습니다.", detail, persist=True)
         except Exception as exc:
             task.error(safe_public_error(exc, "기업자료 분석·등록에 실패했습니다."))
         else:
