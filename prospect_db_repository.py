@@ -11,6 +11,7 @@ from typing import Any
 import requests
 
 from cloud_db import CloudDatabase, get_cloud_config
+from supabase_api_config import server_api_headers
 
 
 TABLE_PROSPECTS = "oasis_prospect_companies"
@@ -406,8 +407,7 @@ def _rest_headers(*, representation: bool = False) -> dict[str, str]:
     if not config.configured:
         raise RuntimeError("Supabase 환경변수가 설정되지 않았습니다.")
     headers = {
-        "apikey": config.secret_key,
-        "Authorization": f"Bearer {config.secret_key}",
+        **server_api_headers(config.secret_key),
         "Content-Type": "application/json",
     }
     if representation:
@@ -429,10 +429,7 @@ def existing_customer_business_nos(values: list[str]) -> set[str]:
     config = get_cloud_config()
     if not config.configured:
         return set()
-    headers = {
-        "apikey": config.secret_key,
-        "Authorization": f"Bearer {config.secret_key}",
-    }
+    headers = server_api_headers(config.secret_key)
     quoted = ",".join(f'"{value}"' for value in normalized)
     response = requests.get(
         f"{config.url}/rest/v1/{TABLE_CUSTOMERS}",
@@ -1284,8 +1281,7 @@ def save_prospects(
     if not config.configured:
         raise RuntimeError("Supabase 환경변수가 설정되지 않았습니다.")
     headers = {
-        "apikey": config.secret_key,
-        "Authorization": f"Bearer {config.secret_key}",
+        **server_api_headers(config.secret_key),
         "Content-Type": "application/json",
         "Prefer": "resolution=merge-duplicates,return=representation",
     }

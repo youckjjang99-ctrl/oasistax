@@ -15,7 +15,8 @@ MAX_COLLECTION_ITEMS = 100
 MAX_SANITIZE_DEPTH = 6
 
 _SENSITIVE_KEY = re.compile(
-    r"(?:api[_-]?key|api[_-]?secret|secret|password|passwd|token|"
+    r"(?:api[_-]?key|api[_-]?secret|service[_-]?(?:role[_-]?)?key|"
+    r"supabase[_-]?key|secret|password|passwd|token|"
     r"authorization|cookie|credential|session(?:[_-]?(?:id|token|secret))?|"
     r"resident(?:[_-]?(?:no|number))?|identity(?:[_-]?(?:no|number))?|"
     r"business(?:[_-]?(?:no|number))|phone|cellphone|mobile|"
@@ -35,11 +36,13 @@ _JWT = re.compile(
     r"\beyJ[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{10,}\b"
 )
 _KNOWN_TOKEN = re.compile(
-    r"\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9]{20,}|"
-    r"github_pat_[A-Za-z0-9_]{25,}|AKIA[0-9A-Z]{16})\b"
+    r"(?:sk-(?:proj-)?[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9]{20,}|"
+    r"github_pat_[A-Za-z0-9_]{25,}|AKIA[0-9A-Z]{16}|"
+    r"sb_secret_[A-Za-z0-9_-]+)\b"
 )
 _SENSITIVE_KEY_VALUE = re.compile(
     r"(?i)(?P<prefix>['\"]?(?:api[_-]?key|api[_-]?secret|secret(?:[_-]?key)?|"
+    r"service[_-]?(?:role[_-]?)?key|supabase[_-]?key|"
     r"password|passwd|token|authorization|cookie|credential|"
     r"session(?:[_-]?(?:id|token|secret))?|resident(?:[_-]?(?:no|number))?|"
     r"identity(?:[_-]?(?:no|number))?|business(?:[_-]?(?:no|number))|"
@@ -49,11 +52,15 @@ _SENSITIVE_KEY_VALUE = re.compile(
     r"고객명|업체명|상호|성명|이름|주소|이메일|메모|상담(?:내용)?)"
     r"['\"]?\s*[:=]\s*)"
     r"(?P<quote>['\"]?)(?P<value>\[[A-Z_]+\]|.*?)(?P=quote)"
-    r"(?=(?:[,;}\]\r\n]|$))"
+    r"(?=(?:[&,;}\]\r\n]|$))"
 )
 _SENSITIVE_QUERY = re.compile(
-    r"(?i)([?&](?:api[_-]?key|secret|password|token|authorization|"
+    r"(?i)([?&](?:api[_-]?key|service[_-]?(?:role[_-]?)?key|"
+    r"supabase[_-]?key|secret|password|token|authorization|"
     r"session[_-]?(?:id|token))=)[^&#\s]+"
+)
+_URL_CREDENTIALS = re.compile(
+    r"(?i)(\b[a-z][a-z0-9+.-]*://)[^/\s?#@]+@"
 )
 _RRN = re.compile(r"(?<!\d)\d{6}[-\s]?[1-8]\d{6}(?!\d)")
 _BUSINESS_NUMBER = re.compile(r"(?<!\d)\d{3}[-\s]\d{2}[-\s]\d{5}(?!\d)")
@@ -83,6 +90,9 @@ def _redact_text(value: Any) -> str:
     text = _JWT.sub("[JWT_REDACTED]", text)
     text = _KNOWN_TOKEN.sub("[TOKEN_REDACTED]", text)
     text = _SENSITIVE_QUERY.sub(lambda match: match.group(1) + REDACTED, text)
+    text = _URL_CREDENTIALS.sub(
+        lambda match: match.group(1) + "[CREDENTIALS_REDACTED]@", text
+    )
     text = _SENSITIVE_KEY_VALUE.sub(
         lambda match: match.group("prefix") + match.group("quote") + REDACTED + match.group("quote"),
         text,

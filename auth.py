@@ -43,6 +43,7 @@ SESSION_SUPERSEDED = "superseded"
 SESSION_UNAVAILABLE = "unavailable"
 PERSISTENT_LOGIN_COOKIE = "oasis_login_v1"
 PERSISTENT_LOGIN_SECONDS = 30 * 24 * 60 * 60
+MIN_SESSION_SECRET_LENGTH = 32
 SIGNED_OUT_QUERY_PARAM = "_oasis_signed_out"
 SIGNED_OUT_SESSION_GUARD = "_persistent_login_restore_blocked_v1"
 SIGNED_OUT_COOKIE_CLEANUP = "_persistent_login_cookie_cleanup_queued_v1"
@@ -732,18 +733,17 @@ def _auth_outage_grace_active(last_verified_at: float, now: float) -> bool:
 
 
 def _persistent_login_cipher() -> Fernet | None:
-    """Build a stable cipher without exposing application secrets to the client."""
-    secret = ""
-    for key in (
-        "APP_SESSION_SECRET",
-        "SUPABASE_SECRET_KEY",
-        "SUPABASE_SERVICE_ROLE_KEY",
-        "APP_LOGIN_PW",
-    ):
-        secret = str(get_secret(key, "") or "").strip()
-        if secret:
-            break
-    if len(secret) < 16:
+    """Use a dedicated key; database/API credential rotation must not affect login.
+
+    Legacy cookies derived from a database key or administrator password are not
+    accepted.  Missing or weak configuration disables cookie persistence only;
+    ordinary credential-based login continues to use the existing session flow.
+    """
+    configured_secret = os.environ.get("APP_SESSION_SECRET")
+    if configured_secret is None:
+        configured_secret = get_secret("APP_SESSION_SECRET", "")
+    secret = str(configured_secret or "").strip()
+    if len(secret) < MIN_SESSION_SECRET_LENGTH:
         return None
     digest = hashlib.sha256(
         f"oasis-persistent-login-v1\0{secret}".encode("utf-8")

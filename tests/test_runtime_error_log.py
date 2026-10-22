@@ -151,6 +151,83 @@ class RuntimeErrorLogTests(unittest.TestCase):
         self.assertIn("exception_message=[REDACTED]", content)
         self.assertIn("exception_type=RuntimeError", content)
 
+    def test_new_supabase_secret_is_redacted_without_a_field_label(self):
+        secret = "sb_" + "secret_" + ("SyntheticKey_" * 3)
+        for value in (secret, "failed with " + secret, {secret: "invalid"}):
+            with self.subTest(value_type=type(value).__name__):
+                sanitized = repr(runtime_error_log._sanitize_details(value))
+                self.assertNotIn(secret, sanitized)
+                self.assertIn("[TOKEN_REDACTED]", sanitized)
+
+    def test_tokens_in_malformed_variable_names_are_redacted(self):
+        for token_prefix in ("sb_" + "secret_", "sk-", "sk-" + "proj-"):
+            secret = token_prefix + ("SyntheticKey" * 3)
+            for name_prefix in ("PREFIX_", "PREFIX"):
+                with self.subTest(token_prefix=token_prefix, name_prefix=name_prefix):
+                    malformed_name = name_prefix + secret
+                    for value in (malformed_name, {malformed_name: "invalid"}):
+                        sanitized = repr(runtime_error_log._sanitize_details(value))
+                        self.assertNotIn(secret, sanitized)
+                        self.assertNotIn("SyntheticKey", sanitized)
+                        self.assertIn("[TOKEN_REDACTED]", sanitized)
+
+    def test_service_key_queries_redact_encoded_values_and_keep_other_parameters(self):
+        encoded_secret = "Synthetic%2BEncoded%2FValue%3D"
+        for parameter in ("serviceKey", "SERVICEKEY", "service_key", "api_key"):
+            with self.subTest(parameter=parameter):
+                value = (
+                    "https://example.test/data?" + parameter + "="
+                    + encoded_secret + "&page=2#results"
+                )
+                sanitized = runtime_error_log._redact_text(value)
+                self.assertNotIn(encoded_secret, sanitized)
+                self.assertIn(parameter + "=[REDACTED]&page=2#results", sanitized)
+
+    def test_legacy_service_key_aliases_are_redacted_in_mappings_and_text(self):
+        secret = "SyntheticLegacyCredentialAlphaBeta"
+        for name in (
+            "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_SERVICE_KEY", "SUPABASE_KEY",
+            "serviceRoleKey", "service_key",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    runtime_error_log._sanitize_details({name: secret})[name],
+                    runtime_error_log.REDACTED,
+                )
+                self.assertNotIn(
+                    secret, runtime_error_log._redact_text(name + "=" + secret)
+                )
+
+    def test_url_userinfo_is_redacted_for_http_and_database_urls(self):
+        userinfo = "SyntheticUser:Synthetic%2FPassword"
+        for scheme in ("https", "postgresql"):
+            with self.subTest(scheme=scheme):
+                value = scheme + "://" + userinfo + "@example.test/resource"
+                sanitized = runtime_error_log._redact_text(value)
+                self.assertNotIn(userinfo, sanitized)
+                self.assertNotIn("SyntheticUser", sanitized)
+                self.assertNotIn("Synthetic%2FPassword", sanitized)
+                self.assertIn("[CREDENTIALS_REDACTED]@example.test", sanitized)
+
+    def test_runtime_log_redacts_rotation_credentials_in_context_and_details(self):
+        secret = "sb_" + "secret_" + ("SyntheticKey_" * 3)
+        legacy_secret = "SyntheticLegacyCredentialAlphaBeta"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_module_path = Path(temp_dir) / "runtime_error_log.py"
+            with patch.object(runtime_error_log, "__file__", str(fake_module_path)):
+                log_path = runtime_error_log.write_runtime_error(
+                    "request " + secret,
+                    RuntimeError("never render exception " + secret),
+                    details={
+                        "endpoint": "https://example.test/?serviceKey=" + legacy_secret,
+                        "SUPABASE_SERVICE_ROLE_KEY": legacy_secret,
+                    },
+                )
+            content = Path(log_path).read_text(encoding="utf-8")
+        self.assertNotIn(secret, content)
+        self.assertNotIn(legacy_secret, content)
+        self.assertIn("exception_message=[REDACTED]", content)
+
 
 if __name__ == "__main__":
     unittest.main()
