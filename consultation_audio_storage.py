@@ -13,6 +13,7 @@ import requests
 import streamlit as st
 
 from data_safety_storage import require_owner_context
+from supabase_api_config import resolve_server_key, server_api_headers
 
 
 BUCKET_NAME = "oasis-consultation-audio"
@@ -44,11 +45,7 @@ def _secret(*names: str) -> str:
 
 def _config() -> tuple[str, str]:
     url = _secret("SUPABASE_URL")
-    key = _secret(
-        "SUPABASE_SERVICE_ROLE_KEY",
-        "SUPABASE_SERVICE_KEY",
-        "SUPABASE_KEY",
-    )
+    key = resolve_server_key(_secret)
     return url.rstrip("/"), key
 
 
@@ -59,10 +56,7 @@ def storage_is_configured() -> bool:
 
 def _headers(content_type: str | None = None) -> dict[str, str]:
     _, key = _config()
-    headers = {
-        "apikey": key,
-        "Authorization": f"Bearer {key}",
-    }
+    headers = server_api_headers(key)
     if content_type:
         headers["Content-Type"] = content_type
     return headers

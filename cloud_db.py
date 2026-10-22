@@ -13,6 +13,7 @@ from urllib.parse import quote
 import requests
 
 from performance_cache import invalidate_cache
+from supabase_api_config import resolve_server_key, server_api_headers
 
 
 TABLE_CUSTOMERS = "oasis_customers"
@@ -96,12 +97,10 @@ class CloudConfig:
 
 
 def get_cloud_config() -> CloudConfig:
+    key = resolve_server_key(_read_secret)
     return CloudConfig(
         url=_read_secret("SUPABASE_URL").rstrip("/"),
-        secret_key=(
-            _read_secret("SUPABASE_SECRET_KEY")
-            or _read_secret("SUPABASE_SERVICE_ROLE_KEY")
-        ),
+        secret_key=key,
     )
 
 
@@ -116,8 +115,7 @@ class CloudDatabase:
     @property
     def headers(self) -> dict[str, str]:
         return {
-            "apikey": self.config.secret_key,
-            "Authorization": f"Bearer {self.config.secret_key}",
+            **server_api_headers(self.config.secret_key),
             "Content-Type": "application/json",
             "Prefer": "return=representation",
         }
@@ -251,8 +249,7 @@ class CloudDatabase:
         ):
             raise ValueError("올바르지 않은 Storage 경로입니다.")
         headers = {
-            "apikey": self.config.secret_key,
-            "Authorization": f"Bearer {self.config.secret_key}",
+            **server_api_headers(self.config.secret_key),
             "Content-Type": str(content_type or "application/octet-stream"),
             "x-upsert": "false",
         }
