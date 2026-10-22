@@ -6,9 +6,10 @@ import os
 import re
 import uuid
 from copy import deepcopy
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -1003,6 +1004,9 @@ def _apply_loaded_record(record: dict[str, Any]) -> None:
     st.session_state.pop("stock_last_result", None)
     st.session_state.pop("stock_last_inputs", None)
     st.session_state["stock_loaded_record_id"] = record.get("record_id", "")
+    st.session_state["stock_tax_adjustment_review"] = deepcopy(
+        record.get("tax_adjustment_review", [])
+    )
     st.session_state["stock_company_name"] = record.get("company_name", "")
     st.session_state["stock_business_no"] = record.get("business_no", "")
     st.session_state["stock_corporate_no"] = record.get("corporate_no", "")
@@ -1138,6 +1142,8 @@ def _clear_stock_customer_state() -> None:
         "stock_last_result",
         "stock_last_inputs",
         "stock_loaded_record_id",
+        "stock_tax_adjustment_review",
+        "stock_tax_adjustment_applied_message",
     ]
     for index in range(1, 4):
         keys.extend(
@@ -1474,6 +1480,343 @@ def render_registry_upload_for_customer(
     _render_registry_upload(user_id, selected_row)
 
 
+def _stock_legal_today() -> date:
+    return datetime.now(ZoneInfo("Asia/Seoul")).date()
+
+
+def _prepare_tax_adjustment_application(
+    *, business_no: str, valuation_date: str, target_years: list[str],
+    candidates: list[dict[str, Any]], reviewed_values: dict[int, dict[str, Any]],
+    reviewed_periods: dict[int, dict[str, Any]], review_confirmed: bool,
+    normal_periods_confirmed: bool,
+    special_adjustments_reviewed: bool = False, special_adjustment_note: str = "",
+    law_changes_reviewed: bool = False,
+    identity_confirmed: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate a complete review before changing any existing valuation input."""
+    from tax_adjustment_valuation import calculate_tax_adjusted_income, LAW_BASE_DATE, LAW_EFFECTIVE_DATE
+
+    if not review_confirmed or not (normal_periods_confirmed or special_adjustments_reviewed):
+        raise ValueError("원문·법정 조정항목과 사업연도·주식수 검토를 먼저 확인해주세요.")
+    if special_adjustments_reviewed and not str(special_adjustment_note).strip():
+        raise ValueError("연환산·증감자 조정 등의 전문가 검토 근거를 입력해주세요.")
+    if len(re.sub(r"\D", "", business_no)) != 10:
+        raise ValueError("자료를 반영할 등록 기업을 먼저 선택해주세요.")
+    try:
+        evaluated = date.fromisoformat(str(valuation_date))
+        years = [int(str(value)) for value in target_years]
+    except (ValueError, TypeError):
+        raise ValueError("평가기준일과 적용 대상 사업연도를 확인해주세요.") from None
+    if not date.fromisoformat(LAW_EFFECTIVE_DATE) <= evaluated <= _stock_legal_today():
+        raise ValueError("평가기준일이 확인한 현행법령 적용 범위 밖입니다. 해당 시점 법령을 별도로 검토한 후 수동 반영해주세요.")
+    if evaluated > date.fromisoformat(LAW_BASE_DATE) and not law_changes_reviewed:
+        raise ValueError("법령 확인 기준일 이후 평가입니다. 평가기준일의 법령 변경 여부를 확인해주세요.")
+    if len(years) != 3 or len(set(years)) != 3 or years != sorted(years, reverse=True):
+        raise ValueError("주가평가 계산 탭에 최근 3개 사업연도를 최신순으로 설정해주세요.")
+    if years != [years[0], years[0] - 1, years[0] - 2]:
+        raise ValueError("최근 3개 사업연도는 누락 없이 연속되어야 합니다.")
+    if not candidates:
+        raise ValueError("반영할 사업연도를 선택해주세요.")
+    if any(item.get("identity_review_required") for item in candidates) and not identity_confirmed:
+        raise ValueError("복수 사업자번호 문서의 항목이 선택한 기업에 속하는지 확인해주세요.")
+    updates: dict[str, Any] = {}
+    reviewed = []
+    fiscal_end_patterns = set()
+    for candidate in candidates:
+        year = int(candidate["year"])
+        if year not in years:
+            raise ValueError("선택한 자료 연도가 현재 주가평가의 3개 사업연도와 일치하지 않습니다.")
+        period = reviewed_periods.get(year, {})
+        try:
+            start = date.fromisoformat(str(period.get("period_start", "")))
+            end = date.fromisoformat(str(period.get("period_end", "")))
+            anniversary = start.replace(year=start.year + 1)
+        except (ValueError, TypeError):
+            raise ValueError("원문에서 확인한 사업연도 시작일·종료일을 YYYY-MM-DD로 입력해주세요.") from None
+        if end.year != year or end >= evaluated or end < start:
+            raise ValueError("사업연도와 평가기준일의 선후관계를 확인해주세요.")
+        if end + timedelta(days=1) != anniversary:
+            raise ValueError("1년 미만·초과 사업연도는 연환산 등 별도 세법 검토 후 수동 반영해야 합니다.")
+        fiscal_end_patterns.add((end.month, end.day))
+        try:
+            current_year_end = date(evaluated.year, end.month, end.day)
+        except ValueError:
+            raise ValueError("결산일 변경·윤년 사업연도는 별도 검토 후 수동 반영해주세요.") from None
+        latest_completed_year = evaluated.year if current_year_end < evaluated else evaluated.year - 1
+        if years[0] != latest_completed_year:
+            raise ValueError("평가기준일 직전 완료된 최근 3개 사업연도인지 확인해주세요.")
+        for field in ("period_start", "period_end"):
+            original = candidate.get(field)
+            if original and str(original) != str(period.get(field)):
+                raise ValueError("입력한 사업연도 기간이 연결 원문의 기간과 다릅니다. 원문을 다시 확인해주세요.")
+        shares = _safe_number(period.get("expert_final_shares") if special_adjustments_reviewed else period.get("shares"))
+        if shares is None or shares <= 0 or not shares.is_integer():
+            raise ValueError("각 사업연도 말의 발행주식총수를 양의 정수로 입력해주세요.")
+        values = dict(reviewed_values.get(year, {}))
+        calculation = calculate_tax_adjusted_income(values)
+        if calculation.get("invalid"):
+            raise ValueError("가산·차감 대상 금액은 음수로 중복 차감하지 않도록 부호를 확인해주세요.")
+        if not calculation.get("complete") or calculation.get("adjusted_net_income") is None:
+            raise ValueError("미확인 법정 조정항목을 원문으로 확인해 입력해주세요. 해당 없음도 0원을 명시해야 합니다.")
+        if not special_adjustments_reviewed and any(
+            item.get("key") in {"capital_adjustment", "reserve_allocation"}
+            and item.get("value") not in (None, 0)
+            for item in calculation.get("components", [])
+        ):
+            raise ValueError(
+                "증감자 조정액 또는 일시환입 안분액이 있으면 전문가 검토 경로에서 "
+                "최종 순손익액·환산주식수와 검토 근거를 별도로 확인해야 합니다."
+            )
+        if special_adjustments_reviewed:
+            expert_income = _safe_number(period.get("expert_final_income"))
+            if expert_income is None or not expert_income.is_integer():
+                raise ValueError("전문가가 확정한 최종 순손익액을 원 단위 정수로 별도 입력해주세요.")
+            if int(expert_income) != calculation["adjusted_net_income"]:
+                raise ValueError("전문가 최종 순손익액과 위 법정 구성항목 합계가 다릅니다. 증감자 조정액 등을 다시 확인해주세요.")
+        sources = candidate.get("sources", [])
+        if not sources or any(not str(source.get("record_id", "")).strip() for source in sources):
+            raise ValueError("추적 가능한 원본 자료가 없어 자동 반영할 수 없습니다.")
+        index = years.index(year) + 1
+        updates[f"stock_net_income_{index}"] = _format_number(calculation["adjusted_net_income"])
+        updates[f"stock_shares_{index}"] = _format_number(shares)
+        reviewed.append({
+            "year": year, "period_start": start.isoformat(), "period_end": end.isoformat(),
+            "shares": int(shares), "values": values,
+            "source_year_end_shares": period.get("shares"),
+            "expert_final_income": period.get("expert_final_income") if special_adjustments_reviewed else None,
+            "expert_final_shares": period.get("expert_final_shares") if special_adjustments_reviewed else None,
+            "adjusted_net_income": calculation["adjusted_net_income"],
+            "sources": deepcopy(sources), "resolved_conflicts": list(candidate.get("conflicts", [])),
+        })
+    if len(reviewed) != len({row["year"] for row in reviewed}):
+        raise ValueError("동일 사업연도 자료를 중복 반영할 수 없습니다.")
+    if len(fiscal_end_patterns) > 1:
+        raise ValueError("결산일이 서로 다른 자료는 사업연도 변경 여부를 전문가가 확인해야 합니다.")
+    return updates, {
+        "business_no": _normalize_business_no(business_no), "valuation_date": evaluated.isoformat(),
+        "law_base_date": LAW_BASE_DATE, "reviewed_at": datetime.now().isoformat(timespec="seconds"),
+        "annual_rows": reviewed, "scope": "adjusted_income_and_year_end_shares_only",
+        "special_adjustments_reviewed": special_adjustments_reviewed,
+        "special_adjustment_note": str(special_adjustment_note).strip(),
+        "law_changes_reviewed": law_changes_reviewed,
+        "identity_confirmed": identity_confirmed,
+    }
+
+
+def _apply_reviewed_tax_adjustment(
+    updates: dict[str, Any], review: dict[str, Any], *, user_id: str,
+) -> None:
+    """Apply an already validated draft atomically and retain its provenance."""
+    if _normalize_business_no(st.session_state.get("stock_business_no", "")) != review["business_no"]:
+        raise ValueError("기업 선택이 변경되었습니다. 자료를 다시 확인해주세요.")
+    previous = {key: st.session_state.get(key) for key in updates}
+    history = list(st.session_state.get("stock_tax_adjustment_review", []) or [])
+    history.append({**deepcopy(review), "reviewed_by": user_id, "previous_inputs": previous})
+    st.session_state.update(updates)
+    st.session_state["stock_tax_adjustment_review"] = history
+    st.session_state.pop("stock_last_result", None)
+    st.session_state.pop("stock_last_inputs", None)
+    st.session_state["stock_tax_adjustment_applied_message"] = (
+        f"검토한 {len(review['annual_rows'])}개 사업연도의 순손익액·연도 말 주식수를 반영했습니다. "
+        "주가평가를 다시 계산한 후 ‘평가자료 저장’을 눌러 반영 근거와 함께 저장해주세요."
+    )
+
+
+def _render_stock_tax_adjustment(user_id: str) -> None:
+    from enterprise_documents import load_enterprise_document_context
+    from tax_adjustment_valuation import (
+        COMPONENTS, LAW_BASE_DATE, build_tax_adjustment_candidates, calculate_tax_adjusted_income,
+    )
+
+    st.markdown("### 세무조정계산서 반영")
+    st.caption(f"법령 확인 기준: {LAW_BASE_DATE} · 금액 단위: 원 · 원본자료는 변경하지 않습니다.")
+    st.info(
+        "각 사업연도소득에 상증세법 시행령 제56조의 가산·차감 항목을 반영합니다. "
+        "과세표준·회계상 당기순이익·법인세비용을 법정 순손익액으로 그대로 사용하지 않습니다."
+    )
+    business_no = _normalize_business_no(st.session_state.get("stock_business_no", ""))
+    if len(re.sub(r"\D", "", business_no)) != 10:
+        st.warning("기업컨설팅에서 자료를 연결한 기업을 먼저 선택해주세요.")
+        return
+    valuation_date = str(st.session_state.get("stock_valuation_date") or date.today().isoformat())
+    target_years = [str(st.session_state.get(f"stock_year_{index}", "")) for index in range(1, 4)]
+    st.caption("적용 대상: " + " / ".join(f"{year or '미설정'} 사업연도" for year in target_years))
+    st.caption("평가기준일·최근 3개 사업연도는 ‘주가평가 계산’ 탭에서 먼저 설정합니다. 일부 연도만 반영하면 나머지 입력값은 유지됩니다.")
+    try:
+        context = load_enterprise_document_context(
+            user_id, business_no, st.session_state.get("stock_company_name", ""),
+            include_remote_tax=True,
+        )
+        candidates = build_tax_adjustment_candidates(context.get("records", []), valuation_date)
+    except Exception as exc:
+        st.error(safe_public_error(exc, "연결된 세무조정 자료를 불러오지 못했습니다."))
+        return
+    if not candidates:
+        st.info("반영할 사업연도가 확인된 세무조정계산서가 없습니다. 기업정보등록에서 자료를 올리고 사업연도를 확인해주세요.")
+        return
+    year_map = {int(item["year"]): item for item in candidates}
+    years = sorted(year_map, reverse=True)
+    scope = f"{user_id}:{business_no}"
+    selected_years = st.multiselect(
+        "반영할 사업연도 선택", years, default=[], key=f"stock_tax_years:{scope}",
+        format_func=lambda year: f"{year} 사업연도",
+    )
+    if not selected_years:
+        st.caption("자료를 검토할 사업연도를 선택하세요. 업로드만으로 기존 평가값이 바뀌지 않습니다.")
+        return
+    selected = [year_map[year] for year in sorted(selected_years, reverse=True)]
+    revision = "|".join(
+        str(source.get("record_id", "")) + str(source.get("uploaded_at", ""))
+        for candidate in selected for source in candidate.get("sources", [])
+    )
+    import hashlib
+    token = hashlib.sha256((
+        scope + revision + repr(selected_years) + valuation_date + repr(target_years)
+        + repr([(item.get("values"), item.get("period_start"), item.get("period_end"), item.get("identity_review_required")) for item in selected])
+    ).encode()).hexdigest()[:16]
+    component_labels = {item["key"]: item["label"] for item in COMPONENTS}
+    for candidate in selected:
+        with st.expander(f"{candidate['year']} 사업연도 · 원본 및 추출 근거", expanded=False):
+            st.dataframe(pd.DataFrame(candidate.get("sources", [])), hide_index=True, use_container_width=True)
+            for warning in candidate.get("warnings", []):
+                st.warning(str(warning))
+            if candidate.get("conflicts"):
+                st.warning("충돌·중복 확인: " + ", ".join(component_labels.get(key, key) for key in candidate["conflicts"]))
+            evidence_rows = []
+            source_ids = {source.get("record_id") for source in candidate.get("sources", [])}
+            for record in context.get("records", []):
+                if record.get("record_id") not in source_ids:
+                    continue
+                for period in (record.get("extracted_fields") or {}).get("valuation_periods", []):
+                    if str(period.get("year")) != str(candidate["year"]):
+                        continue
+                    for key, value in period.get("values", {}).items():
+                        evidence = period.get("evidence", {}).get(key, [])
+                        evidence_rows.append({
+                            "원본": record.get("filename", ""), "항목": component_labels.get(key, key),
+                            "추출금액(원)": _format_number(value),
+                            "인식 근거": "; ".join(f"{item.get('line', '?')}행 · {item.get('unit', '단위 미확인')}" for item in evidence),
+                        })
+            if evidence_rows:
+                st.dataframe(pd.DataFrame(evidence_rows), hide_index=True, use_container_width=True)
+            financial = candidate.get("financial_fields", {})
+            if financial:
+                st.dataframe(pd.DataFrame([{"참고항목": key, "금액": _format_number(value)} for key, value in financial.items()]), hide_index=True, use_container_width=True)
+    st.warning(
+        "공란은 0원이 아닙니다. 원문을 확인해 모든 법정 항목을 입력하고, 해당 없음은 0을 명시하세요. "
+        "동일 연도 자료 간 충돌은 원문을 대조해 직접 해결해야 합니다."
+    )
+    st.caption(
+        "차감세액 합계는 회계상 법인세비용이나 결정세액 한 항목이 아닙니다. "
+        "시행령 제56조제4항제2호가목의 법인세액, 해당 외국법인세액, 법인세 감면액, "
+        "과세표준에 부과되는 농어촌특별세액 및 지방소득세액을 원문과 대조해 검토합니다."
+    )
+    component_rows = []
+    for component in COMPONENTS:
+        row = {"법정 항목": component["label"], "법령": component["legal_ref"]}
+        for candidate in selected:
+            row[str(candidate["year"])] = _format_number(candidate.get("values", {}).get(component["key"]))
+        component_rows.append(row)
+    edited_components = st.data_editor(
+        pd.DataFrame(component_rows), hide_index=True, use_container_width=True,
+        disabled=["법정 항목", "법령"], key=f"stock_tax_components:{token}",
+    )
+    st.markdown("#### 사업연도·연도 말 발행주식수 확인")
+    period_rows = []
+    for candidate in selected:
+        year = str(candidate["year"])
+        index = target_years.index(year) + 1 if year in target_years else None
+        period_rows.append({
+            "사업연도": year, "시작일": candidate.get("period_start") or "",
+            "종료일": candidate.get("period_end") or "",
+            "연도 말·법정 환산 주식수": str(st.session_state.get(f"stock_shares_{index}", "")) or "" if index else "",
+        })
+    edited_periods = st.data_editor(
+        pd.DataFrame(period_rows), hide_index=True, use_container_width=True,
+        disabled=["사업연도"], key=f"stock_tax_periods:{token}",
+    )
+    values_by_year = {
+        int(candidate["year"]): {component["key"]: edited_components.iloc[index][str(candidate["year"])] for index, component in enumerate(COMPONENTS)}
+        for candidate in selected
+    }
+    periods_by_year = {
+        int(row["사업연도"]): {"period_start": row["시작일"], "period_end": row["종료일"], "shares": row["연도 말·법정 환산 주식수"]}
+        for _, row in edited_periods.iterrows()
+    }
+    preview = []
+    for candidate in selected:
+        calculation = calculate_tax_adjusted_income(values_by_year[int(candidate["year"])])
+        preview.append({"사업연도": candidate["year"], "조정 후 순손익액": _format_number(calculation.get("adjusted_net_income")), "미확인 항목 수": len(calculation.get("missing", [])), "부호 확인 항목 수": len(calculation.get("invalid", []))})
+    st.dataframe(pd.DataFrame(preview), hide_index=True, use_container_width=True)
+    st.caption("과거 재무상태표의 총자산·총부채는 참고만 표시합니다. 평가기준일 현재 자산 시가·부채 조정과 영업권은 계산 탭에서 별도로 검토합니다.")
+    reviewed = st.checkbox(
+        "원문·연결 기업·각 사업연도소득·모든 법정 가산차감 항목과 충돌 내용을 확인했습니다.",
+        key=f"stock_tax_review:{token}",
+    )
+    special_review = st.selectbox(
+        "사업연도·증감자 등 특수 조정 검토", [
+            "검토 상태를 선택하세요",
+            "12개월 사업연도이며 증감자·일시 환입 등 별도 조정 사유 없음",
+            "증감자 환산·순손익 조정의 전문가 검토 완료",
+        ], key=f"stock_tax_special:{token}",
+    )
+    normal_periods = special_review == "12개월 사업연도이며 증감자·일시 환입 등 별도 조정 사유 없음"
+    expert_reviewed = special_review == "증감자 환산·순손익 조정의 전문가 검토 완료"
+    expert_note = ""
+    if expert_reviewed:
+        st.warning("이 화면은 증감자 산식을 자동 계산하지 않습니다. 위 금액과 주식수를 법정 조정이 완료된 값으로 직접 수정해야 합니다. 1년 미만·초과 사업연도는 이 반영 기능을 사용하지 않고 별도 연환산 검토 후 계산 탭에 수동 입력합니다.")
+        expert_note = st.text_area("전문가 검토 근거 · 필수", key=f"stock_tax_expert_note:{token}", placeholder="증자일·납입가액·환산주식수·월할 계산·연환산 등 검토 근거와 확인자를 기록하세요.")
+        final_review = st.data_editor(
+            pd.DataFrame([{"사업연도": str(item["year"]), "전문가 최종 순손익액(원)": "", "전문가 확정 환산주식수": ""} for item in selected]),
+            hide_index=True, use_container_width=True, disabled=["사업연도"], key=f"stock_tax_final_review:{token}",
+        )
+        for _, row in final_review.iterrows():
+            periods_by_year[int(row["사업연도"])].update({
+                "expert_final_income": row["전문가 최종 순손익액(원)"],
+                "expert_final_shares": row["전문가 확정 환산주식수"],
+            })
+        st.caption("전문가 최종 순손익액은 위 법정 구성항목 합계와 일치해야 합니다. 빈 확정값은 자동으로 채우지 않습니다.")
+    identity_reviewed = False
+    if any(item.get("identity_review_required") for item in selected):
+        identity_reviewed = st.checkbox(
+            "복수 사업자번호가 포함된 원문에서 선택 기업에 속하는 사업연도와 금액만 추출되었음을 확인했습니다.",
+            key=f"stock_tax_identity:{token}",
+        )
+    law_reviewed = False
+    if valuation_date > LAW_BASE_DATE:
+        law_reviewed = st.checkbox(
+            f"법령 확인 기준일({LAW_BASE_DATE}) 이후 평가기준일까지의 법령 변경 여부와 적용요건을 확인했습니다.",
+            key=f"stock_tax_law_review:{token}",
+        )
+    st.caption(
+        "최근 3개 사업연도 선정과 연도 말 주식수를 확인하세요. 증감자 조정액 또는 일시환입 안분액이 "
+        "0원이 아니면 전문가 검토가 필수입니다. 특수 조정은 자동 판단하지 않으며, 검토 근거를 평가자료와 함께 저장합니다."
+    )
+    can_apply = reviewed and (normal_periods or (expert_reviewed and bool(expert_note.strip())))
+    if valuation_date > LAW_BASE_DATE:
+        can_apply = can_apply and law_reviewed
+    if any(item.get("identity_review_required") for item in selected):
+        can_apply = can_apply and identity_reviewed
+    if st.button("검토한 순손익액·주식수 반영", type="primary", use_container_width=True, disabled=not can_apply, key=f"stock_tax_apply:{token}"):
+        try:
+            updates, review = _prepare_tax_adjustment_application(
+                business_no=business_no, valuation_date=valuation_date, target_years=target_years,
+                candidates=selected, reviewed_values=values_by_year, reviewed_periods=periods_by_year,
+                review_confirmed=reviewed, normal_periods_confirmed=normal_periods,
+                special_adjustments_reviewed=expert_reviewed, special_adjustment_note=expert_note,
+                law_changes_reviewed=law_reviewed,
+                identity_confirmed=identity_reviewed,
+            )
+            _apply_reviewed_tax_adjustment(updates, review, user_id=user_id)
+        except ValueError as exc:
+            st.error(str(exc))
+        except Exception as exc:
+            st.error(safe_public_error(exc, "세무조정계산서 반영을 완료하지 못했습니다."))
+        else:
+            st.success(st.session_state["stock_tax_adjustment_applied_message"])
+    st.markdown("[순손익액·주식수 법령: 상속세 및 증여세법 시행령 제56조](https://www.law.go.kr/법령/상속세및증여세법시행령/제56조)")
+
+
 def render_stock_valuation_page(
     user_id: str,
     user_name: str = "",
@@ -1499,6 +1842,17 @@ def render_stock_valuation_page(
         selected_business_no=selected_business_no,
         selected_company_name=selected_company_name,
     )
+
+    view = st.radio(
+        "주가평가 세부 탭", ["주가평가 계산", "세무조정계산서 반영"], horizontal=True,
+        key="stock_valuation_detail_view", label_visibility="collapsed",
+    )
+    if view == "세무조정계산서 반영":
+        _render_stock_tax_adjustment(user_id)
+        return
+    applied_message = st.session_state.get("stock_tax_adjustment_applied_message", "")
+    if applied_message:
+        st.success(applied_message)
 
     with st.form(
         "stock_valuation_input_form_v855",
@@ -1570,10 +1924,16 @@ def render_stock_valuation_page(
             )
 
         st.markdown("### 2. 최근 3개년 순손익액")
-        st.warning(
-            "자동 입력값은 회계상 당기순이익입니다. "
-            "상증세법상 가산·차감 조정을 반영한 순손익액으로 직접 수정해주세요."
-        )
+        if st.session_state.get("stock_tax_adjustment_review"):
+            st.info(
+                "세무조정계산서 검토 반영 이력이 있습니다. 반영하지 않은 연도와 직접 수정한 값은 "
+                "별도로 재확인하고, 평가자료를 저장하면 원본 연결·검토 근거도 함께 보존합니다."
+            )
+        else:
+            st.warning(
+                "자동 입력값은 회계상 당기순이익입니다. "
+                "상증세법상 가산·차감 조정을 반영한 순손익액으로 직접 수정해주세요."
+            )
 
         current_year = datetime.now().year - 1
         annual_rows = []
@@ -1819,6 +2179,7 @@ def render_stock_valuation_page(
             "nav_floor_rate": nav_floor_pct / 100,
             "premium_exempt": premium_exempt,
             "premium_rate": premium_pct / 100,
+            "tax_adjustment_review": deepcopy(st.session_state.get("stock_tax_adjustment_review", [])),
         }
 
         capital_number = _safe_number(capital_text)
