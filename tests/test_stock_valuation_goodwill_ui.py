@@ -23,7 +23,7 @@ def _valuation_app(legacy=False):
 
     stock._read_customers = lambda _: pd.DataFrame()
     stock._load_stock_customer_context = lambda *args, **kwargs: None
-    stock._load_records = lambda _: []
+    stock._load_records = lambda _, **kw: []
     stock._save_records = lambda _, records: st.session_state.__setitem__("test_saved_records", records)
     stock.sync_stock_valuation = lambda *args: True
     stock._render_stock_history = lambda _: None

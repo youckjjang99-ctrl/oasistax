@@ -34,16 +34,20 @@ def test_articles_result_survives_rerun_and_discloses_attachment_failure(monkeyp
     monkeypatch.setattr(articles_review.st, "file_uploader", lambda *a, **kw: file)
     monkeypatch.setattr(articles_review, "extract_articles_text", Mock(return_value=("검토용 정관 조항 " * 30, {})))
     monkeypatch.setattr(articles_review, "analyze_articles", Mock(return_value={"score": 90}))
-    saved = Mock()
+    saved = Mock(return_value={"history_storage_status": {"cloud_saved": True}})
     monkeypatch.setattr(articles_review, "save_articles_review", saved)
     monkeypatch.setattr(articles_review, "get_latest_articles_review", lambda *a: {})
-    attachment = Mock(side_effect=RuntimeError("synthetic failure") if attachment_failure else None)
+    attachment = Mock(
+        side_effect=RuntimeError("synthetic failure") if attachment_failure else None,
+        return_value={"asset_storage_status": {"cloud_saved": True, "metadata_saved": True},
+                      "history_storage_status": {"cloud_saved": True}},
+    )
     monkeypatch.setattr(enterprise_documents, "register_enterprise_document_bytes", attachment)
     app = AppTest.from_string(
         "from articles_review import render_articles_review\n"
         f"render_articles_review('test-user', {BUSINESS!r}, '검증용 기업')\n"
     ).run()
-    app.button(key=f"articles_analyze_{BUSINESS}").click().run()
+    app.button(key=f"articles_analyze_test-user_{articles_review._normalize_business_no(BUSINESS)}").click().run()
     assert not app.exception
     saved.assert_called_once()
     attachment.assert_called_once()
@@ -92,7 +96,10 @@ def employee_app(monkeypatch):
     monkeypatch.setattr(employee_status, "parse_roster", Mock(return_value=([{}], {})))
     monkeypatch.setattr(employee_status, "_employees_to_review_rows", lambda *a, **kw: [employee_review_row()])
     monkeypatch.setattr(employee_status, "load_employee_versions", lambda *a, **kw: [])
-    monkeypatch.setattr(enterprise_documents, "register_enterprise_document_bytes", Mock())
+    monkeypatch.setattr(enterprise_documents, "register_enterprise_document_bytes", Mock(return_value={
+        "asset_storage_status": {"cloud_saved": True, "metadata_saved": True},
+        "history_storage_status": {"cloud_saved": True},
+    }))
     monkeypatch.setattr(employee_status, "_review_rows_to_employees", lambda *a: ([{"name_masked": "검*"}], []))
     return AppTest.from_string(
         "from employee_status import render_employee_status\n"
@@ -105,7 +112,7 @@ def test_employee_review_and_save_keep_cloud_outcomes_distinct(monkeypatch, empl
     saved = Mock(return_value=({}, "로컬·Supabase 저장" if cloud_saved else "로컬 저장"))
     monkeypatch.setattr(employee_status, "save_employee_roster", saved)
     app = employee_app
-    app.button(key=f"employee_roster_analyze_{BUSINESS}").click().run()
+    app.button(key=f"employee_roster_analyze_test-user_{employee_status._normalize_business_no(BUSINESS)}").click().run()
     assert not app.exception
     assert "직원현황은 아직 저장 전" in card_text(app)
     saved.assert_not_called()
@@ -120,11 +127,11 @@ def test_employee_review_and_save_keep_cloud_outcomes_distinct(monkeypatch, empl
 def test_employee_failed_save_preserves_review_for_retry(monkeypatch, employee_app):
     monkeypatch.setattr(employee_status, "save_employee_roster", Mock(side_effect=RuntimeError("synthetic failure")))
     app = employee_app
-    app.button(key=f"employee_roster_analyze_{BUSINESS}").click().run()
+    app.button(key=f"employee_roster_analyze_test-user_{employee_status._normalize_business_no(BUSINESS)}").click().run()
     next(button for button in app.button if button.label == "검수 완료 후 직원현황 저장").click().run()
     assert not app.exception
     assert "직원현황을 저장하지 못했습니다" in card_text(app)
-    state_key = f"employee_roster_review_{employee_status._company_key(BUSINESS, '검증용 기업')}"
+    state_key = f"employee_roster_review_test-user_{employee_status._normalize_business_no(BUSINESS)}"
     assert app.session_state[state_key]["rows"]
 
 

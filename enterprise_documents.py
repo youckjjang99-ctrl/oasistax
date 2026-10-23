@@ -63,7 +63,19 @@ def _load_records(user_id: str) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        def unique_object(pairs):
+            value = {}
+            for key, item in pairs:
+                if key in value:
+                    raise ValueError("duplicate metadata key")
+                value[key] = item
+            return value
+
+        def invalid_constant(value):
+            raise ValueError("invalid metadata constant")
+
+        value = json.loads(path.read_text(encoding="utf-8"),
+                           object_pairs_hook=unique_object, parse_constant=invalid_constant)
     except Exception as exc:
         raise EnterpriseDocumentCorruptionError(
             "기업 첨부자료 목록을 읽지 못했습니다. 기존 파일은 덮어쓰지 않았습니다."
@@ -86,17 +98,97 @@ def _save_records(user_id: str, records: list[dict[str, Any]]) -> None:
     os.replace(temp, path)
 
 
+def _preserve_document_fields(previous: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    """Merge one original's analysis without clearing previously read fields."""
+    from copy import deepcopy
+
+    result = deepcopy(previous)
+    for name, value in incoming.items():
+        if isinstance(value, dict) and isinstance(result.get(name), dict):
+            result[name] = _preserve_document_fields(result[name], value)
+        elif value is not None and value != "" and value != [] and value != {}:
+            result[name] = deepcopy(value)
+    return result
+
+
 def _save_record(user_id: str, record: dict[str, Any]) -> dict[str, Any]:
-    records = _load_records(user_id)
+    from copy import deepcopy
+    from crm_file_store import atomic_write_json, locked_json
+
+    owner = str(user_id or "").strip()
     record_id = str(record.get("record_id", ""))
-    for index, existing in enumerate(records):
-        if str(existing.get("record_id", "")) == record_id:
-            records[index] = {**existing, **record}
-            _save_records(user_id, records)
-            return records[index]
-    records.insert(0, record)
-    _save_records(user_id, records)
-    return record
+    if not owner or not record_id:
+        raise ValueError("자료를 저장할 사용자와 자료 식별정보가 필요합니다.")
+
+    def revision(data):
+        values = {name: deepcopy(data.get(name, {} if name == "extracted_fields" else ""))
+                  for name in ("extracted_fields", "note", "analysis_summary")}
+        digest = hashlib.sha256(json.dumps(values, sort_keys=True, ensure_ascii=False,
+                                           default=str).encode("utf-8")).hexdigest()[:16]
+        return {**values, "revision": digest, "uploaded_at": data.get("uploaded_at", "")}
+
+    path = _metadata_path(user_id)
+    with locked_json(path):
+        records = _load_records(user_id)
+        positions = [index for index, item in enumerate(records)
+                     if str(item.get("record_id", "")) == record_id]
+        if len(positions) > 1:
+            raise EnterpriseDocumentCorruptionError("같은 자료의 식별정보가 중복되어 원본을 보존하고 저장을 중단했습니다.")
+        existing = records[positions[0]] if positions else {}
+        for value in (existing, record):
+            if any(value.get(name) and str(value[name]) != owner
+                   for name in ("owner_user_id", "user_id")):
+                raise EnterpriseDocumentCorruptionError("자료 소유자가 일치하지 않아 기존 자료를 변경하지 않았습니다.")
+            fields = value.get("extracted_fields", {})
+            if not isinstance(fields, dict):
+                raise EnterpriseDocumentCorruptionError("추출정보 형식이 올바르지 않아 기존 자료를 변경하지 않았습니다.")
+            business = _normalize_business_no(value.get("business_no"))
+            if any(_normalize_business_no(fields.get(name)) not in {"", business}
+                   for name in ("사업자등록번호", "사업자번호", "business_no")):
+                raise EnterpriseDocumentCorruptionError("선택한 기업과 추출정보의 기업이 달라 기존 자료를 변경하지 않았습니다.")
+        for name in ("business_no", "document_type", "sha256"):
+            before, after = existing.get(name), record.get(name)
+            if name == "business_no":
+                before, after = _normalize_business_no(before), _normalize_business_no(after)
+            if before and after and before != after:
+                raise EnterpriseDocumentCorruptionError("기존 자료의 기업·문서 식별정보가 달라 덮어쓰지 않았습니다.")
+        merged = deepcopy(existing)
+        for name, value in deepcopy(record).items():
+            if name in {"note", "analysis_summary", "extracted_fields"} and not value:
+                continue  # Re-registration without analysis must not clear prior work.
+            if name == "extracted_fields":
+                merged[name] = _preserve_document_fields(existing.get(name, {}), value)
+            else:
+                merged[name] = value
+        merged["owner_user_id"] = owner
+        merged["first_uploaded_at"] = (existing.get("first_uploaded_at")
+                                       or existing.get("uploaded_at") or merged.get("uploaded_at", ""))
+        versions = deepcopy(existing.get("analysis_versions", []))
+        if not isinstance(versions, list) or any(not isinstance(item, dict) for item in versions):
+            raise EnterpriseDocumentCorruptionError("기존 자료의 분석이력 형식을 확인하지 못해 저장을 중단했습니다.")
+        for candidate in (existing, merged):
+            if not candidate:
+                continue
+            item = revision(candidate)
+            if not any(version.get("revision") == item["revision"] for version in versions):
+                versions.append(item)
+        merged["analysis_versions"] = versions
+        merged["metadata_revision"] = revision(merged)["revision"]
+        originals = deepcopy(existing.get("original_files", []))
+        if not isinstance(originals, list) or any(not isinstance(item, dict) for item in originals):
+            raise EnterpriseDocumentCorruptionError("기존 원본파일 이력 형식을 확인하지 못해 저장을 중단했습니다.")
+        for candidate in (existing, merged):
+            local_path = str(candidate.get("local_path", "") or "")
+            if local_path and not any(item.get("local_path") == local_path for item in originals):
+                originals.append({name: candidate.get(name, "")
+                                  for name in ("local_path", "filename", "sha256", "size_bytes")})
+        merged["original_files"] = originals
+        if positions:
+            records[positions[0]] = merged
+        else:
+            records.insert(0, merged)
+        atomic_write_json(path, records)
+    return deepcopy(merged)
 
 
 def register_enterprise_document_bytes(
@@ -112,6 +204,11 @@ def register_enterprise_document_bytes(
     analysis_summary: str = "",
     extracted_fields: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    from crm_file_store import locked_json
+
+    owner = str(user_id or "").strip()
+    if not owner:
+        raise ValueError("자료를 등록할 사용자 정보가 필요합니다.")
     normalized = _normalize_business_no(business_no)
     if not normalized:
         raise ValueError("첨부자료를 연결할 올바른 사업자등록번호가 필요합니다.")
@@ -131,56 +228,90 @@ def register_enterprise_document_bytes(
         / "enterprise_documents" / business_key / document_type
     )
     directory.mkdir(parents=True, exist_ok=True)
-    existing = next(
-        (item for item in _load_records(user_id)
-         if str(item.get("record_id", "")) == record_id
-         and Path(str(item.get("local_path", ""))).is_file()),
-        None,
-    )
-    if existing:
-        target = Path(str(existing["local_path"]))
-    else:
-        target = directory / (
-            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{record_id[:8]}_{safe_name}"
-        )
-        target.write_bytes(content)
+    with locked_json(_metadata_path(user_id)):
+        existing = next((item for item in _load_records(user_id)
+                         if str(item.get("record_id", "")) == record_id), None)
+        target = None
+        if existing:
+            previous = Path(str(existing.get("local_path", "")))
+            try:
+                if (previous.resolve().is_relative_to(directory.resolve()) and previous.is_file()
+                        and hashlib.sha256(previous.read_bytes()).hexdigest() == checksum):
+                    target = previous
+            except OSError:
+                pass  # Preserve inaccessible/changed originals; save a separate verified copy.
+        if target is None:
+            target = directory / (
+                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{record_id[:8]}_{uuid.uuid4().hex[:8]}_{safe_name}"
+            )
+            with target.open("xb") as output:
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+        saved_at = datetime.now().isoformat(timespec="microseconds")
+        saved = _save_record(user_id, {
+            "record_id": record_id,
+            "owner_user_id": str(user_id).strip(),
+            "business_no": normalized,
+            "company_name": _clean(company_name),
+            "customer_id": _clean(customer_id),
+            "document_type": document_type,
+            "document_label": DOCUMENT_TYPES[document_type],
+            "filename": safe_name,
+            "local_path": str(target),
+            "sha256": checksum,
+            "size_bytes": len(content),
+            "note": _clean(note),
+            "analysis_summary": _clean(analysis_summary),
+            "extracted_fields": dict(extracted_fields or {}),
+            "uploaded_at": saved_at,
+        })
+    # All material types share the same private-original path, including the
+    # specialized registry/employee/articles screens. Never delete a local copy
+    # or claim cloud success when either object or metadata preservation fails.
+    try:
+        from customer_asset_storage import store_private_customer_asset
 
-    saved_at = datetime.now().isoformat(timespec="seconds")
-    saved = _save_record(user_id, {
-        "record_id": record_id,
-        "business_no": normalized,
-        "company_name": _clean(company_name),
-        "customer_id": _clean(customer_id),
-        "document_type": document_type,
-        "document_label": DOCUMENT_TYPES[document_type],
-        "filename": safe_name,
-        "local_path": str(target),
-        "sha256": checksum,
-        "size_bytes": len(content),
-        "note": _clean(note),
-        "analysis_summary": _clean(analysis_summary),
-        "extracted_fields": dict(extracted_fields or {}),
-        "uploaded_at": saved_at,
-    })
+        stored = store_private_customer_asset(
+            saved["local_path"], owner_user_id=owner,
+            asset_type="enterprise_document", customer_id=_clean(customer_id) or None,
+            source_type=f"enterprise_document:{document_type}", source_id=record_id,
+        )
+        storage_status = stored.as_dict()
+    except Exception:
+        storage_status = {"local_preserved": True, "cloud_enabled": True,
+                          "cloud_saved": False, "metadata_saved": False,
+                          "degraded": True, "error_code": "private_original_unconfirmed"}
+    update = {"record_id": record_id, "asset_storage_status": storage_status}
+    if storage_status.get("cloud_saved") and storage_status.get("metadata_saved") and storage_status.get("asset_id"):
+        update["asset_id"] = str(storage_status["asset_id"])
+    saved = _save_record(user_id, update)
     analysis_revision = hashlib.sha256(json.dumps(
-        extracted_fields or {}, sort_keys=True, ensure_ascii=False, default=str,
+        saved.get("extracted_fields", {}), sort_keys=True, ensure_ascii=False, default=str,
     ).encode("utf-8")).hexdigest()[:12]
     history_result = save_customer_event(
         user_id, normalized, company_name,
-        event_id=f"enterprise-document-{record_id}-{analysis_revision}",
+        event_id=f"enterprise-document-{record_id}-{saved['metadata_revision']}",
         event_title=f"{DOCUMENT_TYPES[document_type]} 등록",
-        event_detail=analysis_summary or note or "기업 첨부자료를 등록했습니다.",
+        event_detail=saved.get("analysis_summary") or saved.get("note") or "기업 첨부자료를 등록했습니다.",
         occurred_at=saved_at,
         source=f"enterprise_document:{document_type}",
         history_type="기업자료",
         extra_data={
             "문서유형": document_type,
             "문서명": DOCUMENT_TYPES[document_type],
-            "분석요약": _clean(analysis_summary),
-            "추출정보": dict(extracted_fields or {}),
+            "분석요약": saved.get("analysis_summary", ""),
+            "추출정보": dict(saved.get("extracted_fields", {})),
+            "자료메모": saved.get("note", ""),
             "파일명": safe_name,
             "자료ID": record_id,
             "분석버전": analysis_revision,
+            "자료버전": saved["metadata_revision"],
+            "원본SHA256": checksum,
+            "원본크기": len(content),
+            "최초등록일": saved.get("first_uploaded_at", saved_at),
+            "클라우드원본ID": saved.get("asset_id", ""),
+            "원본보관상태": dict(saved.get("asset_storage_status", {})),
         },
         return_status=True,
     )
@@ -194,9 +325,12 @@ def register_existing_enterprise_document(
     document_type: str, customer_id: str = "", note: str = "",
     analysis_summary: str = "", extracted_fields: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    source = Path(local_path)
+    source = Path(local_path).resolve()
+    root = Path(get_user_dirs(user_id)["base"]).resolve()
+    if not str(user_id or "").strip() or not source.is_relative_to(root):
+        raise PermissionError("현재 사용자의 자료 보관 영역 안에 있는 파일만 등록할 수 있습니다.")
     if not source.is_file():
-        raise FileNotFoundError(str(source))
+        raise FileNotFoundError("등록할 원본파일을 확인하지 못했습니다.")
     return register_enterprise_document_bytes(
         user_id, business_no, company_name, document_type,
         source.name, source.read_bytes(), customer_id=customer_id, note=note,
@@ -277,20 +411,59 @@ def analyze_rnd_certificate_text(text: str) -> dict[str, Any]:
 def load_enterprise_document_context(
     user_id: str, business_no: str, company_name: str = "",
     *, include_remote_tax: bool = False,
+    include_remote_types: tuple[str, ...] = (),
 ) -> dict[str, Any]:
+    from copy import deepcopy
+    from datetime import timezone
+
     normalized = _normalize_business_no(business_no)
-    records = [dict(item) for item in _load_records(user_id)
-               if _normalize_business_no(item.get("business_no", "")) == normalized]
+    owner = str(user_id or "").strip()
+    if not owner or not normalized:
+        return {"business_no": normalized, "company_name": _clean(company_name),
+                "records": [], "latest_by_type": {}, "financial_fields": {},
+                "rnd_fields": {}, "combined_text": ""}
+    records = [deepcopy(item) for item in _load_records(user_id)
+               if normalized and _normalize_business_no(item.get("business_no", "")) == normalized
+               and not any(item.get(name) and str(item[name]) != owner
+                           for name in ("owner_user_id", "user_id"))
+               and isinstance(item.get("extracted_fields", {}), dict)
+               and not any(_normalize_business_no(item.get("extracted_fields", {}).get(name)) not in {"", normalized}
+                           for name in ("사업자등록번호", "사업자번호", "business_no"))]
+    remote_types = set(include_remote_types).intersection(DOCUMENT_TYPES)
+    history = []
     if include_remote_tax:
-        # Read shared history only when the tax-review panel is explicitly opened.
-        # Do not add an extra cloud query to ordinary navigation.
+        remote_types.add("tax_adjustment")
+
+    def timestamp(value):
+        try:
+            parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+            return (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).timestamp()
+        except (ValueError, TypeError, OverflowError):
+            return float("-inf")
+
+    def version(data):
+        values = {name: deepcopy(data.get(name, {} if name == "extracted_fields" else ""))
+                  for name in ("extracted_fields", "note", "analysis_summary")}
+        digest = hashlib.sha256(json.dumps(values, sort_keys=True, ensure_ascii=False,
+                                           default=str).encode("utf-8")).hexdigest()[:16]
+        return {**values, "revision": digest, "uploaded_at": data.get("uploaded_at", "")}
+
+    if owner and normalized and remote_types:
+        # Explicit panels may restore all material types from the existing
+        # owner+business-scoped server loader. Ordinary navigation stays local.
         from customer_history import get_customer_history
         positions = {str(item.get("record_id", "")): index for index, item in enumerate(records)}
-        for event in get_customer_history(user_id, normalized):
+        history = (get_customer_history(user_id, normalized, limit=None)
+                   if include_remote_types else get_customer_history(user_id, normalized))
+        for event in history:
+            if not isinstance(event, dict):
+                continue
             if _normalize_business_no(event.get("business_no", "")) != normalized:
                 continue
+            if any(event.get(name) and str(event[name]) != owner for name in ("owner_user_id", "user_id")):
+                continue
             data = event.get("data", {})
-            if not isinstance(data, dict) or data.get("문서유형") != "tax_adjustment":
+            if not isinstance(data, dict) or data.get("문서유형") not in remote_types:
                 continue
             record_id = str(data.get("자료ID", ""))
             if not record_id:
@@ -298,24 +471,61 @@ def load_enterprise_document_context(
             fields = data.get("추출정보", {})
             if not isinstance(fields, dict):
                 continue
+            if any(
+                _normalize_business_no(fields.get(name))
+                and _normalize_business_no(fields.get(name)) != normalized
+                for name in ("사업자등록번호", "사업자번호", "business_no")
+            ):
+                continue
+            document_type = data["문서유형"]
             remote_record = {
                 "record_id": record_id, "business_no": normalized,
-                "document_type": "tax_adjustment", "document_label": "세무조정계산서",
+                "owner_user_id": owner,
+                "document_type": document_type, "document_label": DOCUMENT_TYPES[document_type],
                 "filename": str(data.get("파일명", "")),
                 "uploaded_at": str(event.get("captured_at", "")),
-                "extracted_fields": fields, "local_path": "",
+                "first_uploaded_at": str(data.get("최초등록일") or event.get("captured_at", "")),
+                "extracted_fields": deepcopy(fields), "local_path": "",
+                "analysis_summary": _clean(data.get("분석요약", "")),
+                "note": _clean(data.get("자료메모", "")),
+                "sha256": str(data.get("원본SHA256", "")),
+                "size_bytes": data.get("원본크기", 0),
+                "asset_id": str(data.get("클라우드원본ID", "")),
+                "asset_storage_status": deepcopy(data.get("원본보관상태", {})),
             }
             if record_id in positions:
                 index = positions[record_id]
-                # A newer analysis from another device must not be hidden by an
-                # older local copy. Preserve the local original, not stale fields.
                 existing = records[index]
-                if remote_record["uploaded_at"].replace("T", " ") > str(existing.get("uploaded_at", "")).replace("T", " "):
-                    records[index] = {**existing, **remote_record, "local_path": existing.get("local_path", "")}
+                if existing.get("document_type") != document_type:
+                    continue
+                if existing.get("sha256") and remote_record["sha256"] and existing["sha256"] != remote_record["sha256"]:
+                    continue
+                versions = deepcopy(existing.get("analysis_versions", []))
+                if not isinstance(versions, list):
+                    versions = []
+                for candidate in (existing, remote_record):
+                    item = version(candidate)
+                    if not any(value.get("revision") == item["revision"] for value in versions if isinstance(value, dict)):
+                        versions.append(item)
+                if timestamp(remote_record["uploaded_at"]) > timestamp(existing.get("uploaded_at")):
+                    latest = {**existing, **remote_record, "local_path": existing.get("local_path", "")}
+                    for name in ("note", "analysis_summary", "sha256", "size_bytes", "asset_id", "asset_storage_status"):
+                        if not latest.get(name) and existing.get(name):
+                            latest[name] = deepcopy(existing[name])
+                    latest["extracted_fields"] = _preserve_document_fields(
+                        existing.get("extracted_fields", {}), remote_record["extracted_fields"],
+                    )
+                    records[index] = latest
+                records[index]["analysis_versions"] = versions
+                records[index]["first_uploaded_at"] = min(
+                    (existing.get("first_uploaded_at") or existing.get("uploaded_at", ""),
+                     remote_record["first_uploaded_at"]), key=timestamp,
+                )
             else:
                 positions[record_id] = len(records)
+                remote_record["analysis_versions"] = [version(remote_record)]
                 records.append(remote_record)
-    records.sort(key=lambda item: str(item.get("uploaded_at", "")), reverse=True)
+    records.sort(key=lambda item: timestamp(item.get("uploaded_at")), reverse=True)
     latest_by_type: dict[str, dict[str, Any]] = {}
     for item in records:
         latest_by_type.setdefault(str(item.get("document_type", "")), item)
@@ -334,6 +544,7 @@ def load_enterprise_document_context(
         "financial_fields": dict(tax.get("financial_fields", tax) or {}),
         "rnd_fields": dict(rnd.get("rnd_fields", rnd) or {}),
         "combined_text": " ".join(part for part in parts if part),
+        "source_history": history if include_remote_types else [],
     }
 
 
@@ -510,17 +721,23 @@ def process_enterprise_document_batch(
             if isinstance(record, dict) and record.get("local_path"):
                 from customer_asset_storage import store_private_customer_asset
                 try:
-                    stored = store_private_customer_asset(
-                        record["local_path"], owner_user_id=user_id,
-                        asset_type="enterprise_document", customer_id=_clean(customer.get("_customer_id", "")) or None,
-                        source_type=f"enterprise_document:{document_type}", source_id=record["record_id"],
-                    )
+                    stored_status = record.get("asset_storage_status")
+                    if not isinstance(stored_status, dict):
+                        # Compatibility for records from an older registration service.
+                        legacy_stored = store_private_customer_asset(
+                            record["local_path"], owner_user_id=user_id,
+                            asset_type="enterprise_document", customer_id=_clean(customer.get("_customer_id", "")) or None,
+                            source_type=f"enterprise_document:{document_type}", source_id=record["record_id"],
+                        )
+                        stored_status = (legacy_stored.as_dict() if hasattr(legacy_stored, "as_dict")
+                                         else {key: getattr(legacy_stored, key, False)
+                                               for key in ("cloud_saved", "metadata_saved", "cloud_enabled")})
                     history_saved = bool(record.get("history_storage_status", {}).get("cloud_saved"))
-                    if stored.cloud_saved and stored.metadata_saved and history_saved:
+                    if stored_status.get("cloud_saved") and stored_status.get("metadata_saved") and history_saved:
                         storage, storage_message = "cloud", "클라우드 원본 보관 확인 · 분석 결과는 기업 히스토리에서 확인"
-                    elif stored.cloud_saved and stored.metadata_saved:
+                    elif stored_status.get("cloud_saved") and stored_status.get("metadata_saved"):
                         storage, storage_message = "warning", "클라우드 원본 보관 확인 · 분석이력 클라우드 저장은 확인 필요"
-                    elif stored.cloud_enabled:
+                    elif stored_status.get("cloud_enabled"):
                         storage, storage_message = "warning", "로컬 보존 완료 · 클라우드 원본 보관 미완료"
                 except Exception:
                     storage, storage_message = "warning", "로컬 보존 완료 · 클라우드 원본 보관 확인 필요"
@@ -627,6 +844,9 @@ def render_enterprise_information_assets(user_id: str, user_name: str = "") -> N
     st.session_state["_oasis_active_company_name"] = company_name
 
     if st.toggle("이미 등록한 자료 현황 보기", key="enterprise_information_show_overview"):
+        from company_materials import render_company_materials
+
+        render_company_materials(user_id, business_no, company_name)
         metadata_mtime_ns, metadata_size = _enterprise_source_overview_revision(user_id)
         overview = _load_enterprise_source_overview_cached(
             user_id, business_no, company_name, metadata_mtime_ns, metadata_size,
@@ -656,7 +876,9 @@ def render_enterprise_information_assets(user_id: str, user_name: str = "") -> N
         render_saved_consultation_journals(user_id, business_no, company_name=company_name)
     elif document_type == "corporate_registry":
         from stock_valuation import render_registry_upload_for_customer
-        render_registry_upload_for_customer(user_id, business_no, company_name)
+        render_registry_upload_for_customer(
+            user_id, business_no, company_name, selected_customer=customer,
+        )
     elif document_type == "employee_roster":
         from employee_status import render_employee_status
         render_employee_status(

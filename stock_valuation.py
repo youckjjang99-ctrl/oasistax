@@ -145,12 +145,43 @@ def _load_financial_cache(user_id: str) -> dict[str, Any]:
 
 
 def _save_financial_cache(user_id: str, data: dict[str, Any]) -> None:
+    from crm_file_store import atomic_write_json, locked_json
+    import hashlib
+
     path = _financial_cache_path(user_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
-    )
+    with locked_json(path):
+        existing = {}
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(existing, dict) or any(not isinstance(value, dict) for value in existing.values()):
+                    raise ValueError("invalid cache")
+            except (OSError, ValueError):
+                raise ValueError("기존 재무자료를 확인하지 못해 저장을 중단했습니다. 원본은 보존했습니다.") from None
+        for business, incoming in data.items():
+            if not isinstance(incoming, dict):
+                raise ValueError("재무자료 형식을 확인해주세요. 원본은 변경하지 않았습니다.")
+            if _registry_snapshot_identity_conflicts(incoming, business):
+                raise ValueError("재무자료와 연결 기업의 식별번호가 다릅니다.")
+            previous = existing.get(business, {})
+            versions = []
+            seen = set()
+            for value in [*previous.get("_versions", []), previous, *incoming.get("_versions", []), incoming]:
+                if not isinstance(value, dict) or not value:
+                    continue
+                snapshot = {key: deepcopy(item) for key, item in value.items() if key != "_versions"}
+                if _registry_snapshot_identity_conflicts(snapshot, business):
+                    continue
+                digest = hashlib.sha256(json.dumps(snapshot, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
+                if digest not in seen:
+                    seen.add(digest)
+                    versions.append(snapshot)
+            latest = dict(incoming)
+            if str(previous.get("saved_at", "")).replace("T", " ") > str(incoming.get("saved_at", "")).replace("T", " "):
+                latest = dict(previous)
+            existing[business] = {**latest, "_versions": versions}
+        atomic_write_json(path, existing)
 
 
 def save_cretop_financial_snapshot(
@@ -359,7 +390,9 @@ def _read_json_records_cached(path_text: str, modified_time: float) -> list[dict
 
 
 @st.cache_data(ttl=45, show_spinner=False)
-def _load_cloud_records_cached(user_id: str) -> list[dict[str, Any]]:
+def _load_cloud_records_cached(user_id: str, business_no: str = "") -> list[dict[str, Any]]:
+    if business_no:
+        return load_stock_valuations(user_id, limit=None, business_no=business_no)
     return load_stock_valuations(user_id)
 
 
@@ -379,7 +412,7 @@ def _merge_records(local_records: list[dict[str, Any]], cloud_records: list[dict
     return sorted(merged.values(), key=lambda item: str(item.get("saved_at", "") or ""), reverse=True)
 
 
-def _load_records(user_id: str) -> list[dict[str, Any]]:
+def _load_records(user_id: str, *, business_no: str = "") -> list[dict[str, Any]]:
     path = _storage_path(user_id)
     local_records: list[dict[str, Any]] = []
     if path.exists():
@@ -387,14 +420,29 @@ def _load_records(user_id: str) -> list[dict[str, Any]]:
             local_records = _read_json_records_cached(str(path), path.stat().st_mtime)
         except OSError:
             local_records = []
-    cloud_records = _load_cloud_records_cached(user_id)
+    business = _normalize_business_no(business_no)
+    if business:
+        local_records = [record for record in local_records if _normalize_business_no(record.get("business_no", "")) == business]
+    cloud_records = _load_cloud_records_cached(user_id, business) if business else _load_cloud_records_cached(user_id)
     return _merge_records(local_records, cloud_records)
 
 
 def _save_records(user_id: str, records: list[dict[str, Any]]) -> None:
+    from crm_file_store import atomic_write_json, locked_json
+
     path = _storage_path(user_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(records, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    with locked_json(path):
+        existing = []
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(existing, list) or any(not isinstance(item, dict) for item in existing):
+                    raise ValueError("invalid history")
+            except (OSError, ValueError):
+                raise ValueError("기존 평가이력을 확인하지 못해 저장을 중단했습니다. 원본은 그대로 보존했습니다.") from None
+        # Merge under the lock: another local session may have just appended a version.
+        atomic_write_json(path, _merge_records(existing, records))
     _read_json_records_cached.clear()
 
 
@@ -469,10 +517,14 @@ def _customer_defaults(row: pd.Series | None) -> dict[str, Any]:
 
 
 def _record_label(record: dict[str, Any]) -> str:
+    import hashlib
+
     name = record.get("company_name", "회사명 없음")
     base_date = record.get("valuation_date", "")
     saved_at = record.get("saved_at", "")
-    return f"{name} · 기준일 {base_date} · 저장 {saved_at}"
+    record_id = str(record.get("record_id", "") or "")
+    version = hashlib.sha256(record_id.encode("utf-8")).hexdigest()[:8] if record_id else ""
+    return f"{name} · 기준일 {base_date} · 저장 {saved_at}" + (f" · 버전 {version}" if version else "")
 
 
 def calculate_goodwill(
@@ -805,6 +857,98 @@ def _resolve_registry_business_no(
     return unique_matches[0] if len(unique_matches) == 1 else ""
 
 
+def _registry_snapshot_value_present(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "-", "none", "nan", "nat", "<na>"}
+    if isinstance(value, (list, tuple, dict, set)):
+        return bool(value)
+    return True
+
+
+def _registry_snapshot_identity_conflicts(
+    data: dict[str, Any], business_no: Any, corporate_no: Any = "",
+) -> bool:
+    def digits(value: Any) -> str:
+        return re.sub(r"[^0-9]", "", str(value or ""))
+
+    target_business = digits(business_no)
+    data_business = digits(data.get("사업자등록번호", ""))
+    target_corporate = digits(corporate_no)
+    data_corporate = digits(data.get("법인등록번호", ""))
+    return bool(
+        (len(target_business) == len(data_business) == 10 and target_business != data_business)
+        or (len(target_corporate) == len(data_corporate) == 13 and target_corporate != data_corporate)
+    )
+
+
+def _merge_registry_snapshot_versions(
+    local: dict[str, Any], cloud: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge same-company snapshots, retaining a newer pending local upload."""
+    from datetime import timezone
+
+    def timestamp(data: dict[str, Any]) -> float:
+        for name in ("saved_at", "updated_at", "uploaded_at"):
+            try:
+                parsed = datetime.fromisoformat(str(data.get(name, "")).replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.timestamp()
+            except (ValueError, TypeError, OverflowError):
+                continue
+        return float("-inf")
+
+    older, newer = (cloud, local) if timestamp(local) > timestamp(cloud) else (local, cloud)
+    merged = dict(older or {})
+    merged.update({key: value for key, value in dict(newer or {}).items()
+                   if _registry_snapshot_value_present(value)})
+    return merged
+
+
+def _registry_snapshot_from_cache(
+    cache: dict[str, Any], business_no: str, company_name: Any = "", corporate_no: Any = "",
+) -> dict[str, Any]:
+    """Fail closed on conflicting identifiers and ambiguous legacy matches."""
+    direct = cache.get(business_no, {})
+    if direct and not _registry_snapshot_identity_conflicts(direct, business_no, corporate_no):
+        # A previously recovered canonical key must remain readable even while
+        # its original digits-only/corporate-number key is kept as a source.
+        return {**dict(direct), "사업자등록번호": business_no}
+    target_corporate = re.sub(r"[^0-9]", "", str(corporate_no or ""))
+    target_company = _normalize_company_name(company_name)
+    business_matches: list[dict[str, Any]] = []
+    corporate_matches: list[dict[str, Any]] = []
+    company_matches: list[dict[str, Any]] = []
+    for old_key, original in cache.items():
+        data = dict(original)
+        key_digits = re.sub(r"[^0-9]", "", str(old_key))
+        row_business = _normalize_business_no(data.get("사업자등록번호", ""))
+        if not row_business and len(key_digits) == 10:
+            row_business = _normalize_business_no(old_key)
+        if row_business and len(re.sub(r"[^0-9]", "", row_business)) == 10:
+            data.setdefault("사업자등록번호", row_business)
+        row_corporate = re.sub(r"[^0-9]", "", str(data.get("법인등록번호", "")))
+        if not row_corporate and len(key_digits) == 13:
+            row_corporate = key_digits
+            data.setdefault("법인등록번호", row_corporate)
+        if _registry_snapshot_identity_conflicts(data, business_no, corporate_no):
+            continue
+        if row_business == business_no:
+            business_matches.append(data)
+        elif len(target_corporate) == 13 and row_corporate == target_corporate:
+            corporate_matches.append(data)
+        elif not target_corporate:
+            row_company = _normalize_company_name(data.get("법인명") or data.get("업체명"))
+            if target_company and row_company == target_company:
+                company_matches.append(data)
+    matches = business_matches or corporate_matches or company_matches
+    if len(matches) != 1:
+        return {}
+    return matches[0]
+
+
 def _save_registry_cache(
     user_id: str,
     business_no: str,
@@ -812,32 +956,33 @@ def _save_registry_cache(
     *,
     storage_result: dict[str, Any] | None = None,
 ) -> str:
-    cache = _load_registry_cache(user_id, strict=True)
+    from crm_file_store import atomic_write_json, locked_json
+
     key = _resolve_registry_business_no(user_id, business_no, data)
     if not key:
         return ""
-
-    # A partial extraction must never erase previously confirmed registry values.
-    merged = dict(cache.get(key, {}) or {})
-    merged.update({
-        field: value for field, value in dict(data or {}).items()
-        if value not in (None, "", [], {})
-    })
-    cache[key] = {
-        **merged,
-        "사업자등록번호": key,
-        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
+    if _registry_snapshot_identity_conflicts(data, key):
+        raise RegistryCacheReadError("선택 기업과 등기자료의 식별번호가 달라 기존 정보를 보존했습니다.")
     path = _registry_cache_path(user_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    temporary.write_text(
-        json.dumps(cache, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    # The strict read, merge and replacement share one cross-process lock.
+    # Keeping legacy keys also preserves the original uploaded snapshot.
+    with locked_json(path):
+        cache = _load_registry_cache(user_id, strict=True)
+        existing = _registry_snapshot_from_cache(
+            cache, key, data.get("법인명") or data.get("업체명"), data.get("법인등록번호", ""),
+        )
+        direct = cache.get(key, {})
+        if direct and _registry_snapshot_identity_conflicts(direct, key, data.get("법인등록번호", "")):
+            raise RegistryCacheReadError("기존 등기와 새 자료의 식별번호가 달라 덮어쓰지 않았습니다.")
+        merged = dict(existing or {})
+        merged.update({field: value for field, value in dict(data or {}).items()
+                       if _registry_snapshot_value_present(value)})
+        snapshot = {**merged, "사업자등록번호": key,
+                    "saved_at": datetime.now().isoformat(timespec="microseconds")}
+        cache[key] = snapshot
+        atomic_write_json(path, cache)
     try:
-        result = sync_registry_snapshot(user_id, key, cache[key])
+        result = sync_registry_snapshot(user_id, key, snapshot)
         cloud_saved = bool(isinstance(result, tuple) and result and result[0])
     except Exception as exc:
         write_runtime_error("registry_snapshot_sync", exc)
@@ -845,7 +990,7 @@ def _save_registry_cache(
     if storage_result is not None:
         storage_result.update({
             "cloud_saved": cloud_saved,
-            "registry_data": dict(cache[key]),
+            "registry_data": dict(snapshot),
         })
     return key
 
@@ -888,77 +1033,59 @@ def _restore_registry_for_business(
     business_no: Any,
     company_name: Any = "",
     corporate_no: Any = "",
+    *,
+    apply_to_state: bool = True,
 ) -> dict[str, Any]:
+    from crm_file_store import atomic_write_json, locked_json
+
     # 재접속 시 로컬 또는 Supabase에서 등기 업로드 내역을 복원합니다.
     key = _normalize_business_no(business_no)
     if not key:
         return {}
 
     try:
-        cache = _load_registry_cache(user_id, strict=True)
+        with locked_json(_registry_cache_path(user_id)):
+            _load_registry_cache(user_id, strict=True)
     except RegistryCacheReadError:
         st.warning("기존 등기정보 파일을 확인하지 못해 자동 복원을 중단했습니다. 원본은 그대로 보존했으며 관리자 확인이 필요합니다.")
         return {}
-    local = cache.get(key, {})
     cloud = load_registry_snapshot(
         user_id,
         key,
         company_name,
         corporate_no,
     )
-    data = dict(local or {})
-    for field, value in dict(cloud or {}).items():
-        if value not in (None, "", [], {}):
-            data[field] = value
-
-    if not data:
-        target_company = _normalize_company_name(company_name)
-        target_corporate = re.sub(r"[^0-9]", "", str(corporate_no or ""))
-        legacy_matches: list[dict[str, Any]] = []
-        for legacy_key, legacy_data in cache.items():
-            if not isinstance(legacy_data, dict):
-                continue
-            legacy_business = _normalize_business_no(
-                legacy_data.get("사업자등록번호", legacy_key)
-            )
-            legacy_company = _normalize_company_name(
-                legacy_data.get("법인명") or legacy_data.get("업체명")
-            )
-            legacy_corporate = re.sub(
-                r"[^0-9]", "", str(legacy_data.get("법인등록번호", "") or "")
-            )
-            if legacy_business == key or (
-                target_corporate
-                and legacy_corporate
-                and target_corporate == legacy_corporate
-            ) or (
-                target_company
-                and legacy_company
-                and target_company == legacy_company
+    if cloud and _registry_snapshot_identity_conflicts(cloud, key, corporate_no):
+        st.warning("등록 기업과 클라우드 등기의 식별번호가 달라 자동 반영하지 않았습니다. 기존 자료는 보존했습니다.")
+        cloud = {}
+    path = _registry_cache_path(user_id)
+    try:
+        with locked_json(path):
+            # Re-read after the network request: another upload may have saved
+            # a newer snapshot or a different company's record meanwhile.
+            cache = _load_registry_cache(user_id, strict=True)
+            direct = cache.get(key, {})
+            if direct and _registry_snapshot_identity_conflicts(direct, key, corporate_no):
+                st.warning("기존 등기자료와 선택 기업의 식별번호가 달라 자동 반영하지 않았습니다. 원본은 보존했습니다.")
+                return {}
+            local = _registry_snapshot_from_cache(cache, key, company_name, corporate_no)
+            if local and cloud and _registry_snapshot_identity_conflicts(
+                cloud, local.get("사업자등록번호", key), local.get("법인등록번호", ""),
             ):
-                legacy_matches.append(dict(legacy_data))
-        if len(legacy_matches) == 1:
-            data = legacy_matches[0]
+                st.warning("두 등기자료의 법인 식별번호가 달라 자동 병합하지 않았습니다. 원본은 보존했습니다.")
+                return {}
+            data = _merge_registry_snapshot_versions(local, cloud)
+            if data:
+                data["사업자등록번호"] = key
+                cache[key] = dict(data)
+                atomic_write_json(path, cache)
+    except RegistryCacheReadError:
+        st.warning("기존 등기정보 파일을 확인하지 못해 자동 복원을 중단했습니다. 원본은 그대로 보존했으며 관리자 확인이 필요합니다.")
+        return {}
+    if data and not cloud:
+        sync_registry_snapshot(user_id, key, data)
 
-    if data:
-        data["사업자등록번호"] = key
-        cache[key] = {
-            **dict(data),
-            "saved_at": str(
-                data.get("saved_at")
-                or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            ),
-        }
-        path = _registry_cache_path(user_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(cache, ensure_ascii=False, indent=2, default=str),
-            encoding="utf-8",
-        )
-        if not cloud:
-            sync_registry_snapshot(user_id, key, cache[key])
-
-    if data:
+    if data and apply_to_state:
         _apply_registry_data(data)
         st.session_state["stock_last_registry_data"] = data
         issued = _format_number(data.get("발행주식총수"))
@@ -1076,6 +1203,106 @@ def _apply_loaded_record(record: dict[str, Any]) -> None:
         record.get("goodwill_acquired_intangible_remaining", 0)
     )
     st.session_state["stock_goodwill_exclusion_reason"] = record.get("goodwill_exclusion_reason", "")
+    st.session_state["stock_cap_rate_pct"] = float(st.session_state["stock_cap_rate"]) * 100
+    st.session_state["stock_nav_floor_pct"] = float(st.session_state["stock_nav_floor"]) * 100
+    premium_pct = float(st.session_state["stock_premium_rate"]) * 100
+    st.session_state["stock_premium_custom_pct"] = premium_pct
+    st.session_state["stock_premium_selection"] = (
+        "미적용" if st.session_state["stock_premium_exempt"] or not premium_pct
+        else f"{int(premium_pct)}% 적용" if premium_pct in (10, 15, 20)
+        else "직접입력"
+    )
+    if isinstance(record.get("result"), dict) and record["result"]:
+        st.session_state["stock_last_result"] = deepcopy(record["result"])
+        st.session_state["stock_last_inputs"] = _stock_record_inputs(record)
+        st.session_state["stock_saved_result_preview"] = {
+            key: deepcopy(record.get(key)) for key in ("record_id", "valuation_date", "saved_at", "result")
+        }
+
+
+def _stock_record_inputs(record: dict[str, Any]) -> dict[str, Any]:
+    """Reconstruct the saved calculation signature, never calculate a new tax result."""
+    fields = (
+        "company_name", "business_no", "corporate_no", "address", "establishment",
+        "valuation_date", "current_shares", "par_value", "capital", "authorized_shares",
+        "share_classes", "valuation_type", "annual_rows", "total_assets", "total_liabilities",
+        "asset_additions", "asset_deductions", "liability_additions", "liability_deductions",
+        "goodwill", "goodwill_mode", "goodwill_acquired_intangible_remaining",
+        "goodwill_exclusion_reason", "other_adjustments", "capitalization_rate",
+        "nav_floor_rate", "premium_exempt", "premium_rate", "tax_adjustment_review",
+    )
+    values = {key: deepcopy(record.get(key)) for key in fields}
+    values["goodwill"] = record.get("goodwill_manual", record.get("goodwill"))
+    values["share_classes"] = values["share_classes"] or []
+    values["tax_adjustment_review"] = values["tax_adjustment_review"] or []
+    return values
+
+
+def _records_for_stock_company(user_id: str, business_no: Any) -> list[dict[str, Any]]:
+    business = _normalize_business_no(business_no)
+    if not re.fullmatch(r"\d{3}-\d{2}-\d{5}", business):
+        return []
+    return [record for record in _load_records(user_id, business_no=business)
+            if _normalize_business_no(record.get("business_no", "")) == business]
+
+
+def _persist_stock_calculation(
+    user_id: str, user_name: str, inputs: dict[str, Any], result: dict[str, Any],
+) -> dict[str, Any]:
+    """Append an immutable version; retry only the exact same calculation ID."""
+    active_scope = st.session_state.get("_oasis_stock_active_scope")
+    if active_scope and (
+        active_scope[0] != str(user_id)
+        or active_scope[1] != _normalize_business_no(inputs.get("business_no", ""))
+    ):
+        raise ValueError("평가 입력값의 기업이 현재 선택한 기업과 다릅니다. 올바른 기업을 선택한 뒤 다시 계산해주세요.")
+    same_version = bool(
+        st.session_state.get("stock_persisted_record_id")
+        and st.session_state.get("stock_persisted_inputs") == inputs
+    )
+    record_id = (st.session_state["stock_persisted_record_id"] if same_version else uuid.uuid4().hex)
+    record = _build_stock_record(
+        inputs, result, record_id=record_id, saved_by=user_name,
+        saved_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+    previous_id = st.session_state.get("stock_loaded_record_id", "")
+    record["supersedes_record_id"] = previous_id if previous_id != record_id else ""
+    registry_source = st.session_state.get("stock_last_registry_data", {})
+    if isinstance(registry_source, dict) and _registry_snapshot_identity_conflicts(
+        registry_source, inputs.get("business_no", ""), inputs.get("corporate_no", ""),
+    ):
+        raise ValueError("등기 출처와 평가 기업의 식별번호가 다릅니다. 기존 자료는 변경하지 않았습니다.")
+    record["registry_source"] = deepcopy(registry_source)
+    feedback = {"local_saved": False, "cloud_saved": False, "record_id": record_id}
+    try:
+        _save_records(user_id, [record])
+        feedback["local_saved"] = True
+    except Exception as exc:
+        write_runtime_error("stock_history_local_save", exc)
+    try:
+        synced = sync_stock_valuation(user_id, record)
+        feedback["cloud_saved"] = bool(synced[0] if isinstance(synced, tuple) and synced else synced is True)
+    except Exception as exc:
+        write_runtime_error("stock_history_cloud_save", exc)
+    _load_cloud_records_cached.clear()
+    if feedback["local_saved"] or feedback["cloud_saved"]:
+        st.session_state["stock_loaded_record_id"] = record_id
+        st.session_state["stock_persisted_record_id"] = record_id
+        st.session_state["stock_persisted_inputs"] = deepcopy(inputs)
+    st.session_state["stock_save_feedback"] = feedback
+    return feedback
+
+
+def _render_stock_save_feedback() -> None:
+    saved = st.session_state.get("stock_save_feedback", {})
+    if saved.get("cloud_saved"):
+        st.success("계산 결과와 입력값의 새 버전을 클라우드에 저장했습니다.")
+        if not saved.get("local_saved"):
+            st.warning("클라우드 저장은 완료했지만 로컬 이력 보관은 확인이 필요합니다.")
+    elif saved.get("local_saved"):
+        st.warning("계산 결과는 로컬에 보존했습니다. 클라우드 저장은 확인되지 않았으며 동기화 상태를 확인해야 합니다.")
+    elif saved:
+        st.error("계산은 완료했지만 영구 저장을 확인하지 못했습니다. 화면을 유지하고 ‘평가자료 저장’을 다시 눌러주세요.")
 
 
 def _find_stock_customer_row(
@@ -1100,6 +1327,7 @@ def _find_stock_customer_row(
             return business_matches[0]
         if len(business_matches) > 1:
             return None
+        return None  # An explicit business number must never fall back to a namesake.
 
     target_company = _normalize_company_name(company_name)
     if not target_company:
@@ -1115,8 +1343,7 @@ def _find_stock_customer_row(
     return company_matches[0] if len(company_matches) == 1 else None
 
 
-def _clear_stock_customer_state() -> None:
-    """Clear values that must never carry over to another company."""
+def _stock_company_state_keys() -> list[str]:
     keys = [
         "stock_company_name",
         "stock_business_no",
@@ -1144,6 +1371,11 @@ def _clear_stock_customer_state() -> None:
         "stock_loaded_record_id",
         "stock_tax_adjustment_review",
         "stock_tax_adjustment_applied_message",
+        "stock_valuation_date", "stock_valuation_type", "stock_cap_rate", "stock_nav_floor",
+        "stock_premium_exempt", "stock_premium_rate", "stock_cap_rate_pct", "stock_nav_floor_pct",
+        "stock_premium_selection", "stock_premium_custom_pct", "stock_save_feedback",
+        "stock_persisted_record_id", "stock_persisted_inputs", "stock_registry_review_needed",
+        "stock_saved_result_preview",
     ]
     for index in range(1, 4):
         keys.extend(
@@ -1153,8 +1385,38 @@ def _clear_stock_customer_state() -> None:
                 f"stock_shares_{index}",
             ]
         )
-    for key in keys:
+    return keys
+
+
+def _clear_stock_customer_state() -> None:
+    """Clear all company-specific inputs, including actual Streamlit widget keys."""
+    for key in [*_stock_company_state_keys(), "stock_customer_context_key", "stock_auto_loaded_customer_key"]:
         st.session_state.pop(key, None)
+
+
+def _remember_stock_company_state(user_id: str, business_no: Any) -> None:
+    business = _normalize_business_no(business_no)
+    if not re.fullmatch(r"\d{3}-\d{2}-\d{5}", business):
+        return
+    if _normalize_business_no(st.session_state.get("stock_business_no", "")) != business:
+        return
+    bank = dict(st.session_state.get("_oasis_stock_company_drafts", {}))
+    bank[(str(user_id), business)] = {
+        key: deepcopy(st.session_state[key]) for key in _stock_company_state_keys()
+        if key in st.session_state
+    }
+    st.session_state["_oasis_stock_company_drafts"] = bank
+
+
+def _restore_stock_company_state(user_id: str, business_no: Any) -> bool:
+    business = _normalize_business_no(business_no)
+    saved = st.session_state.get("_oasis_stock_company_drafts", {}).get((str(user_id), business))
+    if not isinstance(saved, dict) or _normalize_business_no(saved.get("stock_business_no", "")) != business:
+        return False
+    for key in _stock_company_state_keys():
+        if key in saved:
+            st.session_state[key] = deepcopy(saved[key])
+    return True
 
 
 def _load_stock_customer_context(
@@ -1177,7 +1439,12 @@ def _load_stock_customer_context(
         business_no=explicit_business or state_business,
         company_name=explicit_company or state_company,
     )
+    previous_scope = st.session_state.get("_oasis_stock_active_scope")
     if selected_row is None:
+        if previous_scope:
+            _remember_stock_company_state(*previous_scope)
+        _clear_stock_customer_state()
+        st.session_state.pop("_oasis_stock_active_scope", None)
         return None
 
     resolved_business = _normalize_business_no(
@@ -1187,9 +1454,15 @@ def _load_stock_customer_context(
         selected_row.get("_cloud_updated_at", "") or ""
     )
     customer_id = str(selected_row.get("_customer_id", "") or "")
+    scope = (str(user_id), resolved_business)
     context_key = f"{resolved_business}:{customer_id}:{customer_revision}"
-    if st.session_state.get("stock_customer_context_key") != context_key:
+    needs_restore = previous_scope != scope or state_business != resolved_business
+    if needs_restore:
+        if previous_scope and previous_scope != scope:
+            _remember_stock_company_state(*previous_scope)
         loaded_record_matches = bool(
+            previous_scope in (None, scope)
+            and
             st.session_state.get("stock_loaded_record_id")
             and _normalize_business_no(
                 st.session_state.get("stock_business_no", "")
@@ -1198,9 +1471,13 @@ def _load_stock_customer_context(
         )
         if not loaded_record_matches:
             _clear_stock_customer_state()
+            _restore_stock_company_state(user_id, resolved_business)
         st.session_state["stock_customer_context_key"] = context_key
-        if loaded_record_matches:
+        if _normalize_business_no(st.session_state.get("stock_business_no", "")) == resolved_business:
             st.session_state["stock_auto_loaded_customer_key"] = context_key
+    elif state_business == resolved_business:
+        # Customer edits must not discard a same-company calculation or tax review.
+        st.session_state["stock_auto_loaded_customer_key"] = context_key
 
     if st.session_state.get("stock_auto_loaded_customer_key") != context_key:
         loaded, _ = _apply_customer_financial_data(user_id, selected_row)
@@ -1216,7 +1493,43 @@ def _load_stock_customer_context(
                 _normalize_business_no(business_no)
             )
             st.session_state["stock_auto_loaded_customer_key"] = context_key
+    st.session_state["stock_customer_context_key"] = context_key
+    st.session_state["_oasis_stock_active_scope"] = scope
+    dirty = set(st.session_state.get("_oasis_stock_registry_dirty", set()))
+    if scope in dirty:
+        _refresh_stock_registry_context(user_id)
+        dirty.discard(scope)
+        st.session_state["_oasis_stock_registry_dirty"] = dirty
+    _remember_stock_company_state(user_id, resolved_business)
     return selected_row
+
+
+def _refresh_stock_registry_context(user_id: str) -> None:
+    """Refresh the registered source, without silently rewriting a saved evaluation."""
+    from snapshot_read_cache import invalidate_snapshot_reads
+
+    invalidate_snapshot_reads(user_id)
+    data = _restore_registry_for_business(
+        user_id, st.session_state.get("stock_business_no", ""),
+        company_name=st.session_state.get("stock_company_name", ""),
+        corporate_no=st.session_state.get("stock_corporate_no", ""),
+        apply_to_state=False,
+    )
+    if not data:
+        return
+    st.session_state["stock_last_registry_data"] = data
+    registry_keys = {
+        "stock_current_shares": "발행주식총수", "stock_par_value": "1주당액면가액",
+        "stock_capital": "자본금", "stock_authorized_shares": "발행할주식총수",
+    }
+    for state_key, source_key in registry_keys.items():
+        if not st.session_state.get(state_key) and data.get(source_key) not in (None, ""):
+            st.session_state[state_key] = _format_number(data[source_key])
+    st.session_state["stock_registry_review_needed"] = any(
+        data.get(source_key) not in (None, "")
+        and _safe_number(st.session_state.get(state_key)) != _safe_number(data[source_key])
+        for state_key, source_key in registry_keys.items()
+    )
 
 
 def _registry_identity_error(data: dict[str, Any], selected_row: Any) -> str:
@@ -1267,28 +1580,37 @@ def _render_registry_upload(
 ) -> None:
     st.markdown("### 등기사항증명서 업로드")
     current_business_no = _normalize_business_no(
-        st.session_state.get("stock_business_no", "")
+        selected_row.get("사업자등록번호", "") if selected_row is not None else ""
     )
     current_company_name = str(
-        st.session_state.get("stock_company_name", "") or ""
+        selected_row.get("업체명", "") if selected_row is not None else ""
     ).strip()
     has_customer_context = bool(
-        selected_row is not None and current_business_no
+        selected_row is not None
+        and re.fullmatch(r"\d{3}-\d{2}-\d{5}", current_business_no)
     )
     if has_customer_context:
         st.caption(
-            f"현재 평가기업: {current_company_name or '선택된 등록 고객'} · "
-            "등록된 크레탑·등기정보는 자동으로 불러옵니다."
+            f"자료를 연결할 기업: {current_company_name or '선택된 등록 고객'} · "
+            "이 화면에서 선택한 기업에 등기자료를 등록합니다."
         )
     else:
         st.info(
-            "기업컨설팅에서 업체를 먼저 선택해주세요. "
+            "이 화면 상단에서 자료를 연결할 기업을 먼저 선택해주세요. "
             "업체가 확인되어야 등기자료를 안전하게 연결할 수 있습니다."
         )
 
     restore_key = current_business_no if has_customer_context else ""
+    # Uploading a document must not require (or change) another screen's widgets.
+    # Only hydrate a valuation already open for this exact company.
+    valuation_context_matches = bool(
+        has_customer_context
+        and _normalize_business_no(st.session_state.get("stock_business_no", ""))
+        == current_business_no
+    )
     if (
         restore_key
+        and valuation_context_matches
         and st.session_state.get("stock_registry_restored_key")
         != restore_key
     ):
@@ -1296,7 +1618,7 @@ def _render_registry_upload(
             user_id,
             restore_key,
             company_name=current_company_name,
-            corporate_no=st.session_state.get("stock_corporate_no", ""),
+            corporate_no=selected_row.get("법인등록번호", ""),
         )
         st.session_state["stock_registry_restored_key"] = restore_key
         if restored:
@@ -1307,7 +1629,7 @@ def _render_registry_upload(
     registry_pdf = st.file_uploader(
         "법인 등기사항증명서 PDF",
         type=["pdf"],
-        key="stock_registry_pdf",
+        key=f"stock_registry_pdf:{user_id}:{restore_key or 'unselected'}",
         disabled=not has_customer_context,
     )
     st.caption(
@@ -1317,7 +1639,7 @@ def _render_registry_upload(
     if registry_pdf is not None:
         render_upload_ready(registry_pdf, ui=st)
 
-    if registry_pdf is not None and st.button(
+    if has_customer_context and registry_pdf is not None and st.button(
         "등기자료 분석·등록",
         key="stock_analyze_registry",
         use_container_width=True,
@@ -1355,24 +1677,29 @@ def _render_registry_upload(
                 if not saved_registry_business_no:
                     task.error("분석 결과를 현재 기업과 안전하게 연결하지 못했습니다.", "기업을 다시 선택한 후 재시도해주세요. 기존 정보는 유지됩니다.")
                     return
+                dirty = set(st.session_state.get("_oasis_stock_registry_dirty", set()))
+                dirty.add((str(user_id), saved_registry_business_no))
+                st.session_state["_oasis_stock_registry_dirty"] = dirty
                 registry_data = dict(storage_result.get("registry_data") or registry_data)
                 registry_data["사업자등록번호"] = saved_registry_business_no
-                preserved_financial_inputs = _capture_stock_financial_inputs()
-                _apply_registry_data(registry_data)
-                _restore_stock_financial_inputs(preserved_financial_inputs)
-                st.session_state["stock_last_registry_data"] = registry_data
-                st.session_state["stock_registry_restored_key"] = saved_registry_business_no
-                issued = _format_number(registry_data.get("발행주식총수"))
-                if issued:
-                    for index in range(1, 4):
-                        share_key = f"stock_shares_{index}"
-                        if not st.session_state.get(share_key):
-                            st.session_state[share_key] = issued
+                if valuation_context_matches:
+                    preserved_financial_inputs = _capture_stock_financial_inputs()
+                    _apply_registry_data(registry_data)
+                    _restore_stock_financial_inputs(preserved_financial_inputs)
+                    st.session_state["stock_last_registry_data"] = registry_data
+                    st.session_state["stock_registry_restored_key"] = saved_registry_business_no
+                    issued = _format_number(registry_data.get("발행주식총수"))
+                    if issued:
+                        for index in range(1, 4):
+                            share_key = f"stock_shares_{index}"
+                            if not st.session_state.get(share_key):
+                                st.session_state[share_key] = issued
                 attachment_saved = True
+                original_cloud_confirmed = False
                 try:
                     from enterprise_documents import register_existing_enterprise_document
 
-                    register_existing_enterprise_document(
+                    registered_document = register_existing_enterprise_document(
                         registry_path, user_id=user_id,
                         business_no=saved_registry_business_no,
                         company_name=current_company_name,
@@ -1381,6 +1708,14 @@ def _render_registry_upload(
                         analysis_summary="법인 등기사항증명서 분석을 완료했습니다.",
                         extracted_fields=dict(registry_data),
                     )
+                    if isinstance(registered_document, dict):
+                        original_status = registered_document.get("asset_storage_status", {})
+                        history_status = registered_document.get("history_storage_status", {})
+                        original_cloud_confirmed = bool(
+                            original_status.get("cloud_saved") is True
+                            and original_status.get("metadata_saved") is True
+                            and history_status.get("cloud_saved") is True
+                        )
                     from enterprise_documents import _load_enterprise_source_overview_cached
                     _load_enterprise_source_overview_cached.clear()
                 except Exception as exc:
@@ -1391,7 +1726,9 @@ def _render_registry_upload(
                     detail += " 분석 결과는 로컬에 보관했으며 클라우드 동기화 상태를 확인해야 합니다."
                 if not attachment_saved:
                     detail += " 첨부자료·기업히스토리 연결은 완료하지 못했습니다. 같은 파일로 다시 등록할 수 있습니다."
-                if storage_result.get("cloud_saved") and attachment_saved:
+                elif not original_cloud_confirmed:
+                    detail += " 원본·분석이력의 클라우드 보관 완료는 확인되지 않았으며 로컬 원본은 보존했습니다."
+                if storage_result.get("cloud_saved") and attachment_saved and original_cloud_confirmed:
                     task.complete("등기자료 분석·등록이 완료되었습니다.", detail, persist=True)
                 else:
                     task.warning("등기정보는 보관했지만 일부 저장을 확인해야 합니다.", detail, persist=True)
@@ -1408,30 +1745,29 @@ def _render_registry_upload(
 def _render_stock_history(user_id: str) -> None:
     st.divider()
     st.markdown("### 주가평가 히스토리")
-    records = _load_records(user_id)
+    business_no = _normalize_business_no(st.session_state.get("stock_business_no", ""))
+    records = _records_for_stock_company(user_id, business_no)
     with st.expander("저장된 주가평가 불러오기·수정", expanded=False):
         if not records:
             st.info(
-                "저장된 주가평가 자료가 없습니다. 평가자료를 저장하면 "
+                "현재 기업의 저장된 주가평가 자료가 없습니다. 계산을 완료하면 "
                 "이 메뉴에서 다시 불러올 수 있습니다."
             )
             return
 
         st.caption(
-            f"저장된 평가자료 {len(records)}건 · 로컬 및 Supabase 통합 조회"
+            f"현재 기업의 평가자료 {len(records)}건 · 다른 기업의 자료는 표시하지 않습니다."
         )
-        options = ["선택 안 함"] + [
-            _record_label(record) for record in records
-        ]
-        selected_record_label = st.selectbox(
+        selected_index = st.selectbox(
             "저장 기록",
-            options,
-            key="stock_saved_record_selector",
+            [None, *range(len(records))],
+            format_func=lambda index: "선택 안 함" if index is None else _record_label(records[index]),
+            key=f"stock_saved_record_selector:{user_id}:{business_no}",
         )
-        if selected_record_label == "선택 안 함":
+        if selected_index is None:
             return
 
-        record = records[options.index(selected_record_label) - 1]
+        record = records[selected_index]
         preview_result = record.get("result", {})
         if isinstance(preview_result, dict):
             final_value = _safe_number(
@@ -1459,24 +1795,102 @@ def _render_stock_history(user_id: str) -> None:
             key="stock_load_record",
             use_container_width=True,
         ):
-            _apply_loaded_record(record)
-            st.success("저장된 평가자료를 불러왔습니다.")
+            st.session_state["_oasis_stock_pending_record"] = {
+                "owner": user_id, "business_no": business_no, "record": deepcopy(record),
+            }
             st.rerun()
+
+
+def _render_stock_materials(user_id: str) -> None:
+    """Company-scoped shortcuts before form widgets are created."""
+    business = _normalize_business_no(st.session_state.get("stock_business_no", ""))
+    if not re.fullmatch(r"\d{3}-\d{2}-\d{5}", business):
+        return
+    if st.button("등록 자료 새로고침", key="stock_refresh_saved_registry"):
+        _load_cloud_records_cached.clear(user_id, business)
+        _refresh_stock_registry_context(user_id)
+    registry = st.session_state.get("stock_last_registry_data", {})
+    if not isinstance(registry, dict):
+        registry = {}
+    records = _records_for_stock_company(user_id, business)
+    with st.container(border=True):
+        st.markdown("### 등록 자료 · 최근 평가 바로보기")
+        if registry:
+            r1, r2, r3 = st.columns(3)
+            r1.metric("등록 등기 · 발행주식총수", _format_number(registry.get("발행주식총수")) or "미확인")
+            r2.metric("등록 등기 · 액면가", _format_number(registry.get("1주당액면가액")) or "미확인")
+            r3.metric("등록 등기 · 자본금", _format_number(registry.get("자본금")) or "미확인")
+            st.caption(f"등기 저장일: {registry.get('saved_at') or '기존 자료'} · 현재 입력값과 다른 경우 원문·변경등기를 확인하세요.")
+            if st.session_state.get("stock_registry_review_needed"):
+                st.warning("등록 등기와 현재 평가 입력값이 다릅니다. 기존 평가는 유지했습니다. 최신 등기를 적용하려면 아래 반영 버튼을 눌러주세요.")
+            with st.expander("등록 등기 상세 확인", expanded=False):
+                st.dataframe(pd.DataFrame([
+                    {"항목": label, "등록값": str(registry.get(key, "") or "미확인")}
+                    for label, key in (("법인명", "법인명"), ("설립일", "법인설립일"),
+                                       ("발행주식총수", "발행주식총수"), ("액면가", "1주당액면가액"),
+                                       ("자본금", "자본금"), ("발행할 주식총수", "발행할주식총수"))
+                ]), hide_index=True, use_container_width=True)
+            if st.button("등록 등기값을 현재 평가에 반영", key="stock_apply_saved_registry", use_container_width=True):
+                preserved = _capture_stock_financial_inputs()
+                _apply_registry_data(registry)
+                _restore_stock_financial_inputs(preserved)
+                st.session_state.pop("stock_last_result", None)
+                st.session_state.pop("stock_last_inputs", None)
+                st.session_state["stock_registry_review_needed"] = False
+                st.info("등기값을 반영했습니다. 기존 평가 버전은 보존되며 변경된 입력값으로 다시 계산해주세요.")
+        else:
+            st.caption("연결된 등기 자료가 아직 확인되지 않습니다. 기업정보등록에서 같은 기업에 등기를 등록하세요.")
+        if records:
+            latest = records[0]
+            latest_result = latest.get("result", {})
+            value = _safe_number(latest_result.get("final_value_per_share")) if isinstance(latest_result, dict) else None
+            st.caption(
+                f"최근 평가: {latest.get('valuation_date', '')} · 저장 {latest.get('saved_at', '')}"
+                + (f" · 1주당 {value:,.0f}원" if value is not None else "")
+            )
+            if st.button("최근 평가 바로 열기", key="stock_open_latest_record", use_container_width=True):
+                st.session_state["_oasis_stock_pending_record"] = {
+                    "owner": user_id, "business_no": business, "record": deepcopy(latest),
+                }
+                st.rerun()
+        else:
+            st.caption("첫 계산을 완료하면 입력값과 계산 결과가 새 평가 버전으로 자동 보관됩니다.")
+        preview = st.session_state.get("stock_saved_result_preview", {})
+        snapshot_result = preview.get("result", {}) if isinstance(preview, dict) else {}
+        if isinstance(snapshot_result, dict) and snapshot_result:
+            with st.expander("불러온 저장 평가 결과", expanded=True):
+                st.caption(f"평가기준일 {preview.get('valuation_date', '')} · 저장 당시 결과이며 재계산 전까지 원본으로 유지합니다.")
+                p1, p2 = st.columns(2)
+                p1.metric("저장 당시 1주당 평가액", _format_number(snapshot_result.get("final_value_per_share")) or "미확인")
+                p2.metric("저장 당시 총 주식가치", _format_number(snapshot_result.get("total_equity_value")) or "미확인")
 
 
 def render_registry_upload_for_customer(
     user_id: str,
     business_no: Any,
     company_name: Any = "",
+    *,
+    selected_customer: pd.Series | None = None,
 ) -> None:
-    """Render the existing registry workflow for one registered customer."""
-    customers = _read_customers(user_id)
-    selected_row = _load_stock_customer_context(
-        user_id,
-        customers,
-        selected_business_no=business_no,
-        selected_company_name=company_name,
-    )
+    """Use the registration picker, independently of valuation widget state.
+
+    ``selected_customer`` is the row from the existing owner-scoped server loader,
+    not browser input. Legacy callers are resolved against that same loader.
+    """
+    del company_name  # Never use a name-only fallback to attach a registry.
+    target_business = _normalize_business_no(business_no)
+    selected_row = selected_customer
+    if selected_row is None and target_business:
+        selected_row = _find_stock_customer_row(
+            _read_customers(user_id), business_no=target_business,
+        )
+    if (
+        not re.fullmatch(r"\d{3}-\d{2}-\d{5}", target_business)
+        or selected_row is None
+        or _normalize_business_no(selected_row.get("사업자등록번호", ""))
+        != target_business
+    ):
+        selected_row = None
     _render_registry_upload(user_id, selected_row)
 
 
@@ -1843,16 +2257,35 @@ def render_stock_valuation_page(
         selected_company_name=selected_company_name,
     )
 
+    pending = st.session_state.pop("_oasis_stock_pending_record", None)
+    if isinstance(pending, dict):
+        current_business = _normalize_business_no(st.session_state.get("stock_business_no", ""))
+        pending_record = pending.get("record", {})
+        if (
+            pending.get("owner") == user_id
+            and pending.get("business_no") == current_business
+            and isinstance(pending_record, dict)
+            and _normalize_business_no(pending_record.get("business_no", "")) == current_business
+        ):
+            _apply_loaded_record(pending_record)
+            _remember_stock_company_state(user_id, current_business)
+            st.success("현재 기업의 저장된 입력값과 계산 결과를 불러왔습니다.")
+        else:
+            st.warning("선택 기업과 다른 평가자료는 불러오지 않았습니다.")
+
     view = st.radio(
         "주가평가 세부 탭", ["주가평가 계산", "세무조정계산서 반영"], horizontal=True,
         key="stock_valuation_detail_view", label_visibility="collapsed",
     )
     if view == "세무조정계산서 반영":
         _render_stock_tax_adjustment(user_id)
+        _remember_stock_company_state(user_id, st.session_state.get("stock_business_no", ""))
         return
     applied_message = st.session_state.get("stock_tax_adjustment_applied_message", "")
     if applied_message:
         st.success(applied_message)
+
+    _render_stock_materials(user_id)
 
     with st.form(
         "stock_valuation_input_form_v855",
@@ -2221,6 +2654,8 @@ def render_stock_valuation_page(
             result = calculate_stock_valuation(inputs)
             st.session_state["stock_last_result"] = deepcopy(result)
             st.session_state["stock_last_inputs"] = deepcopy(inputs)
+            if re.fullmatch(r"\d{3}-\d{2}-\d{5}", _normalize_business_no(inputs.get("business_no", ""))):
+                _persist_stock_calculation(user_id, user_name, inputs, result)
             calculation_status.update(
                 label="주가평가가 완료되었습니다.",
                 state="complete",
@@ -2334,10 +2769,11 @@ def render_stock_valuation_page(
                     "매입 무체재산권 원래 금액은 기존 자산에 유지하고 중복 가산분만 차감합니다."
                 )
 
-        st.caption("저장은 마지막으로 성공한 계산의 입력값·영업권·결과를 함께 보존합니다.")
+        _render_stock_save_feedback()
+        st.caption("계산할 때마다 입력값·영업권·결과를 새 버전으로 보존합니다. 이전 평가 버전은 덮어쓰지 않습니다.")
         save_label = (
-            "수정 저장"
-            if st.session_state.get("stock_loaded_record_id")
+            "저장 상태 다시 확인"
+            if st.session_state.get("stock_persisted_record_id")
             else "평가자료 저장"
         )
 
@@ -2346,34 +2782,8 @@ def render_stock_valuation_page(
             key="stock_save_record",
             use_container_width=True,
         ):
-            records = _load_records(user_id)
-            loaded_id = st.session_state.get("stock_loaded_record_id", "")
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            record = _build_stock_record(
-                st.session_state["stock_last_inputs"],
-                result,
-                record_id=loaded_id or datetime.now().strftime("%Y%m%d%H%M%S%f"),
-                saved_by=user_name,
-                saved_at=now,
-            )
-
-            replaced = False
-            for idx, saved_record in enumerate(records):
-                if saved_record.get("record_id") == record["record_id"]:
-                    records[idx] = record
-                    replaced = True
-                    break
-            if not replaced:
-                records.insert(0, record)
-
-            _save_records(user_id, records)
-            sync_stock_valuation(user_id, record)
-            _load_cloud_records_cached.clear()
-            st.session_state["stock_loaded_record_id"] = record["record_id"]
-            st.success(
-                "주가평가 자료를 로컬 파일과 Supabase에 동시 저장했습니다."
-            )
+            _persist_stock_calculation(user_id, user_name, st.session_state["stock_last_inputs"], result)
+            _render_stock_save_feedback()
 
     with st.expander("평가 로직과 법령 적용 안내", expanded=False):
         st.markdown(
@@ -2408,3 +2818,4 @@ def render_stock_valuation_page(
         )
 
     _render_stock_history(user_id)
+    _remember_stock_company_state(user_id, st.session_state.get("stock_business_no", ""))

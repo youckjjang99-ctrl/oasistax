@@ -104,26 +104,20 @@ def _merge_history_lists(
 
 def _save_all(user_id: str, data: dict[str, Any]) -> None:
     """Atomically merge local history without deleting or truncating old rows."""
+    from crm_file_store import atomic_write_json, locked_json
+
     path = _path(user_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    current = _load_all(user_id)
-    merged = dict(current)
-    for business_no, incoming in dict(data or {}).items():
-        existing = current.get(business_no, [])
-        if isinstance(incoming, list) and isinstance(existing, list):
-            merged[business_no] = _merge_history_lists(incoming, existing)
-        elif business_no not in merged:
-            merged[business_no] = incoming
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        temporary.write_text(
-            json.dumps(merged, ensure_ascii=False, indent=2, default=str),
-            encoding="utf-8",
-        )
-        os.replace(temporary, path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    with locked_json(path):
+        current = _load_all(user_id)
+        merged = dict(current)
+        for business_no, incoming in dict(data or {}).items():
+            existing = current.get(business_no, [])
+            if isinstance(incoming, list) and isinstance(existing, list):
+                merged[business_no] = _merge_history_lists(incoming, existing)
+            elif business_no not in merged:
+                merged[business_no] = incoming
+        atomic_write_json(path, merged)
 
 
 def _result_with_status(
@@ -312,9 +306,12 @@ def save_customer_event(
 def get_customer_history(
     user_id: str,
     business_no: str,
+    *, limit: int | None = 200,
 ) -> list[dict[str, Any]]:
     user_id = require_owner_context(user_id, allow_admin=True)
     normalized = _normalize_business_no(business_no)
+    if len(re.sub(r"\D", "", normalized)) != 10:
+        return []
     all_history = _load_all(user_id)
     local_items = all_history.get(normalized, []) or []
     if not isinstance(local_items, list):
@@ -322,14 +319,21 @@ def get_customer_history(
     cloud_items = []
     if normalized and cloud_is_configured():
         try:
-            rows = CloudDatabase().select(
-                TABLE_HISTORY,
-                filters={"owner_user_id": user_id, "business_no": normalized},
-                order="captured_at.desc",
-                limit=200,
-            )
+            database = CloudDatabase()
+            if limit is None:
+                rows = database.select_all(
+                    TABLE_HISTORY, filters={"owner_user_id": user_id, "business_no": normalized},
+                    order="captured_at.desc,id.desc", page_size=500,
+                )
+            else:
+                rows = database.select(
+                    TABLE_HISTORY, filters={"owner_user_id": user_id, "business_no": normalized},
+                    order="captured_at.desc", limit=max(1, int(limit)),
+                )
             for row in rows or []:
                 if not isinstance(row, dict):
+                    continue
+                if row.get("owner_user_id") not in (None, user_id) or _normalize_business_no(row.get("business_no", "")) != normalized:
                     continue
                 data = row.get("snapshot_data", {})
                 if isinstance(data, str):
@@ -342,11 +346,15 @@ def get_customer_history(
                     "data": data if isinstance(data, dict) else {},
                 })
         except Exception:
+            if limit is None and not local_items:
+                raise RuntimeError("기업 자료 이력의 클라우드 조회를 확인하지 못했습니다.") from None
             cloud_items = []
     merged = []
     seen = set()
     for item in cloud_items + local_items:
         if not isinstance(item, dict):
+            continue
+        if item.get("owner_user_id") not in (None, user_id) or _normalize_business_no(item.get("business_no", normalized)) != normalized:
             continue
         data = item.get("data", {}) if isinstance(item.get("data"), dict) else {}
         unique_key = str(data.get("이벤트ID") or (
@@ -362,7 +370,7 @@ def get_customer_history(
         # The 200-row return cap is a UI/cache limit, never a retention limit.
         all_history[normalized] = merged
         _save_all(user_id, all_history)
-    return merged[:200]
+    return merged if limit is None else merged[:max(1, int(limit))]
 
 
 def build_history_table(history: list[dict[str, Any]]) -> pd.DataFrame:
