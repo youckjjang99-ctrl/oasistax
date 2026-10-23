@@ -5,6 +5,7 @@ accounting profit, or unidentified year must not become statutory net income.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 import re
 import unicodedata
 from datetime import date
@@ -53,8 +54,26 @@ _FINANCIAL_LABELS = {label: (label,) for label in (
 _UNIT = re.compile(r"단위\s*[:：]?\s*(억원|백만원|천원|원)")
 _MONEY = re.compile(r"(?<![\d.])([-+−△▲]?\s*\(?\s*\d[\d,]*(?:\.\d+)?\s*\)?)\s*(억원|백만원|천원|원)?")
 _DATE_TOKEN = r"((?:19|20)\d{2})\s*[.년/\-]\s*(\d{1,2})\s*[.월/\-]\s*(\d{1,2})\s*일?\.?"
-_RANGE = re.compile(r"사업\s*연도\s*[:：]?\s*" + _DATE_TOKEN + r"\s*(?:~|∼|〜|－|–|—|부터|-)\s*" + _DATE_TOKEN)
-_YEAR = re.compile(r"(?m)^\s*(?:(?P<before>(?:19|20)\d{2})\s*(?:년\s*)?사업\s*연도|사업\s*연도\s*[:：]?\s*(?P<after>(?:19|20)\d{2})(?:\s*년)?(?=\s*(?:$|[,:;]|법인세|세무|조정)))")
+_PERIOD_LABEL = r"사\s*업\s*연\s*도"
+_RANGE_SEPARATOR = r"(?:~|∼|〜|－|–|—|부터|-)"
+_RANGE = re.compile(_PERIOD_LABEL + r"\s*[:：]?\s*" + _DATE_TOKEN + r"\s*" + _RANGE_SEPARATOR + r"\s*" + _DATE_TOKEN)
+# PDF form cells can lose their range separator, or put the period label
+# between two date-only cells. Keep the label adjacent: unrelated filing and
+# amendment dates elsewhere in a document are never fiscal-period evidence.
+_CELL_RANGE = re.compile(_PERIOD_LABEL + r"\s*[:：]?\s*" + _DATE_TOKEN + r"[\s|]+" + _DATE_TOKEN)
+_SPLIT_LABEL_RANGE = re.compile(
+    r"(?m)^[ \t]*" + _DATE_TOKEN + r"[ \t]*(?:\r?\n[ \t]*)"
+    + _PERIOD_LABEL + r"\s*[:：]?\s*(?:" + _RANGE_SEPARATOR + r"\s*)?" + _DATE_TOKEN
+)
+_YEAR = re.compile(
+    r"(?m)^\s*(?:(?P<before>(?:19|20)\d{2})\s*(?:년\s*)?" + _PERIOD_LABEL
+    + r"|" + _PERIOD_LABEL + r"\s*[:：]?\s*(?P<after>(?:19|20)\d{2})(?:\s*년)?"
+    r"(?=\s*(?:$|[,:;]|법인세|세무|조정)))"
+)
+_ATTRIBUTION_YEAR = re.compile(
+    r"(?m)^[ \t]*(?P<year>(?:19|20)\d{2})\s*년\s*귀\s*속"
+    r"(?=[ \t]*(?:$|법인세|세무\s*조정|조정\s*계산서))"
+)
 _BUSINESS = re.compile(r"사업자\s*등록\s*번호\s*[:：]?\s*(\d{3})\s*-?\s*(\d{2})\s*-?\s*(\d{5})(?!\d)")
 
 
@@ -153,7 +172,12 @@ def _extract_fields(text: str, labels: dict[str, tuple[str, ...]], *, initial_un
 
 def _periods(text: str) -> list[dict]:
     markers = []
-    ranges = list(_RANGE.finditer(text))
+    ranges = []
+    for pattern in (_RANGE, _CELL_RANGE, _SPLIT_LABEL_RANGE):
+        for match in pattern.finditer(text):
+            if not any(existing.start() < match.end() and match.start() < existing.end()
+                       for existing in ranges):
+                ranges.append(match)
     for match in ranges:
         try:
             start = date(*map(int, match.groups()[:3]))
@@ -167,6 +191,11 @@ def _periods(text: str) -> list[dict]:
         if any(item.start() <= match.start() < item.end() for item in ranges):
             continue
         markers.append({"offset": match.start(), "year": int(match.group("before") or match.group("after")), "period_start": "", "period_end": ""})
+    for match in _ATTRIBUTION_YEAR.finditer(text):
+        if any(item.start() <= match.start() < item.end() for item in ranges):
+            continue
+        markers.append({"offset": match.start(), "year": int(match.group("year")),
+                        "period_start": "", "period_end": ""})
     markers.sort(key=lambda item: item["offset"])
     return markers
 
@@ -212,37 +241,113 @@ def analyze_tax_adjustment_text(text: str) -> dict[str, Any]:
     }
 
 
+def _tax_record_identity(record: dict) -> tuple[bool, bool]:
+    """Share the same legacy identity boundary across discovery and recovery."""
+    if not isinstance(record, dict) or record.get("document_type") != "tax_adjustment":
+        return False, False
+    analysis = record.get("extracted_fields") or {}
+    if not isinstance(analysis, dict):
+        return False, False
+    declared_numbers = analysis.get("business_numbers") or []
+    if not isinstance(declared_numbers, (list, tuple)):
+        declared_numbers = [declared_numbers]
+    declared_numbers = [*declared_numbers, analysis.get("business_no", "")]
+    declared_numbers = [str(value).strip() for value in declared_numbers if str(value or "").strip()]
+    identity_numbers = {
+        digits for value in declared_numbers
+        if len(digits := re.sub(r"\D", "", value)) == 10
+    }
+    record_identity = re.sub(r"\D", "", str(record.get("business_no", "")))
+    # Older attachments may have been linked incorrectly before upload
+    # identity checks existed. Never reuse an explicitly different entity.
+    valid = not declared_numbers or (len(record_identity) == 10 and record_identity in identity_numbers)
+    return valid, len(identity_numbers) > 1
+
+
+def _tax_period_year(period: Any) -> int | None:
+    if not isinstance(period, dict):
+        return None
+    try:
+        year = int(period["year"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    return year if 1900 <= year <= 2100 else None
+
+
+def unrecognized_tax_records(records: list[dict]) -> list[dict]:
+    """Expose stored originals needing a confirmed period, not guessed years.
+
+    Historical ``years`` values were collected from arbitrary document dates.
+    They must not silently become approved years or legal-income amounts.
+    The caller remains responsible for the owner/company-scoped record query.
+    """
+    results = []
+    for record in records:
+        valid, _ = _tax_record_identity(record)
+        if not valid:
+            continue
+        periods = (record.get("extracted_fields") or {}).get("valuation_periods") or []
+        if not isinstance(periods, (list, tuple)):
+            periods = []
+        if not any(_tax_period_year(period) is not None for period in periods):
+            results.append(deepcopy(record))
+    return results
+
+
+def reviewed_tax_period_record(
+    record: dict, year: int | str, period_start: str, period_end: str,
+) -> dict:
+    """Build a separately reviewed copy without inferring any legal amounts.
+
+    This pure function does not save, change the original analysis, or infer a
+    calendar-year range from a filename/legacy year list. Its caller must obtain
+    explicit original/period confirmation and preserve the prior analysis version.
+    """
+    valid, _ = _tax_record_identity(record)
+    if not valid or not str(record.get("record_id") or "").strip():
+        raise ValueError("기업에 연결된 원본 자료의 식별정보를 확인하지 못했습니다.")
+    if not unrecognized_tax_records([record]):
+        raise ValueError("이미 사업연도가 확인된 자료는 이 복구 기능으로 변경할 수 없습니다.")
+    try:
+        confirmed_year = int(str(year).strip())
+        if not all(re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(value))
+                   for value in (period_start, period_end)):
+            raise ValueError("not an explicit ISO calendar date")
+        start = date.fromisoformat(str(period_start))
+        end = date.fromisoformat(str(period_end))
+    except (TypeError, ValueError):
+        raise ValueError("사업연도와 원문에서 확인한 시작일·종료일을 YYYY-MM-DD로 입력해주세요.") from None
+    if not 1900 <= confirmed_year <= 2100 or start > end or end.year != confirmed_year:
+        raise ValueError("사업연도는 종료일의 연도와 같아야 하며 시작일·종료일 순서를 확인해주세요.")
+    restored = deepcopy(record)
+    analysis = deepcopy(restored.get("extracted_fields") or {})
+    analysis["valuation_periods"] = [{
+        "year": confirmed_year, "period_start": start.isoformat(), "period_end": end.isoformat(),
+        "values": {}, "financial_fields": {}, "evidence": {}, "financial_evidence": {},
+        "ambiguous_fields": [], "manual_period_review": True,
+    }]
+    restored["extracted_fields"] = analysis
+    return restored
+
+
 def build_tax_adjustment_candidates(records: list[dict], evaluation_date: date | str) -> list[dict]:
     """Merge same-year corroboration; leave differing values unresolved."""
     as_of = evaluation_date if isinstance(evaluation_date, date) else date.fromisoformat(str(evaluation_date)[:10])
     grouped: dict[int, list[tuple[dict, dict]]] = {}
     for record in records:
-        if record.get("document_type") != "tax_adjustment":
+        valid, identity_review = _tax_record_identity(record)
+        if not valid:
             continue
         analysis = record.get("extracted_fields") or {}
-        declared_numbers = analysis.get("business_numbers") or []
-        if not isinstance(declared_numbers, (list, tuple)):
-            declared_numbers = [declared_numbers]
-        declared_numbers = [*declared_numbers, analysis.get("business_no", "")]
-        declared_numbers = [str(value).strip() for value in declared_numbers if str(value or "").strip()]
-        identity_numbers = {
-            digits for value in declared_numbers
-            if len(digits := re.sub(r"\D", "", value)) == 10
-        }
-        record_identity = re.sub(r"\D", "", str(record.get("business_no", "")))
-        # Older attachments may have been linked incorrectly before upload
-        # identity checks existed. Never reuse an explicitly different entity.
-        if declared_numbers and (len(record_identity) != 10 or record_identity not in identity_numbers):
+        record = {**record, "_tax_identity_review_required": identity_review}
+        periods = analysis.get("valuation_periods") or []
+        if not isinstance(periods, (list, tuple)):
             continue
-        record = {**record, "_tax_identity_review_required": len(identity_numbers) > 1}
-        for period in analysis.get("valuation_periods", []):
+        for period in periods:
             if not isinstance(period, dict):
                 continue
-            try:
-                year = int(period["year"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if 1900 <= year <= 2100:
+            year = _tax_period_year(period)
+            if year is not None:
                 grouped.setdefault(year, []).append((record, period))
     results = []
     for year, items in sorted(grouped.items(), reverse=True):
@@ -292,13 +397,18 @@ def build_tax_adjustment_candidates(records: list[dict], evaluation_date: date |
             warnings.append("1년 미만 사업연도이므로 연환산을 별도 검토해야 합니다.")
         if legal_review:
             warnings.append("평가기준일의 법령이 현재 확인 범위 밖이므로 별도 법령 검토가 필요합니다.")
+        manually_reviewed = any(period.get("manual_period_review") for _, period in items)
+        if manually_reviewed:
+            warnings.append("사업연도 기간을 원문 대조 후 직접 확인한 자료입니다. 법정 금액은 별도로 입력·검토해야 합니다.")
         results.append({
             "year": year, "period_start": start, "period_end": end,
             "period_verified": verified and valid_dates, "short_period": short_period,
             "identity_review_required": identity_review,
             "legal_review_required": legal_review, "values": values,
             "financial_fields": facts, "field_sources": field_sources, "conflicts": sorted(set(conflicts)),
-            "sources": [{"record_id": item.get("record_id", ""), "filename": item.get("filename", ""), "uploaded_at": item.get("uploaded_at", "")} for item, _ in items],
+            "sources": [{"record_id": item.get("record_id", ""), "filename": item.get("filename", ""), "uploaded_at": item.get("uploaded_at", ""),
+                         **({"manual_period_review": True} if period.get("manual_period_review") else {})}
+                        for item, period in items],
             "missing": calculate_tax_adjusted_income(values)["missing"],
             "eligible": eligible, "warnings": warnings,
         })

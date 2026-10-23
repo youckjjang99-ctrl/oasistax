@@ -233,28 +233,216 @@ def test_financial_change_invalidates_material_revision(sources, tmp_path):
     assert materials._material_revision(OWNER) != before
 
 
-def test_material_library_type_filter_and_one_click_detail_are_read_only(sources, monkeypatch):
-    values = [
-        {"key": "synthetic-articles", "type": "articles", "label": "정관 분석", "saved_at": "2026-10-23", "filename": "", "record": row("articles", analysis_summary="검토 완료", local_path="synthetic-secret-path")},
-        {"key": "synthetic-stock", "type": "stock_valuation", "label": "주가평가 계산", "saved_at": "2026-10-22", "filename": "", "record": row("stock", result={"per_share": 1000})},
-    ]
-    loader = Mock(return_value=(values, []))
-    monkeypatch.setattr(materials, "_cached_company_materials", loader)
+def file_item(identity, **extra):
+    return {"type": extra.get("document_type", "articles"), "record": row(identity, **extra)}
+
+
+def test_original_projection_hides_analysis_only_and_keeps_input_untouched(sources):
+    values = [file_item("file", document_type="articles", filename="original.pdf"),
+              file_item("calculation", result={"amount": 100}),
+              file_item("note", analysis_summary="private analysis")]
+    before = deepcopy(values)
+    items = materials.project_original_files(OWNER, BUSINESS, values)
+    assert len(items) == 1
+    assert items[0]["filename"] == "original.pdf"
+    assert items[0]["label"] == "정관"
+    assert items[0]["format"] == "PDF"
+    assert values == before
+
+
+def test_original_projection_deduplicates_reanalyses_but_not_different_sha(sources):
+    values = [file_item("current", document_type="articles", filename="same.pdf", sha256="sha-original", first_uploaded_at="2025-01-01"),
+              file_item("old-analysis", document_type="articles", filename="same.pdf", sha256="sha-original", local_path="synthetic-original-path"),
+              file_item("another-file", document_type="articles", filename="same.pdf", sha256="sha-different")]
+    items = materials.project_original_files(OWNER, BUSINESS, values)
+    assert len(items) == 2
+    original = next(item for item in items if item["record"]["sha256"] == "sha-original")
+    assert original["saved_at"] == "2025-01-01"
+    assert original["record"]["local_path"] == "synthetic-original-path"
+
+
+@pytest.mark.parametrize("bad", [{"owner_user_id": "other-owner"}, {"business_no": OTHER_BUSINESS}, {"사업자등록번호": OTHER_BUSINESS}])
+def test_original_projection_rejects_wrong_owner_or_company(sources, bad):
+    assert materials.project_original_files(OWNER, BUSINESS, [file_item("forbidden", filename="private.pdf", **bad)]) == []
+
+
+@pytest.mark.parametrize("name_field,path_field", [("filename", "local_path"), ("source_filename", "file_path"), ("original_filename", "audio_path")])
+def test_original_filename_and_download_support_legacy_fields(sources, tmp_path, name_field, path_field):
+    path = tmp_path / OWNER / "legacy.pdf"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"synthetic legacy")
+    record = row("legacy", **{name_field: "legacy.pdf", path_field: str(path)})
+    item = materials.project_original_files(OWNER, BUSINESS, [{"record": record}])[0]
+    assert item["filename"] == "legacy.pdf"
+    assert materials.read_owned_material_file(OWNER, BUSINESS, record) == b"synthetic legacy"
+
+
+def test_file_collector_loads_archives_not_unrelated_analysis_stores(sources, monkeypatch):
+    sources["documents"] = [row("original", document_type="tax_adjustment", filename="tax.pdf",
+                                analysis_versions=[{"analysis_summary": "not a file"}])]
+    sources["audio"] = [row("audio", original_filename="meeting.m4a", audio_id="audio")]
+    forbidden = Mock(side_effect=AssertionError("analysis-only stores must not load"))
+    monkeypatch.setattr(stock_valuation, "_records_for_stock_company", forbidden)
+    monkeypatch.setattr(stock_valuation, "_load_financial_cache", forbidden)
+    monkeypatch.setattr(employee_status, "load_employee_versions", forbidden)
+    monkeypatch.setattr(articles_review, "get_latest_articles_review", forbidden)
+    monkeypatch.setattr(consultation_journal, "load_company_consultation_context", forbidden)
+    items, failures = materials.collect_company_files(OWNER, BUSINESS)
+    assert failures == []
+    assert {item["filename"] for item in items} == {"tax.pdf", "meeting.m4a"}
+    forbidden.assert_not_called()
+
+
+def _file_app(monkeypatch, values):
+    projected = materials.project_original_files(OWNER, BUSINESS, values)
+    loader = Mock(return_value=(projected, []))
+    monkeypatch.setattr(materials, "_cached_company_files", loader)
     monkeypatch.setattr(materials, "_material_revision", lambda _: ())
-    original = Mock(side_effect=AssertionError("must not read original without click"))
-    monkeypatch.setattr(materials, "read_owned_material_file", original)
     app = AppTest.from_string(
         "from company_materials import render_company_materials\n"
         f"render_company_materials({OWNER!r}, {BUSINESS!r}, '합성 기업')\n"
     ).run()
+    return app, projected, loader
+
+
+def test_file_library_filter_only_shows_file_metadata_and_no_analysis(sources, monkeypatch):
+    values = [file_item("articles", document_type="articles", filename="articles.pdf", analysis_summary="private analysis", local_path="synthetic-secret-path"),
+              file_item("tax", document_type="tax_adjustment", filename="tax.pdf")]
+    original = Mock(side_effect=AssertionError("must not read original without click"))
+    monkeypatch.setattr(materials, "read_owned_material_file", original)
+    app, projected, _ = _file_app(monkeypatch, values)
     assert not app.exception
     assert len(app.dataframe[0].value) == 2
-    app.selectbox[0].select("주가평가 계산").run()
+    assert set(app.dataframe[0].value.columns) == {"종류", "파일명", "형식", "등록일", "원본 상태"}
+    app.selectbox[0].select("정관").run()
     assert not app.exception
     assert len(app.dataframe[0].value) == 1
-    app.selectbox[1].select(0).run()
+    app.selectbox[1].select(next(item["key"] for item in projected if item["type"] == "articles")).run()
     assert not app.exception
-    rendered = str(app.get("json")[0].value)
-    assert "per_share" in rendered and "1000" in rendered
-    assert "synthetic-secret-path" not in rendered
+    assert not app.get("json")
+    assert "private analysis" not in str(app.dataframe[0].value)
+    assert "synthetic-secret-path" not in str(app.dataframe[0].value)
     original.assert_not_called()
+
+
+def test_selected_file_is_prepared_lazily_and_download_survives_rerun(sources, monkeypatch):
+    original = Mock(return_value=b"synthetic original")
+    monkeypatch.setattr(materials, "read_owned_material_file", original)
+    app, values, _ = _file_app(monkeypatch, [file_item("one", filename="one.pdf"), file_item("two", filename="two.pdf")])
+    original.assert_not_called()
+    app.selectbox[1].select(values[0]["key"]).run()
+    original.assert_not_called()
+    next(button for button in app.button if button.label == "원본 다운로드 준비").click().run()
+    assert not app.exception
+    original.assert_called_once()
+    assert len(app.get("download_button")) == 1
+    assert app.session_state["_materials_prepared_download"]["content"] == b"synthetic original"
+    app.run()
+    assert not app.exception
+    assert len(app.get("download_button")) == 1
+    original.assert_called_once()
+    app.selectbox[1].select(values[1]["key"]).run()
+    assert not app.get("download_button")
+    original.assert_called_once()
+    assert "_materials_prepared_download" not in app.session_state
+
+
+def test_missing_original_is_not_shown_as_downloadable_and_explains_reupload(sources, monkeypatch):
+    monkeypatch.setattr(materials, "read_owned_material_file", Mock(side_effect=FileNotFoundError))
+    monkeypatch.setattr(materials, "material_cloud_url", Mock(side_effect=FileNotFoundError))
+    app, values, _ = _file_app(monkeypatch, [file_item("missing", filename="missing.pdf")])
+    assert app.dataframe[0].value.iloc[0]["원본 상태"] == "원본 확인 필요"
+    app.selectbox[1].select(values[0]["key"]).run()
+    next(button for button in app.button if button.label == "원본 다운로드 준비").click().run()
+    assert not app.exception
+    assert not app.get("download_button")
+    assert any("다시 업로드" in warning.value for warning in app.warning)
+
+
+def test_tampered_download_does_not_fall_back_to_cloud(sources, monkeypatch):
+    monkeypatch.setattr(materials, "read_owned_material_file", Mock(side_effect=ValueError("synthetic mismatch")))
+    cloud = Mock()
+    monkeypatch.setattr(materials, "material_cloud_url", cloud)
+    app, values, _ = _file_app(monkeypatch, [file_item("tampered", filename="original.pdf")])
+    app.selectbox[1].select(values[0]["key"]).run()
+    next(button for button in app.button if button.label == "원본 다운로드 준비").click().run()
+    assert not app.exception
+    assert app.error
+    assert not app.get("download_button")
+    cloud.assert_not_called()
+
+
+def test_selected_source_change_discards_prepared_payload(sources, monkeypatch, tmp_path):
+    path = tmp_path / OWNER / "original.pdf"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"original")
+    app, values, _ = _file_app(monkeypatch, [file_item("file", filename="original.pdf", local_path=str(path))])
+    app.selectbox[1].select(values[0]["key"]).run()
+    next(button for button in app.button if button.label == "원본 다운로드 준비").click().run()
+    assert len(app.get("download_button")) == 1
+    path.write_bytes(b"changed original")
+    app.run()
+    assert not app.exception
+    assert not app.get("download_button")
+    assert "_materials_prepared_download" not in app.session_state
+
+
+def test_remote_signed_link_persists_only_until_short_expiry(sources, monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(materials.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(materials, "read_owned_material_file", Mock(side_effect=FileNotFoundError))
+    cloud = Mock(return_value="https://example.invalid/synthetic-private-download")
+    monkeypatch.setattr(materials, "material_cloud_url", cloud)
+    app, values, _ = _file_app(monkeypatch, [file_item("cloud", filename="cloud.pdf", asset_id="synthetic-asset")])
+    app.selectbox[1].select(values[0]["key"]).run()
+    next(button for button in app.button if button.label == "원본 다운로드 준비").click().run()
+    assert not app.exception
+    assert len(app.get("link_button")) == 1
+    app.run()
+    assert len(app.get("link_button")) == 1
+    cloud.assert_called_once()
+    now[0] += 51
+    app.run()
+    assert not app.get("link_button")
+    assert "_materials_prepared_download" not in app.session_state
+
+
+@pytest.mark.parametrize("field,value", [("business", OTHER_BUSINESS), ("owner", "other-owner")])
+def test_download_state_is_cleared_when_company_context_changes(sources, monkeypatch, field, value):
+    monkeypatch.setattr(materials, "read_owned_material_file", Mock(return_value=b"synthetic original"))
+    app, values, _ = _file_app(monkeypatch, [file_item("one", filename="one.pdf")])
+    app.selectbox[1].select(values[0]["key"]).run()
+    next(button for button in app.button if button.label == "원본 다운로드 준비").click().run()
+    assert "_materials_prepared_download" in app.session_state
+    app.session_state["_materials_prepared_download"][field] = value
+    app.run()
+    assert not app.get("download_button")
+    assert "_materials_prepared_download" not in app.session_state
+
+
+def test_original_metadata_change_invalidates_download_without_reading_another_file(sources, monkeypatch):
+    reader = Mock(return_value=b"synthetic original")
+    monkeypatch.setattr(materials, "read_owned_material_file", reader)
+    app, values, _ = _file_app(monkeypatch, [file_item("file", filename="original.pdf")])
+    app.selectbox[1].select(values[0]["key"]).run()
+    next(button for button in app.button if button.label == "원본 다운로드 준비").click().run()
+    assert app.get("download_button")
+    values[0]["record"]["asset_id"] = "new-private-asset"
+    app.run()
+    assert not app.exception
+    assert not app.get("download_button")
+    reader.assert_called_once()
+
+
+def test_original_filename_only_records_never_claim_verified_download(sources):
+    items = materials.project_original_files(OWNER, BUSINESS, [file_item("metadata", filename="metadata-only.pdf")])
+    assert materials._original_status(OWNER, BUSINESS, items[0]) == "원본 확인 필요"
+
+
+def test_file_listing_failure_keeps_other_originals_and_redacts_error_details(sources, monkeypatch):
+    monkeypatch.setattr(enterprise_documents, "load_enterprise_document_context", Mock(side_effect=ValueError("synthetic private path")))
+    sources["audio"] = [row("audio", original_filename="meeting.m4a", audio_id="audio")]
+    items, failures = materials.collect_company_files(OWNER, BUSINESS)
+    assert [item["filename"] for item in items] == ["meeting.m4a"]
+    assert failures == ["업로드 원본 목록"]
+    assert "synthetic private path" not in str(failures)

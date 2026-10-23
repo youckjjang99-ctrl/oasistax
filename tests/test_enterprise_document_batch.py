@@ -143,7 +143,7 @@ def test_remote_tax_metadata_is_owner_company_scoped(monkeypatch):
     loader.assert_not_called()
     records = docs.load_enterprise_document_context("owner", BUSINESS, include_remote_tax=True)["records"]
     assert len(records) == 1
-    loader.assert_called_once_with("owner", BUSINESS)
+    loader.assert_called_once_with("owner", BUSINESS, limit=None)
 
 
 def test_new_remote_analysis_replaces_stale_local_metadata_not_original(monkeypatch):
@@ -151,7 +151,7 @@ def test_new_remote_analysis_replaces_stale_local_metadata_not_original(monkeypa
     monkeypatch.setattr(docs, "_load_records", lambda _: [local])
     remote = {"business_no": BUSINESS, "captured_at": "2026-10-22 10:00:00", "data": {"문서유형": "tax_adjustment", "자료ID": "record", "파일명": "synthetic.pdf", "추출정보": {"revision": 2}}}
     older = {**remote, "captured_at": "2026-10-20 10:00:00", "data": {**remote["data"], "추출정보": {"revision": 0}}}
-    monkeypatch.setattr(customer_history, "get_customer_history", lambda *_: [older, remote])
+    monkeypatch.setattr(customer_history, "get_customer_history", lambda *_, **kwargs: [older, remote])
     records = docs.load_enterprise_document_context("owner", BUSINESS, include_remote_tax=True)["records"]
     assert len(records) == 1
     assert records[0]["extracted_fields"] == {"revision": 2}

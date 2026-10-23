@@ -98,12 +98,30 @@ def _save_records(user_id: str, records: list[dict[str, Any]]) -> None:
     os.replace(temp, path)
 
 
+def _has_extracted_fiscal_periods(periods: Any) -> bool:
+    """Actual extraction outranks a later, amount-free manual recovery."""
+    if not isinstance(periods, list):
+        return False
+    for period in periods:
+        if not isinstance(period, dict) or period.get("manual_period_review"):
+            continue
+        try:
+            if 1900 <= int(period.get("year", 0)) <= 2100:
+                return True
+        except (ValueError, TypeError, OverflowError):
+            continue
+    return False
+
+
 def _preserve_document_fields(previous: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
     """Merge one original's analysis without clearing previously read fields."""
     from copy import deepcopy
 
     result = deepcopy(previous)
     for name, value in incoming.items():
+        if (name == "valuation_periods" and _has_extracted_fiscal_periods(result.get(name))
+                and not _has_extracted_fiscal_periods(value)):
+            continue
         if isinstance(value, dict) and isinstance(result.get(name), dict):
             result[name] = _preserve_document_fields(result[name], value)
         elif value is not None and value != "" and value != [] and value != {}:
@@ -111,7 +129,9 @@ def _preserve_document_fields(previous: dict[str, Any], incoming: dict[str, Any]
     return result
 
 
-def _save_record(user_id: str, record: dict[str, Any]) -> dict[str, Any]:
+def _save_record(
+    user_id: str, record: dict[str, Any], *, require_unrecognized_tax: bool = False,
+) -> dict[str, Any]:
     from copy import deepcopy
     from crm_file_store import atomic_write_json, locked_json
 
@@ -135,6 +155,11 @@ def _save_record(user_id: str, record: dict[str, Any]) -> dict[str, Any]:
         if len(positions) > 1:
             raise EnterpriseDocumentCorruptionError("같은 자료의 식별정보가 중복되어 원본을 보존하고 저장을 중단했습니다.")
         existing = records[positions[0]] if positions else {}
+        if require_unrecognized_tax and existing:
+            from tax_adjustment_valuation import unrecognized_tax_records
+
+            if not unrecognized_tax_records([existing]):
+                raise ValueError("다른 작업에서 이 자료의 사업연도가 확인되었습니다. 새로고침 후 기존 분석을 확인해주세요.")
         for value in (existing, record):
             if any(value.get(name) and str(value[name]) != owner
                    for name in ("owner_user_id", "user_id")):
@@ -166,6 +191,12 @@ def _save_record(user_id: str, record: dict[str, Any]) -> dict[str, Any]:
         versions = deepcopy(existing.get("analysis_versions", []))
         if not isinstance(versions, list) or any(not isinstance(item, dict) for item in versions):
             raise EnterpriseDocumentCorruptionError("기존 자료의 분석이력 형식을 확인하지 못해 저장을 중단했습니다.")
+        incoming_versions = record.get("analysis_versions", [])
+        if not isinstance(incoming_versions, list) or any(not isinstance(item, dict) for item in incoming_versions):
+            raise EnterpriseDocumentCorruptionError("가져온 자료의 분석이력 형식을 확인하지 못해 저장을 중단했습니다.")
+        for item in incoming_versions:
+            if item.get("revision") and not any(value.get("revision") == item["revision"] for value in versions):
+                versions.append(deepcopy(item))
         for candidate in (existing, merged):
             if not candidate:
                 continue
@@ -453,8 +484,10 @@ def load_enterprise_document_context(
         # owner+business-scoped server loader. Ordinary navigation stays local.
         from customer_history import get_customer_history
         positions = {str(item.get("record_id", "")): index for index, item in enumerate(records)}
-        history = (get_customer_history(user_id, normalized, limit=None)
-                   if include_remote_types else get_customer_history(user_id, normalized))
+        # Both explicit panels need the complete owner/company-scoped history.
+        # Otherwise an older tax upload can appear in the library yet disappear
+        # from the valuation picker after a deployment or device change.
+        history = get_customer_history(user_id, normalized, limit=None)
         for event in history:
             if not isinstance(event, dict):
                 continue
@@ -516,6 +549,14 @@ def load_enterprise_document_context(
                         existing.get("extracted_fields", {}), remote_record["extracted_fields"],
                     )
                     records[index] = latest
+                elif (document_type == "tax_adjustment"
+                      and _has_extracted_fiscal_periods(remote_record["extracted_fields"].get("valuation_periods"))
+                      and not _has_extracted_fiscal_periods(records[index].get("extracted_fields", {}).get("valuation_periods"))):
+                    # A later manual recovery must not clear a concurrently
+                    # extracted normal period, regardless of event arrival order.
+                    fields = deepcopy(records[index].get("extracted_fields", {}))
+                    fields["valuation_periods"] = deepcopy(remote_record["extracted_fields"]["valuation_periods"])
+                    records[index]["extracted_fields"] = fields
                 records[index]["analysis_versions"] = versions
                 records[index]["first_uploaded_at"] = min(
                     (existing.get("first_uploaded_at") or existing.get("uploaded_at", ""),
@@ -546,6 +587,64 @@ def load_enterprise_document_context(
         "combined_text": " ".join(part for part in parts if part),
         "source_history": history if include_remote_types else [],
     }
+
+
+def review_tax_document_period(
+    user_id: str, business_no: str, record_id: str,
+    year: int, period_start: str, period_end: str, *, confirmed: bool = False,
+    company_name: str = "",
+) -> dict[str, Any]:
+    """Append a user-confirmed fiscal-period analysis; never rewrite an original.
+
+    The source is resolved again through the owner/company loader instead of
+    trusting a submitted record. Monetary components stay unconfirmed.
+    """
+    from copy import deepcopy
+    from tax_adjustment_valuation import reviewed_tax_period_record
+
+    owner = str(user_id or "").strip()
+    business = _normalize_business_no(business_no)
+    if not owner or not business or not str(record_id or "").strip():
+        raise ValueError("자료를 확인할 사용자·기업·원본 식별정보가 필요합니다.")
+    if confirmed is not True:
+        raise ValueError("원본의 실제 사업연도 시작일·종료일을 먼저 확인해주세요.")
+    context = load_enterprise_document_context(owner, business, company_name, include_remote_tax=True)
+    matches = [item for item in context.get("records", [])
+               if item.get("document_type") == "tax_adjustment"
+               and str(item.get("record_id", "")) == str(record_id)]
+    if len(matches) != 1:
+        raise ValueError("현재 기업의 세무조정 원본자료를 확인하지 못했습니다. 자료를 다시 선택해주세요.")
+    source = matches[0]
+    reviewed = reviewed_tax_period_record(source, year, period_start, period_end)
+    reviewed_at = datetime.now().isoformat(timespec="microseconds")
+    reviewed["extracted_fields"]["fiscal_period_review"] = {
+        "year": int(year), "period_start": period_start, "period_end": period_end,
+        "reviewed_by": owner, "reviewed_at": reviewed_at,
+        "monetary_components_confirmed": False,
+    }
+    reviewed["first_uploaded_at"] = source.get("first_uploaded_at") or source.get("uploaded_at", "")
+    reviewed["uploaded_at"] = reviewed_at
+    saved = _save_record(owner, reviewed, require_unrecognized_tax=True)
+    result = save_customer_event(
+        owner, business, str(source.get("company_name") or company_name or ""),
+        event_id=f"enterprise-document-{record_id}-{saved['metadata_revision']}",
+        event_title="세무조정계산서 사업연도 확인",
+        event_detail="원문에서 확인한 사업연도만 추가했습니다. 법정 순손익 금액은 별도 검토가 필요합니다.",
+        source="enterprise_document:tax_adjustment", history_type="기업자료",
+        extra_data={
+            "문서유형": "tax_adjustment", "문서명": DOCUMENT_TYPES["tax_adjustment"],
+            "자료ID": str(record_id), "파일명": source.get("filename", ""),
+            "추출정보": deepcopy(saved["extracted_fields"]),
+            "분석요약": saved.get("analysis_summary", ""), "자료메모": saved.get("note", ""),
+            "최초등록일": saved.get("first_uploaded_at", ""),
+            "원본SHA256": saved.get("sha256", ""), "원본크기": saved.get("size_bytes", 0),
+            "클라우드원본ID": saved.get("asset_id", ""),
+            "원본보관상태": deepcopy(saved.get("asset_storage_status", {})),
+            "자료버전": saved["metadata_revision"],
+        }, return_status=True,
+    )
+    saved["period_review_storage_status"] = (result or {}).get("storage_status", {})
+    return saved
 
 
 def load_enterprise_source_overview(
@@ -847,14 +946,6 @@ def render_enterprise_information_assets(user_id: str, user_name: str = "") -> N
         from company_materials import render_company_materials
 
         render_company_materials(user_id, business_no, company_name)
-        metadata_mtime_ns, metadata_size = _enterprise_source_overview_revision(user_id)
-        overview = _load_enterprise_source_overview_cached(
-            user_id, business_no, company_name, metadata_mtime_ns, metadata_size,
-        )
-        st.dataframe(pd.DataFrame([
-            {"자료": DOCUMENT_TYPES[item], "상태": "등록됨" if overview[item]["available"] else "미등록", "연결 건수": overview[item]["count"]}
-            for item in UPLOAD_DOCUMENT_TYPES
-        ]), hide_index=True, use_container_width=True)
     st.markdown("#### 2. 자료 종류 선택·업로드")
     chosen_label = st.selectbox(
         "등록할 자료", [DOCUMENT_TYPES[item] for item in UPLOAD_DOCUMENT_TYPES],
