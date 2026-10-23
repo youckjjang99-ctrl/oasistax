@@ -41,7 +41,10 @@ def test_registry_actual_streamlit_rerun_keeps_saved_confirmation(monkeypatch, t
     monkeypatch.setattr(registry_runner, "run_registry_worker", worker)
     monkeypatch.setattr(stock, "get_user_dirs", lambda *a: {"base": tmp_path, "uploads": tmp_path / "uploads"})
     monkeypatch.setattr(stock, "sync_registry_snapshot", lambda *a: (True, ""))
-    monkeypatch.setattr(enterprise_documents, "register_existing_enterprise_document", Mock())
+    monkeypatch.setattr(enterprise_documents, "register_existing_enterprise_document", Mock(return_value={
+        "asset_storage_status": {"cloud_saved": True, "metadata_saved": True},
+        "history_storage_status": {"cloud_saved": True},
+    }))
     app = AppTest.from_string(
         "import pandas as pd\nimport streamlit as st\nfrom stock_valuation import _render_registry_upload\n"
         f"st.session_state.setdefault('stock_business_no', {BUSINESS!r})\n"
@@ -215,7 +218,8 @@ def setup_upload(monkeypatch, tmp_path, result, *, cloud=True, attachment=True):
         ui.events.append(("attachment",))
         if not attachment:
             raise OSError("sensitive filename")
-        return {}
+        return {"asset_storage_status": {"cloud_saved": True, "metadata_saved": True},
+                "history_storage_status": {"cloud_saved": True}}
 
     monkeypatch.setattr(enterprise_documents, "register_existing_enterprise_document", register)
     monkeypatch.setattr(enterprise_documents._load_enterprise_source_overview_cached, "clear", lambda: None)

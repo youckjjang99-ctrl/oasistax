@@ -804,34 +804,77 @@ def sync_stock_valuation(
 
 def load_stock_valuations(
     user_id: str,
-    limit: int = 200,
+    limit: int | None = 200,
+    *,
+    business_no: str = "",
 ) -> list[dict[str, Any]]:
-    """Supabase에 저장된 사용자의 주가평가 기록을 최신순으로 읽습니다."""
-    if not user_id or not cloud_is_configured():
+    """Read owner/company-scoped history before limiting, retaining legacy calls."""
+    user_id = str(user_id or "").strip()
+    selected_business = normalize_business_no(business_no) if business_no else ""
+    if (not user_id or not cloud_is_configured()
+            or (selected_business and len(re.sub(r"[^0-9]", "", selected_business)) != 10)):
         return []
 
     try:
-        rows = CloudDatabase().select(
-            TABLE_STOCK,
-            filters={"owner_user_id": user_id},
-            columns="record_id,valuation_data",
-            order="created_at.desc",
-            limit=limit,
-        )
+        safe_limit = None if limit is None else max(0, int(limit))
+        if safe_limit == 0:
+            return []
+        database = CloudDatabase()
+        rows = []
+        for business in _business_no_variants(selected_business) if selected_business else [""]:
+            filters = {"owner_user_id": user_id}
+            if business:
+                filters["business_no"] = business
+            arguments = {
+                "filters": filters,
+                "columns": "id,record_id,owner_user_id,business_no,created_at,valuation_data",
+                "order": "created_at.desc,id.desc",
+            }
+            if safe_limit is None:
+                rows.extend(database.select_all(TABLE_STOCK, **arguments))
+            else:
+                rows.extend(database.select(TABLE_STOCK, **arguments, limit=safe_limit))
     except Exception:
         return []
 
-    records: list[dict[str, Any]] = []
+    records: dict[str, tuple[str, dict[str, Any]]] = {}
     for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_owner = str(row.get("owner_user_id") or "").strip()
+        if row_owner and row_owner != user_id:
+            continue
         data = row.get("valuation_data", {})
         if not isinstance(data, dict):
             continue
+        payload_owner = str(data.get("owner_user_id") or "").strip()
+        if payload_owner and payload_owner != user_id:
+            continue
+        row_business = normalize_business_no(row.get("business_no")) if row.get("business_no") else ""
+        payload_business = normalize_business_no(data.get("business_no")) if data.get("business_no") else ""
+        if row_business and payload_business and row_business != payload_business:
+            continue
+        authoritative_business = row_business or payload_business
+        if selected_business and authoritative_business != selected_business:
+            continue
+        row_id = str(row.get("record_id") or "").strip()
+        payload_id = str(data.get("record_id") or "").strip()
+        if row_id and payload_id and row_id != payload_id:
+            continue
         record = dict(data)
-        if not record.get("record_id"):
-            record["record_id"] = str(row.get("record_id", "") or "")
-        if record.get("record_id"):
-            records.append(record)
-    return records
+        record["record_id"] = row_id or payload_id
+        record["owner_user_id"] = row_owner or user_id
+        if authoritative_business:
+            record["business_no"] = authoritative_business
+        if record["record_id"]:
+            stamp = str(row.get("created_at") or record.get("saved_at") or "")
+            previous = records.get(record["record_id"])
+            if previous is None or stamp > previous[0]:
+                records[record["record_id"]] = (stamp, record)
+    ordered = [value[1] for value in sorted(
+        records.values(), key=lambda item: (item[0], item[1]["record_id"]), reverse=True,
+    )]
+    return ordered if safe_limit is None else ordered[:safe_limit]
 
 
 def sync_matching_preferences(

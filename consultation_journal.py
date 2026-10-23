@@ -18,6 +18,8 @@ from upload_progress import UploadProgress, render_upload_feedback, render_uploa
 
 from cloud_sync import sync_crm_record
 from cloud_db import CloudDatabase, cloud_is_configured
+from crm_file_store import CrmStorageError, atomic_write_json, locked_json
+from data_safety_storage import require_owner_context
 from ai_usage import (
     estimate_summary_cost,
     estimate_transcription_cost,
@@ -376,15 +378,60 @@ def _journal_path(user_id: str) -> Path:
     return get_user_dirs(user_id)["base"] / "consultation_journals.json"
 
 
-def _load_local_journals(user_id: str) -> list[dict[str, Any]]:
-    path = _journal_path(user_id)
-    if not path.exists():
-        return []
+def _read_journal_rows(path: Path) -> list[dict[str, Any]]:
+    """A damaged journal is not an empty journal: never overwrite its original."""
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate_key")
+            result[key] = value
+        return result
+
+    def reject_constant(value):
+        raise ValueError("invalid_constant")
+
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except Exception:
+        data = json.loads(path.read_text(encoding="utf-8"),
+                          object_pairs_hook=unique_object, parse_constant=reject_constant)
+    except FileNotFoundError:
         return []
+    except (OSError, ValueError, UnicodeError):
+        raise CrmStorageError("상담일지 원본을 안전하게 읽지 못했습니다. 원본을 보존하고 저장을 중단했습니다.") from None
+    if not isinstance(data, list) or any(not isinstance(row, dict) for row in data):
+        raise CrmStorageError("상담일지 형식이 올바르지 않아 원본을 보존하고 저장을 중단했습니다.")
+    return data
+
+
+def _journal_is_owned(record: dict[str, Any], user_id: str) -> bool:
+    # Owner-less legacy rows are scoped by their existing per-user source file.
+    owner = str(record.get("owner_user_id", "") or "").strip()
+    return not owner or owner == user_id
+
+
+def _journal_business_no(record: dict[str, Any]) -> str:
+    value = str(record.get("business_no", "") or "").strip()
+    if value:
+        normalized = normalize_business_no(value)
+        return normalized if len(normalized) == 10 else ""
+    legacy_key = str(record.get("customer_key", "") or "").strip()
+    if legacy_key.startswith("biz:"):
+        normalized = normalize_business_no(legacy_key[4:])
+        if len(normalized) == 10:
+            return normalized
+    return ""
+
+
+def _journal_matches_company(record: dict[str, Any], business_no: str) -> bool:
+    # A company name is never a unique key, even for an old owner-scoped row.
+    normalized = normalize_business_no(business_no)
+    return len(normalized) == 10 and _journal_business_no(record) == normalized
+
+
+def _load_local_journals(user_id: str) -> list[dict[str, Any]]:
+    user_id = require_owner_context(user_id, allow_admin=True)
+    return [row for row in _read_journal_rows(_journal_path(user_id))
+            if _journal_is_owned(row, user_id)]
 
 
 def _load_cloud_journals(
@@ -392,22 +439,41 @@ def _load_cloud_journals(
     business_no: str = "",
     limit: int = 500,
 ) -> list[dict[str, Any]]:
+    user_id = require_owner_context(user_id, allow_admin=True)
     if not cloud_is_configured():
         return []
     try:
-        filters = {"owner_user_id": user_id}
-        rows = CloudDatabase().select(
-            CONSULTATION_JOURNAL_TABLE,
-            filters=filters,
-            order="saved_at.desc",
-            limit=limit,
-        )
+        variants = [""]
+        if business_no:
+            normalized = normalize_business_no(business_no)
+            if len(normalized) != 10:
+                return []
+            variants = [normalized, f"{normalized[:3]}-{normalized[3:5]}-{normalized[5:]}"]
+        rows = []
+        database = CloudDatabase()
+        for variant in variants:
+            filters = {"owner_user_id": user_id}
+            if variant:
+                filters["business_no"] = variant
+            rows.extend(database.select_all(
+                CONSULTATION_JOURNAL_TABLE,
+                filters=filters,
+                order="saved_at.desc,journal_id.asc",
+                page_size=min(max(int(limit), 1), 1000),
+                max_rows=max(int(limit), 1),
+            ))
     except Exception:
         return []
 
     result = []
     for row in rows:
         if not isinstance(row, dict):
+            continue
+        if str(row.get("owner_user_id", "") or "").strip() != user_id:
+            continue
+        # Never allow an embedded customer_key/business_no to reassign a row.
+        row_business_no = normalize_business_no(row.get("business_no", ""))
+        if len(row_business_no) != 10:
             continue
         payload = row.get("journal_data", {})
         if isinstance(payload, str):
@@ -416,14 +482,15 @@ def _load_cloud_journals(
             except Exception:
                 payload = {}
         record = dict(payload) if isinstance(payload, dict) else {}
-        if business_no and normalize_business_no(record.get("business_no", "")) != normalize_business_no(business_no):
-            continue
         for key in (
             "journal_id", "company_name", "business_no",
             "consultant_name", "saved_at",
         ):
-            if row.get(key) not in (None, ""):
-                record[key] = row.get(key)
+            record[key] = row.get(key, "")
+        # Database owner/identity columns are authoritative, not cached payloads.
+        record["owner_user_id"] = user_id
+        if business_no and not _journal_matches_company(record, business_no):
+            continue
         result.append(record)
     return result
 
@@ -470,24 +537,19 @@ def _find_journal_by_transcript(
 
 
 def _merge_journal_rows(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deduplicate identical copies; never blend two differing saved versions."""
     merged: dict[str, dict[str, Any]] = {}
     for group in groups:
         for item in group:
             if not isinstance(item, dict):
                 continue
-            key = str(item.get("journal_id", "")).strip()
-            if not key:
-                key = "|".join([
-                    str(item.get("business_no", "")),
-                    str(item.get("saved_at", "")),
-                    str(item.get("consultation_title", "")),
-                ])
+            canonical = dict(item)
+            if _journal_business_no(item):
+                canonical["business_no"] = _journal_business_no(item)
+            key = hashlib.sha256(json.dumps(canonical, ensure_ascii=False, sort_keys=True,
+                                            default=str).encode("utf-8")).hexdigest()
             if key not in merged:
                 merged[key] = dict(item)
-            else:
-                merged[key].update(
-                    {k: v for k, v in item.items() if v not in (None, "", [], {})}
-                )
     return sorted(
         merged.values(),
         key=lambda row: str(row.get("saved_at", "")),
@@ -495,48 +557,14 @@ def _merge_journal_rows(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
 
 
-def _load_journals(user_id: str) -> list[dict[str, Any]]:
-    return _merge_journal_rows(
-        _load_cloud_journals(user_id),
+def _load_journals(user_id: str, business_no: str = "") -> list[dict[str, Any]]:
+    user_id = require_owner_context(user_id, allow_admin=True)
+    records = _merge_journal_rows(
+        _load_cloud_journals(user_id, business_no=business_no, limit=100000),
         _load_local_journals(user_id),
     )
-
-
-def load_company_consultation_context(
-    user_id: str,
-    business_no: str,
-    company_name: str = "",
-    limit: int = 20,
-) -> list[dict[str, Any]]:
-    # AI 코파일럿용 회사별 상담일지·녹취 컨텍스트를 반환합니다.
-    normalized_no = normalize_business_no(business_no)
-    normalized_name = str(company_name or "").strip()
-
-    records = _load_journals(user_id)
-    matched: list[dict[str, Any]] = []
-
-    for record in records:
-        if not isinstance(record, dict):
-            continue
-
-        record_no = normalize_business_no(record.get("business_no", ""))
-        record_name = str(record.get("company_name", "") or "").strip()
-
-        number_matches = bool(
-            normalized_no and record_no and normalized_no == record_no
-        )
-        name_matches = bool(
-            normalized_name and record_name and normalized_name == record_name
-        )
-
-        if not number_matches and not name_matches:
-            continue
-
-        matched.append(dict(record))
-        if len(matched) >= max(int(limit), 1):
-            break
-
-    return matched
+    return [row for row in records if _journal_is_owned(row, user_id)
+            and (not business_no or _journal_matches_company(row, business_no))]
 
 
 def load_company_consultation_context(
@@ -545,35 +573,19 @@ def load_company_consultation_context(
     company_name: str = "",
     limit: int = 50,
 ) -> list[dict[str, Any]]:
-    # AI copilot: load saved consultation journals for one company.
-    normalized_no = normalize_business_no(business_no)
-    normalized_name = str(company_name or "").strip()
-
-    matched: list[dict[str, Any]] = []
-    for record in _load_journals(user_id):
-        if not isinstance(record, dict):
-            continue
-
-        record_no = normalize_business_no(record.get("business_no", ""))
-        record_name = str(record.get("company_name", "") or "").strip()
-
-        number_match = bool(
-            normalized_no and record_no and normalized_no == record_no
-        )
-        name_match = bool(
-            normalized_name and record_name and normalized_name == record_name
-        )
-        if not number_match and not name_match:
-            continue
-
-        matched.append(dict(record))
-        if len(matched) >= max(1, int(limit)):
-            break
-
-    return matched
+    # Keep company_name in the public API for callers, not as an identity key.
+    del company_name
+    user_id = require_owner_context(user_id, allow_admin=True)
+    if len(normalize_business_no(business_no)) != 10:
+        return []
+    return [dict(row) for row in _load_journals(user_id, business_no)
+            if _journal_matches_company(row, business_no)][:max(1, int(limit))]
 
 
 def _save_cloud_journal(user_id: str, record: dict[str, Any]) -> None:
+    user_id = require_owner_context(user_id)
+    if not _journal_is_owned(record, user_id):
+        raise PermissionError("다른 사용자의 상담일지는 변경할 수 없습니다.")
     if not cloud_is_configured():
         return
     cloud_record = {
@@ -595,12 +607,15 @@ def _save_cloud_journal(user_id: str, record: dict[str, Any]) -> None:
 
 
 def _save_journals(user_id: str, journals: list[dict[str, Any]]) -> None:
+    user_id = require_owner_context(user_id)
+    if any(not isinstance(row, dict) or not _journal_is_owned(row, user_id) for row in journals):
+        raise PermissionError("다른 사용자의 상담일지는 변경할 수 없습니다.")
     path = _journal_path(user_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(journals[:500], ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    with locked_json(path):
+        existing = _read_journal_rows(path)
+        # Re-read under lock so concurrent saves and older history all survive.
+        merged = _merge_journal_rows(journals, existing)
+        atomic_write_json(path, merged)
 
 
 def _extract_response_text(response_data: dict[str, Any]) -> str:
@@ -2136,19 +2151,13 @@ def relink_saved_consultation_journals(
     business_no: str,
     company_name: str,
 ) -> dict[str, Any]:
-    journals = _load_journals(user_id)
-    normalized = normalize_business_no(business_no)
-    matched: list[dict[str, Any]] = []
-
-    for item in journals:
-        if not isinstance(item, dict):
-            continue
-        item_no = normalize_business_no(item.get("business_no", ""))
-        item_company = str(item.get("company_name", "") or "").strip()
-        if normalized and item_no == normalized:
-            matched.append(item)
-        elif not normalized and company_name and item_company == company_name.strip():
-            matched.append(item)
+    user_id = require_owner_context(user_id)
+    if len(normalize_business_no(business_no)) != 10:
+        return {"journal_count": 0, "keyword_count": 0, "interest_count": 0,
+                "history_count": 0,
+                "errors": ["사업자등록번호를 확인한 뒤 상담일지를 연결해 주세요. 원본은 그대로 보존됩니다."]}
+    matched = [row for row in _load_journals(user_id, business_no)
+               if _journal_matches_company(row, business_no)]
 
     matched = sorted(matched, key=lambda row: str(row.get("saved_at", "")))
     processed = _load_journal_relink_state(user_id)
@@ -2230,25 +2239,7 @@ def get_company_consultation_context(
     limit: int = 10,
 ) -> dict[str, Any]:
     # AI 종합진단에 사용할 기업별 상담 맥락
-    normalized = normalize_business_no(business_no)
-    journals = _load_journals(user_id)
-    matched = []
-
-    for item in journals:
-        if not isinstance(item, dict):
-            continue
-        item_no = normalize_business_no(item.get("business_no", ""))
-        item_company = str(item.get("company_name", "") or "").strip()
-        if normalized and item_no == normalized:
-            matched.append(item)
-        elif not normalized and company_name and item_company == company_name.strip():
-            matched.append(item)
-
-    matched = sorted(
-        matched,
-        key=lambda row: str(row.get("saved_at", "")),
-        reverse=True,
-    )[:max(1, int(limit))]
+    matched = load_company_consultation_context(user_id, business_no, company_name, limit)
 
     def unique(values: list[Any]) -> list[str]:
         result: list[str] = []
@@ -2300,18 +2291,10 @@ def render_saved_consultation_journals(
     business_no: str = "",
     company_name: str = "",
 ) -> None:
-    journals = _load_journals(user_id)
-    if business_no:
-        target_business_no = normalize_business_no(business_no)
-        journals = [
-            item for item in journals
-            if normalize_business_no(item.get("business_no", "")) == target_business_no
-        ]
     if company_name and not business_no:
-        journals = [
-            item for item in journals
-            if str(item.get("company_name", "")) == str(company_name)
-        ]
+        st.info("사업자등록번호를 확인한 뒤 상담일지를 연결해 주세요. 기존 상담 원본은 보존됩니다.")
+        return
+    journals = _load_journals(user_id, business_no)
 
     st.markdown("#### 녹음파일 상담일지 보기")
     st.caption(

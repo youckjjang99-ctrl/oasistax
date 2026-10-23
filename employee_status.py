@@ -6,6 +6,8 @@ import io
 import json
 import os
 import re
+import uuid
+from copy import deepcopy
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -545,11 +547,8 @@ def _load_json(path: Path, default: Any) -> Any:
 
 
 def _save_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
-    )
+    from crm_file_store import atomic_write_json
+    atomic_write_json(path, value)
 
 
 def _normalized_columns(df: pd.DataFrame) -> dict[str, str]:
@@ -1734,35 +1733,35 @@ def save_employee_roster(
     employees: list[dict[str, Any]],
     parse_info: dict[str, Any],
 ) -> tuple[dict[str, Any], str]:
+    from crm_file_store import locked_json, read_json_object, CrmStorageError
+
+    normalized = _normalize_business_no(business_no)
+    if not str(user_id or "").strip() or len(normalized) != 10:
+        raise ValueError("직원현황을 연결할 사용자와 사업자등록번호를 확인해주세요.")
     now = datetime.now().isoformat(timespec="seconds")
     summary = build_summary(employees)
-    version_id = hashlib.sha256(
-        f"{user_id}|{business_no}|{filename}|{now}".encode("utf-8")
-    ).hexdigest()[:24]
+    version_id = uuid.uuid4().hex
 
     record = {
         "version_id": version_id,
         "owner_user_id": user_id,
-        "business_no": business_no,
+        "business_no": normalized,
         "company_name": company_name,
         "filename": filename,
         "uploaded_at": now,
         "summary": summary,
-        "employees": employees,
-        "parse_info": parse_info,
+        "employees": deepcopy(employees),
+        "parse_info": deepcopy(parse_info),
     }
 
     path = _storage_path(user_id)
-    data = _load_json(path, {})
-    if not isinstance(data, dict):
-        data = {}
-    key = _company_key(business_no, company_name)
-    versions = data.get(key, [])
-    if not isinstance(versions, list):
-        versions = []
-    versions.insert(0, record)
-    data[key] = versions[:20]
-    _save_json(path, data)
+    with locked_json(path):
+        data = read_json_object(path)
+        versions = data.get(normalized, [])
+        if not isinstance(versions, list) or any(not isinstance(item, dict) for item in versions):
+            raise CrmStorageError("기존 직원현황 이력을 읽지 못해 저장을 중단했습니다. 원본은 보존했습니다.")
+        data[normalized] = [deepcopy(record), *versions]
+        _save_json(path, data)
 
     cloud_message = "로컬 저장"
     if cloud_is_configured():
@@ -1773,7 +1772,7 @@ def save_employee_roster(
                     {
                         "version_id": version_id,
                         "owner_user_id": user_id,
-                        "business_no": business_no,
+                        "business_no": normalized,
                         "company_name": company_name,
                         "filename": filename,
                         "uploaded_at": now,
@@ -1848,18 +1847,23 @@ def _load_cloud_employee_versions(
         return []
 
     normalized_business = _normalize_business_no(business_no)
-    normalized_company = _clean(company_name)
-
-    rows = CloudDatabase().select(
-        TABLE_EMPLOYEE_ROSTERS,
-        filters={"owner_user_id": user_id},
-        columns=(
-            "version_id,owner_user_id,business_no,company_name,"
-            "filename,uploaded_at,summary_data,employee_data,parse_info"
-        ),
-        order="uploaded_at.desc",
-        limit=100,
-    )
+    if not str(user_id or "").strip() or len(normalized_business) != 10:
+        return []
+    # Older uploads stored the display-formatted number. Filter each supported
+    # representation on the server, never fetch an owner's unrelated companies.
+    formatted = f"{normalized_business[:3]}-{normalized_business[3:5]}-{normalized_business[5:]}"
+    rows = []
+    database = CloudDatabase()
+    for value in (normalized_business, formatted):
+        rows.extend(database.select_all(
+            TABLE_EMPLOYEE_ROSTERS,
+            filters={"owner_user_id": user_id, "business_no": value},
+            columns=(
+                "version_id,owner_user_id,business_no,company_name,"
+                "filename,uploaded_at,summary_data,employee_data,parse_info"
+            ),
+            order="uploaded_at.desc,version_id.desc",
+        ))
 
     matched: list[dict[str, Any]] = []
     for row in rows:
@@ -1869,32 +1873,14 @@ def _load_cloud_employee_versions(
         row_business = _normalize_business_no(
             row.get("business_no", "")
         )
-        row_company = _clean(row.get("company_name", ""))
-
-        business_match = bool(
-            normalized_business
-            and row_business == normalized_business
-        )
-        company_match = bool(
-            not normalized_business
-            and normalized_company
-            and row_company == normalized_company
-        )
-        fallback_company_match = bool(
-            normalized_business
-            and not row_business
-            and normalized_company
-            and row_company == normalized_company
-        )
-
-        if business_match or company_match or fallback_company_match:
+        if row_business == normalized_business and str(row.get("owner_user_id") or "") == user_id:
             matched.append(_cloud_employee_record(row))
 
     matched.sort(
         key=lambda item: str(item.get("uploaded_at", "")),
         reverse=True,
     )
-    return matched[:20]
+    return matched
 
 
 def _load_local_employee_versions(
@@ -1902,9 +1888,11 @@ def _load_local_employee_versions(
     business_no: str,
     company_name: str,
 ) -> list[dict[str, Any]]:
+    normalized = _normalize_business_no(business_no)
+    if not str(user_id or "").strip() or len(normalized) != 10:
+        return []
     data = _load_json(_storage_path(user_id), {})
-    key = _company_key(business_no, company_name)
-    versions = data.get(key, []) if isinstance(data, dict) else []
+    versions = data.get(normalized, []) if isinstance(data, dict) else []
     if not isinstance(versions, list):
         return []
     return [
@@ -1917,7 +1905,9 @@ def _load_local_employee_versions(
         }
         for version in versions
         if isinstance(version, dict)
-    ][:20]
+        and _normalize_business_no(version.get("business_no") or normalized) == normalized
+        and str(version.get("owner_user_id") or user_id) == user_id
+    ]
 
 
 def load_employee_versions(
@@ -1925,22 +1915,24 @@ def load_employee_versions(
     business_no: str,
     company_name: str = "",
 ) -> list[dict[str, Any]]:
+    local_versions = _load_local_employee_versions(user_id, business_no, company_name)
+    cloud_versions = []
     try:
         cloud_versions = _load_cloud_employee_versions(
             user_id,
             business_no,
             company_name,
         )
-        if cloud_versions:
-            return cloud_versions
     except Exception:
         pass
-
-    return _load_local_employee_versions(
-        user_id,
-        business_no,
-        company_name,
-    )
+    unique = {}
+    for version in [*cloud_versions, *local_versions]:
+        signature = str(version.get("version_id") or hashlib.sha256(json.dumps(
+            {key: value for key, value in version.items() if key != "storage_source"},
+            ensure_ascii=False, sort_keys=True, default=str,
+        ).encode("utf-8")).hexdigest())
+        unique.setdefault(signature, deepcopy(version))
+    return sorted(unique.values(), key=lambda item: str(item.get("uploaded_at", "")), reverse=True)
 
 
 def get_latest_employee_status(
@@ -2026,7 +2018,7 @@ def render_employee_status(
 
     state_key = (
         f"employee_roster_review_"
-        f"{_company_key(business_no, company_name)}"
+        f"{user_id}_{_company_key(business_no, '')}"
     )
     feedback_key = f"employee-roster:{user_id}:{business_no or company_name}"
     if allow_upload:
@@ -2038,7 +2030,7 @@ def render_employee_status(
             "4대보험 가입자명부 업로드",
             type=["xlsx", "xls", "csv", "pdf", "jpg", "jpeg", "png"],
             accept_multiple_files=True,
-            key=f"employee_roster_upload_{business_no or company_name}",
+            key=f"employee_roster_upload_{user_id}_{_normalize_business_no(business_no)}",
             help=(
                 "가입내역 페이지와 안내 페이지를 함께 올려도 됩니다. "
                 "AI가 직원 행이 없는 안내 페이지는 제외합니다. "
@@ -2051,7 +2043,7 @@ def render_employee_status(
         "AI 비전 분석 후 검수표 만들기",
         type="primary",
         use_container_width=True,
-        key=f"employee_roster_analyze_{business_no or company_name}",
+        key=f"employee_roster_analyze_{user_id}_{_normalize_business_no(business_no)}",
     ):
         with UploadProgress(
             feedback_key, "가입자명부 분석",
@@ -2191,7 +2183,7 @@ def render_employee_status(
                         from enterprise_documents import register_enterprise_document_bytes
 
                         for uploaded in uploaded_files:
-                            register_enterprise_document_bytes(
+                            saved_attachment = register_enterprise_document_bytes(
                                 user_id,
                                 business_no,
                                 company_name,
@@ -2208,6 +2200,12 @@ def render_employee_status(
                                     "expected_count": expected_count,
                                 },
                             )
+                            asset_status = (saved_attachment or {}).get("asset_storage_status", {})
+                            history_status = (saved_attachment or {}).get("history_storage_status", {})
+                            attachment_saved = bool(
+                                attachment_saved and asset_status.get("cloud_saved")
+                                and asset_status.get("metadata_saved") and history_status.get("cloud_saved")
+                            )
                     except Exception:
                         # 검토표와 기존 직원현황 저장 흐름은 첨부 연결 오류와 무관하게 유지합니다.
                         attachment_saved = False
@@ -2223,6 +2221,7 @@ def render_employee_status(
                             else f"AI검수_다중업로드_{len(uploaded_files)}개파일"
                         ),
                         "created_at": datetime.now().isoformat(timespec="seconds"),
+                        "attachment_cloud_confirmed": attachment_saved,
                     }
                     if failures or not attachment_saved:
                         task.warning(
@@ -2425,15 +2424,19 @@ def render_employee_status(
                             parse_info,
                         )
                         st.session_state.pop(state_key, None)
-                        if "Supabase" in message:
+                        if "Supabase" in message and pending.get("attachment_cloud_confirmed"):
                             task.complete(
                                 f"검수 완료한 직원 {len(employees)}명을 저장했습니다.",
                                 detail=message, persist=True,
                             )
                         else:
                             task.warning(
-                                f"검수 완료한 직원 {len(employees)}명을 로컬에 저장했습니다.",
-                                detail="클라우드 저장은 확인되지 않았습니다. 원본 자료를 별도로 보관해 주세요.", persist=True,
+                                f"검수 완료한 직원 {len(employees)}명의 저장 결과를 확인해 주세요.",
+                                detail=(
+                                    "직원현황은 Supabase에 저장했지만 원본·분석이력의 클라우드 보관은 모두 확인되지 않았습니다."
+                                    if "Supabase" in message else
+                                    "클라우드 저장은 확인되지 않았습니다. 로컬 결과는 유지했습니다. 원본 자료를 별도로 보관해 주세요."
+                                ), persist=True,
                             )
                     except Exception as exc:
                         task.error(safe_public_error(exc, "직원현황을 저장하지 못했습니다. 검수표는 유지됩니다."))
@@ -2453,6 +2456,17 @@ def render_employee_status(
             else "기업정보등록에서 4대보험 가입자명부 등록 시 분석됩니다."
         )
         return
+
+    if len(versions) > 1 and business_no:
+        selected = st.selectbox(
+            "저장된 직원현황 바로 보기", range(len(versions)),
+            format_func=lambda index: (
+                f"{str(versions[index].get('uploaded_at', ''))[:19]} · "
+                f"{versions[index].get('filename', '직원현황')}"
+            ),
+            key=f"employee_roster_version_{user_id}_{_normalize_business_no(business_no)}",
+        )
+        latest = versions[selected]
 
     summary = latest.get("summary", {}) or {}
     c1, c2, c3, c4 = st.columns(4)

@@ -684,6 +684,7 @@ def _render_enterprise_company_details(
 
     section_options = [
         "기업정보",
+        "자료함",
         "상담일지",
         "정책자금",
         "주가평가",
@@ -702,7 +703,11 @@ def _render_enterprise_company_details(
     )
     selected_section = selected_section or "기업정보"
 
-    if selected_section == "기업정보":
+    if selected_section == "자료함":
+        from company_materials import render_company_materials
+
+        render_company_materials(user_id, business_no, company_name)
+    elif selected_section == "기업정보":
         left, right = st.columns(2)
         with left:
             st.markdown("#### 기본정보")

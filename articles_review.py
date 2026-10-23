@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import re
 import struct
 import zlib
+import uuid
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -40,11 +43,8 @@ def _load_json(path: Path, default: Any) -> Any:
 
 
 def _save_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
-    )
+    from crm_file_store import atomic_write_json
+    atomic_write_json(path, value)
 
 
 def _review_path(user_id: str) -> Path:
@@ -308,20 +308,40 @@ def save_articles_review(
     filename: str,
     analysis: dict[str, Any],
 ) -> dict[str, Any]:
-    path = _review_path(user_id)
-    all_data = _load_json(path, {})
-    if not isinstance(all_data, dict):
-        all_data = {}
+    from crm_file_store import locked_json, read_json_object
 
-    key = _normalize_business_no(business_no) or company_name
+    normalized = _normalize_business_no(business_no)
+    if not str(user_id or "").strip() or len(normalized) != 10:
+        raise ValueError("정관 검토 결과를 연결할 사용자와 사업자등록번호를 확인해주세요.")
+    path = _review_path(user_id)
     record = {
+        **deepcopy(analysis),
+        "version_id": uuid.uuid4().hex,
+        "owner_user_id": user_id,
         "company_name": company_name,
-        "business_no": business_no,
+        "business_no": normalized,
         "filename": filename,
-        **analysis,
     }
-    all_data[key] = record
-    _save_json(path, all_data)
+    with locked_json(path):
+        try:
+            all_data = read_json_object(path)
+            previous = all_data.get(normalized, {})
+            if previous and not isinstance(previous, (dict, list)):
+                raise ValueError("invalid articles history")
+            retained = previous.get("_versions", [previous]) if isinstance(previous, dict) else previous
+            if not isinstance(retained, list) or any(not isinstance(item, dict) for item in retained):
+                raise ValueError("invalid articles versions")
+            for item in retained:
+                if (_normalize_business_no(item.get("business_no") or normalized) != normalized
+                        or str(item.get("owner_user_id") or user_id) != user_id):
+                    raise ValueError("mismatched articles context")
+        except (OSError, ValueError) as exc:
+            raise ValueError("기존 정관 검토이력을 읽지 못해 저장을 중단했습니다. 원본은 변경하지 않았습니다.") from exc
+        versions = _articles_versions_from_value(previous, user_id, normalized)
+        # Keep the legacy latest-value shape while retaining every prior version.
+        all_data[normalized] = {**record, "_versions": [record, *versions]}
+        _save_json(path, all_data)
+    _load_remote_articles_reviews.clear()
 
     detail = (
         f"정관점수: {analysis.get('score', 0)}점\n"
@@ -334,13 +354,13 @@ def save_articles_review(
             )[:5]
         )
     )
-    save_customer_event(
+    history_result = save_customer_event(
         user_id=user_id,
         business_no=business_no,
         company_name=company_name,
         event_id=(
             "articles-review-"
-            + str(analysis.get("reviewed_at", ""))
+            + record["version_id"]
         ),
         event_title=(
             f"{str(analysis.get('reviewed_at', ''))[:10]} "
@@ -349,8 +369,90 @@ def save_articles_review(
         event_detail=detail,
         occurred_at=analysis.get("reviewed_at", ""),
         source="articles_review",
+        extra_data={"문서유형": "articles", "정관분석": deepcopy(record)},
+        return_status=True,
+    )
+    record["history_storage_status"] = (
+        history_result.get("storage_status", {}) if isinstance(history_result, dict) else {}
     )
     return record
+
+
+def _articles_versions_from_value(value: Any, user_id: str, business_no: str) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        versions = value
+    elif isinstance(value, dict):
+        versions = value.get("_versions", [value])
+    else:
+        return []
+    if not isinstance(versions, list):
+        return []
+    matched = []
+    for version in versions:
+        if not isinstance(version, dict):
+            continue
+        row_business = _normalize_business_no(version.get("business_no", ""))
+        if row_business and row_business != business_no:
+            continue
+        if str(version.get("owner_user_id") or user_id) != user_id:
+            continue
+        item = deepcopy(version)
+        item.pop("_versions", None)
+        if item:
+            matched.append(item)
+    return matched
+
+
+@st.cache_data(ttl=30, max_entries=128, show_spinner=False, scope="session")
+def _load_remote_articles_reviews(user_id: str, business_no: str) -> list[dict[str, Any]]:
+    """Recover full analyses from existing owner-scoped history only when needed."""
+    from cloud_db import cloud_is_configured
+    if not cloud_is_configured():
+        return []
+    from customer_history import get_customer_history
+    records = []
+    for event in get_customer_history(user_id, business_no, limit=None):
+        if _normalize_business_no(event.get("business_no", "")) != business_no:
+            continue
+        if str(event.get("owner_user_id") or user_id) != user_id:
+            continue
+        data = event.get("data", {})
+        if not isinstance(data, dict) or data.get("문서유형") != "articles":
+            continue
+        review = data.get("정관분석")
+        if not isinstance(review, dict):
+            fields = data.get("추출정보", {})
+            review = fields.get("articles_review") if isinstance(fields, dict) else None
+        if isinstance(review, dict):
+            review = {"filename": data.get("파일명", ""),
+                      "reviewed_at": event.get("captured_at", ""), **review}
+            records.extend(_articles_versions_from_value(review, user_id, business_no))
+    return records
+
+
+def load_articles_review_versions(
+    user_id: str, business_no: str, company_name: str = "",
+) -> list[dict[str, Any]]:
+    del company_name  # A company name alone is not a safe cross-company key.
+    normalized = _normalize_business_no(business_no)
+    if not str(user_id or "").strip() or len(normalized) != 10:
+        return []
+    data = _load_json(_review_path(user_id), {})
+    versions = _articles_versions_from_value(
+        data.get(normalized, {}) if isinstance(data, dict) else {}, user_id, normalized,
+    )
+    if not versions:
+        try:
+            versions = _load_remote_articles_reviews(user_id, normalized)
+        except Exception:
+            versions = []
+    unique = {}
+    for item in versions:
+        signature = str(item.get("version_id") or hashlib.sha256(json.dumps(
+            item, ensure_ascii=False, sort_keys=True, default=str,
+        ).encode("utf-8")).hexdigest())
+        unique.setdefault(signature, deepcopy(item))
+    return sorted(unique.values(), key=lambda item: str(item.get("reviewed_at", "")), reverse=True)
 
 
 def get_latest_articles_review(
@@ -358,17 +460,8 @@ def get_latest_articles_review(
     business_no: str,
     company_name: str = "",
 ) -> dict[str, Any]:
-    data = _load_json(
-        _review_path(user_id),
-        {},
-    )
-    key = _normalize_business_no(business_no) or company_name
-    value = (
-        data.get(key, {})
-        if isinstance(data, dict)
-        else {}
-    )
-    return value if isinstance(value, dict) else {}
+    versions = load_articles_review_versions(user_id, business_no, company_name)
+    return versions[0] if versions else {}
 
 
 def render_articles_review(
@@ -393,7 +486,7 @@ def render_articles_review(
                 "pdf", "hwp", "docx", "txt",
                 "png", "jpg", "jpeg", "webp", "tif", "tiff",
             ],
-            key=f"articles_upload_{business_no or company_name}",
+            key=f"articles_upload_{user_id}_{_normalize_business_no(business_no)}",
         )
         render_upload_ready(uploaded)
 
@@ -401,7 +494,7 @@ def render_articles_review(
         "정관 분석 실행",
         type="primary",
         use_container_width=True,
-        key=f"articles_analyze_{business_no or company_name}",
+        key=f"articles_analyze_{user_id}_{_normalize_business_no(business_no)}",
     ):
         with UploadProgress(
             feedback_key, "정관 분석·등록",
@@ -439,7 +532,7 @@ def render_articles_review(
                     extraction=extraction,
                 )
                 task.step("결과 저장", "분석 결과와 기업 첨부자료를 연결하고 있습니다.")
-                save_articles_review(
+                saved_review = save_articles_review(
                     user_id,
                     business_no,
                     company_name,
@@ -450,7 +543,7 @@ def render_articles_review(
                 try:
                     from enterprise_documents import register_enterprise_document_bytes
 
-                    register_enterprise_document_bytes(
+                    saved_attachment = register_enterprise_document_bytes(
                         user_id,
                         business_no,
                         company_name,
@@ -467,6 +560,13 @@ def render_articles_review(
                             "extraction_method": extraction.get("method", ""),
                         },
                     )
+                    asset_status = (saved_attachment or {}).get("asset_storage_status", {})
+                    history_status = (saved_attachment or {}).get("history_storage_status", {})
+                    review_status = (saved_review or {}).get("history_storage_status", {})
+                    attachment_saved = bool(
+                        asset_status.get("cloud_saved") and asset_status.get("metadata_saved")
+                        and history_status.get("cloud_saved") and review_status.get("cloud_saved")
+                    )
                 except Exception:
                     # 정관 분석 결과는 이미 안전하게 저장됐으므로 유지합니다.
                     attachment_saved = False
@@ -474,8 +574,8 @@ def render_articles_review(
                     task.complete("정관 분석과 기업히스토리 저장을 완료했습니다.", persist=True)
                 else:
                     task.warning(
-                        "정관 분석 결과는 저장했지만 첨부자료 연결은 완료하지 못했습니다.",
-                        detail="분석 결과는 보존했습니다. 첨부자료 연결은 다시 등록해 주세요.", persist=True,
+                        "정관 분석 결과는 보존했지만 첨부자료 연결은 완료하지 못했습니다.",
+                        detail="원본·분석이력의 클라우드 보관이 모두 확인되지는 않았습니다. 로컬 결과는 유지했습니다. 자료 보관 상태를 확인해 주세요.", persist=True,
                     )
             except Exception as exc:
                 task.error(safe_public_error(exc, "정관 분석에 실패했습니다."))
@@ -494,6 +594,18 @@ def render_articles_review(
             else "기업정보등록에서 정관 등록 시 분석됩니다."
         )
         return
+
+    versions = load_articles_review_versions(user_id, business_no, company_name)
+    if len(versions) > 1:
+        selected = st.selectbox(
+            "저장된 정관 검토결과 바로 보기", range(len(versions)),
+            format_func=lambda index: (
+                f"{str(versions[index].get('reviewed_at', ''))[:19]} · "
+                f"{versions[index].get('filename', '정관 검토결과')}"
+            ),
+            key=f"articles_version_{user_id}_{_normalize_business_no(business_no)}",
+        )
+        review = versions[selected]
 
     c1, c2, c3 = st.columns(3)
     c1.metric(

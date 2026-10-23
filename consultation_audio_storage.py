@@ -103,25 +103,59 @@ def _rest_url(path: str) -> str:
     return f"{url}{path}"
 
 
-def _select_audio_rows(user_id: str, limit: int = 500) -> list[dict[str, Any]]:
+def _select_audio_rows(
+    user_id: str, limit: int = 500, *, business_no: str = "",
+) -> list[dict[str, Any]]:
     user_id = require_owner_context(user_id, allow_admin=True)
     if not storage_is_configured():
         return []
-    response = requests.get(
-        _rest_url(f"/rest/v1/{TABLE_NAME}"),
-        headers=_headers(),
-        params={
-            "select": "*",
-            "owner_user_id": f"eq.{user_id}",
-            "order": "created_at.desc",
-            "limit": str(limit),
-        },
-        timeout=REQUEST_TIMEOUT,
-    )
-    if not response.ok:
+    target = normalize_business_no(business_no)
+    if business_no and len(target) != 10:
         return []
-    rows = response.json()
-    return rows if isinstance(rows, list) else []
+    # Explicit library views page only the selected owner/company. Include
+    # exact legacy spellings without ever falling back to a company name.
+    variants = [None] if not business_no else [
+        ("business_no_normalized", target), ("business_no", target),
+        ("business_no", f"{target[:3]}-{target[3:5]}-{target[5:]}"),
+    ]
+    page_size = min(max(int(limit), 1), 1000)
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for variant in variants:
+        offset = 0
+        pages: set[str] = set()
+        while True:
+            params = {"select": "*", "owner_user_id": f"eq.{user_id}",
+                      "order": "created_at.desc,audio_id.asc", "limit": str(page_size),
+                      "offset": str(offset)}
+            if variant:
+                params[variant[0]] = f"eq.{variant[1]}"
+            response = requests.get(_rest_url(f"/rest/v1/{TABLE_NAME}"),
+                                    headers=_headers(), params=params, timeout=REQUEST_TIMEOUT)
+            if not response.ok:
+                return []
+            rows = response.json()
+            if not isinstance(rows, list):
+                return []
+            fingerprint = hashlib.sha256(json.dumps(rows, sort_keys=True,
+                                                    default=str).encode("utf-8")).hexdigest()
+            if rows and fingerprint in pages:
+                raise RuntimeError("상담 녹음 목록의 페이지를 안전하게 확인하지 못했습니다.")
+            pages.add(fingerprint)
+            for row in rows:
+                if not isinstance(row, dict) or str(row.get("owner_user_id") or "").strip() != user_id:
+                    continue
+                if business_no and not _same_company(row, "", business_no):
+                    continue
+                key = json.dumps(row, sort_keys=True, default=str)
+                if key not in seen:
+                    seen.add(key)
+                    result.append(row)
+            if not business_no or not rows:
+                break
+            offset += len(rows)
+    return sorted(result, key=lambda row: (str(row.get("created_at", "")),
+                                           str(row.get("audio_id", ""))), reverse=True)
 
 
 def _select_owned_audio_metadata(
@@ -165,7 +199,11 @@ def _select_owned_audio_metadata(
     if not isinstance(rows, list) or not rows:
         return None
     row = rows[0]
-    return row if isinstance(row, dict) else None
+    if not isinstance(row, dict):
+        return None
+    if "owner_user_id" in row and str(row.get("owner_user_id") or "").strip() != owner_user_id:
+        return None
+    return row
 
 
 def _same_company(row: dict[str, Any], company_name: str, business_no: str) -> bool:
@@ -173,8 +211,9 @@ def _same_company(row: dict[str, Any], company_name: str, business_no: str) -> b
     row_no = normalize_business_no(
         str(row.get("business_no_normalized") or row.get("business_no") or "")
     )
-    if target_no and row_no:
-        return target_no == row_no
+    if str(business_no or "").strip():
+        # Explicit company identity always outranks a legacy display name.
+        return len(target_no) == 10 and len(row_no) == 10 and target_no == row_no
     target_name = _normalize_company_name(company_name)
     row_name = _normalize_company_name(str(row.get("company_name", "")))
     return bool(target_name and row_name and target_name == row_name)
@@ -410,12 +449,17 @@ def list_company_audio(
     include_archived: bool = False,
 ) -> list[dict[str, Any]]:
     """표기 차이를 무시하고 같은 기업의 클라우드 녹음을 조회한다."""
-    rows = _select_audio_rows(user_id, limit=1000)
+    user_id = require_owner_context(user_id, allow_admin=True)
+    if len(normalize_business_no(business_no)) != 10:
+        return []
+    rows = _select_audio_rows(user_id, limit=1000, business_no=business_no)
     return [
         row for row in rows
+        if isinstance(row, dict)
+        if "owner_user_id" not in row or str(row.get("owner_user_id") or "").strip() == user_id
         if (include_archived or not _is_archived(row))
         if _same_company(row, company_name, business_no)
-    ][:100]
+    ]
 
 
 def create_signed_audio_url(
