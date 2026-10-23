@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from cloud_db import (
     CloudDatabase,
@@ -65,7 +66,10 @@ def _storage_path(owner_user_id: str, filename: str) -> str:
         str(owner_user_id).encode("utf-8")
     ).hexdigest()[:20]
     date_path = datetime.now(timezone.utc).strftime("%Y/%m/%d")
-    return f"{owner_hash}/{date_path}/{uuid.uuid4().hex}_{_safe_filename(filename)}"
+    # Storage object keys have stricter character rules than display filenames.
+    # Keep the original Korean filename in metadata, not in the private key.
+    suffix = Path(_safe_filename(filename)).suffix
+    return f"{owner_hash}/{date_path}/{uuid.uuid4().hex}{suffix}"
 
 
 def _asset_association_key(
@@ -433,9 +437,17 @@ def create_customer_asset_download_url(
     if not rows:
         raise PermissionError("문서를 찾을 수 없거나 접근 권한이 없습니다.")
     row = rows[0]
-    return db.create_private_signed_url(
+    download_name = str(row.get("original_filename") or "download")
+    signed_url = db.create_private_signed_url(
         str(row["storage_bucket"]),
         str(row["storage_path"]),
         expires_in=max(10, min(int(expires_in), 300)),
-        download_name=str(row.get("original_filename") or "download"),
+        download_name=download_name,
     )
+    # Storage serves an attachment only when download is on the final URL.
+    # Preserve the signature and other options, replacing any stale filename.
+    parts = urlsplit(signed_url)
+    query = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)
+             if key != "download"]
+    query.append(("download", download_name))
+    return urlunsplit(parts._replace(query=urlencode(query)))

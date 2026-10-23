@@ -1,4 +1,5 @@
 from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
 
 import pytest
 
@@ -10,6 +11,41 @@ from sync_outbox import load_local_outbox, retry_local_outbox
 SYNTHETIC_PHONE = "-".join(("010", "0000", "0000"))
 SYNTHETIC_NAME = "".join(("Private", "Person"))
 SYNTHETIC_SECRET = "".join(("private", "-secret"))
+
+
+@pytest.mark.parametrize("filename", ["한글_세무조정계산서.pdf", "원본_정관_최종.docx", "企業資料_日本語.xlsx"])
+def test_private_storage_key_is_ascii_without_changing_display_filename(filename):
+    first = storage._storage_path("synthetic-owner", filename)
+    second = storage._storage_path("synthetic-owner", filename)
+    assert first.isascii() and second.isascii()
+    assert first != second
+    assert Path(first).suffix == Path(filename).suffix
+    assert "synthetic-owner" not in first
+    assert storage._safe_filename("한글_세무조정계산서.pdf") == "한글_세무조정계산서.pdf"
+
+
+def test_korean_original_keeps_metadata_name_and_bytes_while_using_valid_private_key(tmp_path, monkeypatch):
+    source = tmp_path / "한글_세무조정계산서.pdf"
+    source.write_bytes(b"synthetic original")
+    monkeypatch.setenv(storage.PRIVATE_ASSET_FEATURE_FLAG, "true")
+    monkeypatch.setattr(storage, "cloud_is_configured", lambda: True)
+    captured = {}
+    class FakeDatabase:
+        def select(self, *args, **kwargs):
+            return []
+        def upload_private_object(self, bucket, path, content, content_type):
+            assert path.isascii()
+            captured.update(path=path, content=content)
+        def upsert(self, table, rows, on_conflict):
+            if table == storage.TABLE_CUSTOMER_ASSETS:
+                captured["metadata"] = rows[0]
+            return rows
+    monkeypatch.setattr(storage, "CloudDatabase", FakeDatabase)
+    result = storage.store_private_customer_asset(source, owner_user_id="synthetic-owner", asset_type="enterprise_document")
+    assert result.cloud_saved and result.metadata_saved
+    assert captured["metadata"]["original_filename"] == source.name
+    assert captured["metadata"]["storage_path"] == captured["path"]
+    assert captured["content"] == source.read_bytes() == b"synthetic original"
 
 
 def test_feature_off_preserves_local_file_without_cloud_call(
@@ -92,9 +128,33 @@ def test_signed_download_is_scoped_to_owner(monkeypatch) -> None:
         owner_user_id="user-1",
     )
 
-    assert url == "https://signed.invalid/temporary"
+    assert url == "https://signed.invalid/temporary?download=customer.pdf"
     assert captured["filters"]["owner_user_id"] == "user-1"
     assert captured["filters"]["status"] == "active"
+
+
+def test_signed_download_preserves_signature_and_uses_korean_original_filename(monkeypatch):
+    monkeypatch.setenv(storage.PRIVATE_ASSET_FEATURE_FLAG, "1")
+    captured = {}
+
+    class FakeDatabase:
+        def select(self, *args, **kwargs):
+            return [{"storage_bucket": "private", "storage_path": "opaque.pdf",
+                     "original_filename": "한글 자료.pdf"}]
+
+        def create_private_signed_url(self, *args, **kwargs):
+            captured.update(kwargs)
+            return "https://signed.invalid/temporary?token=synthetic%2Bsignature&download=old&option=&download=duplicate#section"
+
+    monkeypatch.setattr(storage, "CloudDatabase", FakeDatabase)
+    url = storage.create_customer_asset_download_url("asset-1", owner_user_id="user-1", expires_in=999)
+    parts = urlsplit(url)
+    assert parts.scheme == "https" and parts.netloc == "signed.invalid"
+    assert parts.path == "/temporary" and parts.fragment == "section"
+    assert parse_qsl(parts.query, keep_blank_values=True) == [
+        ("token", "synthetic+signature"), ("option", ""), ("download", "한글 자료.pdf")]
+    assert captured["expires_in"] == 300
+    assert captured["download_name"] == "한글 자료.pdf"
 
 
 def test_same_blob_can_be_linked_to_a_second_customer_without_reupload(

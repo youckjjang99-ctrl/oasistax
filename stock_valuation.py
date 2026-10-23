@@ -2036,6 +2036,68 @@ def _apply_reviewed_tax_adjustment(
     )
 
 
+def _render_tax_period_recovery(
+    user_id: str, business_no: str, records: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Keep legacy/unreadable uploads visible without inventing fiscal facts."""
+    from enterprise_documents import review_tax_document_period
+    from tax_adjustment_valuation import unrecognized_tax_records
+
+    unresolved = [item for item in unrecognized_tax_records(records)
+                  if any(item.get(name) for name in
+                         ("filename", "source_filename", "local_path", "file_path", "asset_id", "sha256"))]
+    if not unresolved:
+        return None
+    scope = f"{user_id}:{business_no}"
+    with st.expander(f"사업연도 확인이 필요한 업로드 {len(unresolved)}개", expanded=True):
+        st.info(
+            "파일은 등록되어 있지만 사업연도를 읽지 못했거나 이전 분석 형식으로 저장된 자료입니다. "
+            "파일명의 연도·신고일은 확정 사업연도가 아닙니다. 원본을 대조해 실제 시작일과 종료일을 확인해주세요."
+        )
+        choice = st.selectbox(
+            "사업연도를 확인할 원본파일", range(len(unresolved)), index=None,
+            format_func=lambda index: str(unresolved[index].get("filename") or "등록된 세무조정계산서")
+            + " · " + str(unresolved[index].get("first_uploaded_at") or unresolved[index].get("uploaded_at") or "등록일 미확인"),
+            placeholder="사업연도가 빠진 파일을 선택하세요", key=f"stock_tax_recovery_file:{scope}",
+        )
+        if choice is None:
+            return None
+        record = unresolved[choice]
+        record_key = str(record.get("record_id", ""))
+        if not record_key:
+            st.warning("원본 식별정보가 없어 확인정보를 안전하게 연결할 수 없습니다. 해당 파일을 다시 등록해주세요.")
+            return None
+        st.caption("원본은 자료함에서 확인할 수 있습니다. 이 작업은 사업연도만 추가하며, 기존 평가값이나 금액을 자동 변경하지 않습니다.")
+        with st.form(f"stock_tax_recovery:{scope}:{record_key}"):
+            year_text = st.text_input("확인한 사업연도(종료연도)", placeholder="예: 2023")
+            start_text = st.text_input("원본의 사업연도 시작일", placeholder="YYYY-MM-DD")
+            end_text = st.text_input("원본의 사업연도 종료일", placeholder="YYYY-MM-DD")
+            confirmed = st.checkbox("원본에서 선택 기업의 실제 사업연도 시작일·종료일을 직접 확인했습니다.")
+            submitted = st.form_submit_button("확인한 사업연도 저장·목록에 추가", type="primary")
+        if not submitted:
+            return None
+        try:
+            if not re.fullmatch(r"(?:19|20)\d{2}", year_text.strip()):
+                raise ValueError("사업연도는 4자리 연도로 입력해주세요.")
+            saved = review_tax_document_period(
+                user_id, business_no, record_key, int(year_text.strip()),
+                start_text.strip(), end_text.strip(), confirmed=confirmed,
+                company_name=str(st.session_state.get("stock_company_name", "")),
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+            return None
+        except Exception as exc:
+            st.error(safe_public_error(exc, "사업연도 확인정보를 저장하지 못했습니다. 기존 자료는 변경하지 않았습니다."))
+            return None
+        status = saved.get("period_review_storage_status", {})
+        if status.get("cloud_saved"):
+            st.success("사업연도 확인정보를 클라우드에 저장했습니다. 아래 목록에서 해당 연도를 선택하고 법정 금액을 검토하세요.")
+        else:
+            st.warning("사업연도 확인정보는 로컬에 보존했습니다. 클라우드 저장은 미확인이며, 다른 기기에서 보이지 않을 수 있습니다.")
+        return saved
+
+
 def _render_stock_tax_adjustment(user_id: str) -> None:
     from enterprise_documents import load_enterprise_document_context
     from tax_adjustment_valuation import (
@@ -2061,12 +2123,22 @@ def _render_stock_tax_adjustment(user_id: str) -> None:
             user_id, business_no, st.session_state.get("stock_company_name", ""),
             include_remote_tax=True,
         )
-        candidates = build_tax_adjustment_candidates(context.get("records", []), valuation_date)
     except Exception as exc:
         st.error(safe_public_error(exc, "연결된 세무조정 자료를 불러오지 못했습니다."))
         return
+    recovered = _render_tax_period_recovery(user_id, business_no, context.get("records", []))
+    if recovered:
+        context["records"] = [
+            recovered if item.get("record_id") == recovered.get("record_id") else item
+            for item in context.get("records", [])
+        ]
+    try:
+        candidates = build_tax_adjustment_candidates(context.get("records", []), valuation_date)
+    except Exception as exc:
+        st.error(safe_public_error(exc, "세무조정 자료의 사업연도를 확인하지 못했습니다."))
+        return
     if not candidates:
-        st.info("반영할 사업연도가 확인된 세무조정계산서가 없습니다. 기업정보등록에서 자료를 올리고 사업연도를 확인해주세요.")
+        st.info("확정된 사업연도가 아직 없습니다. 위 ‘사업연도 확인이 필요한 업로드’에서 원본의 기간을 확인하거나 기업정보등록에서 자료를 올려주세요.")
         return
     year_map = {int(item["year"]): item for item in candidates}
     years = sorted(year_map, reverse=True)

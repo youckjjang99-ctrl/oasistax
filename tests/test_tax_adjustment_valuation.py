@@ -216,3 +216,153 @@ def test_matching_explicit_identity_preserves_candidate_without_review_flag():
     candidate = tax.build_tax_adjustment_candidates([item], date(2026, 10, 22))[0]
     assert not candidate["identity_review_required"]
     assert candidate["values"]["income"] == 100
+
+
+@pytest.mark.parametrize("heading", [
+    "사업연도 2023.01.01\n2023.12.31",
+    "사업연도\n2023.01.01\n2023.12.31",
+    "사업연도 2023.01.01 | 2023.12.31",
+    "사 업 연 도\n2023년 1월 1일\n2023년 12월 31일",
+    "2023.01.01\n사업연도\n~ 2023.12.31",
+    "2023.01.01\n사 업 연 도\n2023.12.31",
+])
+def test_explicit_adjacent_form_cells_recover_fiscal_period(heading):
+    result = tax.analyze_tax_adjustment_text(
+        "세무조정계산서\n" + heading + "\n각사업연도소득금액 100원"
+    )
+    assert len(result["valuation_periods"]) == 1
+    period = result["valuation_periods"][0]
+    assert (period["year"], period["period_start"], period["period_end"]) == (
+        2023, "2023-01-01", "2023-12-31",
+    )
+    assert period["values"]["income"] == 100
+
+
+@pytest.mark.parametrize("heading", [
+    "2023년 귀속 세무조정계산서",
+    "2023년 귀속 법인세 과세표준 및 세액신고서",
+    "2023년 귀속\n세무조정계산서",
+    "2023년 사 업 연 도",
+])
+def test_clear_attribution_heading_offers_year_without_inventing_period(heading):
+    result = tax.analyze_tax_adjustment_text(heading + "\n각사업연도소득금액 100원")
+    assert result["years"] == ["2023"]
+    period = result["valuation_periods"][0]
+    assert period["period_start"] == period["period_end"] == ""
+    candidate = tax.build_tax_adjustment_candidates([record(heading)], date(2026, 10, 23))[0]
+    assert not candidate["period_verified"]
+
+
+@pytest.mark.parametrize("heading", [
+    "작성일 2023.01.01\n사업연도\n2023.12.31",
+    "사업연도\n작성일 2023.01.01\n법개정일 2023.12.31",
+    "세무조정계산서\n법개정일 2023년 귀속",
+    "2023년 귀속 근로소득 지급명세서",
+    "첨부파일명 tax_2023.pdf\n작성일 2023.01.01",
+])
+def test_unrelated_dates_and_noncorporate_attribution_are_not_periods(heading):
+    result = tax.analyze_tax_adjustment_text(heading + "\n각사업연도소득금액 100원")
+    assert result["valuation_periods"] == []
+
+
+def _legacy_tax_record(**analysis):
+    return {
+        "document_type": "tax_adjustment", "record_id": "legacy-source",
+        "filename": "synthetic-legacy.pdf", "uploaded_at": "2026-10-23T10:00:00",
+        "business_no": "-".join(("123", "45", "67890")), "owner_user_id": "synthetic-owner",
+        "extracted_fields": {"recognized": True, "years": ["2023"],
+                             "financial_fields": {"당기순이익": 999, "과세표준": 888},
+                             **analysis},
+    }
+
+
+@pytest.mark.parametrize("analysis", [
+    {}, {"years": []}, {"valuation_periods": []},
+    {"valuation_periods": [{"year": "unknown"}]},
+    {"valuation_periods": "malformed historical data"},
+])
+def test_missing_legacy_period_is_listed_without_automatically_guessing_year(analysis):
+    source = _legacy_tax_record(**analysis)
+    unresolved = tax.unrecognized_tax_records([source])
+    assert unresolved == [source]
+    assert unresolved[0] is not source
+    assert tax.build_tax_adjustment_candidates([source], date(2026, 10, 23)) == []
+
+
+def test_manual_period_recovery_preserves_original_and_never_maps_legacy_amounts():
+    from copy import deepcopy
+
+    original = _legacy_tax_record()
+    before = deepcopy(original)
+    reviewed = tax.reviewed_tax_period_record(original, 2023, "2023-01-01", "2023-12-31")
+    assert original == before
+    assert reviewed["extracted_fields"]["years"] == ["2023"]
+    assert reviewed["extracted_fields"]["financial_fields"] == before["extracted_fields"]["financial_fields"]
+    candidate = tax.build_tax_adjustment_candidates([reviewed], date(2026, 10, 23))[0]
+    assert candidate["period_verified"]
+    assert candidate["year"] == 2023
+    assert all(value is None for value in candidate["values"].values())
+    assert all(value is None for value in candidate["financial_fields"].values())
+    assert candidate["missing"] == [component["key"] for component in tax.COMPONENTS]
+    assert candidate["sources"][0]["manual_period_review"] is True
+    assert tax.unrecognized_tax_records([reviewed]) == []
+
+
+@pytest.mark.parametrize("year,start,end", [
+    (2024, "2023-01-01", "2023-12-31"),
+    (2023, "2023-12-31", "2023-01-01"),
+    (2023, "2023-02-30", "2023-12-31"),
+    (2023, "20230101", "2023-12-31"),
+    (2023, "2023-1-1", "2023-12-31"),
+    (2023, "", "2023-12-31"),
+    (2023, "2023-01-01", ""),
+    (1899, "1899-01-01", "1899-12-31"),
+    (2101, "2101-01-01", "2101-12-31"),
+    (True, "2023-01-01", "2023-12-31"),
+])
+def test_manual_period_recovery_rejects_invalid_or_inconsistent_dates(year, start, end):
+    with pytest.raises(ValueError):
+        tax.reviewed_tax_period_record(_legacy_tax_record(), year, start, end)
+
+
+def test_manual_short_period_keeps_existing_annualization_guard_information():
+    reviewed = tax.reviewed_tax_period_record(
+        _legacy_tax_record(), 2023, "2023-07-01", "2023-12-31",
+    )
+    candidate = tax.build_tax_adjustment_candidates([reviewed], date(2026, 10, 23))[0]
+    assert candidate["short_period"]
+    assert candidate["period_verified"]
+
+
+def test_manual_recovery_does_not_overwrite_an_already_recognized_period():
+    source = record("2023 사업연도\n각사업연도소득금액 100원")
+    assert tax.unrecognized_tax_records([source]) == []
+    with pytest.raises(ValueError, match="이미 사업연도"):
+        tax.reviewed_tax_period_record(source, 2023, "2023-01-01", "2023-12-31")
+
+
+@pytest.mark.parametrize("record_changes,analysis_changes", [
+    ({"document_type": "corporate_registry"}, {}),
+    ({}, {"business_no": "-".join(("999", "99", "99999"))}),
+    ({}, {"business_numbers": ["-".join(("999", "99", "99999"))]}),
+    ({"business_no": ""}, {"business_numbers": ["-".join(("123", "45", "67890"))]}),
+    ({}, {"business_numbers": ["invalid historical identity"]}),
+])
+def test_manual_recovery_reuses_original_company_identity_boundary(record_changes, analysis_changes):
+    source = {**_legacy_tax_record(**analysis_changes), **record_changes}
+    assert tax.unrecognized_tax_records([source]) == []
+    with pytest.raises(ValueError, match="식별정보"):
+        tax.reviewed_tax_period_record(source, 2023, "2023-01-01", "2023-12-31")
+
+
+def test_manual_recovery_retains_multi_company_identity_review_requirement():
+    source = _legacy_tax_record(business_numbers=["-".join(("123", "45", "67890")), "-".join(("999", "99", "99999"))])
+    recovered = tax.reviewed_tax_period_record(source, 2023, "2023-01-01", "2023-12-31")
+    candidate = tax.build_tax_adjustment_candidates([recovered], date(2026, 10, 23))[0]
+    assert candidate["identity_review_required"]
+
+
+def test_manual_recovery_requires_traceable_original_record_id():
+    source = {**_legacy_tax_record(), "record_id": ""}
+    with pytest.raises(ValueError, match="식별정보"):
+        tax.reviewed_tax_period_record(source, 2023, "2023-01-01", "2023-12-31")
