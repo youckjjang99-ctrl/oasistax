@@ -591,8 +591,10 @@ def calculate_goodwill(
 
 
 def calculate_stock_valuation(inputs: dict[str, Any]) -> dict[str, Any]:
+    from stock_capital_ui import validate_capital_inputs
+    validate_capital_inputs(inputs)
     current_shares = _safe_number(inputs.get("current_shares"))
-    if not current_shares or current_shares <= 0:
+    if not current_shares or current_shares <= 0 or not current_shares.is_integer():
         raise ValueError("현재 발행주식총수를 입력해주세요.")
 
     annual_rows = inputs.get("annual_rows", [])
@@ -602,7 +604,7 @@ def calculate_stock_valuation(inputs: dict[str, Any]) -> dict[str, Any]:
 
     for weight, row in zip((3, 2, 1), annual_rows):
         net_income = _safe_number(row.get("adjusted_net_income"))
-        annual_shares = _safe_number(row.get("shares")) or current_shares
+        annual_shares = _safe_number(row.get("shares"))
         year = row.get("year")
 
         if net_income is None:
@@ -615,7 +617,7 @@ def calculate_stock_valuation(inputs: dict[str, Any]) -> dict[str, Any]:
             })
             continue
 
-        if not annual_shares or annual_shares <= 0:
+        if not annual_shares or annual_shares <= 0 or not annual_shares.is_integer():
             raise ValueError(f"{year}년 발행주식총수를 확인해주세요.")
 
         per_share_income = net_income / annual_shares
@@ -883,6 +885,28 @@ def _registry_snapshot_identity_conflicts(
     )
 
 
+def _merge_registry_capital_fields(older, newer):
+    """A reviewed parser result is a coherent snapshot, including unknowns."""
+    merged = {**deepcopy(older or {}), **{key: deepcopy(value) for key, value in (newer or {}).items()
+                                        if _registry_snapshot_value_present(value)}}
+    if (newer or {}).get("registry_parser_version") == "capital-history-v1":
+        for key in ("발행주식총수", "자본금", "1주당액면가액", "주식종류", "capital_history", "capital_events",
+                    "capital_history_warnings", "capital_history_review_required", "registry_parser_version"):
+            merged[key] = deepcopy(newer.get(key))
+    versions = []
+    for source in (older or {}, newer or {}):
+        for version in source.get("_versions", []):
+            if version not in versions:
+                versions.append(deepcopy(version))
+    prior = {key: deepcopy(value) for key, value in (older or {}).items() if key != "_versions"}
+    latest = {key: value for key, value in (newer or {}).items() if key != "_versions"}
+    if prior and prior != latest and prior not in versions:
+        versions.append(prior)
+    if versions:
+        merged["_versions"] = versions
+    return merged
+
+
 def _merge_registry_snapshot_versions(
     local: dict[str, Any], cloud: dict[str, Any],
 ) -> dict[str, Any]:
@@ -901,10 +925,7 @@ def _merge_registry_snapshot_versions(
         return float("-inf")
 
     older, newer = (cloud, local) if timestamp(local) > timestamp(cloud) else (local, cloud)
-    merged = dict(older or {})
-    merged.update({key: value for key, value in dict(newer or {}).items()
-                   if _registry_snapshot_value_present(value)})
-    return merged
+    return _merge_registry_capital_fields(older, newer)
 
 
 def _registry_snapshot_from_cache(
@@ -974,9 +995,14 @@ def _save_registry_cache(
         direct = cache.get(key, {})
         if direct and _registry_snapshot_identity_conflicts(direct, key, data.get("법인등록번호", "")):
             raise RegistryCacheReadError("기존 등기와 새 자료의 식별번호가 달라 덮어쓰지 않았습니다.")
-        merged = dict(existing or {})
-        merged.update({field: value for field, value in dict(data or {}).items()
-                       if _registry_snapshot_value_present(value)})
+        merged = _merge_registry_capital_fields(existing, data)
+        versions = deepcopy(merged.get("_versions", []))
+        if existing:
+            previous = {field: deepcopy(value) for field, value in existing.items() if field != "_versions"}
+            if previous not in versions:
+                versions.append(previous)
+        if versions:
+            merged["_versions"] = versions
         snapshot = {**merged, "사업자등록번호": key,
                     "saved_at": datetime.now().isoformat(timespec="microseconds")}
         cache[key] = snapshot
@@ -1026,6 +1052,12 @@ def _apply_registry_data(data: dict[str, Any]) -> None:
     ) or st.session_state.get("stock_authorized_shares", "")
     if data.get("주식종류"):
         st.session_state["stock_share_classes"] = data["주식종류"]
+    if data.get("registry_parser_version") == "capital-history-v1":
+        # An ambiguous current count must not retain the old parsed number.
+        for source_key, state_key in (("발행주식총수", "stock_current_shares"), ("자본금", "stock_capital"),
+                                      ("1주당액면가액", "stock_par_value")):
+            st.session_state[state_key] = _format_number(data.get(source_key))
+        st.session_state["stock_share_classes"] = deepcopy(data.get("주식종류") or [])
 
 
 def _restore_registry_for_business(
@@ -1088,12 +1120,6 @@ def _restore_registry_for_business(
     if data and apply_to_state:
         _apply_registry_data(data)
         st.session_state["stock_last_registry_data"] = data
-        issued = _format_number(data.get("발행주식총수"))
-        if issued:
-            for index in range(1, 4):
-                key_name = f"stock_shares_{index}"
-                if not st.session_state.get(key_name):
-                    st.session_state[key_name] = issued
     return data
 
 
@@ -1134,6 +1160,7 @@ def _apply_loaded_record(record: dict[str, Any]) -> None:
     st.session_state["stock_tax_adjustment_review"] = deepcopy(
         record.get("tax_adjustment_review", [])
     )
+    st.session_state["stock_capital_review"] = deepcopy(record.get("capital_review", {}))
     st.session_state["stock_company_name"] = record.get("company_name", "")
     st.session_state["stock_business_no"] = record.get("business_no", "")
     st.session_state["stock_corporate_no"] = record.get("corporate_no", "")
@@ -1235,6 +1262,9 @@ def _stock_record_inputs(record: dict[str, Any]) -> dict[str, Any]:
     values["goodwill"] = record.get("goodwill_manual", record.get("goodwill"))
     values["share_classes"] = values["share_classes"] or []
     values["tax_adjustment_review"] = values["tax_adjustment_review"] or []
+    for key in ("capital_source", "capital_review"):
+        if key in record:
+            values[key] = deepcopy(record[key])
     return values
 
 
@@ -1268,6 +1298,9 @@ def _persist_stock_calculation(
     previous_id = st.session_state.get("stock_loaded_record_id", "")
     record["supersedes_record_id"] = previous_id if previous_id != record_id else ""
     registry_source = st.session_state.get("stock_last_registry_data", {})
+    capital_review = inputs.get("capital_review") or {}
+    if capital_review and capital_review.get("owner_user_id") != str(user_id):
+        raise ValueError("다른 사용자의 자본변동 검토를 현재 평가에 저장할 수 없습니다.")
     if isinstance(registry_source, dict) and _registry_snapshot_identity_conflicts(
         registry_source, inputs.get("business_no", ""), inputs.get("corporate_no", ""),
     ):
@@ -1376,6 +1409,7 @@ def _stock_company_state_keys() -> list[str]:
         "stock_premium_selection", "stock_premium_custom_pct", "stock_save_feedback",
         "stock_persisted_record_id", "stock_persisted_inputs", "stock_registry_review_needed",
         "stock_saved_result_preview",
+        "stock_capital_review",
     ]
     for index in range(1, 4):
         keys.extend(
@@ -1688,12 +1722,6 @@ def _render_registry_upload(
                     _restore_stock_financial_inputs(preserved_financial_inputs)
                     st.session_state["stock_last_registry_data"] = registry_data
                     st.session_state["stock_registry_restored_key"] = saved_registry_business_no
-                    issued = _format_number(registry_data.get("발행주식총수"))
-                    if issued:
-                        for index in range(1, 4):
-                            share_key = f"stock_shares_{index}"
-                            if not st.session_state.get(share_key):
-                                st.session_state[share_key] = issued
                 attachment_saved = True
                 original_cloud_confirmed = False
                 try:
@@ -1813,6 +1841,8 @@ def _render_stock_materials(user_id: str) -> None:
     if not isinstance(registry, dict):
         registry = {}
     records = _records_for_stock_company(user_id, business)
+    from stock_capital_ui import render_registry_reanalysis
+    render_registry_reanalysis(user_id)
     with st.container(border=True):
         st.markdown("### 등록 자료 · 최근 평가 바로보기")
         if registry:
@@ -2350,6 +2380,8 @@ def render_stock_valuation_page(
         key="stock_valuation_detail_view", label_visibility="collapsed",
     )
     if view == "세무조정계산서 반영":
+        from stock_capital_ui import render_stock_capital_review
+        render_stock_capital_review(user_id)
         _render_stock_tax_adjustment(user_id)
         _remember_stock_company_state(user_id, st.session_state.get("stock_business_no", ""))
         return
@@ -2358,6 +2390,11 @@ def render_stock_valuation_page(
         st.success(applied_message)
 
     _render_stock_materials(user_id)
+    from stock_capital_ui import render_stock_capital_review, capital_registry_source, capital_review_required
+    _ensure_text_state("stock_valuation_date", date.today().isoformat())
+    for index in range(1, 4):
+        _ensure_text_state(f"stock_year_{index}", str(date.today().year - index))
+    render_stock_capital_review(user_id)
 
     with st.form(
         "stock_valuation_input_form_v855",
@@ -2468,7 +2505,7 @@ def render_stock_valuation_page(
                 shares = st.text_input(
                     "해당 연도 발행주식총수(주)",
                     key=shares_key,
-                    placeholder="공란이면 현재 주식수 적용",
+                    placeholder="각 사업연도 말·법정 환산 주식수 확인 필수",
                 )
                 annual_rows.append({
                     "year": year,
@@ -2686,6 +2723,10 @@ def render_stock_valuation_page(
             "premium_rate": premium_pct / 100,
             "tax_adjustment_review": deepcopy(st.session_state.get("stock_tax_adjustment_review", [])),
         }
+        capital_source = capital_registry_source(st.session_state.get("stock_last_registry_data") or {})
+        if capital_review_required(capital_source):
+            inputs["capital_source"] = capital_source
+            inputs["capital_review"] = deepcopy(st.session_state.get("stock_capital_review", {}))
 
         capital_number = _safe_number(capital_text)
         issued_shares_number = _safe_number(current_shares_text)
