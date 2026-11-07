@@ -59,6 +59,12 @@ def _valuation_app(legacy=False):
 
 
 def _calculate(app):
+    # Year-end counts are explicitly reviewed; blank values no longer inherit
+    # the current count, including when a legacy evaluation omitted them.
+    for index in range(1, 4):
+        widget = app.text_input(key=f"stock_shares_{index}")
+        if not widget.value:
+            widget.input("10000")
     next(button for button in app.button if button.label == "주가평가 계산").click().run()
     assert not app.exception
 
