@@ -320,6 +320,8 @@ def _offline_app(monkeypatch, *, real_history=False, navigation=False):
             "stock_year_1": "2025", "stock_year_2": "2024", "stock_year_3": "2023",
             "stock_net_income_1": "300,000", "stock_net_income_2": "200,000",
             "stock_net_income_3": "100,000", "stock_goodwill_mode": "manual",
+            # Explicitly reviewed year-end counts, no current-count fallback.
+            "stock_shares_1": "100", "stock_shares_2": "100", "stock_shares_3": "100",
         })
         return True, "synthetic financial source"
 

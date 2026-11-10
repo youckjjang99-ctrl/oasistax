@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import re
 from pathlib import Path
 from typing import Any
@@ -703,7 +704,22 @@ def sync_registry_snapshot(
             )
             existing_data = existing_row.get("registry_data", {})
             if isinstance(existing_data, dict):
-                data = _merge_snapshot_data(existing_data, data)
+                incoming = deepcopy(data)
+                data = _merge_snapshot_data(existing_data, incoming)
+                if incoming.get("registry_parser_version") == "capital-history-v1":
+                    # Unknowns in one new analysis must not resurrect old values.
+                    for key in ("발행주식총수", "자본금", "1주당액면가액", "주식종류", "capital_history", "capital_events",
+                                "capital_history_warnings", "capital_history_review_required", "registry_parser_version"):
+                        data[key] = deepcopy(incoming.get(key))
+                versions = deepcopy(existing_data.get("_versions", []))
+                for version in incoming.get("_versions", []):
+                    if version not in versions:
+                        versions.append(deepcopy(version))
+                prior = {key: deepcopy(value) for key, value in existing_data.items() if key != "_versions"}
+                if prior and prior not in versions:
+                    versions.append(prior)
+                if versions:
+                    data["_versions"] = versions
     data["사업자등록번호"] = business_no
 
     result = _safe_upsert(
